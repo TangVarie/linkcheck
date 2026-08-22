@@ -148,39 +148,62 @@ async def feishu_search(token, app_token, table_id, field_names, filter_spec,
             return items, True
 
 
-async def feishu_field_options(token, app_token, table_id, field_name):
-    """读某个多选字段已建的选项，读不到返回 None（= 不过滤，宁可试着写）。
+async def feishu_fields(token, app_token, table_id, deadline=None):
+    """一次取回表的全部字段元数据：({列名集合}, {列名: 选项列表})。
+    读不到返回 (None, {})——None = 不过滤，宁可试着写。
 
-    这层过滤在扣子路径上尤其重要：batch_update 是全成功或全失败，
-    一个没建过的选项名（比如「大爆」没建，而某行评论数刚过 100）会让整批
-    几十行一起回滚——而且每一轮都重算出同一个标签、每一轮都整批失败，
-    钱照花、结果全丢，直到有人去把选项建好。服务端跑得了 doctor 能提前发现，
-    扣子跑不了，只能在这里挡。
+    两个用途，都是防「表级错误让整批回滚」：
+    * 列名集合：按名字写一个表里不存在的列（1254045）会让整批写回失败，
+      还没建的机器列要在写回前挡下来（挡下的列在结果消息里提示）；
+    * 选项列表：写一个没建过的多选选项（1254291）同样整批回滚。
+    服务端跑得了 doctor 能提前发现这两类问题，扣子跑不了，只能在这里挡。
+
+    deadline：到点按「读不到」返回。元数据现在是读表前的串行步骤，
+    超过 100 列的表翻页慢时不能让它吃光读表和写回的预算。
     """
     page_token = ""
+    names, options_map = set(), {}
     try:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None, {}
             url = (f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}"
                    f"/fields?page_size=100")
             if page_token:
                 url += "&page_token=" + _quote(page_token)
+            wait = 15.0 if deadline is None else max(1.0, min(15.0, deadline - time.monotonic()))
             response = await requests.get(
-                url, headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+                url, headers={"Authorization": f"Bearer {token}"}, timeout=wait)
             data = json.loads(response.text)
             if data.get("code") not in (0, None):
-                return None
+                return None, {}
             payload = data.get("data") or {}
             for item in payload.get("items") or []:
-                if item.get("field_name") == field_name:
-                    options = ((item.get("property") or {}).get("options")) or []
-                    return [o["name"] for o in options if isinstance(o, dict) and o.get("name")]
+                name = item.get("field_name")
+                if not name:
+                    continue
+                names.add(str(name))
+                prop = item.get("property") or {}
+                if "options" in prop:
+                    # 选择类字段一定带 options 键；空列表也要记下来——
+                    # 空表示「一个选项都没建，全部拦下」，丢成 None 会被
+                    # 解读成「读不到元数据、别过滤」，机器选项直接写进去
+                    # 就是整批回滚。
+                    options_map[str(name)] = [
+                        o["name"] for o in (prop.get("options") or [])
+                        if isinstance(o, dict) and o.get("name")]
+                else:
+                    # 列存在但不是选择类字段（比如被误建成文本列）：记空表全拦。
+                    # 往文本列写多选列表本来就写不进去，拦下比整批回滚强——
+                    # 与服务端 cli 的口径一致。.get 返回 None 只留给「列不存在」。
+                    options_map[str(name)] = []
             if not payload.get("has_more"):
-                return None
+                return names, options_map
             page_token = payload.get("page_token") or ""
             if not page_token:
-                return None
+                return names, options_map
     except Exception:                                  # noqa: BLE001
-        return None
+        return None, {}
 
 
 async def feishu_batch_update(token, app_token, table_id, updates):
@@ -309,26 +332,38 @@ async def main(args: Any) -> dict:
         filter_spec = {"conjunction": "and", "conditions": [
             {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
 
-    # 读表 + 两个多选列的选项**并发**取：选项各有 15 秒超时，串行的话
-    # 慢响应会把读表的预算先吃光，扫出空表还报 ok:True。
+    # 字段元数据必须先取：search 按名字请求列，请求一个还没建的列
+    # （比如「点赞数」）会让整个 search 报 1254045、一行都读不到。
+    # 只给软截止的 1/6 当预算——它是读表前的串行步骤，不能饿死后面的
+    # 扫描和写回。超时/失败 = 不过滤（宁可试着写），与服务端语义一致。
+    try:
+        table_fields, options_map = await feishu_fields(
+            token, p["app_token"], p["table_id"],
+            deadline=time.monotonic() + SOFT_DEADLINE / 6)
+    except Exception:                                  # noqa: BLE001
+        table_fields, options_map = None, {}
+    if mode != "row" and table_fields is not None and f.last_updated not in table_fields:
+        # 「最近检查时间」列还没建：分层刷新没有依据，每一行都会被判成
+        # 「该刷了」，一轮 sweep 就是全表重刷；写回侧又会把时间戳挡掉
+        # （列不存在），下一轮照样全刷——烧钱死循环，拒跑。
+        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
+                "message": f"表里还没建「{f.last_updated}」列：分层刷新没有依据，"
+                           "每一轮都会全表重刷烧钱，先建好这一列再跑"}
+    traffic_options = options_map.get(f.traffic_status)
+    status_options = options_map.get(f.comment_status)
+    wanted_fields = f.must_read()
+    if table_fields is not None:
+        wanted_fields = [c for c in wanted_fields if c in table_fields]
+
     # 读表按「最后更新时间」升序扫（最久没刷的最前），预算给到软截止的一半。
     scan_deadline = deadline - SOFT_DEADLINE / 2
-    search_result, traffic_options, status_options = await asyncio.gather(
-        feishu_search(token, p["app_token"], p["table_id"], f.must_read(),
-                      filter_spec, deadline=scan_deadline, sort_field=f.last_updated),
-        feishu_field_options(token, p["app_token"], p["table_id"], f.traffic_status),
-        feishu_field_options(token, p["app_token"], p["table_id"], f.comment_status),
-        return_exceptions=True,
-    )
-    if isinstance(search_result, Exception):
+    try:
+        records, scan_complete = await feishu_search(
+            token, p["app_token"], p["table_id"], wanted_fields,
+            filter_spec, deadline=scan_deadline, sort_field=f.last_updated)
+    except Exception as exc:                           # noqa: BLE001
         return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
-                "message": str(search_result)}
-    records, scan_complete = search_result
-    # 选项读取失败 = None = 不过滤（宁可试着写），与服务端语义一致。
-    if isinstance(traffic_options, Exception):
-        traffic_options = None
-    if isinstance(status_options, Exception):
-        status_options = None
+                "message": str(exc)}
     scan_note = ("" if scan_complete
                  else "；⚠ 读表未扫完（飞书响应慢），本轮按最久未刷的行优先，其余下一轮继续")
 
@@ -342,12 +377,15 @@ async def main(args: Any) -> dict:
             record_id=record_id,
             link_cell=_cell_text(cells.get(f.link)),
             publish_time_ms=_cell_ms(cells.get(f.publish_time)),
-            expected_pinned=_cell_text(cells.get(f.expected_pinned)),
+            seed_keywords=_cell_keywords(cells.get(f.seed_keywords)),
             current_tags=_cell_tags(cells.get(f.traffic_status)),
             previous_comment_count=_cell_int(cells.get(f.comment_count)),
+            previous_like_count=_cell_int(cells.get(f.like_count)),
+            previous_collect_count=_cell_int(cells.get(f.collect_count)),
             last_updated_ms=_cell_ms(cells.get(f.last_updated)),
             consecutive_failures=_cell_int(cells.get(f.consecutive_failures)) or 0,
             comment_status=_cell_tags(cells.get(f.comment_status)),
+            pinned_comment=_cell_text(cells.get(f.pinned_comment)),
             queued=bool(cells.get(f.queued)),
         )
         if wanted or row.queued or row.is_due(settings, now):
@@ -379,6 +417,7 @@ async def main(args: Any) -> dict:
     # fen 用 float 累加、最后一次取整——按单次调用四舍五入的话，
     # TikHub 抖音 0.72 分/次会被每次凑成 1 分，虚报近四成。
     updates, fen, balance, used = [], 0.0, 0, {}
+    dropped_columns = set()
     entries = []   # (update, 刷新状态) —— 熔断要能找到该撤销的那些行
     attempted = gone = fatal_rows = 0
     for row, result in zip(rows, results):
@@ -398,6 +437,13 @@ async def main(args: Any) -> dict:
             fatal_rows += 1
         for name, count in tally.items():
             used[name] = used.get(name, 0) + count
+        if fields and table_fields is not None:
+            # 表里还没建的机器列挡下来：按名字写不存在的列是表级错误，
+            # 会让整批写回失败。挡下的列名在结果消息里提示。
+            missing = set(fields) - table_fields
+            if missing:
+                dropped_columns |= missing
+                fields = {k: v for k, v in fields.items() if k in table_fields}
         if fields:
             update = {"record_id": row.record_id, "fields": fields}
             updates.append(update)
@@ -415,11 +461,17 @@ async def main(args: Any) -> dict:
         for update, status in entries:
             update["fields"].pop(f.traffic_status, None)
             if status in ("已失效", "疑似受限"):
-                update["fields"][f.refresh_status] = "刷新失败"
                 update["fields"].pop(f.consecutive_failures, None)
-                original = str(update["fields"].get(f.failure_reason) or "")
-                update["fields"][f.failure_reason] = \\
-                    (f"{original}；{note}" if original else note)[:500]
+                update["fields"].pop(f.alive_confirmed, None)
+                # 只往表里真实存在的列写：entries 里的 fields 已按 table_fields
+                # 过滤过，熔断改写不能把被挡掉的列再塞回去——那会恰好在
+                # 上游故障（熔断要兜的时刻）让整批写回失败。
+                if table_fields is None or f.refresh_status in table_fields:
+                    update["fields"][f.refresh_status] = "刷新失败"
+                if table_fields is None or f.failure_reason in table_fields:
+                    original = str(update["fields"].get(f.failure_reason) or "")
+                    merged_note = f"{original}；{note}" if original else note
+                    update["fields"][f.failure_reason] = merged_note[:500]
 
     cents = round(fen)
     try:
@@ -434,6 +486,9 @@ async def main(args: Any) -> dict:
         message += f"；⚠ 本轮 {'、'.join(sorted(disabled))} 通道不可用，已降级"
     if tripped:
         message += "；⚠ 本批失效比例异常，已熔断，未改流量状态"
+    if dropped_columns:
+        message += ("；⚠ 这些列在表里还没建，本轮已跳过："
+                    + "、".join(sorted(dropped_columns)))
     if fatal_rows:
         # Key 失效 / 余额耗尽把通道全打死了：必须报 ok:False 让下游告警分支
         # 接住——静默返回成功，半夜的故障就没人知道了。已完成的行照常写回。
@@ -519,6 +574,8 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
                          "已失效" if convicted else "疑似受限",
                          traffic_options, status_options, touch_tags=convicted)
         fields[f.consecutive_failures] = strikes
+        if convicted:
+            fields[f.alive_confirmed] = False
         return (fields, fen, balance, "已失效" if convicted else "疑似受限", tally)
 
     if snapshot is None:
@@ -531,14 +588,17 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
     verdict = decide(snapshot, settings,
                      previous_comment_count=row.previous_comment_count,
                      age_hours=row.age_hours(now),
-                     expected_pinned=row.expected_pinned,
+                     seed_keywords=row.seed_keywords,
                      current_tags=row.current_tags,
-                     current_comment_status=row.comment_status)
+                     previous_pinned=row.pinned_comment)
     if snapshot.censored:
         verdict.notes.append("⚠ 上游把这条标成了审核中/受限，请人工确认")
     fields = _render(row, verdict, snapshot, settings, now, "正常",
                      traffic_options, status_options)
     fields[f.consecutive_failures] = 0
+    # 有正面证据（评论或评论数）才勾「已确认存活」；空壳轮次复选框不动。
+    if snapshot.comments or snapshot.comment_count:
+        fields[f.alive_confirmed] = True
     return (fields, fen, balance, "正常", tally)
 
 
@@ -568,7 +628,8 @@ def _render(row, verdict, snapshot, settings, now, status,
             )[:500]
         if merged.changed:
             fields[f.traffic_status] = merged.final
-        wanted = comment_status_values(verdict.pin, row.comment_status, settings)
+        # 「评论状态」由关键词命中结果驱动（命中=显示评论，未命中=没有显示）。
+        wanted = comment_status_values(verdict, settings)
         if wanted is not None:
             merged_status = merge(row.comment_status, wanted,
                                   settings.comment_status.namespace(),
@@ -589,12 +650,23 @@ def _render(row, verdict, snapshot, settings, now, status,
             if row.previous_comment_count is not None:
                 fields[f.previous_comment_count] = row.previous_comment_count
             fields[f.comment_count] = snapshot.comment_count
+        # 点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
         if snapshot.like_count is not None:
+            if row.previous_like_count is not None:
+                fields[f.previous_like_count] = row.previous_like_count
             fields[f.like_count] = snapshot.like_count
         if snapshot.collect_count is not None:
+            if row.previous_collect_count is not None:
+                fields[f.previous_collect_count] = row.previous_collect_count
             fields[f.collect_count] = snapshot.collect_count
-        fields[f.pinned_comment] = format_pinned(snapshot)
-        fields[f.comment_digest] = format_digest(snapshot, settings.digest)
+        # 置顶评论和快照只在看到了评论页时更新：空壳轮写空串/「暂无评论」
+        # 会抹掉上一轮的真实内容，「置顶评论」还是掉落告警的对比基线。
+        if snapshot.comments or snapshot.comment_count is not None:
+            fields[f.pinned_comment] = format_pinned(snapshot)
+            fields[f.comment_digest] = format_digest(snapshot, settings.digest)
+        seed_text = format_seed_match(verdict, snapshot)
+        if seed_text is not None:
+            fields[f.seed_match] = seed_text
     return fields
 
 
@@ -618,6 +690,23 @@ def _cell_tags(value):
         return [v if isinstance(v, str) else str((v or {}).get("name") or "")
                 for v in value if v]
     return [value] if isinstance(value, str) and value else []
+
+
+def _cell_keywords(value):
+    """评论关键词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分
+    （不按空格，「cGMP 因子」这类带空格的词组不能拆碎）。"""
+    raw = [w for w in _cell_tags(value) if w] if isinstance(value, list) else []
+    if not raw:
+        # 富文本分段（单行文本列的返回形态）走文本拼接再拆，
+        # 否则文本列里的关键词会静默消失。
+        raw = re.split(r"[，,、;；\\n]+", _cell_text(value))
+    seen, out = set(), []
+    for word in raw:
+        word = (word or "").strip()
+        if word and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
 
 
 def _cell_int(value):

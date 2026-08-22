@@ -186,104 +186,79 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat) -> str:
 
 
 def _normalize(text: str) -> str:
-    """比对置顶文案用的归一化：去空白、去标点、统一大小写。
+    """比对文本用的归一化：去空白、去标点、统一大小写。
 
-    运营在小红书 App 里发的置顶评论，跟表里登记的「期望置顶文案」几乎不可能
-    逐字一致（emoji、换行、被平台吞掉的符号），所以只做宽松包含匹配。
+    表里登记的关键词和评论区里实际打出来的字几乎不可能逐字一致
+    （大小写、emoji、被平台吞掉的符号），所以只做宽松包含匹配——
+    实际数据里「cGMP因子」和「cgmp因子」就是混着写的。
     """
     return re.sub(r"[\s\W_]+", "", (text or "")).lower()
 
 
-def _looks_like_seed(comment: CommentView, expected: str) -> bool:
-    """这条评论是不是我们种下去的那条。
+@dataclass
+class SeedHit:
+    """关键词命中结果：哪个词、命中在哪条评论。"""
 
-    运营在 App 里发的置顶评论，跟表里登记的关键词几乎不可能逐字一致
-    （emoji、换行、被平台吞掉的符号、事后追加编辑），所以做宽松匹配。
+    keyword: str
+    comment: str
+
+
+def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[SeedHit]:
+    """评论关键词组 × 第一页评论的包含匹配。
+
+    这查的是**我们自己的种子评论有没有显示出来**（和「蓝词」无关——
+    蓝词指评论里变成超链接的词，那是人工在手机端自查的）。
+    规则刻意简单：任一关键词（归一化后）出现在任一条评论里就算命中，
+    按关键词在表里的顺序取第一个命中的。没有长度门槛、没有辨识度要求——
+    「西地那非口溶膜」这类词本身就有辨识度。
     """
-    needle = _normalize(expected)
-    if len(needle) < 4:
-        # 太短的关键词误命中概率太高，宁可判不出也不要认错人。
-        return False
-    haystack = _normalize(comment.content)
-    if not haystack:
-        return False
-    # 反向包含（评论是关键词的子串）只为一种情况存在：我方评论被平台截断后
-    # 比登记的全文短。要求评论至少有关键词一半长——不然别人一条「好用！」
-    # 恰好是我方长文案的子串，就会被认成我方评论，漏报置顶被顶掉。
-    return needle in haystack or (
-        len(haystack) >= 8 and 2 * len(haystack) >= len(needle) and haystack in needle
-    )
+    for keyword in keywords:
+        needle = _normalize(keyword)
+        if not needle:
+            continue
+        for comment in snapshot.comments:
+            if needle in _normalize(comment.content):
+                return SeedHit(keyword, comment.content)
+    return None
 
 
 class Pin(Enum):
-    """置顶判定结果。"""
+    """置顶判定结果。
+
+    帖子是我们自己发的，置顶评论必然是我方置顶的——所以不需要拿关键词
+    去核对置顶内容，只需要回答「置顶还在不在」。置顶的具体内容由
+    「置顶评论」列原样展示。
+    """
 
     UNSUPPORTED = "unsupported"   # 抖音：接口没有 is_pinned，判不了
-    NO_SEED = "no_seed"           # 没填种子关键词，无从比对
-    SUCCESS = "success"           # 置顶的就是我们那条
-    REPLACED = "replaced"         # 有置顶，但被换成了别人的
-    LOST = "lost"                 # 置顶没了，但我方评论还在首页
-    SEED_MISSING = "seed_missing"  # 首页找不到我方评论
-    NONE_PINNED = "none_pinned"   # 压根没有置顶评论
+    PINNED = "pinned"             # 有置顶
+    NONE_PINNED = "none_pinned"   # 没有置顶
 
 
-def decide_pin(snapshot: Snapshot, expected: str) -> tuple[Pin, str]:
-    """判定置顶。返回（结果, 写进诊断信息的补充说明）。
-
-    这里刻意不只回答「置顶成功了吗」。对品牌方来说最该立刻知道的那种情况是
-    **置顶还在，但被换成了别人的评论**——只看「我们的置顶在不在」会完全错过这一幕。
-    """
+def decide_pin(snapshot: Snapshot) -> Pin:
     if not snapshot.supports_pinned:
-        return Pin.UNSUPPORTED, ""
-
-    pinned = snapshot.pinned
-    seeded = (expected or "").strip()
-
-    if not seeded:
-        if pinned is None:
-            return Pin.NONE_PINNED, ""
-        return Pin.NO_SEED, "未填写种子评论关键词，只能确认存在置顶评论，无法确认是不是我方的"
-
-    position = next(
-        (i for i, c in enumerate(snapshot.comments, start=1) if _looks_like_seed(c, seeded)),
-        None,
-    )
-
-    if pinned is not None:
-        if _looks_like_seed(pinned, seeded):
-            return Pin.SUCCESS, ""
-        if position:
-            return Pin.REPLACED, f"⚠ 置顶位被他人占据，我方评论掉到第 {position} 条"
-        return Pin.REPLACED, "⚠ 置顶位被他人占据，且首页未找到我方评论"
-
-    if position:
-        return Pin.LOST, f"⚠ 置顶已掉，我方评论现在排在第 {position} 条"
-    return Pin.SEED_MISSING, "⚠ 首页未找到我方种子评论（可能已被删除，或不在第一页）"
+        return Pin.UNSUPPORTED
+    return Pin.PINNED if snapshot.pinned is not None else Pin.NONE_PINNED
 
 
-def comment_status_values(
-    pin: Pin,
-    current: Optional[list[str]],
-    settings: Settings,
-) -> Optional[set[str]]:
-    """算出「评论状态」这一列里机器该写的值。
+def comment_status_values(verdict: "Verdict", settings: Settings) -> Optional[set[str]]:
+    """算出「评论状态」这一列里机器该写的值——由关键词命中结果驱动。
+
+    命中 = 我们的种子评论显示出来了 → 显示评论；
+    配了关键词但一条没中 → 没有显示（「待评论」也会被这个结论替掉——
+    待评论本质上就是还没显示）。
 
     返回 None 表示**这一轮不该碰这一列**，和「写一个空集合」完全不是一回事：
-    空集合会把机器上一轮写的置顶结论摘掉，None 是原样保留。
+    空集合会把上一轮的结论摘掉，None 是原样保留。没填关键词的行、
+    以及本轮没取到评论页内容的行都返回 None。
 
-    两种必须返回 None 的情况：
-      * 抖音 —— 接口没有 is_pinned，判不了
-      * 有置顶但没填种子关键词 —— 分不清是我方的还是别人的，
-        写「置顶成功」是撒谎，写「没有置顶」也是撒谎
+    和置顶无关：置顶内容由「置顶评论」列单独展示。匹配的是第一页评论，
+    两个平台都拿得到，所以抖音行同样能判。
     """
-    cs = settings.comment_status
-    if pin in (Pin.UNSUPPORTED, Pin.NO_SEED):
+    if not verdict.seed_checked:
         return None
-    if pin is Pin.SUCCESS:
-        return {cs.pinned_ok}
-    # 剩下的都是「我方置顶现在不在」：置顶被别人顶了、掉了、种子评论找不到、
-    # 压根没有置顶。区分只看历史——成功过就是掉了，没成功过就是从来没有。
-    return {cs.pinned_lost} if cs.ever_pinned(current) else {cs.never_pinned}
+    cs = settings.comment_status
+    return {cs.displayed} if verdict.seed_hit is not None else {cs.not_displayed}
 
 
 @dataclass
@@ -291,6 +266,11 @@ class Verdict:
     tags: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
     pin: Pin = Pin.UNSUPPORTED
+    # 关键词命中结果：seed_checked=True 且 seed_hit=None = 确认未命中；
+    # seed_checked=False（没填关键词、或本轮没看到评论页）时
+    # 「关键词命中」和「评论状态」两列都不碰。
+    seed_hit: Optional[SeedHit] = None
+    seed_checked: bool = False
 
 
 def decide(
@@ -299,9 +279,9 @@ def decide(
     *,
     previous_comment_count: Optional[int],
     age_hours: Optional[float],
-    expected_pinned: str = "",
+    seed_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
-    current_comment_status: Optional[list[str]] = None,
+    previous_pinned: Optional[str] = None,
 ) -> Verdict:
     """算出这一行本次应有的机器标签和置顶判定。
 
@@ -367,19 +347,52 @@ def decide(
         )
 
     # —— 置顶 ——
-    verdict.pin, note = decide_pin(snapshot, expected_pinned)
-    if note:
-        verdict.notes.append(note)
-    # 之前置顶成功过、现在掉了 —— 这是种草投放里最该被立刻发现的事之一。
-    # NO_SEED 也要排除：没填种子关键词时根本判不了「我方置顶在不在」，
-    # 这时报「已不在」和 comment_status_values 里「判不了就不下结论」的口径矛盾。
+    verdict.pin = decide_pin(snapshot)
+    # 之前有过置顶、现在没了 —— 自家帖子的置顶掉了，最该被立刻发现。
+    # 「之前有过」看的是上一轮写进「置顶评论」列的内容：非空且不是
+    # 抖音的「不支持」占位，就说明上一轮确实看到过置顶。
+    # 和关键词命中同一道证据门槛：本轮连评论页都没看到（评论和评论数
+    # 都空）就没资格说「掉了」——现有通道上小红书的空壳在上游层就被
+    # 译成 GONE 到不了这里，这道闸防的是上游契约漂移。
     if (
-        settings.comment_status.ever_pinned(current_comment_status)
-        and verdict.pin not in (Pin.SUCCESS, Pin.UNSUPPORTED, Pin.NO_SEED)
+        verdict.pin is Pin.NONE_PINNED
+        and (snapshot.comments or snapshot.comment_count is not None)
+        and previous_pinned
+        and previous_pinned != DOUYIN_PINNED_UNSUPPORTED
     ):
-        verdict.notes.append("⚠ 此前已确认置顶成功，本轮我方置顶已不在")
+        verdict.notes.append("⚠ 此前已确认有置顶，本轮置顶已不在")
+
+    # —— 关键词命中：任一关键词出现在第一页任一条评论里即算命中 ——
+    # 只在真的看到了评论页（有评论、或至少知道评论数）时才下结论：
+    # 空壳轮（items 空 + 评论数也没拿到）写「未命中/没有显示」是拿
+    # 上游缺数当证据，会诱导运营去无谓补评论。
+    if seed_keywords and (snapshot.comments or snapshot.comment_count is not None):
+        verdict.seed_checked = True
+        verdict.seed_hit = match_seed_keywords(snapshot, seed_keywords)
+        if verdict.seed_hit is None:
+            verdict.notes.append(
+                f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何关键词"
+                f"（共 {len(seed_keywords)} 个词）→ 评论没有显示"
+            )
+    elif seed_keywords:
+        verdict.notes.append("本轮未取到评论页内容，关键词命中与评论状态保持原样")
 
     return verdict
+
+
+def format_seed_match(verdict: Verdict, snapshot: Snapshot) -> Optional[str]:
+    """「关键词命中」列的内容：只标命中的那一条（或明确未命中）。
+
+    None = 这一轮不碰这一列（没填关键词、或没看到评论页）。
+    完整的第一页评论在「评论区快照」里，那一列是看评论区氛围的，
+    这里不重复也不覆盖。
+    """
+    if not verdict.seed_checked:
+        return None
+    if verdict.seed_hit is not None:
+        excerpt = re.sub(r"\s+", " ", verdict.seed_hit.comment or "").strip()[:60]
+        return f"✅ 命中「{verdict.seed_hit.keyword}」：{excerpt}"
+    return f"❌ 未命中（第一页 {len(snapshot.comments)} 条评论）"
 
 
 def gone_verdict(settings: Settings, reason: str = "",

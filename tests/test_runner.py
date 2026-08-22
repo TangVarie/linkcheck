@@ -42,7 +42,7 @@ def comment_page(count=50, pinned=True, balance=9000):
             "next_page_token": "", "points": {"cost": 10, "balance": balance}}
 
 
-def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, expected=""):
+def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, keywords=None):
     published = NOW - timedelta(days=age_days)
     return Row(
         record_id=record_id,
@@ -50,7 +50,7 @@ def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, expec
         publish_time_ms=int(published.timestamp() * 1000),
         current_tags=tags or [],
         previous_comment_count=prev_count,
-        expected_pinned=expected,
+        seed_keywords=keywords or [],
     )
 
 
@@ -358,7 +358,8 @@ class TestDouyin(RunnerTest):
         self.assertIn("抖音不支持置顶监控", pinned)
 
     def test_douyin_never_touches_comment_status(self):
-        """抖音判不了置顶，就绝不能碰运营手工维护的「评论状态」列。"""
+        """没填关键词的抖音行判不了「显示没显示」，绝不能碰「评论状态」列。
+        （填了关键词的抖音行现在能判——匹配的是第一页评论，不依赖置顶字段。）"""
         page = {"items": [], "comment_count": 5, "points": {"cost": 10, "balance": 1}}
         report = self.run_with([sse(page), sse({"comment_count": 5, "points": {"cost": 10, "balance": 1}})],
                                [self._row()])
@@ -366,11 +367,13 @@ class TestDouyin(RunnerTest):
 
 
 class TestPinnedTracking(RunnerTest):
-    """「评论状态」多选列：机器管置顶三值，人工值原样保留。"""
+    """「评论状态」由关键词命中驱动（命中=显示评论，未命中=没有显示）；
+    置顶只看「置顶评论」列的内容变化，掉了在诊断信息里报警。"""
 
-    def _row(self, *, expected="戳主页领券", status=None):
-        row = xhs_row(expected=expected)
+    def _row(self, *, status=None, keywords=None, pinned_cell=""):
+        row = xhs_row(keywords=keywords)
         row.comment_status = status or []
+        row.pinned_comment = pinned_cell
         return row
 
     def _run(self, pinned, row):
@@ -380,92 +383,207 @@ class TestPinnedTracking(RunnerTest):
             [row],
         )
 
-    def test_seeded_comment_still_pinned(self):
-        fields = self._run(True, self._row()).outcomes[0].fields
+    def test_hit_writes_displayed(self):
+        fields = self._run(True, self._row(keywords=["好用"])).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status],
-                         [self.settings.comment_status.pinned_ok])
+                         [self.settings.comment_status.displayed])
 
-    def test_never_pinned(self):
-        fields = self._run(False, self._row()).outcomes[0].fields
+    def test_miss_writes_not_displayed(self):
+        fields = self._run(True, self._row(keywords=["艾时达口溶膜"])).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status],
-                         [self.settings.comment_status.never_pinned])
+                         [self.settings.comment_status.not_displayed])
 
-    def test_pin_fell_off_after_success(self):
-        cs = self.settings.comment_status
-        fields = self._run(False, self._row(status=[cs.pinned_ok])).outcomes[0].fields
-        self.assertEqual(fields[self.settings.fields.comment_status], [cs.pinned_lost])
-        self.assertIn("此前已确认置顶成功", fields[self.settings.fields.failure_reason])
-
-    def test_human_value_in_the_same_column_survives(self):
-        """「评论是否显示」这类人工维护的值和置顶并列在同一列，机器绝不碰。"""
-        cs = self.settings.comment_status
-        row = self._row(status=["评论已显示", cs.pinned_ok])
-        final = self._run(False, row).outcomes[0].fields[self.settings.fields.comment_status]
-        self.assertIn("评论已显示", final)
-        self.assertIn(cs.pinned_lost, final)
-        self.assertNotIn(cs.pinned_ok, final)     # 三值互斥，旧值被摘掉
-
-    def test_pin_taken_over_by_someone_else(self):
-        """品牌方最该立刻知道的一种：置顶还在，但被换成了别人的评论。"""
-        page = comment_page(pinned=True)
-        page["items"][0]["content"] = "楼主恰饭了吧，别买"
-        page["items"].append({"content": "戳主页领券", "like_count": 1, "is_pinned": False,
-                              "is_author_comment": True, "ip_location": "上海",
-                              "author": {"name": "官号"}})
-        cs = self.settings.comment_status
-        report = self.run_with(
-            [sse(page), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [self._row(status=[cs.pinned_ok])],
-        )
-        fields = report.outcomes[0].fields
-        self.assertEqual(fields[self.settings.fields.comment_status], [cs.pinned_lost])
-        self.assertIn("置顶位被他人占据", fields[self.settings.fields.failure_reason])
-        # 置顶评论列展示的是「实际置顶的那条」，不是我们希望置顶的那条
-        self.assertIn("楼主恰饭了吧", fields[self.settings.fields.pinned_comment])
-
-    def test_no_seed_keyword_leaves_the_column_alone(self):
-        """有置顶但没填种子关键词：写「置顶成功」是撒谎，写「没有置顶」也是撒谎。"""
-        row = self._row(expected="", status=["评论已显示"])
-        fields = self._run(True, row).outcomes[0].fields
+    def test_no_keywords_leaves_column_alone(self):
+        """没填关键词的行判不了「显示没显示」，这一列绝不能碰。"""
+        fields = self._run(False, self._row(status=["待评论"])).outcomes[0].fields
         self.assertNotIn(self.settings.fields.comment_status, fields)
+
+    def test_verdict_replaces_pending(self):
+        """「待评论」本质上是还没显示：机器拿到结论后替掉它；
+        这一列里其他人工值原样保留。"""
+        cs = self.settings.comment_status
+        row = self._row(status=[cs.pending, "重点盯"], keywords=["好用"])
+        final = self._run(True, row).outcomes[0].fields[self.settings.fields.comment_status]
+        self.assertIn(cs.displayed, final)
+        self.assertNotIn(cs.pending, final)
+        self.assertIn("重点盯", final)
+
+    def test_pin_fell_off_is_reported(self):
+        """上一轮「置顶评论」里有内容、这一轮没有 → 置顶刚掉，诊断里报警，
+        「置顶评论」列清空（下一轮就不再重复报）。"""
+        row = self._row(pinned_cell="官号: 戳主页领券")
+        fields = self._run(False, row).outcomes[0].fields
+        self.assertIn("置顶已不在", fields[self.settings.fields.failure_reason])
+        self.assertEqual(fields[self.settings.fields.pinned_comment], "")
 
     def test_unknown_option_is_filtered(self):
         report = self.run_with(
             [sse(comment_page(pinned=True)),
              sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [self._row()],
-            comment_status_options=["评论已显示"],     # 表里没建置顶三值
+            [self._row(keywords=["好用"])],
+            comment_status_options=["待评论"],     # 表里没建「显示评论」选项
         )
         fields = report.outcomes[0].fields
         self.assertNotIn(self.settings.fields.comment_status, fields)
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
 
-class TestExitSignal(RunnerTest):
-    """退出码要能区分「真故障」和「正常分批」——定时任务的重启策略靠它。"""
+class TestFailurePathsLeaveKeywordColumnsAlone(RunnerTest):
+    """失败/存疑路径对「评论状态」「关键词命中」零发言权。
 
-    def test_fatal_error_is_marked_fatal(self):
-        report = self.run_with([err(401, 1401, "API Key 无效或已失效。")], [xhs_row()])
-        self.assertTrue(report.fatal)
+    这条不变量此前只靠 seed_checked 的默认值隐式成立：一旦有人让失败路径
+    也下「没有显示」的结论，一次上游故障就会给全表配了关键词的行批量摘掉
+    「显示评论」，诱导运营无谓补评论——恰是新口径三令五申要防的。
+    """
 
-    def test_quota_exhausted_is_fatal(self):
-        report = self.run_with([err(200, 1004, "当前 API Key 积分不足。")], [xhs_row()])
-        self.assertTrue(report.fatal)
+    def _row(self, *, strikes=0):
+        row = xhs_row(keywords=["艾时达口溶膜"])
+        row.comment_status = ["显示评论"]
+        row.consecutive_failures = strikes
+        return row
 
-    def test_soft_deadline_is_not_fatal(self):
-        """到软截止把剩余的行留给下一轮，是正常运行不是失败。
-        判错这条会让云平台把每一轮正常分批都当成崩溃，反复重启。"""
-        self.settings.soft_deadline_seconds = 0.0001
-        rows = [xhs_row(f"rec{i}") for i in range(5)]
-        report = self.run_with(lambda *a, **k: sse(comment_page()), rows)
-        self.assertFalse(report.fatal)
+    def assert_untouched(self, outcome):
+        self.assertNotIn(self.settings.fields.comment_status, outcome.fields)
+        self.assertNotIn(self.settings.fields.seed_match, outcome.fields)
 
-    def test_normal_run_is_not_fatal(self):
+    def test_first_strike_suspect(self):
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [self._row()])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_SUSPECT)
+        self.assert_untouched(report.outcomes[0])
+
+    def test_convicted_gone(self):
+        report = self.run_with([err(200, 1008, "当前作品已删除。")],
+                               [self._row(strikes=1)])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_GONE)
+        self.assert_untouched(report.outcomes[0])
+
+    def test_network_failure(self):
+        blip = transport.Response(0, "", "网络错误：timed out")
+        report = self.run_with([blip] * 3, [self._row()])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
+        self.assert_untouched(report.outcomes[0])
+
+
+class TestSeedKeywordColumn(RunnerTest):
+    """「关键词命中」列：表里填了评论关键词才写；任一词命中任一条评论即算命中。"""
+
+    def test_hit_written_with_keyword_and_comment(self):
+        page = comment_page(pinned=False)
+        page["items"].append({"content": "朋友安利的西地那非口溶膜", "like_count": 2,
+                              "is_pinned": False, "is_author_comment": False,
+                              "ip_location": "上海", "author": {"name": "路人"}})
+        report = self.run_with(
+            [sse(page), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(keywords=["西地那非口溶膜", "cGMP因子"])],
+        )
+        cell = report.outcomes[0].fields[self.settings.fields.seed_match]
+        self.assertIn("命中「西地那非口溶膜」", cell)
+        self.assertIn("西地那非口溶膜", cell)
+
+    def test_miss_written_explicitly(self):
+        report = self.run_with(
+            [sse(comment_page(pinned=False)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(keywords=["西地那非口溶膜"])],
+        )
+        fields = report.outcomes[0].fields
+        self.assertIn("未命中", fields[self.settings.fields.seed_match])
+        self.assertTrue(any("未命中" in n for n in [fields[self.settings.fields.failure_reason]]))
+
+    def test_no_keywords_leaves_column_alone(self):
         report = self.run_with(
             [sse(comment_page()), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [xhs_row()])
-        self.assertFalse(report.fatal)
-        self.assertEqual(report.aborted_reason, "")
+            [xhs_row()],
+        )
+        self.assertNotIn(self.settings.fields.seed_match, report.outcomes[0].fields)
+
+    def test_zero_comment_page_is_a_real_miss(self):
+        """评论数确认为 0 的空页不是空壳：第一页真的什么都没有，
+        「没有显示」和「未命中」都是可靠结论，端到端也要落列。"""
+        page = {"items": [], "comment_count": 0, "top_level_comment_count": 0,
+                "next_page_token": "", "points": {"cost": 10, "balance": 1}}
+        report = self.run_with(
+            [sse(page), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(keywords=["艾时达口溶膜"])],
+        )
+        fields = report.outcomes[0].fields
+        self.assertEqual(fields[self.settings.fields.comment_status],
+                         [self.settings.comment_status.not_displayed])
+        self.assertIn("未命中", fields[self.settings.fields.seed_match])
+
+
+class TestPreviousMetricsShift(RunnerTest):
+    """点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
+    判定仍然只基于评论数，这两组只作参考。"""
+
+    def test_previous_values_are_shifted(self):
+        row = xhs_row(prev_count=40)
+        row.previous_like_count = 500
+        row.previous_collect_count = 60
+        report = self.run_with(
+            [sse(comment_page(count=50)),
+             sse({"like_count": 800, "collect_count": 90,
+                  "points": {"cost": 10, "balance": 1}})],
+            [row],
+        )
+        f = self.settings.fields
+        fields = report.outcomes[0].fields
+        self.assertEqual(fields[f.previous_comment_count], 40)
+        self.assertEqual(fields[f.comment_count], 50)
+        self.assertEqual(fields[f.previous_like_count], 500)
+        self.assertEqual(fields[f.like_count], 800)
+        self.assertEqual(fields[f.previous_collect_count], 60)
+        self.assertEqual(fields[f.collect_count], 90)
+
+    def test_first_round_writes_only_current(self):
+        report = self.run_with(
+            [sse(comment_page(count=50)),
+             sse({"like_count": 800, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()],
+        )
+        f = self.settings.fields
+        fields = report.outcomes[0].fields
+        self.assertNotIn(f.previous_like_count, fields)
+        self.assertEqual(fields[f.like_count], 800)
+
+
+class TestAliveConfirmed(RunnerTest):
+    def test_ok_ticks_the_box(self):
+        report = self.run_with(
+            [sse(comment_page()), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()],
+        )
+        self.assertIs(report.outcomes[0].fields[self.settings.fields.alive_confirmed], True)
+
+    def test_confirmed_gone_unticks(self):
+        row = xhs_row()
+        row.consecutive_failures = 1
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [row])
+        self.assertIs(report.outcomes[0].fields[self.settings.fields.alive_confirmed], False)
+
+    def test_suspect_leaves_box_alone(self):
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [xhs_row()])
+        self.assertNotIn(self.settings.fields.alive_confirmed, report.outcomes[0].fields)
+
+    def test_ok_round_without_evidence_leaves_box_alone(self):
+        """评论页空壳 + detail 兜底失败：这一轮「成功」但对存亡零证据。
+        勾上「已确认存活」等于替上游缺数作保——复选框必须原样不动。"""
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7123456789012345678",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        calls = {"n": 0}
+
+        def responder(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return sse({"items": [], "comment_count": None,
+                            "points": {"cost": 10, "balance": 100}})
+            return err(500, 1005, "服务暂时不可用，请稍后重试")
+
+        report = self.run_with(responder, [row])
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_OK)
+        self.assertNotIn(self.settings.fields.alive_confirmed, outcome.fields)
 
 
 class TestSoftDeadline(RunnerTest):
@@ -477,7 +595,9 @@ class TestSoftDeadline(RunnerTest):
     """
 
     def test_rows_past_deadline_are_not_written_back(self):
-        self.settings.soft_deadline_seconds = 0.0001
+        # 负值 = 起跑线上截止就已过。0.0001 这种「快到期」在快机器上会让
+        # 第一行赶在 100µs 内被派发出去，CI 上必挂——测试要的是确定性。
+        self.settings.soft_deadline_seconds = -1
         rows = [xhs_row(f"rec{i}") for i in range(3)]
         row_with_history = rows[1]
         row_with_history.consecutive_failures = 1
@@ -494,7 +614,7 @@ class TestSoftDeadline(RunnerTest):
         self.assertFalse(report.fatal)                   # 正常分批，不是故障
 
     def test_deferred_rows_do_not_trip_the_breaker(self):
-        self.settings.soft_deadline_seconds = 0.0001
+        self.settings.soft_deadline_seconds = -1
         rows = [xhs_row(f"rec{i}") for i in range(12)]
         with mock.patch.object(transport, "post"):
             report = runner.refresh(rows, "fake-key", self.settings, now=NOW)
@@ -584,6 +704,9 @@ class TestUnknownCommentCount(RunnerTest):
         # 标签无变化 → 字段根本不进 payload（保持原样的最强形式）
         self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
         self.assertIn("保持原样", outcome.fields[self.settings.fields.failure_reason])
+        # 空壳轮也不该拿「暂无评论」/占位去覆盖上一轮的真实快照和置顶内容
+        self.assertNotIn(self.settings.fields.comment_digest, outcome.fields)
+        self.assertNotIn(self.settings.fields.pinned_comment, outcome.fields)
 
 
 class TestBreakerAccounting(RunnerTest):
@@ -617,6 +740,9 @@ class TestBreakerAccounting(RunnerTest):
         for outcome in report.outcomes:
             # 判定作废，这一轮的计数增量也要一并撤销
             self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+            # 「已确认存活=False」也是这轮 GONE 判定的产物，同样要撤销——
+            # 留着它，熔断就只救了状态列，没救勾选框。
+            self.assertNotIn(self.settings.fields.alive_confirmed, outcome.fields)
             reason = outcome.fields[self.settings.fields.failure_reason]
             self.assertIn("未找到对应内容", reason)     # 原始错误（含 request_id 线索）还在
             self.assertIn("疑似上游故障", reason)       # 熔断说明是追加的，不是覆盖

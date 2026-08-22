@@ -171,11 +171,8 @@ class TestCommentAnalysis(unittest.TestCase):
 
 
 class TestPinnedState(unittest.TestCase):
-    """置顶判定。品牌方最该立刻知道的不是「我们的置顶在不在」，
-    而是「置顶位有没有被别人占了」——只判前者会完全错过后一幕。"""
-
-    def setUp(self):
-        self.settings = Settings()
+    """置顶判定。帖子是我们自己发的，置顶评论必然是我方置顶的——
+    所以只需要回答「置顶还在不在」，不做任何内容比对。"""
 
     def _snap(self, comments, platform="xhs"):
         items = [
@@ -185,51 +182,79 @@ class TestPinnedState(unittest.TestCase):
         ]
         return analyze.read_comment_page(platform, {"items": items, "comment_count": len(items)})
 
-    def state(self, comments, expected, platform="xhs"):
-        return analyze.decide_pin(self._snap(comments, platform), expected)[0]
+    def test_pinned_exists(self):
+        self.assertIs(analyze.decide_pin(self._snap([("随便什么内容", True)])),
+                      analyze.Pin.PINNED)
 
-    def test_our_comment_is_pinned(self):
-        self.assertIs(self.state([("戳主页领 30 元优惠券～", True)], "戳主页领30元优惠券"),
-                      analyze.Pin.SUCCESS)
-
-    def test_emoji_and_whitespace_tolerated(self):
-        self.assertIs(self.state([("戳 主页  领 30 元优惠券 🎁✨", True)], "戳主页领30元优惠券"),
-                      analyze.Pin.SUCCESS)
-
-    def test_pin_taken_over_by_someone_else(self):
-        self.assertIs(
-            self.state([("楼主是不是恰饭了", True), ("戳主页领30元优惠券", False)],
-                       "戳主页领30元优惠券"),
-            analyze.Pin.REPLACED)
-
-    def test_pin_dropped_but_our_comment_still_there(self):
-        self.assertIs(
-            self.state([("好用", False), ("戳主页领30元优惠券", False)], "戳主页领30元优惠券"),
-            analyze.Pin.LOST)
-
-    def test_our_comment_gone_entirely(self):
-        self.assertIs(self.state([("路过", False)], "戳主页领30元优惠券"), analyze.Pin.SEED_MISSING)
-
-    def test_no_seed_configured_but_pin_exists(self):
-        self.assertIs(self.state([("随便什么", True)], ""), analyze.Pin.NO_SEED)
-
-    def test_no_seed_and_no_pin(self):
-        self.assertIs(self.state([("路过", False)], ""), analyze.Pin.NONE_PINNED)
+    def test_no_pinned(self):
+        self.assertIs(analyze.decide_pin(self._snap([("路过", False)])),
+                      analyze.Pin.NONE_PINNED)
 
     def test_douyin_always_unsupported(self):
-        self.assertIs(
-            self.state([("哈哈", False)], "戳主页领30元优惠券", platform="douyin"),
-            analyze.Pin.UNSUPPORTED)
+        self.assertIs(analyze.decide_pin(self._snap([("哈哈", False)], platform="douyin")),
+                      analyze.Pin.UNSUPPORTED)
 
-    def test_too_short_seed_refuses_to_match(self):
-        # 「券」这种一两个字的关键词会命中一大半评论，宁可判不出也不认错人
-        self.assertIs(self.state([("求券", True)], "券"), analyze.Pin.REPLACED)
 
-    def test_position_written_into_note(self):
-        _, note = analyze.decide_pin(
-            self._snap([("别人的置顶", True), ("x", False), ("戳主页领30元优惠券", False)]),
-            "戳主页领30元优惠券")
-        self.assertIn("第 3 条", note)
+class TestSeedKeywordMatch(unittest.TestCase):
+    """评论关键词组 × 第一页评论：任一词出现在任一条评论里即算命中，
+    返回命中的词和那条评论。规则刻意简单，没有长度门槛。"""
+
+    def _snap(self, texts):
+        items = [{"content": t, "is_pinned": False, "is_author_comment": False,
+                  "like_count": 0, "ip_location": "", "author": {"name": "x"}}
+                 for t in texts]
+        return analyze.read_comment_page("xhs", {"items": items, "comment_count": len(items)})
+
+    KEYWORDS = ["西地那非口溶膜", "艾时达口溶膜", "cGMP因子"]
+
+    def test_any_keyword_in_any_comment_hits(self):
+        snap = self._snap(["路过", "朋友推荐了艾时达口溶膜，用着还行", "求链接"])
+        hit = analyze.match_seed_keywords(snap, self.KEYWORDS)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.keyword, "艾时达口溶膜")
+        self.assertIn("艾时达口溶膜", hit.comment)
+
+    def test_case_insensitive(self):
+        """实际表里「cGMP因子」和「cgmp因子」混着写，必须都能命中。"""
+        snap = self._snap(["听说是 CGMP 因子的原理？"])
+        self.assertIsNotNone(analyze.match_seed_keywords(snap, ["cgmp因子"]))
+
+    def test_keyword_order_decides_which_hit_is_reported(self):
+        snap = self._snap(["西地那非口溶膜和艾时达口溶膜都见过"])
+        hit = analyze.match_seed_keywords(snap, self.KEYWORDS)
+        self.assertEqual(hit.keyword, "西地那非口溶膜")
+
+    def test_no_hit_returns_none(self):
+        snap = self._snap(["好用", "求链接"])
+        self.assertIsNone(analyze.match_seed_keywords(snap, self.KEYWORDS))
+
+    def test_empty_keywords_no_crash(self):
+        snap = self._snap(["好用"])
+        self.assertIsNone(analyze.match_seed_keywords(snap, []))
+        self.assertIsNone(analyze.match_seed_keywords(snap, ["", "  "]))
+
+    def test_decide_wires_hit_into_verdict(self):
+        snap = self._snap(["用的西地那非口溶膜"])
+        v = analyze.decide(snap, Settings(), previous_comment_count=None, age_hours=10,
+                           seed_keywords=self.KEYWORDS)
+        self.assertTrue(v.seed_checked)
+        self.assertEqual(v.seed_hit.keyword, "西地那非口溶膜")
+        self.assertIn("命中「西地那非口溶膜」", analyze.format_seed_match(v, snap))
+
+    def test_decide_reports_miss_in_notes(self):
+        snap = self._snap(["好用", "路过"])
+        v = analyze.decide(snap, Settings(), previous_comment_count=None, age_hours=10,
+                           seed_keywords=self.KEYWORDS)
+        self.assertTrue(v.seed_checked)
+        self.assertIsNone(v.seed_hit)
+        self.assertTrue(any("未命中" in n for n in v.notes))
+        self.assertIn("未命中", analyze.format_seed_match(v, snap))
+
+    def test_no_keywords_means_column_untouched(self):
+        snap = self._snap(["好用"])
+        v = analyze.decide(snap, Settings(), previous_comment_count=None, age_hours=10)
+        self.assertFalse(v.seed_checked)
+        self.assertIsNone(analyze.format_seed_match(v, snap))
 
 
 class TestHeatTiers(unittest.TestCase):
@@ -332,85 +357,94 @@ class TestRiskDetection(unittest.TestCase):
                                        "ip_location": "", "author": {"name": "官号"}}],
                             "comment_count": count})
                         v = analyze.decide(snap, self.settings, previous_comment_count=prev,
-                                           age_hours=age, expected_pinned="官方置顶文案在此")
+                                           age_hours=age,
+                                           seed_keywords=["官方置顶文案在此"])
                         self.assertTrue(v.tags <= ns, f"{v.tags} 越界")
 
 
 class TestCommentStatusColumn(unittest.TestCase):
-    """「评论状态」是人机共用的多选列：机器管置顶三值，人工值原样保留。"""
+    """「评论状态」由评论关键词的命中结果驱动：命中=显示评论，
+    未命中=没有显示。和置顶无关（置顶内容由「置顶评论」列单独展示），
+    匹配的是第一页评论内容，所以抖音行同样能判。"""
 
     def setUp(self):
         self.settings = Settings()
         self.cs = self.settings.comment_status
 
-    def _snap(self, pinned_text=None, others=(), platform="xhs"):
-        items = []
-        if pinned_text is not None:
-            items.append({"content": pinned_text, "is_pinned": True, "is_author_comment": True,
-                          "like_count": 0, "ip_location": "", "author": {"name": "官号"}})
-        for text in others:
-            items.append({"content": text, "is_pinned": False, "is_author_comment": False,
-                          "like_count": 0, "ip_location": "", "author": {"name": "路人"}})
-        return analyze.read_comment_page(platform, {"items": items, "comment_count": len(items)})
+    def _snap(self, texts=("这条真好用",), platform="xhs", count=1):
+        items = [{"content": t, "is_pinned": False, "is_author_comment": False,
+                  "like_count": 0, "ip_location": "", "author": {"name": "路人"}}
+                 for t in texts]
+        return analyze.read_comment_page(platform, {"items": items, "comment_count": count})
 
-    def values(self, snap, expected, current=None):
-        pin, _ = analyze.decide_pin(snap, expected)
-        return analyze.comment_status_values(pin, current, self.settings)
+    def values(self, snap, keywords):
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, seed_keywords=keywords)
+        return analyze.comment_status_values(v, self.settings)
 
-    def test_success(self):
-        self.assertEqual(self.values(self._snap("戳主页领30元优惠券"), "戳主页领30元优惠券"),
-                         {self.cs.pinned_ok})
+    def test_hit_means_displayed(self):
+        snap = self._snap(("路过", "艾时达口溶膜真不错"))
+        self.assertEqual(self.values(snap, ["艾时达口溶膜"]), {self.cs.displayed})
 
-    def test_never_pinned_when_no_history(self):
-        """从来没有置顶 → 「没有置顶」。"""
-        self.assertEqual(self.values(self._snap(others=["路过"]), "戳主页领30元优惠券", []),
-                         {self.cs.never_pinned})
+    def test_miss_means_not_displayed(self):
+        self.assertEqual(self.values(self._snap(("路过",)), ["艾时达口溶膜"]),
+                         {self.cs.not_displayed})
 
-    def test_lost_when_previously_succeeded(self):
-        """置顶过、现在没了 → 「置顶掉了」。区分全靠这一行的历史。"""
-        self.assertEqual(
-            self.values(self._snap(others=["路过"]), "戳主页领30元优惠券", [self.cs.pinned_ok]),
-            {self.cs.pinned_lost})
-
-    def test_lost_stays_lost(self):
-        """掉了之后一直没恢复，下一轮不该退回「没有置顶」——
-        那等于把曾经置顶过这件事抹掉。"""
-        self.assertEqual(
-            self.values(self._snap(others=["路过"]), "戳主页领30元优惠券", [self.cs.pinned_lost]),
-            {self.cs.pinned_lost})
-
-    def test_taken_over_counts_as_lost(self):
-        """置顶位被别人占了，对我方而言就是置顶没了。"""
-        snap = self._snap("楼主恰饭了吧", others=["戳主页领30元优惠券"])
-        self.assertEqual(self.values(snap, "戳主页领30元优惠券", [self.cs.pinned_ok]),
-                         {self.cs.pinned_lost})
-
-    def test_recovery_back_to_success(self):
-        self.assertEqual(
-            self.values(self._snap("戳主页领30元优惠券"), "戳主页领30元优惠券", [self.cs.pinned_lost]),
-            {self.cs.pinned_ok})
-
-    def test_douyin_returns_none_not_empty(self):
+    def test_no_keywords_returns_none_not_empty(self):
         """None = 不碰这一列；空集合会把上一轮的结论摘掉，两者天差地别。"""
-        self.assertIsNone(self.values(self._snap(others=["哈哈"], platform="douyin"), "任意关键词"))
+        self.assertIsNone(self.values(self._snap(), []))
 
-    def test_no_seed_keyword_returns_none(self):
-        """有置顶但没填种子关键词：写「置顶成功」是撒谎，写「没有置顶」也是撒谎。"""
-        self.assertIsNone(self.values(self._snap("某条置顶"), ""))
+    def test_douyin_rows_are_judged_too(self):
+        """旧口径靠置顶字段所以抖音判不了；新口径匹配第一页评论内容，
+        两个平台都拿得到。"""
+        snap = self._snap(("cgmp因子 冲了",), platform="douyin")
+        self.assertEqual(self.values(snap, ["cGMP因子"]), {self.cs.displayed})
 
-    def test_human_values_survive_the_merge(self):
-        merged = tags.merge(["评论已显示", self.cs.pinned_ok], {self.cs.pinned_lost},
-                            self.cs.namespace())
-        self.assertIn("评论已显示", merged.final)
-        self.assertIn(self.cs.pinned_lost, merged.final)
-        self.assertNotIn(self.cs.pinned_ok, merged.final)   # 三值互斥
+    def test_empty_shell_round_returns_none(self):
+        """评论页空壳（没有评论、评论数也没拿到）：拿上游缺数当「没有显示」
+        的证据会诱导运营去无谓补评论——这一轮必须不碰这一列。"""
+        snap = analyze.read_comment_page("douyin", {"items": [], "comment_count": None})
+        self.assertIsNone(self.values(snap, ["艾时达口溶膜"]))
+
+    def test_zero_comments_is_evidence_of_not_displayed(self):
+        """评论数确认为 0 的空页不是空壳——第一页真的什么都没有，
+        「没有显示」是可靠结论。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 0})
+        self.assertEqual(self.values(snap, ["艾时达口溶膜"]), {self.cs.not_displayed})
+
+    def test_verdict_supersedes_pending(self):
+        """「待评论」本质上是还没显示：机器拿到结论后替掉它，不共存；
+        这一列里其他人工值原样保留。"""
+        merged = tags.merge(["待评论", "重点盯"], {self.cs.displayed},
+                            self.cs.namespace(),
+                            exclusive=(self.cs.namespace(),))
+        self.assertIn(self.cs.displayed, merged.final)
+        self.assertNotIn(self.cs.pending, merged.final)
+        self.assertIn("重点盯", merged.final)
 
     def test_loss_is_called_out_in_notes(self):
-        snap = self._snap(others=["路过"])
-        v = analyze.decide(snap, self.settings, previous_comment_count=None, age_hours=10,
-                           expected_pinned="官方置顶文案在此",
-                           current_comment_status=[self.cs.pinned_ok])
-        self.assertTrue(any("此前已确认置顶成功" in n for n in v.notes))
+        """上一轮「置顶评论」列里有内容、这一轮没有置顶 → 置顶刚掉，
+        诊断信息里必须报出来。"""
+        v = analyze.decide(self._snap(), self.settings, previous_comment_count=None,
+                           age_hours=10, previous_pinned="戳主页领券")
+        self.assertTrue(any("置顶已不在" in n for n in v.notes))
+
+    def test_empty_shell_round_does_not_report_pin_loss(self):
+        """空壳轮（评论和评论数都没拿到）没资格说「置顶掉了」——
+        拿上游缺数当证据的假告警会让运营白跑一趟手机端核对。
+        与关键词命中同一道证据门槛。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, previous_pinned="戳主页领券")
+        self.assertFalse(any("置顶已不在" in n for n in v.notes))
+
+    def test_douyin_placeholder_is_not_pin_history(self):
+        """「—（抖音不支持置顶监控）」是占位不是置顶记录：链接被换过平台的行
+        不该因为这个占位报「置顶掉了」。"""
+        v = analyze.decide(self._snap(), self.settings, previous_comment_count=None,
+                           age_hours=10,
+                           previous_pinned=analyze.DOUYIN_PINNED_UNSUPPORTED)
+        self.assertFalse(any("置顶已不在" in n for n in v.notes))
 
 
 class TestCallPlanning(unittest.TestCase):

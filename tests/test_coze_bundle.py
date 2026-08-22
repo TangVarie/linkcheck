@@ -109,10 +109,11 @@ class TestCozeBundle(unittest.TestCase):
             "points": {"cost": 10, "balance": 500},
         })
         verdict = ns["decide"](snapshot, settings, previous_comment_count=10,
-                               age_hours=20, expected_pinned="戳主页领券")
+                               age_hours=20, seed_keywords=["戳主页领券"])
         self.assertIn("爆贴", verdict.tags)          # 88 条落在 50–99 档
         self.assertNotIn("大爆", verdict.tags)       # 档位互斥
-        self.assertIs(verdict.pin, ns["Pin"].SUCCESS)
+        self.assertIs(verdict.pin, ns["Pin"].PINNED)  # 自家帖子：有置顶即成功
+        self.assertEqual(verdict.seed_hit.keyword, "戳主页领券")   # 关键词命中
         self.assertIn("置顶", ns["format_digest"](snapshot, settings.digest))
 
     def test_heat_tiers_match_the_agreed_thresholds(self):
@@ -164,6 +165,18 @@ class TestCozeBundle(unittest.TestCase):
     def test_soft_deadline_is_under_coze_hard_limit(self):
         # 扣子代码节点硬上限 60 秒，超时会把已经算完的几十行结果一起丢掉
         self.assertLess(self.namespace["SOFT_DEADLINE"], 60)
+
+    def test_repo_coze_node_matches_build_output(self):
+        """仓库根的 coze_node.py 才是实际部署的产物：只改 xhsearch/FOOTER
+        忘了重新生成的话，测试全绿、上线的却是旧口径。逐字钉死。"""
+        import pathlib
+
+        deployed = pathlib.Path(__file__).resolve().parent.parent / "coze_node.py"
+        self.assertEqual(
+            deployed.read_text(encoding="utf-8").rstrip("\n"),
+            self.source.rstrip("\n"),
+            "coze_node.py 与 build() 产物不一致——运行 "
+            "python3 tools/build_coze_node.py > coze_node.py 重新生成")
 
 
 class TestCozeOrchestration(unittest.TestCase):
@@ -433,6 +446,38 @@ class TestCozeOrchestration(unittest.TestCase):
         # 保留旧档位后合并结果与现值相同 → 不写这一列（保持原样的最强形式）
         self.assertNotIn(settings.fields.traffic_status, fields)
         self.assertIn("还没建选项", fields[settings.fields.failure_reason])
+
+    def test_render_writes_comment_status_from_keyword_verdict(self):
+        """评论状态合并块在打包产物里真正跑一遍：命中写「显示评论」、
+        替掉「待评论」、保留其他人工值、报置顶掉落——与 runner 同口径是硬承诺，
+        此前这一块在打包测试里从未被执行过。"""
+        from datetime import datetime, timezone
+
+        ns = self.namespace
+        settings = ns["Settings"]()
+        snapshot = ns["read_comment_page"]("xhs", {
+            "items": [{"content": "艾时达口溶膜真不错", "is_pinned": False,
+                       "is_author_comment": False, "like_count": 0,
+                       "ip_location": "", "author": {"name": "路人"}}],
+            "comment_count": 1})
+        row = ns["Row"](record_id="r",
+                        link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24,
+                        seed_keywords=["艾时达口溶膜"],
+                        comment_status=["待评论", "重点盯"],
+                        pinned_comment="官号: 戳主页领券")
+        verdict = ns["decide"](snapshot, settings, previous_comment_count=None,
+                               age_hours=10, seed_keywords=row.seed_keywords,
+                               previous_pinned=row.pinned_comment)
+        fields = ns["_render"](row, verdict, snapshot,
+                               settings, datetime.now(timezone.utc), "正常",
+                               None, ["显示评论", "没有显示", "待评论"])
+        final = fields[settings.fields.comment_status]
+        self.assertIn("显示评论", final)
+        self.assertNotIn("待评论", final)
+        self.assertIn("重点盯", final)
+        self.assertIn("命中", fields[settings.fields.seed_match])
+        # 上一轮「置顶评论」有内容、本轮没有置顶：掉落告警进诊断信息
+        self.assertIn("置顶已不在", fields[settings.fields.failure_reason])
 
 
 if __name__ == "__main__":

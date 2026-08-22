@@ -145,6 +145,136 @@ class TestErrorContext(unittest.TestCase):
         self.assertIn("rid-42", text)
 
 
+class TestReadKeywords(unittest.TestCase):
+    def test_multi_select_list(self):
+        self.assertEqual(feishu.read_keywords(["西地那非口溶膜", "cGMP因子"]),
+                         ["西地那非口溶膜", "cGMP因子"])
+
+    def test_rich_text_list_is_not_swallowed(self):
+        """单行文本列的返回形态是富文本分段（带 text 的对象）。
+        按多选取会全部丢掉——关键词静默消失，「关键词命中」永远不更新。"""
+        value = [{"text": "西地那非口溶膜、cGMP因子", "type": "text"}]
+        self.assertEqual(feishu.read_keywords(value),
+                         ["西地那非口溶膜", "cGMP因子"])
+
+    def test_plain_text_split_and_dedup(self):
+        self.assertEqual(feishu.read_keywords("甲，乙、甲; 丙\n丁"),
+                         ["甲", "乙", "丙", "丁"])
+
+    def test_space_inside_keyword_survives(self):
+        self.assertEqual(feishu.read_keywords("cGMP 因子、快充口溶膜"),
+                         ["cGMP 因子", "快充口溶膜"])
+
+    def test_empty(self):
+        self.assertEqual(feishu.read_keywords(None), [])
+        self.assertEqual(feishu.read_keywords(""), [])
+
+
+class TestLoadRowsFieldFiltering(unittest.TestCase):
+    """search 按名字请求列：请求一个还没建的列会让整个 search 报 1254045，
+    一行都读不到——所以读侧也要按表里实际存在的列过滤。"""
+
+    class _StubTable:
+        def __init__(self):
+            self.requested_fields = None
+
+        def search(self, field_names, *, filter_spec=None, max_records=None):
+            self.requested_fields = list(field_names)
+            return []
+
+    def test_missing_columns_are_not_requested(self):
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+        table = self._StubTable()
+        known = {f.link, f.publish_time, f.monitoring, f.queued,
+                 f.traffic_status, f.comment_count, f.last_updated,
+                 f.consecutive_failures, f.comment_status}   # 缺 点赞数/收藏数/评论关键词
+        runner.load_rows(table, settings, known_fields=known)
+        self.assertNotIn(f.like_count, table.requested_fields)
+        self.assertNotIn(f.collect_count, table.requested_fields)
+        self.assertNotIn(f.seed_keywords, table.requested_fields)
+        self.assertIn(f.link, table.requested_fields)
+
+    def test_pinned_comment_cell_is_read_as_text(self):
+        """「置顶评论」是掉落告警的对比基线。文本列读回来是富文本分段，
+        必须拼回纯文本——读错形态的话，告警要么永不触发（永远空串）、
+        要么每轮误报（永远真值）。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                self.requested = list(field_names)
+                return [{"record_id": "rec1", "fields": {
+                    f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24,
+                    f.pinned_comment: [{"text": "官号: 戳主页领券", "type": "text"}],
+                }}]
+
+        table = _Table()
+        rows = runner.load_rows(table, settings, only_due=False)
+        self.assertEqual(rows[0].pinned_comment, "官号: 戳主页领券")
+        self.assertIn(f.pinned_comment, table.requested)
+
+    def test_queue_mode_without_queued_column_does_nothing(self):
+        """「排队刷新」列没建时 queue 模式必须空转——退化成无过滤全表刷新
+        会花掉一整轮 sweep 的钱。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        table = self._StubTable()
+        rows = runner.load_rows(table, settings, only_queued=True,
+                                known_fields={settings.fields.link})
+        self.assertEqual(rows, [])
+        self.assertIsNone(table.requested_fields)   # 连 search 都没发
+
+    def test_sweep_without_timestamp_column_does_nothing(self):
+        """「最近检查时间」列没建时 sweep 必须空转：分层刷新失去依据，
+        每一行都会被判成该刷，一轮就是全表重刷；写回侧又写不进时间戳，
+        下一轮照样全刷——烧钱死循环。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+        table = self._StubTable()
+        rows = runner.load_rows(table, settings, only_due=True,
+                                known_fields={f.link, f.monitoring, f.queued})
+        self.assertEqual(rows, [])
+        self.assertIsNone(table.requested_fields)   # 连 search 都没发
+
+
+class TestFieldsMeta(unittest.TestCase):
+    """fields_meta 是 doctor 全量体检的地基：类型、选项都得原样带回来。"""
+
+    def test_types_and_options_are_preserved(self):
+        page = ok({"items": [
+            {"field_name": "反馈链接", "type": 1, "ui_type": "Text"},
+            {"field_name": "流量状态", "type": 4, "ui_type": "MultiSelect",
+             "property": {"options": [{"name": "爆贴"}, {"name": "大爆"}]}},
+            {"field_name": "评论状态", "type": 4, "ui_type": "MultiSelect",
+             "property": {"options": []}},
+        ], "has_more": False})
+        with mock.patch.object(transport, "get", return_value=page):
+            meta = make_table().fields_meta()
+        self.assertEqual(meta["反馈链接"]["type"], 1)
+        # None = 没有「选项」概念的字段；空列表 = 建了选择列但零选项。两者不能混。
+        self.assertIsNone(meta["反馈链接"]["options"])
+        self.assertEqual(meta["流量状态"]["options"], ["爆贴", "大爆"])
+        self.assertEqual(meta["评论状态"]["options"], [])
+
+    def test_unreadable_returns_none(self):
+        with mock.patch.object(transport, "get",
+                               return_value=transport.Response(403, "", "denied")):
+            self.assertIsNone(make_table().fields_meta())
+
+
 class TestFieldOptionsPagination(unittest.TestCase):
     def test_field_on_second_page_is_found(self):
         pages = [

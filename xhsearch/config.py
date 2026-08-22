@@ -14,28 +14,48 @@ from dataclasses import dataclass, field
 
 @dataclass
 class FieldNames:
-    """多维表格列名。左边是代码里的角色，右边是表头文字。"""
+    """多维表格列名。左边是代码里的角色，右边是表头文字。
+
+    默认值按 OKMAN 系列表的实际结构对齐（2026-08 以「OKMAN第一期」为准）：
+    巡查三件套（是否巡查/巡查状态/最近检查时间）由本系统接管，
+    「实时数据.评论数」是评论数落点。
+    表里还没有的列（评论关键词、关键词命中、上次点赞数等）要先在飞书里建好——
+    doctor 会列出缺哪些；没建的列会被自动跳过并在日志里提示，不会写坏表。
+
+    ⚠️ 「蓝词字段」机器**完全不读不写**：蓝词（评论里变成超链接的词）
+    是人工在手机端自查的，和「评论关键词」（查我们自己的种子评论有没有
+    显示出来）是两回事。接口数据里目前拿不到「这个词有没有变成超链接」，
+    所以两者没有任何关联（见 docs/待验证清单.md）。
+    """
 
     # —— 人工维护 ——
-    link: str = "链接"
+    link: str = "反馈链接"
     publish_time: str = "发布时间"
-    expected_pinned: str = "种子评论关键词"   # 选填；填了才做置顶内容比对
-    monitoring: str = "监控中"                # 复选框；取消勾选即停止刷新
+    seed_keywords: str = "评论关键词"         # 多选或文本（顿号/逗号分隔）：一组词，
+                                              # 任一出现在第一页任一条评论里 = 我们的
+                                              # 评论显示出来了。注意不是「蓝词字段」！
+    monitoring: str = "是否巡查"              # 复选框；取消勾选即停止刷新
     queued: str = "排队刷新"                  # 复选框；勾上=手动请求刷新，机器处理完自动清掉
 
     # —— 机器写入 · 运营主视图 ——
     platform: str = "平台"
-    comment_count: str = "评论数"
+    comment_count: str = "实时数据.评论数"
     previous_comment_count: str = "上次评论数"
     like_count: str = "点赞数"
+    previous_like_count: str = "上次点赞数"
     collect_count: str = "收藏数"
-    pinned_comment: str = "置顶评论"
-    comment_status: str = "评论状态"          # 多选，人机共用：机器管置顶三值，人工值不碰
+    previous_collect_count: str = "上次收藏数"
+    pinned_comment: str = "置顶评论"          # 实际置顶的那条内容（自家帖子，置顶必为我方）
+    comment_status: str = "评论状态"          # 由关键词命中驱动：命中=显示评论，
+                                              # 未命中=没有显示；没填关键词的行不碰
     comment_digest: str = "评论区快照"
-    traffic_status: str = "流量状态"          # 多选，人机共用
-    refresh_status: str = "刷新状态"
+    seed_match: str = "关键词命中"            # 命中了哪个词、命中在哪条评论（单独标明，
+                                              # 不覆盖「评论区快照」——快照是看氛围的）
+    traffic_status: str = "流量状态"          # 多选，人机共用（无水花等人工值不碰）
+    refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
-    last_updated: str = "最后更新时间"
+    last_updated: str = "最近检查时间"
+    alive_confirmed: str = "已确认存活"       # 复选框：本轮取到数=勾上，确认失效=取消
 
     # —— 机器写入 · 系统列（建议在运营视图里隐藏）——
     consecutive_failures: str = "连续失败次数"   # 两击定罪的计数器
@@ -45,14 +65,17 @@ class FieldNames:
         return [
             self.link,
             self.publish_time,
-            self.expected_pinned,
+            self.seed_keywords,
             self.monitoring,
             self.queued,
             self.traffic_status,          # 合并多选必须先读现值
             self.comment_count,           # 判定掉量必须知道上一次的数
+            self.like_count,              # 搬「上次点赞数」要先读现值
+            self.collect_count,           # 搬「上次收藏数」同理
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
-            self.comment_status,          # 判断置顶是不是刚掉的
+            self.comment_status,          # 合并写回前要先读现值
+            self.pinned_comment,          # 判断置顶是不是刚掉的（和上一轮的置顶内容比）
         ]
 
 
@@ -90,35 +113,33 @@ class Tags:
 
 @dataclass
 class CommentStatus:
-    """「评论状态」多选列里**机器管辖**的三个值。
+    """「评论状态」列的取值：我们的种子评论有没有显示出来。
 
-    这一列是人机共用的：置顶结论由机器每轮重算并覆盖，而「评论是否显示」
-    这类人工维护的值并列在同一列里，机器读得到但永远不碰。
-    用的是和 流量状态 完全相同的合并算法。
+    判定完全由「评论关键词」的命中结果驱动（和置顶无关——置顶内容
+    由「置顶评论」列单独展示）：
 
-    三个值互斥，每轮只写一个：
+        显示评论  —— 任一关键词出现在第一页任一条评论里
+        没有显示  —— 配了关键词，但第一页一条都没命中
+        待评论    —— 人工排期用的旧值：机器**从不写**，但拿到结论时会
+                     替掉它——「待评论」本质上也是「还没显示」，有了
+                     自动巡查的结论就不需要人工再标了
 
-        置顶成功  —— 置顶的确认是我方种子评论
-        置顶掉了  —— 之前置顶成功过，现在我方的置顶不在了
-        没有置顶  —— 从来没成功过，现在也没有
-
-    只有小红书能判（抖音评论接口没有 is_pinned 字段），抖音行完全不碰这一列。
+    三个值互斥。没填关键词的行机器完全不碰这一列。
+    两个平台都能判——匹配的是第一页评论内容，不依赖置顶字段，
+    所以抖音行同样有效。
     """
 
-    pinned_ok: str = "置顶成功"
-    pinned_lost: str = "置顶掉了"
-    never_pinned: str = "没有置顶"
+    displayed: str = "显示评论"
+    not_displayed: str = "没有显示"
+    pending: str = "待评论"
 
     def namespace(self) -> list[str]:
-        return [self.pinned_ok, self.pinned_lost, self.never_pinned]
+        """机器管辖的值（含只撤不写的「待评论」）。"""
+        return [self.displayed, self.not_displayed, self.pending]
 
-    def ever_pinned(self, current: list[str] | None) -> bool:
-        """这一行历史上有没有成功置顶过。
-
-        「置顶掉了」本身也算证据——掉了之后一直没恢复，下一轮不该退回
-        「没有置顶」，那等于把曾经置顶过这件事抹掉。
-        """
-        return bool({self.pinned_ok, self.pinned_lost} & set(current or []))
+    def machine_written(self) -> list[str]:
+        """机器实际会写入的值——doctor 检查选项是否建好用这个清单。"""
+        return [self.displayed, self.not_displayed]
 
 
 @dataclass
