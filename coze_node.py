@@ -1995,10 +1995,15 @@ async def feishu_fields(token, app_token, table_id):
                 if not name:
                     continue
                 names.add(str(name))
-                options = ((item.get("property") or {}).get("options")) or []
-                if options:
+                prop = item.get("property") or {}
+                if "options" in prop:
+                    # 选择类字段一定带 options 键；空列表也要记下来——
+                    # 空表示「一个选项都没建，全部拦下」，丢成 None 会被
+                    # 解读成「读不到元数据、别过滤」，机器选项直接写进去
+                    # 就是整批回滚。
                     options_map[str(name)] = [
-                        o["name"] for o in options if isinstance(o, dict) and o.get("name")]
+                        o["name"] for o in (prop.get("options") or [])
+                        if isinstance(o, dict) and o.get("name")]
             if not payload.get("has_more"):
                 return names, options_map
             page_token = payload.get("page_token") or ""
@@ -2134,24 +2139,29 @@ async def main(args: Any) -> dict:
         filter_spec = {"conjunction": "and", "conditions": [
             {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
 
-    # 读表 + 两个多选列的选项**并发**取：选项各有 15 秒超时，串行的话
-    # 慢响应会把读表的预算先吃光，扫出空表还报 ok:True。
-    # 读表按「最后更新时间」升序扫（最久没刷的最前），预算给到软截止的一半。
-    scan_deadline = deadline - SOFT_DEADLINE / 2
-    search_result, fields_result = await asyncio.gather(
-        feishu_search(token, p["app_token"], p["table_id"], f.must_read(),
-                      filter_spec, deadline=scan_deadline, sort_field=f.last_updated),
-        feishu_fields(token, p["app_token"], p["table_id"]),
-        return_exceptions=True,
-    )
-    if isinstance(search_result, Exception):
-        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
-                "message": str(search_result)}
-    records, scan_complete = search_result
-    # 字段元数据读取失败 = 不过滤（宁可试着写），与服务端语义一致。
-    table_fields, options_map = (None, {}) if isinstance(fields_result, Exception)         else fields_result
+    # 字段元数据必须先取：search 按名字请求列，请求一个还没建的列
+    # （比如「点赞数」）会让整个 search 报 1254045、一行都读不到。
+    # 元数据失败 = 不过滤（宁可试着写），与服务端语义一致。
+    try:
+        table_fields, options_map = await feishu_fields(
+            token, p["app_token"], p["table_id"])
+    except Exception:                                  # noqa: BLE001
+        table_fields, options_map = None, {}
     traffic_options = options_map.get(f.traffic_status)
     status_options = options_map.get(f.comment_status)
+    wanted_fields = f.must_read()
+    if table_fields is not None:
+        wanted_fields = [c for c in wanted_fields if c in table_fields]
+
+    # 读表按「最后更新时间」升序扫（最久没刷的最前），预算给到软截止的一半。
+    scan_deadline = deadline - SOFT_DEADLINE / 2
+    try:
+        records, scan_complete = await feishu_search(
+            token, p["app_token"], p["table_id"], wanted_fields,
+            filter_spec, deadline=scan_deadline, sort_field=f.last_updated)
+    except Exception as exc:                           # noqa: BLE001
+        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
+                "message": str(exc)}
     scan_note = ("" if scan_complete
                  else "；⚠ 读表未扫完（飞书响应慢），本轮按最久未刷的行优先，其余下一轮继续")
 
@@ -2250,6 +2260,7 @@ async def main(args: Any) -> dict:
             if status in ("已失效", "疑似受限"):
                 update["fields"][f.refresh_status] = "刷新失败"
                 update["fields"].pop(f.consecutive_failures, None)
+                update["fields"].pop(f.alive_confirmed, None)
                 original = str(update["fields"].get(f.failure_reason) or "")
                 update["fields"][f.failure_reason] = \
                     (f"{original}；{note}" if original else note)[:500]
@@ -2377,7 +2388,9 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
     fields = _render(row, verdict, snapshot, settings, now, "正常",
                      traffic_options, status_options)
     fields[f.consecutive_failures] = 0
-    fields[f.alive_confirmed] = True
+    # 有正面证据（评论或评论数）才勾「已确认存活」；空壳轮次复选框不动。
+    if snapshot.comments or snapshot.comment_count:
+        fields[f.alive_confirmed] = True
     return (fields, fen, balance, "正常", tally)
 
 
@@ -2470,9 +2483,10 @@ def _cell_tags(value):
 def _cell_keywords(value):
     """蓝词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分（不按空格，
     「cGMP 因子」这类带空格的词组不能拆碎）。"""
-    if isinstance(value, list):
-        raw = _cell_tags(value)
-    else:
+    raw = [w for w in _cell_tags(value) if w] if isinstance(value, list) else []
+    if not raw:
+        # 富文本分段（单行文本列的返回形态）走文本拼接再拆，
+        # 否则文本列里的关键词会静默消失。
         raw = re.split(r"[，,、;；\n]+", _cell_text(value))
     seen, out = set(), []
     for word in raw:

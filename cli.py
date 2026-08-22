@@ -220,6 +220,9 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     now = datetime.now(timezone.utc)
 
     print(f"读表（模式：{mode}）…")
+    # 列名清单读一次、读写两侧共用：读侧过滤 search 请求的列（请求不存在的
+    # 列会让整个 search 失败），写侧过滤还没建的机器列。
+    known_fields = table.field_names()
     row_list = runner.load_rows(
         table,
         settings,
@@ -229,7 +232,12 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
         only_due=(mode in ("sweep", "estimate")),
         only_queued=(mode == "queue"),
         now=now,
+        known_fields=known_fields,
     )
+    if mode == "queue" and not row_list and known_fields is not None \
+            and settings.fields.queued not in known_fields:
+        print(f"⚠ 表里还没建「{settings.fields.queued}」列，queue 模式无法工作，先去建列")
+        return 1
     if record_ids:
         found = {r.record_id for r in row_list}
         missing = [rid for rid in record_ids if rid not in found]
@@ -275,7 +283,7 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     dropped_fields: set = set()
     try:
         written = runner.write_back(table, report, errors=write_errors,
-                                    known_fields=table.field_names(),
+                                    known_fields=known_fields,
                                     dropped_fields=dropped_fields)
     except feishu.FeishuError as exc:
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。

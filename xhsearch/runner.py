@@ -609,7 +609,10 @@ def refresh(
         outcome = finish(row, verdict, snapshot, status=STATUS_OK,
                          credits=credits, cost_yuan=cost_yuan)
         outcome.fields[f.consecutive_failures] = 0
-        outcome.fields[f.alive_confirmed] = True
+        # 「已确认存活」要有正面证据才勾：拿到评论或评论数才算见到活的。
+        # 评论页空壳 + detail 兜底失败的轮次没有任何存亡证据，复选框不动。
+        if _looks_alive(snapshot):
+            outcome.fields[f.alive_confirmed] = True
         return outcome
 
     pending = list(rows)
@@ -657,6 +660,8 @@ def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
             # 判定作废，计数增量也要一并撤销——否则熔断轮照样给每行 +1，
             # 上游故障一恢复，下一次单个非权威 GONE 就能一击定罪。
             outcome.fields.pop(settings.fields.consecutive_failures, None)
+            # 「已确认存活=取消」同理作废：上游故障轮不能把一批活帖的勾全摘掉。
+            outcome.fields.pop(settings.fields.alive_confirmed, None)
             # 追加而不是覆盖：原始错误文案里带着 request_id，是找厂商排查的唯一凭据。
             original = str(outcome.fields.get(settings.fields.failure_reason) or "")
             note = (
@@ -680,13 +685,23 @@ def load_rows(
     only_queued: bool = False,
     now: Optional[datetime] = None,
     max_records: Optional[int] = None,
+    known_fields: Optional[set[str]] = None,
 ) -> list[Row]:
     """从表里读出待刷新的行。
 
     分层刷新在这里落地，而且只是一个过滤条件，不是一套调度代码。
+
+    known_fields 传入表里实际存在的列名时，search 只请求存在的列——
+    按名字请求不存在的列（比如还没建的「点赞数」）会让整个 search 直接
+    报 1254045，一行都读不到，写侧的列过滤根本轮不到出场。
     """
     f = settings.fields
     now = now or datetime.now(timezone.utc)
+
+    if known_fields is not None and only_queued and f.queued not in known_fields:
+        # 「排队刷新」列还没建：queue 模式无事可做。绝不能退化成无过滤
+        # 全表刷新——那会花掉一整轮 sweep 的钱。
+        return []
 
     filter_spec: Optional[dict[str, Any]] = None
     if only_record_ids is None:
@@ -695,7 +710,11 @@ def load_rows(
             conditions.append({"field_name": f.queued, "operator": "is", "value": ["true"]})
         filter_spec = {"conjunction": "and", "conditions": conditions}
 
-    records = table.search(f.must_read(), filter_spec=filter_spec, max_records=max_records)
+    wanted_fields = f.must_read()
+    if known_fields is not None:
+        wanted_fields = [c for c in wanted_fields if c in known_fields]
+
+    records = table.search(wanted_fields, filter_spec=filter_spec, max_records=max_records)
 
     wanted = set(only_record_ids or [])
     result: list[Row] = []

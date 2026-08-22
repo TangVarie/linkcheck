@@ -505,6 +505,26 @@ class TestAliveConfirmed(RunnerTest):
         report = self.run_with([err(200, 1003, "未找到对应内容")], [xhs_row()])
         self.assertNotIn(self.settings.fields.alive_confirmed, report.outcomes[0].fields)
 
+    def test_ok_round_without_evidence_leaves_box_alone(self):
+        """评论页空壳 + detail 兜底失败：这一轮「成功」但对存亡零证据。
+        勾上「已确认存活」等于替上游缺数作保——复选框必须原样不动。"""
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7123456789012345678",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        calls = {"n": 0}
+
+        def responder(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return sse({"items": [], "comment_count": None,
+                            "points": {"cost": 10, "balance": 100}})
+            return err(500, 1005, "服务暂时不可用，请稍后重试")
+
+        report = self.run_with(responder, [row])
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_OK)
+        self.assertNotIn(self.settings.fields.alive_confirmed, outcome.fields)
+
 
 class TestSoftDeadline(RunnerTest):
     """软截止的承诺是「没跑到的行**不写回**，留给下一轮」。
@@ -655,6 +675,9 @@ class TestBreakerAccounting(RunnerTest):
         for outcome in report.outcomes:
             # 判定作废，这一轮的计数增量也要一并撤销
             self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+            # 「已确认存活=False」也是这轮 GONE 判定的产物，同样要撤销——
+            # 留着它，熔断就只救了状态列，没救勾选框。
+            self.assertNotIn(self.settings.fields.alive_confirmed, outcome.fields)
             reason = outcome.fields[self.settings.fields.failure_reason]
             self.assertIn("未找到对应内容", reason)     # 原始错误（含 request_id 线索）还在
             self.assertIn("疑似上游故障", reason)       # 熔断说明是追加的，不是覆盖

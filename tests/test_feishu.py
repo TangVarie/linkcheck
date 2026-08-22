@@ -145,6 +145,73 @@ class TestErrorContext(unittest.TestCase):
         self.assertIn("rid-42", text)
 
 
+class TestReadKeywords(unittest.TestCase):
+    def test_multi_select_list(self):
+        self.assertEqual(feishu.read_keywords(["西地那非口溶膜", "cGMP因子"]),
+                         ["西地那非口溶膜", "cGMP因子"])
+
+    def test_rich_text_list_is_not_swallowed(self):
+        """单行文本列的返回形态是富文本分段（带 text 的对象）。
+        按多选取会全部丢掉——关键词静默消失，蓝词命中永远不更新。"""
+        value = [{"text": "西地那非口溶膜、cGMP因子", "type": "text"}]
+        self.assertEqual(feishu.read_keywords(value),
+                         ["西地那非口溶膜", "cGMP因子"])
+
+    def test_plain_text_split_and_dedup(self):
+        self.assertEqual(feishu.read_keywords("甲，乙、甲; 丙\n丁"),
+                         ["甲", "乙", "丙", "丁"])
+
+    def test_space_inside_keyword_survives(self):
+        self.assertEqual(feishu.read_keywords("cGMP 因子、快充口溶膜"),
+                         ["cGMP 因子", "快充口溶膜"])
+
+    def test_empty(self):
+        self.assertEqual(feishu.read_keywords(None), [])
+        self.assertEqual(feishu.read_keywords(""), [])
+
+
+class TestLoadRowsFieldFiltering(unittest.TestCase):
+    """search 按名字请求列：请求一个还没建的列会让整个 search 报 1254045，
+    一行都读不到——所以读侧也要按表里实际存在的列过滤。"""
+
+    class _StubTable:
+        def __init__(self):
+            self.requested_fields = None
+
+        def search(self, field_names, *, filter_spec=None, max_records=None):
+            self.requested_fields = list(field_names)
+            return []
+
+    def test_missing_columns_are_not_requested(self):
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+        table = self._StubTable()
+        known = {f.link, f.publish_time, f.monitoring, f.queued,
+                 f.traffic_status, f.comment_count, f.last_updated,
+                 f.consecutive_failures, f.comment_status}   # 缺 点赞数/收藏数/蓝词字段
+        runner.load_rows(table, settings, known_fields=known)
+        self.assertNotIn(f.like_count, table.requested_fields)
+        self.assertNotIn(f.collect_count, table.requested_fields)
+        self.assertNotIn(f.seed_keywords, table.requested_fields)
+        self.assertIn(f.link, table.requested_fields)
+
+    def test_queue_mode_without_queued_column_does_nothing(self):
+        """「排队刷新」列没建时 queue 模式必须空转——退化成无过滤全表刷新
+        会花掉一整轮 sweep 的钱。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        table = self._StubTable()
+        rows = runner.load_rows(table, settings, only_queued=True,
+                                known_fields={settings.fields.link})
+        self.assertEqual(rows, [])
+        self.assertIsNone(table.requested_fields)   # 连 search 都没发
+
+
 class TestFieldOptionsPagination(unittest.TestCase):
     def test_field_on_second_page_is_found(self):
         pages = [

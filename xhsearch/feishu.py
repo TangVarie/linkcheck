@@ -336,9 +336,12 @@ def read_keywords(value: Any) -> list[str]:
     刻意不按空格拆——「cGMP 因子」这种带空格的词组会被拆碎。
     单个词里的前后空白剥掉，空项丢弃，保序去重。
     """
-    if isinstance(value, list):
-        raw = read_multi_select(value)
-    else:
+    # 只有列表才可能是多选列（字符串或带 name 的对象）；纯字符串是文本列，
+    # 必须走拆分（read_multi_select 会把整串包成单元素列表，等于不拆）。
+    # 列表按多选取不到时再当富文本分段拼成整段文本去拆——
+    # 否则单行文本列的关键词会静默消失。
+    raw = read_multi_select(value) if isinstance(value, list) else []
+    if not raw:
         raw = re.split(r"[，,、;；\n]+", read_text(value))
     seen: set[str] = set()
     out: list[str] = []
