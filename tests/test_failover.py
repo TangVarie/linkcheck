@@ -358,9 +358,10 @@ class TestDouyinLinkOnlyRows(FailoverTest):
         # 运营手册教人看到降级不为 0 就去查主通道。
         self.assertEqual(report.failovers, 0)
 
-    def test_tikhub_only_deployment_fails_the_row_cleanly(self):
+    def test_tikhub_only_deployment_skips_the_row_cleanly(self):
         """只配了 TikHub：这行没法刷，但要败得明白——
-        行级「刷新失败」+ 说清原因，不烧钱、不中止整批、不碰定罪计数。"""
+        按「跳过」处理（和坏链接同类）并说清原因：不烧钱、不中止整批、
+        不碰定罪计数，也不进熔断的失效比例分母。"""
         report = self.run_with(
             on_get=lambda i: self.fail("不该发出任何请求"),
             on_post=lambda i: self.fail("没配 SDX 的 key"),
@@ -368,11 +369,12 @@ class TestDouyinLinkOnlyRows(FailoverTest):
             keys={"tikhub": "t-key"},
         )
         outcome = report.outcomes[0]
-        self.assertEqual(outcome.status, runner.STATUS_FAILED)
+        self.assertEqual(outcome.status, runner.STATUS_SKIPPED)
         self.assertFalse(report.fatal)
         self.assertEqual(report.cost_yuan, 0.0)
         self.assertIn("不支持这种链接形态", outcome.fields[self.settings.fields.failure_reason])
         self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+        self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
 
     def test_full_video_link_still_uses_tikhub(self):
         """带数字 ID 的完整链接不受影响，照走便宜的主通道。"""

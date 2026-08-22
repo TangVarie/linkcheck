@@ -26,6 +26,16 @@ BASE = "https://open.feishu.cn/open-apis"
 # 一批越大，一个坏值导致的回滚面就越大。
 BATCH_SIZE = 500
 
+# 值得二分定位的**行级**错误码：这一行的问题不影响别的行，隔离出来其余照写。
+# 表级错误（权限 91403/99991672、列名 1254045、token 失效、网络中断）会让每个
+# 子分片同样失败——对 500 行的分片，二分会把一次失败放大成近千次请求，
+# 既拖垮任务超时又在捶打飞书接口，必须立刻向上抛。
+_ROW_LEVEL_CODES = frozenset({
+    1254005,   # record_id 不存在（写回前行刚被删）
+    1254060,   # 字段值类型不对（某一行的坏值）
+    1254291,   # 写入的多选选项在字段配置里不存在
+})
+
 
 class FeishuError(RuntimeError):
     def __init__(self, code: int, msg: str, hint: str = ""):
@@ -190,13 +200,15 @@ class Bitable:
         并行写会拿到 1254607 之类的并发冲突，还可能写坏。
 
         飞书的批量写是全成功或全失败：一个坏行（比如写回前刚被运营删掉，
-        1254005）会让整个分片回滚。这里对失败的分片做二分重试，把坏行
-        隔离出来单独失败，好行照写——一个坏行只该损失它自己，不该作废
-        同分片的 499 个好行，更不该丢掉后续所有分片。
+        1254005）会让整个分片回滚。这里对**行级错误**（_ROW_LEVEL_CODES）
+        的分片做二分重试，把坏行隔离出来单独失败，好行照写——一个坏行
+        只该损失它自己，不该作废同分片的 499 个好行，更不该丢掉后续分片。
 
-        坏行收集进 errors（(record_id, FeishuError) 列表）；不传 errors 时，
-        所有分片都尝试完之后才抛一个汇总异常——不再让第一个坏分片
-        直接中断整个写回。
+        表级错误（权限、列名、token）不做二分、立刻抛出：那种错误每个
+        子分片都会同样失败，二分只是把一次失败放大成上千次请求。
+
+        行级坏行收集进 errors（(record_id, FeishuError) 列表）；不传 errors
+        时，所有分片都尝试完之后才抛一个汇总异常。
         """
         collected: list[tuple[str, FeishuError]] = []
         written = 0
@@ -227,6 +239,8 @@ class Bitable:
             _check(resp)
             return len(chunk)
         except FeishuError as exc:
+            if exc.code not in _ROW_LEVEL_CODES:
+                raise   # 表级错误：二分只会放大失败，直接向上抛
             if len(chunk) == 1:
                 errors.append((str(chunk[0].get("record_id") or ""), exc))
                 return 0

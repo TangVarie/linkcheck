@@ -86,6 +86,23 @@ class TestBatchUpdateIsolation(unittest.TestCase):
         self.assertIn("2 行已写回", str(ctx.exception))
         self.assertIn("bad", str(ctx.exception))
 
+    def test_table_level_error_is_not_bisected(self):
+        """表级错误（权限/列名）每个子分片都会同样失败：二分只会把一次失败
+        放大成上千次请求。必须立刻抛出，而不是逐行捶打飞书接口。"""
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            return feishu_err(91403, "Forbidden")
+
+        updates = [{"record_id": rid, "fields": {"x": 1}} for rid in ("a", "b", "c", "d")]
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError) as ctx:
+                make_table().batch_update(updates, errors=[])
+        self.assertEqual(calls["n"], 1)          # 一次失败就收手，不二分
+        self.assertEqual(ctx.exception.code, 91403)
+
     def test_all_good_rows_write_in_one_call(self):
         calls = {"n": 0}
 

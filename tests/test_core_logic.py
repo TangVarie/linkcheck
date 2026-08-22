@@ -667,6 +667,19 @@ class TestMergeWithMissingOptions(unittest.TestCase):
         self.assertIn("大爆", result.final)
         self.assertNotIn("爆贴", result.final)
 
+    def test_preservation_respects_tier_exclusivity(self):
+        """升「大爆」成功、但「风控中」恰好没建选项：保留旧标签的动作
+        不能把已让位的「爆贴」又捡回来——热度档位同时只能有一个。"""
+        result = tags.merge(
+            ["爆贴", "已复盘"], {"大爆", "风控中"}, self.NS,
+            known_options=["评估中", "爆贴", "大爆", "已失效"],   # 缺 风控中
+            exclusive=(["评估中", "爆贴", "大爆"],),
+        )
+        self.assertIn("大爆", result.final)
+        self.assertNotIn("爆贴", result.final)      # 同组旧档位正常让位
+        self.assertIn("已复盘", result.final)
+        self.assertEqual(result.dropped_unknown, ["风控中"])
+
 
 class TestUrlBoundary(unittest.TestCase):
     def test_cjk_text_glued_to_url_is_not_swallowed(self):

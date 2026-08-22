@@ -1254,6 +1254,7 @@ def merge(
     computed: Iterable[str],
     machine_namespace: Iterable[str],
     known_options: Iterable[str] | None = None,
+    exclusive: Iterable[Sequence[str]] = (),
 ) -> TagMerge:
     """把机器算出的标签并进现有标签，不碰人工标签。
 
@@ -1270,6 +1271,11 @@ def merge(
         该多选字段实际配置了哪些选项。给了就做过滤——飞书 batch_update 是
         全成功或全失败，一个字段里没有的选项名可能让整批几百行一起回滚，
         与其赌服务端会自动建选项，不如在这里挡掉并把它记进 dropped_unknown。
+    exclusive:
+        互斥组（如热度三档），组内同时只能留一个。只在「选项没建、保留旧
+        机器标签」的路径上用：本轮已有同组的可写标签时，旧的同组标签正常
+        让位，不参与保留——否则「爆贴」升「大爆」恰逢「风控中」没建选项时，
+        两个档位会同时出现在行上。
     """
     current_set = [t.strip() for t in (current or []) if t and t.strip()]
     machine = set(machine_namespace)
@@ -1292,10 +1298,15 @@ def merge(
         dropped = sorted(computed_set - allowed)
         computed_set = allowed
         if dropped:
-            # 想写的标签写不进去（选项没建）时，这一轮**不摘任何旧机器标签**：
+            # 想写的标签写不进去（选项没建）时，这一轮**不摘旧机器标签**：
             # 「评论数到了大爆、但大爆选项没建」不该把行上的「爆贴」顺手清掉——
             # 那会让一次配置疏漏抹掉行上仅存的热度/风控信息。
-            computed_set |= previous_machine
+            preserved = set(previous_machine)
+            for group in exclusive:
+                if computed_set & set(group):
+                    # 本轮已经算出并且写得进同组的标签：旧的同组标签正常让位
+                    preserved -= set(group)
+            computed_set |= preserved
 
     # 保序：先按原顺序留下人工标签，再追加机器标签，表里看起来才稳定。
     human = [t for t in current_set if t not in machine]
@@ -1893,13 +1904,18 @@ async def feishu_token(app_id: str, app_secret: str) -> str:
     return data["tenant_access_token"]
 
 
-async def feishu_search(token, app_token, table_id, field_names, filter_spec, page_size=200):
+async def feishu_search(token, app_token, table_id, field_names, filter_spec,
+                        page_size=200, deadline=None):
     """按条件拉记录，**自动翻页**——语义与服务端 feishu.Bitable.search 一致。
 
     ⚠️ 这里绝不能只取一页：过滤条件只有「监控中」，到期判断在取回后才做，
     而飞书的返回顺序和是否刷过无关。只取一页的话，每一轮看到的都是同样的
     前 N 条记录，第 N+1 条以后**永远轮不到刷新**且没有任何报错——
     「600 行按每轮 40 行排干」的断点续跑机制全靠这里拿到全量。
+
+    deadline：到点就带着已取到的页返回（部分结果照常处理，剩下的行
+    下一轮再捞）。扣子只有 60 秒，飞书响应慢的时候不能让翻页把
+    处理和写回的预算吃光。
     """
     items, page_token = [], ""
     base = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
@@ -1907,6 +1923,8 @@ async def feishu_search(token, app_token, table_id, field_names, filter_spec, pa
     if filter_spec:
         body["filter"] = filter_spec
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            return items
         url = f"{base}?page_size={page_size}"
         if page_token:
             url += "&page_token=" + _quote(page_token)
@@ -2091,8 +2109,10 @@ async def main(args: Any) -> dict:
             {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
 
     try:
+        # 翻页预算最多给到软截止的一半：剩下的时间要留给取数和写回。
         records = await feishu_search(token, p["app_token"], p["table_id"],
-                                      f.must_read(), filter_spec)
+                                      f.must_read(), filter_spec,
+                                      deadline=deadline - SOFT_DEADLINE / 2)
     except Exception as exc:                           # noqa: BLE001
         return {"ok": False, "processed": 0, "credits": 0, "balance": 0, "message": str(exc)}
 
@@ -2143,7 +2163,7 @@ async def main(args: Any) -> dict:
     # TikHub 抖音 0.72 分/次会被每次凑成 1 分，虚报近四成。
     updates, fen, balance, used = [], 0.0, 0, {}
     entries = []   # (update, 刷新状态) —— 熔断要能找到该撤销的那些行
-    attempted = gone = 0
+    attempted = gone = fatal_rows = 0
     for row, result in zip(rows, results):
         if isinstance(result, Exception):
             continue
@@ -2151,11 +2171,14 @@ async def main(args: Any) -> dict:
         fen += spent
         balance = bal or balance
         # 熔断的分母只算真正打过上游的行：冷却/软截止顺延的行（fields None）
-        # 和坏链接（跳过）没有产生「取不到内容」的观测，混进去会稀释比例。
+        # 和坏链接/不支持的链接形态（跳过）没有产生「取不到内容」的观测，
+        # 混进去会稀释比例。
         if status in ("正常", "已失效", "疑似受限", "刷新失败"):
             attempted += 1
         if status in ("已失效", "疑似受限"):
             gone += 1
+        if status == "fatal":
+            fatal_rows += 1
         for name, count in tally.items():
             used[name] = used.get(name, 0) + count
         if fields:
@@ -2194,6 +2217,13 @@ async def main(args: Any) -> dict:
         message += f"；⚠ 本轮 {'、'.join(sorted(disabled))} 通道不可用，已降级"
     if tripped:
         message += "；⚠ 本批失效比例异常，已熔断，未改流量状态"
+    if fatal_rows:
+        # Key 失效 / 余额耗尽把通道全打死了：必须报 ok:False 让下游告警分支
+        # 接住——静默返回成功，半夜的故障就没人知道了。已完成的行照常写回。
+        message += (f"；❌ 数据通道全部不可用（Key 失效或余额耗尽），"
+                    f"{fatal_rows} 行未处理、未写回，修复后下一轮自动重捞")
+        return {"ok": False, "processed": written, "credits": cents,
+                "balance": balance, "message": message}
     return {"ok": True, "processed": written, "credits": cents,
             "balance": balance, "message": message}
 
@@ -2230,11 +2260,18 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
                     # 一个请求都没发出去：整行留给下一轮，不写回。
                     return (None, fen, balance, "", tally)
                 break  # 评论已到手，detail 放弃，按已有数据完成本行
+            if result.code == "unsupported_link":
+                # 链接形态不被当前配置的通道支持（比如只配 TikHub 的抖音短链）：
+                # 这是链接/配置问题不是上游观测——按「跳过」处理，
+                # 不进熔断分母，不碰标签和定罪计数。
+                return (_base_fields(settings, "跳过", [result.operator_text()], now),
+                        fen, balance, "跳过", tally)
             if result.kind in FATAL:
                 # 所有通道都是 AUTH/QUOTA：这是通道故障，不是这一行的结论。
                 # 不写回——写「刷新失败」会顶掉最后更新时间、清掉排队勾，
-                # 等于替一次 Key 故障惩罚了这一行。
-                return (None, fen, balance, "", tally)
+                # 等于替一次 Key 故障惩罚了这一行。状态标 "fatal"，
+                # 让 main 能把「Key 失效/余额耗尽」上报成 ok:False 而不是静默成功。
+                return (None, fen, balance, "fatal", tally)
             if result.kind is Failure.GONE and not (
                     snapshot and (snapshot.comments or snapshot.comment_count)):
                 # 死亡信号可能来自 detail（小红书 data 为 []、抖音 filter_list 命中）。
@@ -2304,7 +2341,8 @@ def _render(row, verdict, snapshot, settings, now, status,
     fields = _base_fields(settings, status, verdict.notes, now)
     if touch_tags:
         merged = merge(row.current_tags, verdict.tags, settings.tags.namespace(),
-                       known_options=traffic_options)
+                       known_options=traffic_options,
+                       exclusive=(settings.tags.heat_tiers(),))
         if merged.dropped_unknown:
             fields[f.failure_reason] = (
                 fields[f.failure_reason]
@@ -2317,7 +2355,8 @@ def _render(row, verdict, snapshot, settings, now, status,
         if wanted is not None:
             merged_status = merge(row.comment_status, wanted,
                                   settings.comment_status.namespace(),
-                                  known_options=status_options)
+                                  known_options=status_options,
+                                  exclusive=(settings.comment_status.namespace(),))
             if merged_status.dropped_unknown:
                 fields[f.failure_reason] = (
                     fields[f.failure_reason]

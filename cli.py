@@ -222,10 +222,20 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
         return 0
 
     yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
+
+    # 显示的通道要和计价用的是同一套选择逻辑（第一家配了 key 的），
+    # 否则只配备胎 key 时会按 SDX 计价、嘴上却说走 TikHub，自相矛盾。
+    def _display_channel(platform: str) -> str:
+        for name in settings.channels.for_platform(platform):
+            if api_keys.get(name):
+                return name
+        return settings.channels.primary(platform)
+
     print(f"待刷 {len(row_list)} 行，预计花费 ≈ ¥{yuan:.2f}"
-          f"（按每个平台的主通道单价算："
-          f"小红书走 {settings.channels.primary('xhs')}，"
-          f"抖音走 {settings.channels.primary('douyin')}）")
+          f"（按各行实际会走的通道计价："
+          f"小红书主走 {_display_channel('xhs')}，"
+          f"抖音主走 {_display_channel('douyin')}；"
+          "提不出数字 ID 的抖音链接按 socialdatax 计）")
 
     if mode == "estimate":
         return 0
@@ -242,15 +252,23 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     print(report.summary())
 
     write_errors: list = []
-    written = runner.write_back(table, report, errors=write_errors)
+    try:
+        written = runner.write_back(table, report, errors=write_errors)
+    except feishu.FeishuError as exc:
+        # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
+        # 未写回的行 last_updated 没动，下一轮会自然重捞。
+        print(f"❌ 写回失败（表级错误）：{exc}")
+        return 1
     print(f"已写回 {written} 行")
     if write_errors:
         print(f"⚠ {len(write_errors)} 行写回失败（其余行不受影响）：")
         for record_id, exc in write_errors:
             print(f"  {record_id}: {exc}")
-    # 只有真故障才返回非零。到软截止后「留给下一轮」是正常运行，
-    # 返回非零会让 cron / 云平台的重启策略把它当失败反复重启。
-    return 1 if report.fatal else 0
+    # 退出码语义：到软截止「留给下一轮」是正常运行返回 0（返回非零会让
+    # cron / 云平台的重启策略把它当失败反复重启）；真故障（Key/余额）和
+    # 「花了钱但有行没写回」都返回非零——花出去的钱没落进表里，
+    # 不能让 cron 和 Actions 显示一个绿色的成功。
+    return 1 if (report.fatal or write_errors) else 0
 
 
 def main(argv: list[str]) -> int:

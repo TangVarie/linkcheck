@@ -320,6 +320,16 @@ def _fetch_one(
             if deadline is not None:
                 wait = min(wait, max(0.0, deadline - time.monotonic()))
             time.sleep(wait)
+            if deadline is not None and time.monotonic() >= deadline:
+                # 等待吃光了预算就别再打了：传输层只会回一个合成的截止响应，
+                # 被当成普通网络失败写成「刷新失败」——该留给下一轮的行
+                # 会因此被顶掉更新时间、清掉排队勾。
+                if snapshot is None:
+                    return None, protocol.Err(
+                        protocol.Failure.UNKNOWN, "deadline",
+                        "限流等待中到达软截止，本行留给下一轮"
+                    ), credits, yuan, failovers
+                break  # 评论已到手：detail 放弃，按已有数据完成本行
             result = attempt(call)
 
         if isinstance(result, protocol.Err):
@@ -436,6 +446,7 @@ def refresh(
                 verdict.tags,
                 settings.tags.namespace(),
                 known_options=known_options,
+                exclusive=(settings.tags.heat_tiers(),),
             )
             if merged.dropped_unknown:
                 fields[f.failure_reason] = (
@@ -460,6 +471,8 @@ def refresh(
                     wanted,
                     settings.comment_status.namespace(),
                     known_options=comment_status_options,
+                    # 置顶三值本身就是互斥组
+                    exclusive=(settings.comment_status.namespace(),),
                 )
                 if merged_status.changed:
                     fields[f.comment_status] = merged_status.final
@@ -522,6 +535,14 @@ def refresh(
         if snapshot is None and error is not None and error.code == "deadline":
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            "已到软截止，留给下一轮", credits, cost_yuan)
+
+        # —— 链接形态不被当前配置的通道支持（比如只配 TikHub 的抖音短链）——
+        # 这是链接/配置问题，不是上游观测：按「跳过」处理（和坏链接同类），
+        # 不进熔断的失效比例分母，也不碰任何标签和定罪计数。
+        if snapshot is None and error is not None and error.code == "unsupported_link":
+            verdict = analyze.Verdict(notes=[error.operator_text()])
+            return finish(row, verdict, None, status=STATUS_SKIPPED,
+                          credits=credits, cost_yuan=cost_yuan, touch_tags=False)
 
         # —— 取不到内容：两击定罪 ——
         if snapshot is None and error is not None and error.kind is protocol.Failure.GONE:

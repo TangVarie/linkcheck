@@ -324,6 +324,62 @@ class TestCozeOrchestration(unittest.TestCase):
         settings = ns["Settings"]()
         self.assertNotIn(settings.fields.consecutive_failures, fields)
 
+    def test_process_fatal_channel_outage_is_marked_not_silent(self):
+        """Key 失效/余额耗尽把通道全打死：不能返回和普通顺延一样的空状态——
+        那会让 main 报 ok:True，半夜的故障没人知道。"""
+        import asyncio
+        import json as _json
+        import time as _time
+        from datetime import datetime, timezone
+
+        ns = self.namespace
+
+        async def fake_post(url, headers=None, json=None, timeout=None, data=None):
+            return _FakeResponse(status_code=401, text=_json.dumps(
+                {"code": 1401, "message": "API Key 无效或已失效。"}))
+
+        self.mod.post = fake_post
+        row = ns["Row"](record_id="r",
+                        link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24)
+
+        async def run():
+            import asyncio as _asyncio
+            sem = _asyncio.Semaphore(1)
+            return await ns["_process"](
+                row, {"socialdatax": "s"}, ns["Settings"](),
+                datetime.now(timezone.utc), sem, _time.monotonic() + 60, set(),
+                None, None, wanted=True)
+
+        fields, fen, balance, status, tally = asyncio.run(run())
+        self.assertIsNone(fields)                 # 不写回（不是这一行的错）
+        self.assertEqual(status, "fatal")         # 但要向 main 报故障
+
+    def test_process_unsupported_link_is_skipped_not_failed(self):
+        """只配 TikHub 的抖音短链行：按「跳过」处理，不进熔断分母。"""
+        import asyncio
+        import time as _time
+        from datetime import datetime, timezone
+
+        ns = self.namespace
+        row = ns["Row"](record_id="r",
+                        link_cell="7.86 复制打开抖音 https://v.douyin.com/iRxYzAb/",
+                        publish_time_ms=None)
+
+        async def run():
+            import asyncio as _asyncio
+            sem = _asyncio.Semaphore(1)
+            return await ns["_process"](
+                row, {"tikhub": "t"}, ns["Settings"](),
+                datetime.now(timezone.utc), sem, _time.monotonic() + 60, set(),
+                None, None, wanted=True)
+
+        fields, fen, balance, status, tally = asyncio.run(run())
+        self.assertEqual(status, "跳过")
+        settings = ns["Settings"]()
+        self.assertIn("不支持这种链接形态",
+                      fields[settings.fields.failure_reason])
+        self.assertEqual(fen, 0.0)                # 一分钱没花
+
     def test_render_filters_unknown_options_and_keeps_old_tier(self):
         """「大爆」没建选项：既不能写进去（整批回滚），也不能顺手摘掉「爆贴」。"""
         from datetime import datetime, timezone
