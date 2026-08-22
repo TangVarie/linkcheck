@@ -296,6 +296,7 @@ class Settings:
     # SocialDataX 官方 skill 明文要求最多 3 并发，不要突发请求。留一档余量。
     max_concurrency: int = 2
 
-    # 单次运行的软截止。扣子代码节点硬上限 60 秒，留足写回时间。
-    # 独立服务跑批量时设成 0（不限）。
+    # 单次运行的软截止。给受执行时限约束的运行时准备（曾经的扣子代码
+    # 节点硬上限 60 秒，默认 45 由此而来）；Railway 独立服务跑批量时
+    # cli 会用环境变量 SOFT_DEADLINE_SECONDS（默认 0 = 不限）覆盖。
     soft_deadline_seconds: float = 45.0

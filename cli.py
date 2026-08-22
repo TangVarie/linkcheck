@@ -42,7 +42,7 @@ def _apply_endpoint_overrides() -> None:
     """按部署位置切 TikHub 的接入域名。
 
     对方文档要求「请勿跨区使用，会影响访问速度」：
-        境内（扣子、国内 VPS）  → api.tikhub.dev（默认，不用设）
+        境内（国内 VPS）        → api.tikhub.dev（默认，不用设）
         境外（Railway、Actions）→ TIKHUB_BASE=https://api.tikhub.io
     """
     providers.set_tikhub_base(os.environ.get("TIKHUB_BASE", ""))
@@ -72,7 +72,7 @@ def _table() -> feishu.Bitable:
 def _settings() -> Settings:
     _apply_endpoint_overrides()
     settings = Settings()
-    # 独立服务跑批量不需要软截止（那是给扣子 60 秒硬上限准备的）。
+    # 独立服务跑批量不需要软截止（那是给有执行时限的运行时准备的）。
     settings.soft_deadline_seconds = _numeric_env("SOFT_DEADLINE_SECONDS", float, 0.0)
     settings.max_concurrency = _numeric_env("MAX_CONCURRENCY", int, settings.max_concurrency)
     settings.detail_within_days = _numeric_env("DETAIL_WITHIN_DAYS", int, settings.detail_within_days)
