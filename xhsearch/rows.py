@@ -45,10 +45,9 @@ class Row:
     previous_collect_count: Optional[int] = None
     last_updated_ms: Optional[int] = None
     consecutive_failures: int = 0
-    comment_status: list[str] = field(default_factory=list)
-    # 上一轮写进「置顶评论」列的内容：非空（且不是抖音的「不支持」占位）
-    # 而本轮没有置顶，就是「置顶刚掉」——最该被立刻发现的告警。
-    pinned_comment: str = ""
+    # 「置顶状态」单选的现值：上一轮是 置顶成功/置顶掉了、这一轮没置顶
+    # → 置顶掉了；否则 → 无置顶。「掉了」和「从来没有」的区分全靠它。
+    pin_status: str = ""
     queued: bool = False
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)
