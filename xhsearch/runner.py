@@ -314,8 +314,8 @@ def _fetch_one(
         result = attempt(call)
 
         if isinstance(result, protocol.Err) and result.kind is protocol.Failure.RATE_LIMIT:
-            # 退避一次再试。等待时间不能越过软截止——在扣子那种 60 秒硬上限里，
-            # 一次 30 秒的 retry_after 睡过头会把整个节点拖超时。
+            # 退避一次再试。等待时间不能越过软截止——设了软截止的运行时里，
+            # 一次 30 秒的 retry_after 睡过头会把整轮拖超时。
             wait = result.retry_after_seconds or 5.0
             if deadline is not None:
                 wait = min(wait, max(0.0, deadline - time.monotonic()))

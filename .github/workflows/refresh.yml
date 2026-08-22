@@ -2,7 +2,7 @@ name: 刷新监控表
 
 # 默认**只有手动触发**，定时任务是注释掉的。
 #
-# 为什么：如果你把定时刷新放在 Railway 或扣子上跑，这里再开一套定时，
+# 为什么：定时刷新在 Railway 上跑（主方案），这里再开一套定时，
 # 两边会同时刷同一张表 —— 重复花钱，还可能互相覆盖写入。
 # 一套定时只能有一个地方跑，这是硬规矩。
 #
@@ -71,6 +71,6 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
           FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
-          # 独立进程跑批量，不需要扣子那种 60 秒软截止
+          # 独立进程跑批量，不需要软截止
           SOFT_DEADLINE_SECONDS: "0"
         run: python3 cli.py ${{ steps.mode.outputs.value }}

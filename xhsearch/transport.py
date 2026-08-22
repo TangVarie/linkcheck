@@ -1,10 +1,7 @@
 """HTTP 传输层。整个项目只有这里和 feishu.py 会碰网络。
 
 刻意只用标准库：不引第三方依赖，独立服务、云函数、本地定时任务都能直接跑。
-
-扣子代码节点是例外——它禁用 http.client（urllib 底层就是它），只提供
-requests_async。要在扣子里跑，把下面的 post() 换成 coze/ 目录里的异步版本即可，
-其余模块一行都不用改。
+换运行时只需要换这一层，其余模块一行都不用改。
 """
 
 from __future__ import annotations
@@ -167,8 +164,8 @@ def post_with_retry(
     按返回的等待时间等待（没给就等 2 秒），然后从未完成的位置继续。base_delay
     默认取 2 秒就是照这个来的。
 
-    deadline 是 time.monotonic() 的绝对时刻。到点就不再重试——在扣子代码节点
-    这种有 60 秒硬上限的地方，宁可把这一条留给下一轮，也不能让整个节点超时，
+    deadline 是 time.monotonic() 的绝对时刻。到点就不再重试——在有执行
+    时限的运行时里，宁可把这一条留给下一轮，也不能让整轮超时，
     因为超时会把已经跑完的几十条结果一起丢掉。
     """
     return request_with_retry(

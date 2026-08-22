@@ -41,9 +41,9 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-# 直接导名字，不要 `from . import protocol` —— 打包进扣子时模块会被拼成一个
-# 扁平文件，那里根本没有 protocol 这个名字，用 protocol.xxx 会当场 NameError。
-# 也必须写成一行：打包脚本是按行剥 import 的，跨行的括号形式会留下半截语法。
+# 直接导名字，不要 `from . import protocol`（历史习惯：这份代码曾被打包成
+# 扁平单文件粘进扣子，模块前缀在那种命名空间里会 NameError；打包路径已
+# 退役，写法保留——零成本，还省了模块前缀噪音）。
 from .protocol import Err, Failure, Ok, Result, build_body, endpoint, headers, parse_response  # noqa: E501
 
 SOCIALDATAX = "socialdatax"
@@ -60,8 +60,8 @@ TIKHUB_BASE = "https://api.tikhub.dev"
 def set_tikhub_base(url: str) -> None:
     """改 TikHub 的接入域名。
 
-    做成函数而不是读环境变量，是因为这份代码要整段粘进扣子代码节点——
-    那边没有环境变量这回事。宿主（cli.py）负责从环境里读，扣子那边用默认值。
+    做成函数而不是在这里读环境变量：宿主（cli.py）负责从环境里读，
+    库代码保持与运行环境无关（历史上也因此能整段粘进无环境变量的运行时）。
     """
     global TIKHUB_BASE
     cleaned = (url or "").strip().rstrip("/")
@@ -97,9 +97,9 @@ _SAFE = frozenset(
 
 
 def _quote(value: Any) -> str:
-    """百分号编码。刻意不用 urllib.parse——这份代码要整段粘进扣子代码节点，
-    那边禁用了 http.client，围绕 urllib 有多少能用、多少不能用没有文档保证。
-    一个六行的编码器换掉一整个不确定性，很划算。"""
+    """百分号编码。刻意不用 urllib.parse（历史原因：曾要粘进禁用 http.client
+    的扣子运行时，urllib 可用范围没有保证）。六行的编码器没有维护负担，
+    保留它避免无谓改动。"""
     out = []
     for byte in str(value).encode("utf-8"):
         char = chr(byte)
@@ -513,8 +513,8 @@ REGISTRY: dict[str, Provider] = {
 def get_provider(name: str) -> Provider:
     """按名字取供应商。
 
-    名字刻意叫 get_provider 而不是 get——这份代码会被打成一个扁平的单文件粘进
-    扣子，一个叫 get 的模块级函数在那种命名空间里迟早撞车。
+    名字刻意叫 get_provider 而不是 get——模块级的 get 太容易在
+    大命名空间里撞车（历史上还要被拼进扁平单文件，风险更大）。
     """
     provider = REGISTRY.get((name or "").strip().lower())
     if provider is None:
@@ -550,7 +550,7 @@ def usable_order(channels: Any, platform: str, keys: dict[str, str],
     """这个平台此刻真正可用的供应商顺序：有 key、且本轮没被判死。
 
     channels 是 config.Channels；这里刻意用 Any 接住，好让 providers 不反过来
-    依赖 config——打包进扣子时模块是按依赖顺序拼接的，一旦成环就拼不出来。
+    依赖 config——依赖保持单向，模块图不成环。
     """
     dead = disabled or set()
     return [n for n in channels.for_platform(platform) if keys.get(n) and n not in dead]

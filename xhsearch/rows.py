@@ -19,8 +19,7 @@ from typing import Any, Optional
 
 from .config import Settings
 from .links import ParsedLink, parse
-# 直接导名字并写成一行（理由同 providers.py 顶部）：打包进扣子时模块被拼成
-# 扁平文件，`providers.xxx` 这种模块前缀在那边会 NameError。
+# 直接导名字并写成一行（理由同 providers.py 顶部的历史说明）。
 from .providers import get_provider  # noqa: F401
 
 
