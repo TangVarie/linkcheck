@@ -58,9 +58,10 @@ def merge(
         与其赌服务端会自动建选项，不如在这里挡掉并把它记进 dropped_unknown。
     exclusive:
         互斥组（如热度三档），组内同时只能留一个。只在「选项没建、保留旧
-        机器标签」的路径上用：本轮已有同组的可写标签时，旧的同组标签正常
-        让位，不参与保留——否则「爆贴」升「大爆」恰逢「风控中」没建选项时，
-        两个档位会同时出现在行上。
+        机器标签」的路径上用，用来圈定**每个被拦标签的同类范围**：
+        「大爆」写不进去 → 只保留行上同组的旧档位（爆贴），既不让两个
+        档位并存，也绝不顺手把不相干的旧状态标签（比如上一轮的「已失效」）
+        复活——那会把一条刚恢复正常的行继续标成死的。
     """
     current_set = [t.strip() for t in (current or []) if t and t.strip()]
     machine = set(machine_namespace)
@@ -83,14 +84,16 @@ def merge(
         dropped = sorted(computed_set - allowed)
         computed_set = allowed
         if dropped:
-            # 想写的标签写不进去（选项没建）时，这一轮**不摘旧机器标签**：
-            # 「评论数到了大爆、但大爆选项没建」不该把行上的「爆贴」顺手清掉——
-            # 那会让一次配置疏漏抹掉行上仅存的热度/风控信息。
-            preserved = set(previous_machine)
-            for group in exclusive:
-                if computed_set & set(group):
-                    # 本轮已经算出并且写得进同组的标签：旧的同组标签正常让位
-                    preserved -= set(group)
+            # 想写的标签写不进去（选项没建）时，只保留**同类**的旧标签：
+            # 「大爆」被拦 → 留住行上的旧档位「爆贴」（热度信息不清零）；
+            # 但绝不把不相干的旧标签一并复活——被拦的是「风控中」时，
+            # 行上残留的「已失效」不在它的同类范围里，照常摘掉，
+            # 否则一条刚恢复正常的行会继续顶着死亡标签。
+            groups = [set(g) for g in exclusive]
+            preserved: set[str] = set()
+            for tag in dropped:
+                category = next((g for g in groups if tag in g), {tag})
+                preserved |= previous_machine & category
             computed_set |= preserved
 
     # 保序：先按原顺序留下人工标签，再追加机器标签，表里看起来才稳定。

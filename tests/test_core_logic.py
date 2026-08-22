@@ -651,15 +651,29 @@ class TestGoneKeepsHeatHistory(unittest.TestCase):
 class TestMergeWithMissingOptions(unittest.TestCase):
     NS = ["评估中", "爆贴", "大爆", "风控中", "已失效"]
 
+    HEAT = (["评估中", "爆贴", "大爆"],)
+
     def test_dropped_computed_tag_does_not_strip_existing_machine_tags(self):
         """想写「大爆」但选项没建：这一轮不能顺手把行上的「爆贴」摘掉——
         一次配置疏漏不该抹掉行上仅存的热度信息。"""
         result = tags.merge(["爆贴", "已复盘"], {"大爆"}, self.NS,
-                            known_options=["评估中", "爆贴", "风控中", "已失效"])
+                            known_options=["评估中", "爆贴", "风控中", "已失效"],
+                            exclusive=self.HEAT)
         self.assertIn("爆贴", result.final)
         self.assertIn("已复盘", result.final)
         self.assertEqual(result.dropped_unknown, ["大爆"])
         self.assertEqual(result.removed, [])
+
+    def test_preservation_does_not_resurrect_unrelated_tags(self):
+        """被拦的是「风控中」：只该考虑保留同类的旧值——行上残留的
+        「已失效」和它不是一类，照常摘掉。否则一条刚恢复正常、
+        本轮成功取到数的行会继续顶着死亡标签。"""
+        result = tags.merge(["爆贴", "已失效"], {"爆贴", "风控中"}, self.NS,
+                            known_options=["评估中", "爆贴", "大爆", "已失效"],
+                            exclusive=self.HEAT)
+        self.assertIn("爆贴", result.final)
+        self.assertNotIn("已失效", result.final)     # 不复活无关旧标签
+        self.assertEqual(result.dropped_unknown, ["风控中"])
 
     def test_normal_upgrade_still_swaps_the_tier(self):
         """选项齐全时行为不变：升档照样换标签。"""

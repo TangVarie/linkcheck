@@ -208,10 +208,49 @@ class TestCozeOrchestration(unittest.TestCase):
             return _FakeResponse(text=_json.dumps(pages[len(calls) - 1]))
 
         self.mod.post = fake_post
-        records = asyncio.run(ns["feishu_search"]("tok", "app", "tbl", ["链接"], None))
+        records, complete = asyncio.run(
+            ns["feishu_search"]("tok", "app", "tbl", ["链接"], None,
+                                sort_field="最后更新时间"))
         self.assertEqual([r["record_id"] for r in records], ["r1", "r2"])
+        self.assertTrue(complete)
         self.assertEqual(len(calls), 2)
         self.assertIn("page_token=tok%2B1", calls[1])   # 不透明 token 必须编码
+
+    def test_feishu_search_scans_stalest_first(self):
+        """部分扫描不饿死任何行的关键：按「最后更新时间」升序扫，
+        被刷过的行自动沉到队尾，游标藏在数据自己身上。"""
+        import asyncio
+        import json as _json
+
+        ns = self.namespace
+        bodies: list = []
+
+        async def fake_post(url, headers=None, json=None, timeout=None, data=None):
+            bodies.append(json)
+            return _FakeResponse(text=_json.dumps(
+                {"code": 0, "data": {"items": [], "has_more": False}}))
+
+        self.mod.post = fake_post
+        asyncio.run(ns["feishu_search"]("tok", "app", "tbl", ["链接"], None,
+                                        sort_field="最后更新时间"))
+        self.assertEqual(bodies[0]["sort"],
+                         [{"field_name": "最后更新时间", "desc": False}])
+
+    def test_feishu_search_partial_scan_is_flagged(self):
+        import asyncio
+        import time as _time
+
+        ns = self.namespace
+
+        async def fake_post(url, headers=None, json=None, timeout=None, data=None):
+            raise AssertionError("截止已过，不该再发请求")
+
+        self.mod.post = fake_post
+        records, complete = asyncio.run(
+            ns["feishu_search"]("tok", "app", "tbl", ["链接"], None,
+                                deadline=_time.monotonic() - 1))
+        self.assertEqual(records, [])
+        self.assertFalse(complete)      # main 靠这个标志提示「读表未扫完」
 
     def test_channel_call_routes_douyin_url_to_socialdatax(self):
         """抖音短链（提不出数字 ID）：TikHub 端点只收 aweme_id，

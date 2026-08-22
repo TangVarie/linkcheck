@@ -1273,9 +1273,10 @@ def merge(
         与其赌服务端会自动建选项，不如在这里挡掉并把它记进 dropped_unknown。
     exclusive:
         互斥组（如热度三档），组内同时只能留一个。只在「选项没建、保留旧
-        机器标签」的路径上用：本轮已有同组的可写标签时，旧的同组标签正常
-        让位，不参与保留——否则「爆贴」升「大爆」恰逢「风控中」没建选项时，
-        两个档位会同时出现在行上。
+        机器标签」的路径上用，用来圈定**每个被拦标签的同类范围**：
+        「大爆」写不进去 → 只保留行上同组的旧档位（爆贴），既不让两个
+        档位并存，也绝不顺手把不相干的旧状态标签（比如上一轮的「已失效」）
+        复活——那会把一条刚恢复正常的行继续标成死的。
     """
     current_set = [t.strip() for t in (current or []) if t and t.strip()]
     machine = set(machine_namespace)
@@ -1298,14 +1299,16 @@ def merge(
         dropped = sorted(computed_set - allowed)
         computed_set = allowed
         if dropped:
-            # 想写的标签写不进去（选项没建）时，这一轮**不摘旧机器标签**：
-            # 「评论数到了大爆、但大爆选项没建」不该把行上的「爆贴」顺手清掉——
-            # 那会让一次配置疏漏抹掉行上仅存的热度/风控信息。
-            preserved = set(previous_machine)
-            for group in exclusive:
-                if computed_set & set(group):
-                    # 本轮已经算出并且写得进同组的标签：旧的同组标签正常让位
-                    preserved -= set(group)
+            # 想写的标签写不进去（选项没建）时，只保留**同类**的旧标签：
+            # 「大爆」被拦 → 留住行上的旧档位「爆贴」（热度信息不清零）；
+            # 但绝不把不相干的旧标签一并复活——被拦的是「风控中」时，
+            # 行上残留的「已失效」不在它的同类范围里，照常摘掉，
+            # 否则一条刚恢复正常的行会继续顶着死亡标签。
+            groups = [set(g) for g in exclusive]
+            preserved: set[str] = set()
+            for tag in dropped:
+                category = next((g for g in groups if tag in g), {tag})
+                preserved |= previous_machine & category
             computed_set |= preserved
 
     # 保序：先按原顺序留下人工标签，再追加机器标签，表里看起来才稳定。
@@ -1905,26 +1908,34 @@ async def feishu_token(app_id: str, app_secret: str) -> str:
 
 
 async def feishu_search(token, app_token, table_id, field_names, filter_spec,
-                        page_size=200, deadline=None):
+                        page_size=200, deadline=None, sort_field=None):
     """按条件拉记录，**自动翻页**——语义与服务端 feishu.Bitable.search 一致。
+    返回 (records, 是否扫完)。
 
-    ⚠️ 这里绝不能只取一页：过滤条件只有「监控中」，到期判断在取回后才做，
-    而飞书的返回顺序和是否刷过无关。只取一页的话，每一轮看到的都是同样的
-    前 N 条记录，第 N+1 条以后**永远轮不到刷新**且没有任何报错——
-    「600 行按每轮 40 行排干」的断点续跑机制全靠这里拿到全量。
+    ⚠️ 这里绝不能只取一页：过滤条件只有「监控中」，到期判断在取回后才做。
+    只取一页的话每一轮看到的都是同样的前 N 条，第 N+1 条以后
+    **永远轮不到刷新**——「600 行按每轮 40 行排干」全靠这里拿到全量。
 
-    deadline：到点就带着已取到的页返回（部分结果照常处理，剩下的行
-    下一轮再捞）。扣子只有 60 秒，飞书响应慢的时候不能让翻页把
-    处理和写回的预算吃光。
+    deadline：到点就带着已取到的页返回（第二个返回值 False）。扣子只有
+    60 秒，飞书响应慢时不能让翻页吃光处理和写回的预算。
+
+    sort_field：按这一列**升序**扫（传「最后更新时间」= 最久没刷的排最前）。
+    这是「部分扫描也不会饿死任何行」的关键：没有可持久化的翻页游标，
+    但把最饥饿的行排在最前面，游标就藏在数据自己身上——被刷过的行
+    时间戳更新后自动沉到队尾，下一轮的前缀永远是最该刷的那批。
+    不排序的话，慢响应下每轮都只扫到同一批前缀行，前缀刷完后
+    整个节点会一直报「没有到期的行」，而后面的行永远没人看。
     """
     items, page_token = [], ""
     base = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
     body = {"field_names": list(field_names), "automatic_fields": False}
     if filter_spec:
         body["filter"] = filter_spec
+    if sort_field:
+        body["sort"] = [{"field_name": sort_field, "desc": False}]
     while True:
         if deadline is not None and time.monotonic() >= deadline:
-            return items
+            return items, False
         url = f"{base}?page_size={page_size}"
         if page_token:
             url += "&page_token=" + _quote(page_token)
@@ -1936,10 +1947,10 @@ async def feishu_search(token, app_token, table_id, field_names, filter_spec,
         payload = data.get("data") or {}
         items.extend(payload.get("items") or [])
         if not payload.get("has_more"):
-            return items
+            return items, True
         page_token = payload.get("page_token") or ""
         if not page_token:
-            return items
+            return items, True
 
 
 async def feishu_field_options(token, app_token, table_id, field_name):
@@ -2097,24 +2108,34 @@ async def main(args: Any) -> dict:
     except Exception as exc:                           # noqa: BLE001
         return {"ok": False, "processed": 0, "credits": 0, "balance": 0, "message": str(exc)}
 
-    # 两个人机共用多选列的已建选项。读不到 = None = 不过滤（宁可试着写）。
-    traffic_options = await feishu_field_options(
-        token, p["app_token"], p["table_id"], f.traffic_status)
-    status_options = await feishu_field_options(
-        token, p["app_token"], p["table_id"], f.comment_status)
 
     filter_spec = None
     if mode != "row":
         filter_spec = {"conjunction": "and", "conditions": [
             {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
 
-    try:
-        # 翻页预算最多给到软截止的一半：剩下的时间要留给取数和写回。
-        records = await feishu_search(token, p["app_token"], p["table_id"],
-                                      f.must_read(), filter_spec,
-                                      deadline=deadline - SOFT_DEADLINE / 2)
-    except Exception as exc:                           # noqa: BLE001
-        return {"ok": False, "processed": 0, "credits": 0, "balance": 0, "message": str(exc)}
+    # 读表 + 两个多选列的选项**并发**取：选项各有 15 秒超时，串行的话
+    # 慢响应会把读表的预算先吃光，扫出空表还报 ok:True。
+    # 读表按「最后更新时间」升序扫（最久没刷的最前），预算给到软截止的一半。
+    scan_deadline = deadline - SOFT_DEADLINE / 2
+    search_result, traffic_options, status_options = await asyncio.gather(
+        feishu_search(token, p["app_token"], p["table_id"], f.must_read(),
+                      filter_spec, deadline=scan_deadline, sort_field=f.last_updated),
+        feishu_field_options(token, p["app_token"], p["table_id"], f.traffic_status),
+        feishu_field_options(token, p["app_token"], p["table_id"], f.comment_status),
+        return_exceptions=True,
+    )
+    if isinstance(search_result, Exception):
+        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
+                "message": str(search_result)}
+    records, scan_complete = search_result
+    # 选项读取失败 = None = 不过滤（宁可试着写），与服务端语义一致。
+    if isinstance(traffic_options, Exception):
+        traffic_options = None
+    if isinstance(status_options, Exception):
+        status_options = None
+    scan_note = ("" if scan_complete
+                 else "；⚠ 读表未扫完（飞书响应慢），本轮按最久未刷的行优先，其余下一轮继续")
 
     rows = []
     for record in records:
@@ -2139,7 +2160,8 @@ async def main(args: Any) -> dict:
     rows = rows[:BATCH_LIMIT]
 
     if not rows:
-        return {"ok": True, "processed": 0, "credits": 0, "balance": 0, "message": "没有到期的行"}
+        return {"ok": True, "processed": 0, "credits": 0, "balance": 0,
+                "message": "没有到期的行" + scan_note}
 
     keys = {k: v for k, v in {
         "tikhub": (p.get("tikhub_key") or "").strip(),
@@ -2212,7 +2234,7 @@ async def main(args: Any) -> dict:
                 "message": f"算完了但写回失败：{exc}"}
 
     via = "、".join(f"{k} {v} 次" for k, v in sorted(used.items())) or "无调用"
-    message = f"刷新 {written} 行，花费 ≈ ¥{fen / 100:.2f}（{via}）"
+    message = f"刷新 {written} 行，花费 ≈ ¥{fen / 100:.2f}（{via}）" + scan_note
     if disabled:
         message += f"；⚠ 本轮 {'、'.join(sorted(disabled))} 通道不可用，已降级"
     if tripped:
