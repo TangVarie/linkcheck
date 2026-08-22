@@ -59,6 +59,11 @@ class RunReport:
     # 两者必须分开，否则定时任务会把正常的分批执行当成失败反复重启。
     fatal: bool = False
     breaker_tripped: bool = False
+    # 熔断判定用的样本（真正打过上游的行数 / 其中判了失效或嫌疑的行数），
+    # 在单表熔断作废**之前**记录。跨表熔断要把各表样本加总重算比例，
+    # 作废会把 GONE/SUSPECT 改成 FAILED，事后从 outcomes 里就数不出来了。
+    breaker_attempted: int = 0
+    breaker_gone: int = 0
     points_balance: Optional[int] = None
     # 本轮实际用过的供应商，以及降级次数——写进日志，免得「怎么突然贵/便宜了」查不出来。
     used_providers: dict[str, int] = field(default_factory=dict)
@@ -113,12 +118,15 @@ class _Abort(Exception):
 def _looks_alive(snapshot: Optional[analyze.Snapshot]) -> bool:
     """这一轮有没有拿到「这篇内容还活着」的正面证据。
 
-    有评论、或者评论数大于 0，就算活着。评论数为 0 不算证据——
-    刚发的帖子和已经没了的帖子都是 0。
+    有评论、或者评论数/点赞数/收藏数任何一个大于 0，都算见到活的——
+    detail 接口能返回非零互动数，说明这篇笔记就在那里。之前只认评论数，
+    一条有点赞没评论的帖子明明数据都写进表了，存活勾却一直空着。
+    全为 0 仍然不算证据——刚发的帖子和已经没了的帖子都是 0。
     """
     if snapshot is None:
         return False
-    return bool(snapshot.comments) or bool(snapshot.comment_count)
+    return (bool(snapshot.comments) or bool(snapshot.comment_count)
+            or bool(snapshot.like_count) or bool(snapshot.collect_count))
 
 
 @dataclass
@@ -390,6 +398,8 @@ def refresh(
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
+    deadline: Optional[float] = None,
+    disabled: Optional[set[str]] = None,
 ) -> RunReport:
     """刷新一批行。不写回，只算结果——写回由调用方决定时机。
 
@@ -400,13 +410,19 @@ def refresh(
 
     到软截止就停止派发新行；没跑到的行**不会**被写回，因此它们的
     「最后更新时间」保持原样，下一轮自然会被重新捞起来。这是断点续跑的全部机制。
+
+    deadline / disabled 是给多表调用方用的：软截止是整次运行的预算而不是
+    每张表各一份，deadline 传入绝对的 time.monotonic() 截止点让各表共享；
+    disabled 传入同一个集合，「某家 Key 已失效/余额耗尽」的结论就能跨表
+    生效，不用每张表都花一次真实请求重新发现。都不传时行为与单表一致。
     """
     now = now or datetime.now(timezone.utc)
-    deadline = (
-        time.monotonic() + settings.soft_deadline_seconds
-        if settings.soft_deadline_seconds
-        else None
-    )
+    if deadline is None:
+        deadline = (
+            time.monotonic() + settings.soft_deadline_seconds
+            if settings.soft_deadline_seconds
+            else None
+        )
     report = RunReport()
     say = progress or (lambda _: None)
     f = settings.fields
@@ -414,7 +430,8 @@ def refresh(
     keys = providers.credentials(api_key)
     # 本轮已经确认不可用的通道（Key 失效、余额耗尽）。多线程共享，
     # 但只做「加一个字符串」这一种写入，GIL 下天然安全，不值得上锁。
-    disabled: set[str] = set()
+    if disabled is None:
+        disabled = set()
     tally: dict[str, int] = {}
     # tally / report 计数的读-改-写要过这把锁（见 _fetch_one.attempt）。
     lock = threading.Lock()
@@ -601,9 +618,6 @@ def refresh(
         )
         if error is not None:
             verdict.notes.append(f"（detail 未取到：{error.operator_text()[:120]}）")
-        if snapshot.censored:
-            # 只是提醒，不打标签——这个字段的语义还没在真被封的帖子上验过。
-            verdict.notes.append("⚠ 上游把这条标成了审核中/受限，请人工确认")
         if snapshot.points_balance is not None:
             report.points_balance = snapshot.points_balance
 
@@ -645,12 +659,43 @@ def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
     # 「取不到内容」的观测，混进分母会稀释失效比例，让该熔的批熔不了。
     attempted = [o for o in report.outcomes if o.status not in _NOT_ATTEMPTED]
     total = len(attempted)
+    gone = sum(1 for o in attempted if o.status in (STATUS_GONE, STATUS_SUSPECT))
+    # 样本先记在 report 上再决定熔不熔：跨表熔断要用作废前的原始计数。
+    report.breaker_attempted, report.breaker_gone = total, gone
     if total < settings.safety.breaker_min_sample:
         return
-    gone = sum(1 for o in attempted if o.status in (STATUS_GONE, STATUS_SUSPECT))
     if gone / total <= settings.safety.breaker_gone_ratio:
         return
+    _void_gone_writes(report, settings, gone, total)
 
+
+def apply_cross_run_breaker(reports: list[RunReport], settings: Settings) -> bool:
+    """跨表熔断：把同一轮里多张表的观测合起来再算一次失效比例。
+
+    多表部署下每张表可能只有三五行，单表永远凑不满 breaker_min_sample——
+    但上游故障是通道级的，跟行分在哪张表没关系，样本理应全局算。
+    这里用各 report 在单表熔断**之前**记下的原始计数（见 breaker_attempted），
+    已经自己熔断过的表不重复作废（诊断信息会追加两遍），
+    但它的样本照常计入全局比例。触发时返回 True，调用方据此提示。
+    """
+    total = sum(r.breaker_attempted for r in reports)
+    if total < settings.safety.breaker_min_sample:
+        return False
+    gone = sum(r.breaker_gone for r in reports)
+    if gone / total <= settings.safety.breaker_gone_ratio:
+        return False
+    for report in reports:
+        if not report.breaker_tripped:
+            _void_gone_writes(report, settings, gone, total)
+    return True
+
+
+def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: int) -> None:
+    """熔断的执行动作：撤销这份 report 里所有失效判定的写入。
+
+    gone/total 是触发熔断的样本（单表熔断是本表的，跨表熔断是全局合计的），
+    只用于诊断文案，让运营看到判定被作废的依据。
+    """
     report.breaker_tripped = True
     field_name = settings.fields.traffic_status
     for outcome in report.outcomes:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 
 from xhsearch import feishu, providers, rows as rows_mod, runner
@@ -230,7 +231,7 @@ def _expected_schema(settings: Settings) -> list[tuple]:
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
          "机器直接覆盖写入当前状态（待评论等旧值会被覆盖）"),
         (f.comment_digest, (1,), "文本", None, None),
-        (f.traffic_status, (4,), "多选", settings.tags.namespace(),
+        (f.traffic_status, (4,), "多选", settings.tags.machine_written(),
          "机器按多选合并写入——建成单选会让写回整批失败"),
         (f.refresh_status, (3, 1), "单选或文本", statuses, None),
         (f.failure_reason, (1,), "文本", None, None),
@@ -414,10 +415,17 @@ def cmd_doctor(selected: list[str] | None = None) -> int:
     return 0
 
 
-def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
-               api_keys: dict[str, str], table: feishu.Bitable, now: datetime,
-               *, quiet_missing: bool = False) -> tuple[int, set[str], int, float]:
-    """在一张表上执行 mode。返回（退出码, 找到的 record_id, 待刷行数, 预估元）。
+def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
+                   api_keys: dict[str, str], table: feishu.Bitable, now: datetime,
+                   *, quiet_missing: bool = False,
+                   deadline: float | None = None,
+                   disabled: set[str] | None = None):
+    """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
+
+    返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
+    待写回材料是 (report, known_fields)，None 表示这张表本轮没有要写的
+    （estimate、没有待刷行、缺列护栏拦下）。写回推迟到所有表都刷完之后
+    （见 _run）：跨表熔断要先看全局样本再定罪，作废的判定不能已经落了表。
 
     quiet_missing：多表 row 模式下，某张表没有目标行属于正常（行在别的
     表里），静默跳过；缺不缺由调用方汇总所有表之后统一报。
@@ -443,12 +451,12 @@ def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
     if mode == "queue" and not row_list and known_fields is not None \
             and settings.fields.queued not in known_fields:
         print(f"⚠ 表里还没建「{settings.fields.queued}」列，queue 模式无法工作，先去建列")
-        return 1, found, 0, 0.0
+        return 1, found, 0, 0.0, None
     if mode in ("sweep", "estimate") and not row_list and known_fields is not None \
             and settings.fields.last_updated not in known_fields:
         print(f"⚠ 表里还没建「{settings.fields.last_updated}」列：分层刷新没有依据，"
               "每一轮 sweep 都会全表重刷烧钱，先去建列")
-        return 1, found, 0, 0.0
+        return 1, found, 0, 0.0, None
     if record_ids and not quiet_missing:
         missing = [rid for rid in record_ids if rid not in found]
         if missing:
@@ -456,7 +464,7 @@ def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
     if not row_list:
         if not (record_ids and quiet_missing):
             print("没有需要刷新的行。")
-        return (1 if record_ids and not quiet_missing else 0), found, 0, 0.0
+        return (1 if record_ids and not quiet_missing else 0), found, 0, 0.0, None
 
     yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
 
@@ -475,7 +483,7 @@ def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
           "提不出数字 ID 的抖音链接按 socialdatax 计）")
 
     if mode == "estimate":
-        return 0, found, len(row_list), yuan
+        return 0, found, len(row_list), yuan, None
 
     report = runner.refresh(
         row_list, api_keys, settings,
@@ -485,8 +493,16 @@ def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
         pin_status_options=_options_from_meta(fields_meta, settings.fields.pinned_status),
         forced=(record_ids is not None),
         progress=print,
+        deadline=deadline,
+        disabled=disabled,
     )
-    print()
+    return 0, found, len(row_list), yuan, (report, known_fields)
+
+
+def _write_back_table(table: feishu.Bitable, report,
+                      known_fields: set[str] | None) -> int:
+    """写回阶段。summary 也在这里打印——跨表熔断可能刚作废过判定，
+    这时各行显示的才是真正落表的最终状态。"""
     print(report.summary())
 
     write_errors: list = []
@@ -499,7 +515,7 @@ def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
         print(f"❌ 写回失败（表级错误）：{exc}")
-        return 1, found, len(row_list), yuan
+        return 1
     print(f"已写回 {written} 行")
     if dropped_fields:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
@@ -512,7 +528,7 @@ def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
     # cron / 云平台的重启策略把它当失败反复重启）；真故障（Key/余额）和
     # 「花了钱但有行没写回」都返回非零——花出去的钱没落进表里，
     # 不能让 cron 和 Actions 显示一个绿色的成功。
-    return (1 if (report.fatal or write_errors) else 0), found, len(row_list), yuan
+    return 1 if (report.fatal or write_errors) else 0
 
 
 def _run(mode: str, record_ids: list[str] | None,
@@ -526,16 +542,32 @@ def _run(mode: str, record_ids: list[str] | None,
     now = datetime.now(timezone.utc)
     multi = len(tables) > 1
 
+    # 软截止是整次运行的预算，不是每张表各领一份——在这里算一次绝对
+    # 截止点传给每张表共享，五张表就不会把时限放大成五倍。
+    deadline = (time.monotonic() + settings.soft_deadline_seconds
+                if settings.soft_deadline_seconds else None)
+    # 「某家 Key 失效/余额耗尽」的死讯同理跨表共享：第一张表用真实
+    # 请求换来的结论，后面的表直接沿用，不再逐表花钱重新发现。
+    disabled: set[str] = set()
+
     worst = 0
     found_all: set[str] = set()
     total_rows, total_yuan = 0, 0.0
+    # 先把所有表都刷完、攒起来，写回放到跨表熔断之后（见下）。
+    pending: list[tuple[str, feishu.Bitable, runner.RunReport, set[str] | None]] = []
+    channels_dead = False
     for index, (label, table) in enumerate(tables):
         if multi:
             print(("\n" if index else "") + f"━━━━ 表：{label} ━━━━")
+        if channels_dead:
+            print("⚠ 数据通道已全部不可用（Key 失效或余额耗尽），这张表本轮"
+                  "不再尝试；行都没动过，修好通道后下一轮自然补上")
+            worst = 1
+            continue
         try:
-            code, found, row_count, yuan = _run_table(
+            code, found, row_count, yuan, prep = _refresh_table(
                 mode, record_ids, settings, api_keys, table, now,
-                quiet_missing=multi)
+                quiet_missing=multi, deadline=deadline, disabled=disabled)
         except feishu.FeishuError as exc:
             # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
             print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
@@ -545,6 +577,32 @@ def _run(mode: str, record_ids: list[str] | None,
         found_all |= found
         total_rows += row_count
         total_yuan += yuan
+        if prep is not None:
+            report, known_fields = prep
+            pending.append((label, table, report, known_fields))
+            if report.fatal and not [k for k in api_keys if k not in disabled]:
+                channels_dead = True
+
+    # 跨表熔断：单表可能只有三五行，永远凑不满熔断的最小样本，但上游
+    # 故障是通道级的——把这一轮所有表的观测合起来再判一次，该作废的
+    # 失效判定在写回**之前**作废掉。
+    if len(pending) > 1 and runner.apply_cross_run_breaker(
+            [report for _, _, report, _ in pending], settings):
+        print("\n🛑 跨表熔断：本轮各表合计的失效比例异常偏高，疑似上游故障，"
+              "已作废所有表的失效判定（明细见各表结果）")
+
+    for label, table, report, known_fields in pending:
+        if multi:
+            print(f"\n━━━━ 表：{label}（结果）━━━━")
+        else:
+            print()
+        try:
+            code = _write_back_table(table, report, known_fields)
+        except feishu.FeishuError as exc:
+            print(f"❌ 这张表写回失败（表级错误）：{exc}；继续处理其余表")
+            worst = 1
+            continue
+        worst = max(worst, code)
 
     if record_ids and multi:
         missing = [rid for rid in record_ids if rid not in found_all]
@@ -569,6 +627,10 @@ def main(argv: list[str]) -> int:
         if index + 1 >= len(args):
             sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
         selected = [s.strip() for s in args[index + 1].split(",") if s.strip()]
+        if not selected:
+            # 「--table ,」这类写法解析出空清单。空清单和「没传 --table」
+            # 在下游没法区分，会静默变成全表都跑——必须在这里吵闹。
+            sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
         del args[index:index + 2]
     if not args:
         print(__doc__)

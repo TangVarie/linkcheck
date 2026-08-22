@@ -37,8 +37,13 @@ class TestDoctorSchema(unittest.TestCase):
         漏一个，那个值就会被 known_options 静默拦下，判定等于没生效。"""
         f = self.settings.fields
         _, _, traffic_required, _ = self.schema[f.traffic_status]
-        for tag in self.settings.tags.namespace():
+        for tag in self.settings.tags.machine_written():
             self.assertIn(tag, traffic_required)
+        # 退役标签（已失效）只留在 merge 的管辖范围里用于摘掉旧值，
+        # 不该被 doctor 要求建选项——新表根本不需要它。
+        for tag in self.settings.tags.retired:
+            self.assertNotIn(tag, traffic_required)
+            self.assertIn(tag, self.settings.tags.namespace())
         _, _, status_required, _ = self.schema[f.comment_status]
         for value in self.settings.comment_status.machine_written():
             self.assertIn(value, status_required)
@@ -110,6 +115,14 @@ class TestTablesFromEnv(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli._tables_from_env(
                 {"FEISHU_TABLES": "甲=bascnA:tbl1; 甲=bascnB:tbl2"})
+
+
+class TestMainArgs(unittest.TestCase):
+    def test_empty_table_filter_exits(self):
+        """「--table ,」解析出空清单，和「没传 --table」在下游没法区分，
+        会静默变成全表都跑——必须当场拒绝。"""
+        with self.assertRaises(SystemExit):
+            cli.main(["cli.py", "sweep", "--table", ","])
 
 
 class TestLoadDotenv(unittest.TestCase):

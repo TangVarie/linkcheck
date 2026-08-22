@@ -68,10 +68,10 @@ class Snapshot:
 
     # 上游自己给的审核/封禁标记（小红书 in_censor、抖音 is_prohibited/in_reviewing）。
     # 只有 TikHub 通道拿得到，SocialDataX 那边没有这个字段，所以永远可能是 None。
-    # ⚠️ 刻意**不参与打标签**：这两个字段的语义还没在真实被封的帖子上验过，
-    # 只见过 false。凭没验过的字段打「风控中」，一旦误报就是运营全线停投——
-    # 那正是这个项目最不能犯的错。现在只写进诊断信息给人看。
-    # 验过之后再决定要不要提升成判定依据，见 docs/待验证清单.md。
+    # 运营定的口径：它返回 True 就打「风控中」——风控中只认两种硬证据
+    # （审查标记、链接失效），评论数异常一律走 疑似限流 / 无水花，不进风控。
+    # 字段语义还没在真实被封的帖子上验过（只见过 false），所以打标签的同时
+    # 仍在诊断信息里请人工确认，见 docs/待验证清单.md。
     censored: Optional[bool] = None
 
     @property
@@ -319,8 +319,14 @@ def decide(
     )
     if count is not None:
         tier = th.heat_tier(count, t)
+        # 发出去够久了还够不上最低热度档 → 无水花。这不是异常，就是没起来——
+        # 和「疑似限流」（有量之后异常下跌）必须分开，证据完全不同。
+        flopped = (tier is None and age_hours is not None
+                   and age_hours >= th.flop_hours)
+        if flopped:
+            tier = t.flop
         # 棘轮：算上表里已有的档位取最高。评论被删导致数字掉下去，不该让
-        # 一条帖子从「大爆」退回「爆贴」——那是风控信号，由风控标签表达。
+        # 一条帖子从「大爆」退回「爆贴」——那种异常由「疑似限流」表达。
         best = max(
             (x for x in (tier, previous_best) if x),
             key=t.rank,
@@ -328,40 +334,45 @@ def decide(
         )
         if best:
             verdict.tags.add(best)
-            if best == tier:
-                verdict.notes.append(f"评论数 {count} → {best}")
-            else:
+            if best != tier:
                 verdict.notes.append(f"评论数 {count}，但曾达到「{best}」，保留高档位")
+            elif flopped:
+                verdict.notes.append(
+                    f"发布 {age_hours:.0f} 小时评论数仍只有 {count}"
+                    f"（不足 {th.tier_evaluating} 条）→ {t.flop}")
+            else:
+                verdict.notes.append(f"评论数 {count} → {best}")
     else:
         # 评论数未知（抖音评论接口的 total 是 integer|null，detail 兜底又恰好
         # 失败）——这一轮对热度和风控**没有获得任何新证据**。此时必须把已有的
-        # 档位和风控标签原样带上：verdict.tags 留空会让 merge 把它们整体摘掉，
+        # 档位和状态标签原样带上：verdict.tags 留空会让 merge 把它们整体摘掉，
         # 等于用一次上游缺数抹掉「大爆」的棘轮历史和一条在生效的风控告警。
         if previous_best:
             verdict.tags.add(previous_best)
-        if t.risk in (current_tags or []):
-            verdict.tags.add(t.risk)
-        verdict.notes.append("本轮未取到评论数，热度/风控标签保持原样")
+        for keep in (t.risk, t.throttled):
+            if keep in (current_tags or []):
+                verdict.tags.add(keep)
+        verdict.notes.append("本轮未取到评论数，热度/状态标签保持原样")
 
     # —— 掉量：评论被平台悄悄批量删除，往往比笔记整个失效早得多 ——
+    # 打「疑似限流」而不是「风控中」：风控中只认硬证据（审查标记、链接失效），
+    # 数字异常是软证据，口径分开运营才知道该去查什么。
     if (
         count is not None
         and previous_comment_count is not None
         and previous_comment_count >= th.risk_drop_min_baseline
         and count <= previous_comment_count * (1 - th.risk_drop_ratio)
     ):
-        verdict.tags.add(t.risk)
+        verdict.tags.add(t.throttled)
         verdict.notes.append(
             f"⚠ 评论数从 {previous_comment_count} 掉到 {count}，"
-            f"跌幅超过 {int(th.risk_drop_ratio * 100)}%，疑似限流或删评"
+            f"跌幅超过 {int(th.risk_drop_ratio * 100)}% → {t.throttled}（也可能是删评/折叠）"
         )
 
-    # 发出去够久了还是零评论，疑似限流。
-    if count == 0 and age_hours is not None and age_hours >= th.risk_zero_comment_hours:
+    # —— 审查标记：上游明确说这条在审核/受限，才打「风控中」——
+    if snapshot.censored:
         verdict.tags.add(t.risk)
-        verdict.notes.append(
-            f"⚠ 发布 {age_hours:.0f} 小时仍为 0 评论（阈值 {th.risk_zero_comment_hours} 小时）"
-        )
+        verdict.notes.append("⚠ 上游把这条标成了审核中/受限 → 风控中，请人工确认")
 
     # —— 置顶 ——
     verdict.pin = decide_pin(snapshot)
@@ -402,12 +413,13 @@ def gone_verdict(settings: Settings, reason: str = "",
                  current_tags: Optional[list[str]] = None) -> Verdict:
     """帖子确认取不到时的结论（已经过两击确认，不是第一次失败就走这里）。
 
-    同时打 已失效 和 风控 ——「已失效」说明事实，「风控」是运营真正会去筛的那一列。
+    打「风控中」——链接失效是风控中认可的两种硬证据之一（另一种是上游
+    审查标记）。事实细节（几次没取到、上游原话）在「巡查状态=已失效」
+    和诊断信息里，流量状态这列只留运营真正会去筛的那一个词。
     已有的热度档位原样保留：「爆过就是爆过」的棘轮不因帖子死了而清史——
     一条大爆过的帖子被删，恰恰是最需要留着「大爆」标签供复盘的那种。
     """
     verdict = Verdict()
-    verdict.tags.add(settings.tags.gone)
     verdict.tags.add(settings.tags.risk)
     t = settings.tags
     best = max(

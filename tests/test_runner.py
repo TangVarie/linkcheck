@@ -4,6 +4,7 @@
 """
 
 import json
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -123,6 +124,18 @@ class TestHumanTagsAreNeverClobbered(RunnerTest):
         self.assertNotIn(self.settings.fields.traffic_status, fields)
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
+    def test_retired_gone_tag_is_cleaned_up(self):
+        """旧版机器会打「已失效」，这个标签已退役（失效并入「风控中」）——
+        行上的残留旧值要在下一轮成功刷新时被自动摘掉，不能永远挂着。"""
+        report = self.run_with(
+            [sse(comment_page(count=150)), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(tags=["已失效", "已复盘"])],
+        )
+        final = report.outcomes[0].fields[self.settings.fields.traffic_status]
+        self.assertNotIn("已失效", final)
+        self.assertIn("已复盘", final)
+        self.assertIn("大爆", final)
+
     def test_no_tag_change_means_no_write(self):
         """无变化不写：省一次写、避开选项冲突，也不让人看到这行被反复改动。"""
         report = self.run_with(
@@ -166,8 +179,8 @@ class TestDeadPostDetection(RunnerTest):
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_GONE)
         final = outcome.fields[self.settings.fields.traffic_status]
-        self.assertIn("已失效", final)
-        self.assertIn("风控中", final)
+        self.assertIn("风控中", final)     # 链接失效 = 风控中的硬证据
+        self.assertNotIn("已失效", final)  # 该标签已退役，不再产出
         self.assertIn("已复盘", final)     # 人工标签照样保住
         self.assertIn("未找到对应内容", outcome.fields[self.settings.fields.failure_reason])
 
@@ -177,7 +190,7 @@ class TestDeadPostDetection(RunnerTest):
         report = self.run_with([err(200, 1008, "当前作品已删除。")], [xhs_row()])
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_GONE)
-        self.assertIn("已失效", outcome.fields[self.settings.fields.traffic_status])
+        self.assertIn("风控中", outcome.fields[self.settings.fields.traffic_status])
 
     def test_surface_unavailable_is_not_treated_as_dead(self):
         """1007「页面暂时不可访问」是瞬时故障，不是内容没了。
@@ -569,6 +582,29 @@ class TestAliveConfirmed(RunnerTest):
         report = self.run_with([err(200, 1003, "未找到对应内容")], [xhs_row()])
         self.assertNotIn(self.settings.fields.alive_confirmed, report.outcomes[0].fields)
 
+    def test_likes_only_round_ticks_the_box(self):
+        """有点赞没评论的活帖：非零互动数就是存活证据。之前只认评论数，
+        这种行明明点赞/收藏都写进表了，存活勾却一直空着。"""
+        report = self.run_with(
+            [sse({"items": [], "comment_count": 0, "points": {"cost": 10, "balance": 1}}),
+             sse({"like_count": 500, "collect_count": 0, "comment_count": 0,
+                  "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()],
+        )
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_OK)
+        self.assertIs(outcome.fields[self.settings.fields.alive_confirmed], True)
+
+    def test_zero_engagement_round_still_leaves_box_alone(self):
+        """互动全为 0 依然不算证据——刚发的帖子和已经没了的帖子都是 0。"""
+        report = self.run_with(
+            [sse({"items": [], "comment_count": 0, "points": {"cost": 10, "balance": 1}}),
+             sse({"like_count": 0, "collect_count": 0, "comment_count": 0,
+                  "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()],
+        )
+        self.assertNotIn(self.settings.fields.alive_confirmed, report.outcomes[0].fields)
+
     def test_ok_round_without_evidence_leaves_box_alone(self):
         """评论页空壳 + detail 兜底失败：这一轮「成功」但对存亡零证据。
         勾上「已确认存活」等于替上游缺数作保——复选框必须原样不动。"""
@@ -675,7 +711,7 @@ class TestRateLimitThenGone(RunnerTest):
             report = runner.refresh([xhs_row()], "fake-key", self.settings, now=NOW)
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_GONE)
-        self.assertIn("已失效", outcome.fields[self.settings.fields.traffic_status])
+        self.assertIn("风控中", outcome.fields[self.settings.fields.traffic_status])
 
 
 class TestUnknownCommentCount(RunnerTest):
@@ -750,6 +786,79 @@ class TestBreakerAccounting(RunnerTest):
             reason = outcome.fields[self.settings.fields.failure_reason]
             self.assertIn("未找到对应内容", reason)     # 原始错误（含 request_id 线索）还在
             self.assertIn("疑似上游故障", reason)       # 熔断说明是追加的，不是覆盖
+
+
+class TestCrossRunBreaker(RunnerTest):
+    """多表部署：单表可能只有三五行，永远凑不满熔断的最小样本——
+    但上游故障是通道级的，跟行分在哪张表没关系，样本要全局算。"""
+
+    def _gone_report(self, n, prefix):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"{prefix}{i}")
+            row.consecutive_failures = 1
+            rows.append(row)
+        return self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
+
+    def test_small_tables_add_up_and_trip_together(self):
+        r1 = self._gone_report(6, "a")
+        r2 = self._gone_report(6, "b")
+        self.assertFalse(r1.breaker_tripped)    # 单表 6 行不到样本线
+        self.assertFalse(r2.breaker_tripped)
+        self.assertTrue(runner.apply_cross_run_breaker([r1, r2], self.settings))
+        for report in (r1, r2):
+            self.assertTrue(report.breaker_tripped)
+            for outcome in report.outcomes:
+                self.assertEqual(outcome.status, runner.STATUS_FAILED)
+                self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
+                self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+                self.assertIn("疑似上游故障",
+                              outcome.fields[self.settings.fields.failure_reason])
+
+    def test_below_global_sample_stays_calm(self):
+        r1 = self._gone_report(2, "a")
+        r2 = self._gone_report(2, "b")
+        self.assertFalse(runner.apply_cross_run_breaker([r1, r2], self.settings))
+        self.assertEqual(r1.outcomes[0].status, runner.STATUS_GONE)
+
+    def test_already_tripped_table_is_not_voided_twice(self):
+        """大表自己熔断过：全局熔断不能给它的诊断信息再追加一遍，
+        但它的原始样本要照常计入全局比例，小表才能被一起救下。"""
+        big = self._gone_report(12, "big")
+        small = self._gone_report(3, "small")
+        self.assertTrue(big.breaker_tripped)
+        self.assertTrue(runner.apply_cross_run_breaker([big, small], self.settings))
+        self.assertTrue(small.breaker_tripped)
+        reason = big.outcomes[0].fields[self.settings.fields.failure_reason]
+        self.assertEqual(reason.count("疑似上游故障"), 1)
+
+
+class TestSharedRunBudget(RunnerTest):
+    """多表共享的运行预算：deadline 传绝对截止点（软截止是整次运行一份，
+    不是每张表各一份），disabled 传共享集合（死讯跨表生效）。"""
+
+    def test_external_deadline_defers_everything(self):
+        with mock.patch.object(transport, "post") as posted:
+            report = runner.refresh([xhs_row()], "fake-key", self.settings,
+                                    now=NOW, deadline=time.monotonic() - 1)
+        posted.assert_not_called()
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_DEFERRED)
+
+    def test_shared_disabled_channel_prevents_any_spend(self):
+        """上一张表已确认唯一的 Key 失效：这张表一个请求都不该发。"""
+        with mock.patch.object(transport, "post") as posted:
+            report = runner.refresh([xhs_row()], "fake-key", self.settings,
+                                    now=NOW, disabled={"socialdatax"})
+        posted.assert_not_called()
+        self.assertTrue(report.fatal)
+        self.assertIn("没有可用的数据通道", report.aborted_reason)
+
+    def test_disabled_set_is_shared_back_to_caller(self):
+        """本表发现的死讯要落进调用方传入的集合，下一张表才看得见。"""
+        shared: set[str] = set()
+        self.run_with([err(401, 1401, "API Key 无效或已失效。")], [xhs_row()],
+                      disabled=shared)
+        self.assertIn("socialdatax", shared)
 
 
 if __name__ == "__main__":

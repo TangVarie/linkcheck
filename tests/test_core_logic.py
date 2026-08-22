@@ -321,25 +321,64 @@ class TestRiskDetection(unittest.TestCase):
         kw.setdefault("age_hours", 10)
         return analyze.decide(self._snap(count), self.settings, **kw)
 
-    def test_comment_halving_flags_risk(self):
-        self.assertIn("风控中", self.decide(20, previous_comment_count=100).tags)
+    def test_comment_halving_means_throttled_not_risk(self):
+        """腰斩是数字异常（软证据）→ 疑似限流；风控中只认硬证据。"""
+        tags_ = self.decide(20, previous_comment_count=100).tags
+        self.assertIn("疑似限流", tags_)
+        self.assertNotIn("风控中", tags_)
 
     def test_small_baseline_drop_is_noise(self):
-        self.assertNotIn("风控中", self.decide(2, previous_comment_count=8).tags)
+        tags_ = self.decide(2, previous_comment_count=8).tags
+        self.assertNotIn("疑似限流", tags_)
+        self.assertNotIn("风控中", tags_)
 
-    def test_zero_comments_after_window_flags_risk(self):
-        self.assertIn("风控中", self.decide(0, age_hours=72).tags)
+    def test_low_comments_after_window_means_flop(self):
+        """发出去够久还起不来 = 无水花，不是限流也不是风控——
+        把「没起来」标成异常，运营会去查一个不存在的问题。"""
+        for count in (0, 5, 19):
+            tags_ = self.decide(count, age_hours=72).tags
+            self.assertIn("无水花", tags_, f"评论数 {count}")
+            self.assertNotIn("风控中", tags_)
+            self.assertNotIn("疑似限流", tags_)
 
-    def test_zero_comments_during_cold_start_is_fine(self):
-        self.assertNotIn("风控中", self.decide(0, age_hours=3).tags)
+    def test_low_comments_during_cold_start_is_fine(self):
+        """刚发两小时只有几条评论再正常不过，一个标签都不打。"""
+        self.assertEqual(self.decide(0, age_hours=3).tags, set())
 
-    def test_risk_is_volatile_and_clears_on_recovery(self):
+    def test_flop_ratchets_up_but_never_back(self):
+        """无水花是最低热度档：起来了就换高档，绝不从评估中退回无水花。"""
+        up = self.decide(25, age_hours=72, current_tags=["无水花"])
+        self.assertIn("评估中", up.tags)
+        self.assertNotIn("无水花", up.tags)
+        down = self.decide(3, age_hours=72, current_tags=["评估中"])
+        self.assertIn("评估中", down.tags)
+        self.assertNotIn("无水花", down.tags)
+
+    def test_censor_flag_from_upstream_flags_risk(self):
+        """风控中的硬证据之一：上游明确返回了审核/受限标记。"""
+        snap = self._snap(30)
+        snap.censored = True
+        v = analyze.decide(snap, self.settings, previous_comment_count=None, age_hours=10)
+        self.assertIn("风控中", v.tags)
+        self.assertTrue(any("审核中/受限" in n for n in v.notes))
+
+    def test_throttled_is_volatile_and_clears_on_recovery(self):
         """恢复正常要能自动摘掉，否则表会越来越红，最后没人看。"""
-        v = self.decide(80, previous_comment_count=75, current_tags=["风控中"])
+        v = self.decide(80, previous_comment_count=75,
+                        current_tags=["疑似限流", "风控中"])
+        self.assertNotIn("疑似限流", v.tags)
         self.assertNotIn("风控中", v.tags)
 
-    def test_gone_tags_both_gone_and_risk(self):
-        self.assertEqual(analyze.gone_verdict(self.settings).tags, {"已失效", "风控中"})
+    def test_unknown_count_round_keeps_throttled_alarm(self):
+        """评论数没取到的轮次没有新证据，生效中的疑似限流不能被抹掉。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, current_tags=["疑似限流"])
+        self.assertIn("疑似限流", v.tags)
+
+    def test_gone_maps_to_risk_only(self):
+        """链接失效 = 风控中的另一种硬证据；「已失效」标签已退役。"""
+        self.assertEqual(analyze.gone_verdict(self.settings).tags, {"风控中"})
 
     def test_first_strike_tags_nothing(self):
         """一次抖动就把好帖子标成风控 = 运营全线停投。绝不能发生。"""
@@ -704,11 +743,11 @@ class TestGoneKeepsHeatHistory(unittest.TestCase):
     def test_gone_verdict_preserves_the_tier(self):
         settings = Settings()
         verdict = analyze.gone_verdict(settings, "已删除", current_tags=["大爆", "已复盘"])
-        self.assertEqual(verdict.tags, {"已失效", "风控中", "大爆"})
+        self.assertEqual(verdict.tags, {"风控中", "大爆"})
 
     def test_gone_verdict_without_history_stays_minimal(self):
         settings = Settings()
-        self.assertEqual(analyze.gone_verdict(settings).tags, {"已失效", "风控中"})
+        self.assertEqual(analyze.gone_verdict(settings).tags, {"风控中"})
 
 
 class TestMergeWithMissingOptions(unittest.TestCase):
