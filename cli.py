@@ -7,12 +7,17 @@
     python3 cli.py row <record_id>...  # 刷指定行（无视冷却和分层节流）
     python3 cli.py estimate            # 只估算这一轮要花多少钱，不发请求
 
+多表：设 FEISHU_TABLES 一次巡查多张表（见 .env.example），上面每个命令都会
+逐表执行；`--table 标签` 可以只跑其中某几张（逗号分隔）。
+单表继续用 FEISHU_APP_TOKEN + FEISHU_TABLE_ID，行为不变。
+
 配置走环境变量，见 .env.example。
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -61,13 +66,84 @@ def _api_keys() -> dict[str, str]:
     return {k: v for k, v in keys.items() if v}
 
 
-def _table() -> feishu.Bitable:
-    return feishu.Bitable(
-        app_id=_env("FEISHU_APP_ID"),
-        app_secret=_env("FEISHU_APP_SECRET"),
-        app_token=_env("FEISHU_APP_TOKEN"),
-        table_id=_env("FEISHU_TABLE_ID"),
-    )
+def _tables_from_env(environ) -> list[tuple[str, str, str]]:
+    """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
+
+    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项三种写法都认：
+
+        OKMAN一期=bascnXXX:tblAAA
+        OKMAN二期=https://xx.feishu.cn/base/bascnXXX?table=tblBBB
+        bascnYYY:tblCCC                     （不带标签时标签取 table_id）
+
+    标签用在日志分节和 --table 筛选上，起个人能认的名字。
+    单表继续用 FEISHU_APP_TOKEN + FEISHU_TABLE_ID；两种都配了以
+    FEISHU_TABLES 为准。所有表共用同一个飞书应用（App ID/Secret），
+    应用要逐张表「添加文档应用」授权。
+    """
+    spec = environ.get("FEISHU_TABLES", "").strip()
+    if spec:
+        entries: list[tuple[str, str, str]] = []
+        for chunk in re.split(r"[;；\n]+", spec):
+            chunk = chunk.strip().strip(",")
+            if not chunk:
+                continue
+            head, sep, rest = chunk.partition("=")
+            # URL 里本来就有 =（?table=tbl...），只有「短标签=」才当标签用
+            if sep and "://" not in head and "/" not in head and ":" not in head:
+                label, target = head.strip(), rest.strip()
+            else:
+                label, target = "", chunk
+            match = re.search(r"/base/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
+            if match:
+                app_token, table_id = match.group(1), match.group(2)
+            elif "://" in target:
+                sys.exit(f"FEISHU_TABLES 里这个网址提不出表信息：{target!r}。"
+                         "要用 /base/xxx?table=tblxxx 形式的地址（打开目标数据表时"
+                         "浏览器地址栏那串；/wiki/ 地址不行）")
+            elif ":" in target:
+                app_token, _, table_id = target.partition(":")
+                app_token, table_id = app_token.strip(), table_id.strip()
+            else:
+                sys.exit(f"FEISHU_TABLES 里这一项看不懂：{chunk!r}。每一项写成 "
+                         "标签=app_token:table_id 或 标签=表格完整网址，"
+                         "多项之间用分号隔开（参考 .env.example）")
+            if not app_token or not table_id:
+                sys.exit(f"FEISHU_TABLES 里这一项缺 app_token 或 table_id：{chunk!r}")
+            entries.append((label or table_id, app_token, table_id))
+        if not entries:
+            sys.exit("FEISHU_TABLES 设了但一张表都没解析出来，检查格式（参考 .env.example）")
+        seen: set[tuple[str, str]] = set()
+        for _, app_token, table_id in entries:
+            if (app_token, table_id) in seen:
+                sys.exit(f"FEISHU_TABLES 里 {table_id} 配了两遍——同一张表刷两次是白花钱")
+            seen.add((app_token, table_id))
+        labels = [label for label, _, _ in entries]
+        if len(set(labels)) != len(labels):
+            sys.exit("FEISHU_TABLES 里有重复的标签，--table 会分不清——给每张表起个不同的名字")
+        return entries
+
+    app_token = environ.get("FEISHU_APP_TOKEN", "").strip()
+    table_id = environ.get("FEISHU_TABLE_ID", "").strip()
+    if not app_token or not table_id:
+        sys.exit("没配任何表：多表设 FEISHU_TABLES，单表设 "
+                 "FEISHU_APP_TOKEN + FEISHU_TABLE_ID（参考 .env.example）")
+    return [(table_id, app_token, table_id)]
+
+
+def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+    entries = _tables_from_env(os.environ)
+    if selected:
+        by_label = {label: entry for entry in entries for label in [entry[0]]}
+        missing = [s for s in selected if s not in by_label]
+        if missing:
+            sys.exit(f"--table 指定的表不存在：{'、'.join(missing)}。"
+                     f"可选：{'、'.join(label for label, _, _ in entries)}")
+        entries = [by_label[s] for s in selected]
+    return [(label, feishu.Bitable(app_id=app_id, app_secret=app_secret,
+                                   app_token=app_token, table_id=table_id))
+            for label, app_token, table_id in entries]
 
 
 def _settings() -> Settings:
@@ -252,11 +328,9 @@ def _options_from_meta(meta, column: str):
     return options if options is not None else []
 
 
-def cmd_doctor() -> int:
-    """上线前体检。不花一分钱，但能挡掉九成的「配好了跑不通」。"""
-    settings = _settings()
+def _doctor_table(settings: Settings, table: feishu.Bitable) -> int:
+    """体检一张表（①token ②列名/类型/选项 ③试读），就地打印问题，返回问题数。"""
     f = settings.fields
-    table = _table()
     problems: list[str] = []
 
     print("① 取 tenant_access_token …", end=" ", flush=True)
@@ -296,7 +370,26 @@ def cmd_doctor() -> int:
         print("失败")
         problems.append(str(exc))
 
-    print("④ 数据通道 …")
+    if problems:
+        print(f"⚠ 这张表发现 {len(problems)} 个问题：")
+        for index, problem in enumerate(problems, 1):
+            print(f"  {index}. {problem}")
+    else:
+        print("✅ 这张表检查通过")
+    return len(problems)
+
+
+def cmd_doctor(selected: list[str] | None = None) -> int:
+    """上线前体检。不花一分钱，但能挡掉九成的「配好了跑不通」。"""
+    settings = _settings()
+    tables = _tables(selected)
+    total = 0
+    for index, (label, table) in enumerate(tables):
+        if len(tables) > 1:
+            print(("\n" if index else "") + f"━━━━ 表：{label} ━━━━")
+        total += _doctor_table(settings, table)
+
+    print("\n④ 数据通道 …")
     keys = _api_keys()
     for platform in ("xhs", "douyin"):
         order = settings.channels.for_platform(platform)
@@ -304,7 +397,7 @@ def cmd_doctor() -> int:
         label = "小红书" if platform == "xhs" else "抖音"
         if not live:
             print(f"   {label}：❌ 配置的是 {'、'.join(order)}，但一个 Key 都没有")
-            problems.append(f"{label}没有可用的数据通道，任何刷新都会立刻失败")
+            total += 1
         elif len(live) == 1:
             print(f"   {label}：⚠ 只有 {live[0]} 一条通道，它挂了这一轮就全丢")
         else:
@@ -314,24 +407,21 @@ def cmd_doctor() -> int:
               "（是否有效需要真实调用一次才知道）")
 
     print()
-    if problems:
-        print(f"发现 {len(problems)} 个问题：")
-        for i, problem in enumerate(problems, 1):
-            print(f"  {i}. {problem}")
+    if total:
+        print(f"共发现 {total} 个问题（明细见上）")
         return 1
     print("✅ 全部通过，可以开跑")
     return 0
 
 
-def _run(mode: str, record_ids: list[str] | None) -> int:
-    settings = _settings()
-    table = _table()
-    api_keys = _api_keys()
-    if not api_keys:
-        sys.exit("一个数据通道的 Key 都没配：需要 TIKHUB_API_KEY 或 SOCIALDATAX_API_KEY"
-                 "（参考 .env.example）")
-    now = datetime.now(timezone.utc)
+def _run_table(mode: str, record_ids: list[str] | None, settings: Settings,
+               api_keys: dict[str, str], table: feishu.Bitable, now: datetime,
+               *, quiet_missing: bool = False) -> tuple[int, set[str], int, float]:
+    """在一张表上执行 mode。返回（退出码, 找到的 record_id, 待刷行数, 预估元）。
 
+    quiet_missing：多表 row 模式下，某张表没有目标行属于正常（行在别的
+    表里），静默跳过；缺不缺由调用方汇总所有表之后统一报。
+    """
     print(f"读表（模式：{mode}）…")
     # 字段元数据读一次、处处共用：读侧过滤 search 请求的列（请求不存在的
     # 列会让整个 search 失败），写侧过滤还没建的机器列，两个选择列的
@@ -349,25 +439,24 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
         now=now,
         known_fields=known_fields,
     )
+    found = {r.record_id for r in row_list}
     if mode == "queue" and not row_list and known_fields is not None \
             and settings.fields.queued not in known_fields:
         print(f"⚠ 表里还没建「{settings.fields.queued}」列，queue 模式无法工作，先去建列")
-        return 1
+        return 1, found, 0, 0.0
     if mode in ("sweep", "estimate") and not row_list and known_fields is not None \
             and settings.fields.last_updated not in known_fields:
         print(f"⚠ 表里还没建「{settings.fields.last_updated}」列：分层刷新没有依据，"
               "每一轮 sweep 都会全表重刷烧钱，先去建列")
-        return 1
-    if record_ids:
-        found = {r.record_id for r in row_list}
+        return 1, found, 0, 0.0
+    if record_ids and not quiet_missing:
         missing = [rid for rid in record_ids if rid not in found]
         if missing:
             print(f"⚠ 这些 record_id 在表里没找到（可能拼错或已删除）：{'、'.join(missing)}")
-            if not row_list:
-                return 1
     if not row_list:
-        print("没有需要刷新的行。")
-        return 0
+        if not (record_ids and quiet_missing):
+            print("没有需要刷新的行。")
+        return (1 if record_ids and not quiet_missing else 0), found, 0, 0.0
 
     yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
 
@@ -386,7 +475,7 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
           "提不出数字 ID 的抖音链接按 socialdatax 计）")
 
     if mode == "estimate":
-        return 0
+        return 0, found, len(row_list), yuan
 
     report = runner.refresh(
         row_list, api_keys, settings,
@@ -410,7 +499,7 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
         print(f"❌ 写回失败（表级错误）：{exc}")
-        return 1
+        return 1, found, len(row_list), yuan
     print(f"已写回 {written} 行")
     if dropped_fields:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
@@ -423,25 +512,76 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     # cron / 云平台的重启策略把它当失败反复重启）；真故障（Key/余额）和
     # 「花了钱但有行没写回」都返回非零——花出去的钱没落进表里，
     # 不能让 cron 和 Actions 显示一个绿色的成功。
-    return 1 if (report.fatal or write_errors) else 0
+    return (1 if (report.fatal or write_errors) else 0), found, len(row_list), yuan
+
+
+def _run(mode: str, record_ids: list[str] | None,
+         selected: list[str] | None = None) -> int:
+    settings = _settings()
+    api_keys = _api_keys()
+    if not api_keys:
+        sys.exit("一个数据通道的 Key 都没配：需要 TIKHUB_API_KEY 或 SOCIALDATAX_API_KEY"
+                 "（参考 .env.example）")
+    tables = _tables(selected)
+    now = datetime.now(timezone.utc)
+    multi = len(tables) > 1
+
+    worst = 0
+    found_all: set[str] = set()
+    total_rows, total_yuan = 0, 0.0
+    for index, (label, table) in enumerate(tables):
+        if multi:
+            print(("\n" if index else "") + f"━━━━ 表：{label} ━━━━")
+        try:
+            code, found, row_count, yuan = _run_table(
+                mode, record_ids, settings, api_keys, table, now,
+                quiet_missing=multi)
+        except feishu.FeishuError as exc:
+            # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
+            print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
+            worst = 1
+            continue
+        worst = max(worst, code)
+        found_all |= found
+        total_rows += row_count
+        total_yuan += yuan
+
+    if record_ids and multi:
+        missing = [rid for rid in record_ids if rid not in found_all]
+        if missing:
+            print(f"\n⚠ 这些 record_id 在所有已配置的表里都没找到："
+                  f"{'、'.join(missing)}")
+            if not found_all:
+                return 1
+    if mode == "estimate" and multi:
+        print(f"\n合计：待刷 {total_rows} 行，预计花费 ≈ ¥{total_yuan:.2f}")
+    return worst
 
 
 def main(argv: list[str]) -> int:
     # 本地跑时把仓库根的 .env 补进环境变量（已存在的环境变量优先）。
     # Railway / Actions 由平台注入，这一步是空操作。
     load_dotenv()
-    if len(argv) < 2:
+    args = list(argv[1:])
+    selected: list[str] | None = None
+    if "--table" in args:
+        index = args.index("--table")
+        if index + 1 >= len(args):
+            sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
+        selected = [s.strip() for s in args[index + 1].split(",") if s.strip()]
+        del args[index:index + 2]
+    if not args:
         print(__doc__)
         return 2
-    command = argv[1]
+    command = args[0]
     if command == "doctor":
-        return cmd_doctor()
+        return cmd_doctor(selected)
     if command in ("sweep", "queue", "estimate"):
-        return _run(command, None)
+        return _run(command, None, selected)
     if command == "row":
-        if len(argv) < 3:
-            sys.exit("用法：python3 cli.py row <record_id> [<record_id> ...]")
-        return _run("row", argv[2:])
+        if len(args) < 2:
+            sys.exit("用法：python3 cli.py row <record_id> [<record_id> ...] [--table 标签]")
+        return _run("row", args[1:], selected)
     print(__doc__)
     return 2
 

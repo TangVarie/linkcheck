@@ -263,8 +263,17 @@ python3 cli.py row recXXXXXXXX     # 真刷一行
 | `TIKHUB_BASE` | **`https://api.tikhub.io`** ← 见下 |
 | `FEISHU_APP_ID` | 飞书 App ID |
 | `FEISHU_APP_SECRET` | 飞书 App Secret |
-| `FEISHU_APP_TOKEN` | 表格地址里 `/base/` 后面那段 |
-| `FEISHU_TABLE_ID` | 表格地址里 `table=` 后面那段 |
+| `FEISHU_APP_TOKEN` | 表格地址里 `/base/` 后面那段（单表用） |
+| `FEISHU_TABLE_ID` | 表格地址里 `table=` 后面那段（单表用） |
+
+> **要巡查多张表**：不填上面两个，改填一个 `FEISHU_TABLES`——分号分隔，
+> 每一项 `标签=app_token:table_id` 或 `标签=表格完整网址`，例如
+> `FEISHU_TABLES=OKMAN一期=bascnXXX:tblAAA; OKMAN二期=https://xx.feishu.cn/base/bascnXXX?table=tblBBB`。
+> 每个命令（doctor/sweep/queue/row）都会逐表执行，日志按标签分节，
+> 一张表出故障不影响其余表。三个前提：①每张表都照 `表结构.md` 建列
+> （列名/类型/选项一致）；②飞书应用要**逐张表**「添加文档应用」授权；
+> ③新表先 `python3 cli.py doctor --table 标签` 单独体检一次。
+> 加表就是改这一个变量，不用加服务、不用改代码。
 
 > **`TIKHUB_BASE` 为什么要填**：TikHub 有两个同功能的域名，
 > `api.tikhub.dev` 给境内、`api.tikhub.io` 是主域名，对方文档明确要求

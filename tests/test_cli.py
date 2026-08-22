@@ -55,6 +55,63 @@ class TestDoctorSchema(unittest.TestCase):
         self.assertEqual(self.schema[f.pinned_status][0], (3,))
 
 
+class TestTablesFromEnv(unittest.TestCase):
+    """FEISHU_TABLES 解析：这是多表部署的唯一配置入口，
+    解析错一项就是少刷一整张表（静默）或整个进程起不来（吵闹）——
+    必须吵闹，且报错要说得清哪一项、该怎么写。"""
+
+    def test_single_table_fallback(self):
+        entries = cli._tables_from_env(
+            {"FEISHU_APP_TOKEN": "bascnA", "FEISHU_TABLE_ID": "tblX"})
+        self.assertEqual(entries, [("tblX", "bascnA", "tblX")])
+
+    def test_multi_with_labels_and_both_forms(self):
+        spec = ("OKMAN一期=bascnA:tbl1; "
+                "OKMAN二期=https://xx.feishu.cn/base/bascnA?table=tbl2&view=vewZ;"
+                "bascnB:tbl3")
+        entries = cli._tables_from_env({"FEISHU_TABLES": spec})
+        self.assertEqual(entries, [
+            ("OKMAN一期", "bascnA", "tbl1"),
+            ("OKMAN二期", "bascnA", "tbl2"),
+            ("tbl3", "bascnB", "tbl3"),      # 不带标签时标签取 table_id
+        ])
+
+    def test_tables_wins_over_single_vars(self):
+        entries = cli._tables_from_env({
+            "FEISHU_TABLES": "甲=bascnA:tbl1",
+            "FEISHU_APP_TOKEN": "bascnZ", "FEISHU_TABLE_ID": "tblZ"})
+        self.assertEqual(entries, [("甲", "bascnA", "tbl1")])
+
+    def test_newline_and_chinese_semicolon_separators(self):
+        entries = cli._tables_from_env(
+            {"FEISHU_TABLES": "甲=bascnA:tbl1\n乙=bascnA:tbl2；丙=bascnB:tbl3"})
+        self.assertEqual([e[0] for e in entries], ["甲", "乙", "丙"])
+
+    def test_nothing_configured_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env({})
+
+    def test_garbage_entry_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env({"FEISHU_TABLES": "甲=看不懂的东西"})
+
+    def test_url_without_table_param_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env(
+                {"FEISHU_TABLES": "甲=https://xx.feishu.cn/base/bascnA"})
+
+    def test_duplicate_table_exits(self):
+        """同一张表配两遍会被两轮 cron 各刷一次——纯白花钱，必须拦。"""
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env(
+                {"FEISHU_TABLES": "甲=bascnA:tbl1; 乙=bascnA:tbl1"})
+
+    def test_duplicate_label_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env(
+                {"FEISHU_TABLES": "甲=bascnA:tbl1; 甲=bascnB:tbl2"})
+
+
 class TestLoadDotenv(unittest.TestCase):
     """本地跑 doctor/row 的前提：.env 真的会被读进环境变量。
     没有这个加载器，文档里「填好 .env 就能跑」在本地是空头支票。"""
