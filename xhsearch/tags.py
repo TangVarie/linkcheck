@@ -39,6 +39,7 @@ def merge(
     computed: Iterable[str],
     machine_namespace: Iterable[str],
     known_options: Iterable[str] | None = None,
+    exclusive: Iterable[Sequence[str]] = (),
 ) -> TagMerge:
     """把机器算出的标签并进现有标签，不碰人工标签。
 
@@ -55,6 +56,12 @@ def merge(
         该多选字段实际配置了哪些选项。给了就做过滤——飞书 batch_update 是
         全成功或全失败，一个字段里没有的选项名可能让整批几百行一起回滚，
         与其赌服务端会自动建选项，不如在这里挡掉并把它记进 dropped_unknown。
+    exclusive:
+        互斥组（如热度三档），组内同时只能留一个。只在「选项没建、保留旧
+        机器标签」的路径上用，用来圈定**每个被拦标签的同类范围**：
+        「大爆」写不进去 → 只保留行上同组的旧档位（爆贴），既不让两个
+        档位并存，也绝不顺手把不相干的旧状态标签（比如上一轮的「已失效」）
+        复活——那会把一条刚恢复正常的行继续标成死的。
     """
     current_set = [t.strip() for t in (current or []) if t and t.strip()]
     machine = set(machine_namespace)
@@ -68,12 +75,26 @@ def merge(
             "放行会导致这个标签之后永远无法撤回。"
         )
 
+    previous_machine = {t for t in current_set if t in machine}
+
     dropped: list[str] = []
     if known_options is not None:
         options = set(known_options)
         allowed = {t for t in computed_set if t in options}
         dropped = sorted(computed_set - allowed)
         computed_set = allowed
+        if dropped:
+            # 想写的标签写不进去（选项没建）时，只保留**同类**的旧标签：
+            # 「大爆」被拦 → 留住行上的旧档位「爆贴」（热度信息不清零）；
+            # 但绝不把不相干的旧标签一并复活——被拦的是「风控中」时，
+            # 行上残留的「已失效」不在它的同类范围里，照常摘掉，
+            # 否则一条刚恢复正常的行会继续顶着死亡标签。
+            groups = [set(g) for g in exclusive]
+            preserved: set[str] = set()
+            for tag in dropped:
+                category = next((g for g in groups if tag in g), {tag})
+                preserved |= previous_machine & category
+            computed_set |= preserved
 
     # 保序：先按原顺序留下人工标签，再追加机器标签，表里看起来才稳定。
     human = [t for t in current_set if t not in machine]
@@ -83,8 +104,6 @@ def merge(
         if tag not in seen:
             seen.add(tag)
             final.append(tag)
-
-    previous_machine = {t for t in current_set if t in machine}
     return TagMerge(
         final=final,
         added=sorted(computed_set - previous_machine),

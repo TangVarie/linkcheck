@@ -114,6 +114,12 @@ def flat_daily(total_posts: float, xhs_share: float, with_detail: bool) -> dict:
 def main() -> int:
     per_day = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
     xhs_share = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
+    if per_day <= 0:
+        print("每天新发条数要大于 0", file=sys.stderr)
+        return 2
+    if not 0 <= xhs_share <= 1:
+        print("小红书占比要在 0 和 1 之间（如 0.7）", file=sys.stderr)
+        return 2
 
     settings = Settings()
     result = estimate(per_day, xhs_share, settings)

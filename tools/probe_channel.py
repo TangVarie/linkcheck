@@ -108,7 +108,14 @@ def main() -> int:
 
     only = ""
     if "--only" in sys.argv:
-        only = sys.argv[sys.argv.index("--only") + 1].strip().lower()
+        index = sys.argv.index("--only") + 1
+        if index >= len(sys.argv):
+            print("--only 后面要跟通道名：tikhub 或 socialdatax", file=sys.stderr)
+            return 2
+        only = sys.argv[index].strip().lower()
+        if only not in ENV:
+            print(f"--only 的值 {only!r} 不认识，可选：{' / '.join(ENV)}", file=sys.stderr)
+            return 2
 
     providers.set_tikhub_base(os.environ.get("TIKHUB_BASE", ""))
     settings = Settings()

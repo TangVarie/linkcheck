@@ -45,9 +45,11 @@ _DOUYIN_ID_PATTERNS = [
     re.compile(r"/share/video/(\d{6,})", re.I),
 ]
 
-# 从一段分享文案里把 URL 抠出来。中文分享文案常把链接和标点黏在一起，
-# 所以右边界要排掉中文标点和常见收尾符号。
-_URL_RE = re.compile(r"https?://[^\s，。、！？；：）】》\"'<>]+", re.I)
+# 从一段分享文案里把 URL 抠出来。中文分享文案常把链接和文字、标点黏在一起，
+# 所以右边界除了常见中文标点，还要排掉整个 CJK 区段和左侧括号——
+# 「看这条https://v.douyin.com/xxx很火」这种没有空格的写法，
+# 不排 CJK 就会把「很火」吞进 URL 里，短链直接 404。
+_URL_RE = re.compile(r"https?://[^\s，。、！？；：）】》（《【\"'<>一-鿿]+", re.I)
 
 # 裸 ID：整格就是一个 ID 的情况（运营有时只贴 ID）。
 _BARE_XHS_ID = re.compile(rf"^\s*({_XHS_NOTE_ID})\s*$", re.I)

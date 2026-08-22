@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -24,6 +25,16 @@ BASE = "https://open.feishu.cn/open-apis"
 # 飞书文档给的批量写上限是 1000，这里取一半。批量操作是全成功或全失败，
 # 一批越大，一个坏值导致的回滚面就越大。
 BATCH_SIZE = 500
+
+# 值得二分定位的**行级**错误码：这一行的问题不影响别的行，隔离出来其余照写。
+# 表级错误（权限 91403/99991672、列名 1254045、token 失效、网络中断）会让每个
+# 子分片同样失败——对 500 行的分片，二分会把一次失败放大成近千次请求，
+# 既拖垮任务超时又在捶打飞书接口，必须立刻向上抛。
+_ROW_LEVEL_CODES = frozenset({
+    1254005,   # record_id 不存在（写回前行刚被删）
+    1254060,   # 字段值类型不对（某一行的坏值）
+    1254291,   # 写入的多选选项在字段配置里不存在
+})
 
 
 class FeishuError(RuntimeError):
@@ -46,9 +57,15 @@ _HINTS = {
 }
 
 
-def _check(payload: Any) -> dict[str, Any]:
+def _check(resp: transport.Response) -> dict[str, Any]:
+    payload = resp.json()
     if not isinstance(payload, dict):
-        raise FeishuError(-1, f"响应不是 JSON：{str(payload)[:200]}")
+        # 非 JSON（网关错误页、连接中断）：把 HTTP 状态、body 片段和 request_id
+        # 都带上——只报「响应不是 JSON：None」等于把排查线索全丢了。
+        detail = f"HTTP {resp.status} {resp.body[:200]}".strip()
+        if resp.request_id:
+            detail += f"（request_id={resp.request_id}）"
+        raise FeishuError(-1, f"响应不是 JSON：{detail}")
     code = payload.get("code")
     if code not in (0, None):
         raise FeishuError(int(code), str(payload.get("msg", "")), _HINTS.get(int(code), ""))
@@ -92,11 +109,13 @@ class Bitable:
         if self._token and self._token.expires_at > now:
             return self._token.value
 
-        resp = transport.post(
+        # 带重试：token 是整轮的第一步，一次网络抖动就断送整轮太不值。
+        resp = transport.post_with_retry(
             f"{BASE}/auth/v3/tenant_access_token/internal",
             {"Content-Type": "application/json; charset=utf-8"},
             json.dumps({"app_id": self.app_id, "app_secret": self.app_secret}),
             timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
         )
         payload = resp.json()
         if not isinstance(payload, dict):
@@ -143,7 +162,8 @@ class Bitable:
         while True:
             url = self._url(f"records/search?page_size={min(page_size, 500)}")
             if page_token:
-                url += f"&page_token={page_token}"
+                # page_token 是服务端生成的不透明字符串，可能带 +/= 等字符，必须编码。
+                url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
             body: dict[str, Any] = {"field_names": fields, "automatic_fields": False}
             if filter_spec:
                 body["filter"] = filter_spec
@@ -155,7 +175,7 @@ class Bitable:
                 timeout=self.timeout,
                 should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
             )
-            data = _check(resp.json())
+            data = _check(resp)
             collected.extend(data.get("items") or [])
 
             if max_records is not None and len(collected) >= max_records:
@@ -168,15 +188,47 @@ class Bitable:
 
     # ---------- 写 ----------
 
-    def batch_update(self, updates: list[dict[str, Any]]) -> int:
+    def batch_update(
+        self,
+        updates: list[dict[str, Any]],
+        *,
+        errors: Optional[list[tuple[str, FeishuError]]] = None,
+    ) -> int:
         """批量更新。updates 形如 [{"record_id": "...", "fields": {...}}, ...]
 
         串行发，不并行：飞书官方建议同一时刻对同一篇多维表格只做一个写操作。
         并行写会拿到 1254607 之类的并发冲突，还可能写坏。
+
+        飞书的批量写是全成功或全失败：一个坏行（比如写回前刚被运营删掉，
+        1254005）会让整个分片回滚。这里对**行级错误**（_ROW_LEVEL_CODES）
+        的分片做二分重试，把坏行隔离出来单独失败，好行照写——一个坏行
+        只该损失它自己，不该作废同分片的 499 个好行，更不该丢掉后续分片。
+
+        表级错误（权限、列名、token）不做二分、立刻抛出：那种错误每个
+        子分片都会同样失败，二分只是把一次失败放大成上千次请求。
+
+        行级坏行收集进 errors（(record_id, FeishuError) 列表）；不传 errors
+        时，所有分片都尝试完之后才抛一个汇总异常。
         """
+        collected: list[tuple[str, FeishuError]] = []
         written = 0
         for start in range(0, len(updates), BATCH_SIZE):
-            chunk = updates[start : start + BATCH_SIZE]
+            written += self._submit(updates[start : start + BATCH_SIZE], collected)
+        if collected:
+            if errors is not None:
+                errors.extend(collected)
+            else:
+                first_id, first_exc = collected[0]
+                raise FeishuError(
+                    first_exc.code,
+                    f"{len(collected)} 行写回失败（其余 {written} 行已写回）。"
+                    f"第一个失败行 {first_id}：{first_exc.msg}",
+                    _HINTS.get(first_exc.code, ""),
+                )
+        return written
+
+    def _submit(self, chunk: list[dict[str, Any]], errors: list[tuple[str, FeishuError]]) -> int:
+        try:
             resp = transport.post_with_retry(
                 self._url("records/batch_update"),
                 self._headers(),
@@ -184,9 +236,16 @@ class Bitable:
                 timeout=self.timeout,
                 should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
             )
-            _check(resp.json())
-            written += len(chunk)
-        return written
+            _check(resp)
+            return len(chunk)
+        except FeishuError as exc:
+            if exc.code not in _ROW_LEVEL_CODES:
+                raise   # 表级错误：二分只会放大失败，直接向上抛
+            if len(chunk) == 1:
+                errors.append((str(chunk[0].get("record_id") or ""), exc))
+                return 0
+            mid = len(chunk) // 2
+            return self._submit(chunk[:mid], errors) + self._submit(chunk[mid:], errors)
 
     def list_field_options(self, field_name: str) -> Optional[list[str]]:
         """读某个单选/多选字段已配置的选项，读不到返回 None。
@@ -197,21 +256,27 @@ class Bitable:
         返回 None 表示「查不到，别过滤」而不是「没有选项」，两者必须区分：
         前者应放行（宁可试着写），后者应全部拦下。
         """
-        resp = transport.get(
-            self._url("fields?page_size=200"),
-            self._headers(),
-            timeout=self.timeout,
-        )
-        payload = resp.json()
-        if not isinstance(payload, dict) or payload.get("code") not in (0, None):
-            return None
+        page_token = ""
+        while True:
+            # 列出字段接口的 page_size 上限是 100（比记录接口低），超了会被拒。
+            url = self._url("fields?page_size=100")
+            if page_token:
+                url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
+            resp = transport.get(url, self._headers(), timeout=self.timeout)
+            payload = resp.json()
+            if not isinstance(payload, dict) or payload.get("code") not in (0, None):
+                return None
 
-        data = payload.get("data") or {}
-        for field in data.get("items") or []:
-            if field.get("field_name") == field_name:
-                options = ((field.get("property") or {}).get("options")) or []
-                return [o["name"] for o in options if isinstance(o, dict) and o.get("name")]
-        return None
+            data = payload.get("data") or {}
+            for field in data.get("items") or []:
+                if field.get("field_name") == field_name:
+                    options = ((field.get("property") or {}).get("options")) or []
+                    return [o["name"] for o in options if isinstance(o, dict) and o.get("name")]
+            if not data.get("has_more"):
+                return None
+            page_token = data.get("page_token") or ""
+            if not page_token:
+                return None
 
 
 # ---------- 单元格取值 / 赋值 ----------

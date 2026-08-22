@@ -226,11 +226,18 @@ class RefreshTiers:
     archive_after_days: int = 30     # 超过就不再自动刷，只保留手动触发
 
     def interval_hours_for_age(self, age_days: float) -> int | None:
-        """返回该年龄的帖子应有的刷新间隔；None 表示已归档。"""
+        """返回该年龄的帖子应有的刷新间隔；None 表示已归档。
+
+        归档界线由 archive_after_days 决定；tiers 只决定归档前的刷新节奏，
+        超出最后一档年龄但还没到归档线的，沿用最后一档的间隔。
+        （默认两者都是 30 天，行为不变；把 archive_after_days 调大才有差别。）
+        """
+        if age_days > self.archive_after_days:
+            return None
         for max_age_days, interval_hours in self.tiers:
             if age_days <= max_age_days:
                 return interval_hours
-        return None
+        return self.tiers[-1][1] if self.tiers else None
 
 
 @dataclass
@@ -350,9 +357,11 @@ _DOUYIN_ID_PATTERNS = [
     re.compile(r"/share/video/(\d{6,})", re.I),
 ]
 
-# 从一段分享文案里把 URL 抠出来。中文分享文案常把链接和标点黏在一起，
-# 所以右边界要排掉中文标点和常见收尾符号。
-_URL_RE = re.compile(r"https?://[^\s，。、！？；：）】》\"'<>]+", re.I)
+# 从一段分享文案里把 URL 抠出来。中文分享文案常把链接和文字、标点黏在一起，
+# 所以右边界除了常见中文标点，还要排掉整个 CJK 区段和左侧括号——
+# 「看这条https://v.douyin.com/xxx很火」这种没有空格的写法，
+# 不排 CJK 就会把「很火」吞进 URL 里，短链直接 404。
+_URL_RE = re.compile(r"https?://[^\s，。、！？；：）】》（《【\"'<>一-鿿]+", re.I)
 
 # 裸 ID：整格就是一个 ID 的情况（运营有时只贴 ID）。
 _BARE_XHS_ID = re.compile(rf"^\s*({_XHS_NOTE_ID})\s*$", re.I)
@@ -519,12 +528,15 @@ _CODES: dict[int, tuple[Failure, bool]] = {
 
 # 兜底：错误码没命中时，从描述文案里找线索。有了官方错误码表之后，
 # 这里只是防御——正常情况下不该走到。
+# ⚠️ 顺序即优先级：TRANSPORT 必须排在 GONE 前面——「当前内容暂时不可用」这类
+# 瞬时故障文案包含「不可用」三个字，GONE 在前会把一次临时故障计成死亡一击，
+# 两击定罪的第一击就这么被白送了。
 _MESSAGE_HINTS: list[tuple[tuple[str, ...], Failure]] = [
     (("积分不足", "余额不足", "insufficient"), Failure.QUOTA),
     (("过于频繁", "频率", "rate limit"), Failure.RATE_LIMIT),
+    (("暂时不可用", "稍后重试", "service", "网络错误", "超时", "timed out"), Failure.TRANSPORT),
     (("不存在", "已删除", "已下架", "不可用", "违规", "not found", "deleted"), Failure.GONE),
     (("API Key", "鉴权", "unauthorized"), Failure.AUTH),
-    (("暂时不可用", "稍后重试", "service"), Failure.TRANSPORT),
 ]
 
 
@@ -587,7 +599,10 @@ def _classify(code: Any, message: str, http_status: Optional[int]) -> tuple[Fail
             return Failure.GONE, False
         if http_status == 429:
             return Failure.RATE_LIMIT, True
-        if http_status >= 500:
+        if http_status >= 500 or http_status == 0:
+            # 0 = 传输层的超时/拒连/DNS 失败（transport.py 的约定）。
+            # 漏掉这条会把网络故障归成 UNKNOWN——既不重试也不降级，
+            # SocialDataX 作主通道时双通道就白配了（TikHub 侧一直有对应规则）。
             return Failure.TRANSPORT, True
 
     return Failure.UNKNOWN, False
@@ -779,6 +794,25 @@ class Request:
     body: str = ""
 
 
+def _handles_everything(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
+    return True
+
+
+def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
+    """TikHub 吃不吃这种参数形态。
+
+    抖音的图文和视频共用同一对端点（aweme 本来就两种都算），**形态无关**；
+    但这对端点只收数字 aweme_id，不收链接——OpenAPI 写明 aweme_id 是「作品id」，
+    解析分享链接是另外的端点。把 v.douyin.com 短链塞进 aweme_id 必然失败，
+    还会被归一化成 GONE 嫌疑：两轮之后一条活着的内容就被标成「已失效」，钱照扣。
+    所以这种行让 TikHub 直接让位给吃链接的 SocialDataX。
+    小红书不受影响：share_text 参数长链短链分享文案都吃（实测）。
+    """
+    if platform == "douyin" and not arguments.get("aweme_id"):
+        return False
+    return True
+
+
 @dataclass
 class Provider:
     name: str
@@ -794,6 +828,9 @@ class Provider:
     # 这里保守当作不收——宁可少报一点点备胎的钱，也不要凭猜测把账单虚高，
     # 一个天天虚报成本的监控没人会信。验完见 docs/待验证清单.md 第 6 项。
     bills_failed_lookups: bool = False
+    # 这家能不能处理这种（平台, 用途, 参数）组合。挑通道时先过这一关，
+    # 免得把请求发给一个注定报错的端点——白花钱还可能把行判成失效。
+    can_handle: Callable[[str, str, dict[str, Any]], bool] = _handles_everything
 
 
 # =============================================================================
@@ -909,10 +946,12 @@ def _tikhub_error(payload: dict[str, Any], http_status: int, api_key: str) -> Er
     # 成功和失败是两套信封：成功时 code/message 在顶层，失败时整个塞进 detail。
     envelope = payload.get("detail") if isinstance(payload.get("detail"), dict) else payload
     code = envelope.get("code", http_status)
+    # 先脱敏再截断（反过来的话 Key 横跨截断边界时会有半截漏出去）。
     message = _redact(
-        str(envelope.get("message_zh") or envelope.get("message") or json.dumps(payload, ensure_ascii=False)[:300]),
+        str(envelope.get("message_zh") or envelope.get("message")
+            or json.dumps(payload, ensure_ascii=False)),
         api_key,
-    )
+    )[:300]
     request_id = str(envelope.get("request_id") or "")
 
     # TikHub 没有公开的业务错误码表，只能按 HTTP 状态 + 文案归类。
@@ -1002,8 +1041,9 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
                       http_status: int, request_id: str, api_key: str) -> Result:
     inner = payload.get("data")
     if not isinstance(inner, dict):
+        # 先脱敏再截断：反过来的话，Key 恰好横跨截断边界时会有半截漏出去。
         return Err(Failure.UNKNOWN, "no_data",
-                   _redact(json.dumps(payload, ensure_ascii=False)[:300], api_key),
+                   _redact(json.dumps(payload, ensure_ascii=False), api_key)[:300],
                    http_status=http_status, request_id=request_id)
 
     if platform == "xhs" and purpose == "comments":
@@ -1027,6 +1067,12 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
     if platform == "xhs" and purpose == "detail":
         core = inner.get("data")
         note_list = core[0].get("note_list") if isinstance(core, list) and core and isinstance(core[0], dict) else None
+        if note_list and not isinstance(note_list, list):
+            # 有内容但形状不认识（比如上游把 list 改成了 dict）：这是协议漂移，
+            # 不是「笔记没了」。硬下 [0] 会 KeyError 炸穿；按 GONE 定罪更是误杀。
+            return Err(Failure.UNKNOWN, "unexpected_shape",
+                       _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
+                       http_status=http_status, request_id=request_id)
         if not note_list:
             # 干净的死亡信号：不存在的笔记，data 直接是 []（实测）。
             return Err(Failure.GONE, "no_note", "详情接口没有返回任何笔记，笔记已不存在或不可见",
@@ -1097,10 +1143,16 @@ def _tikhub_parse(platform: str, purpose: str, http_status: int, content_type: s
     try:
         payload = json.loads(body or "")
     except json.JSONDecodeError:
+        # 非 JSON 的 403 基本只有一种来源：Cloudflare 的 HTML 拦截页
+        # （TikHub 的业务错误全是 JSON）。那是这条出口被拦，不是 Key 的问题，
+        # 归 TRANSPORT 才能降级到备胎；归 UNKNOWN 会把行判死还不换通道。
+        kind = (Failure.TRANSPORT
+                if http_status >= 500 or http_status == 0 or http_status == 403
+                else Failure.UNKNOWN)
         return Err(
-            Failure.TRANSPORT if http_status >= 500 or http_status == 0 else Failure.UNKNOWN,
+            kind,
             f"http_{http_status}",
-            _redact((body or f"HTTP {http_status}")[:500], api_key),
+            _redact(body or f"HTTP {http_status}", api_key)[:500],
             http_status=http_status, request_id=request_id,
         )
 
@@ -1129,7 +1181,7 @@ REGISTRY: dict[str, Provider] = {
     SOCIALDATAX: Provider(SOCIALDATAX, "SocialDataX", _sdx_build, _sdx_parse, _sdx_yuan,
                           bills_failed_lookups=False),
     TIKHUB: Provider(TIKHUB, "TikHub", _tikhub_build, _tikhub_parse, _tikhub_yuan,
-                     bills_failed_lookups=True),
+                     bills_failed_lookups=True, can_handle=_tikhub_can_handle),
 }
 
 
@@ -1202,6 +1254,7 @@ def merge(
     computed: Iterable[str],
     machine_namespace: Iterable[str],
     known_options: Iterable[str] | None = None,
+    exclusive: Iterable[Sequence[str]] = (),
 ) -> TagMerge:
     """把机器算出的标签并进现有标签，不碰人工标签。
 
@@ -1218,6 +1271,12 @@ def merge(
         该多选字段实际配置了哪些选项。给了就做过滤——飞书 batch_update 是
         全成功或全失败，一个字段里没有的选项名可能让整批几百行一起回滚，
         与其赌服务端会自动建选项，不如在这里挡掉并把它记进 dropped_unknown。
+    exclusive:
+        互斥组（如热度三档），组内同时只能留一个。只在「选项没建、保留旧
+        机器标签」的路径上用，用来圈定**每个被拦标签的同类范围**：
+        「大爆」写不进去 → 只保留行上同组的旧档位（爆贴），既不让两个
+        档位并存，也绝不顺手把不相干的旧状态标签（比如上一轮的「已失效」）
+        复活——那会把一条刚恢复正常的行继续标成死的。
     """
     current_set = [t.strip() for t in (current or []) if t and t.strip()]
     machine = set(machine_namespace)
@@ -1231,12 +1290,26 @@ def merge(
             "放行会导致这个标签之后永远无法撤回。"
         )
 
+    previous_machine = {t for t in current_set if t in machine}
+
     dropped: list[str] = []
     if known_options is not None:
         options = set(known_options)
         allowed = {t for t in computed_set if t in options}
         dropped = sorted(computed_set - allowed)
         computed_set = allowed
+        if dropped:
+            # 想写的标签写不进去（选项没建）时，只保留**同类**的旧标签：
+            # 「大爆」被拦 → 留住行上的旧档位「爆贴」（热度信息不清零）；
+            # 但绝不把不相干的旧标签一并复活——被拦的是「风控中」时，
+            # 行上残留的「已失效」不在它的同类范围里，照常摘掉，
+            # 否则一条刚恢复正常的行会继续顶着死亡标签。
+            groups = [set(g) for g in exclusive]
+            preserved: set[str] = set()
+            for tag in dropped:
+                category = next((g for g in groups if tag in g), {tag})
+                preserved |= previous_machine & category
+            computed_set |= preserved
 
     # 保序：先按原顺序留下人工标签，再追加机器标签，表里看起来才稳定。
     human = [t for t in current_set if t not in machine]
@@ -1246,8 +1319,6 @@ def merge(
         if tag not in seen:
             seen.add(tag)
             final.append(tag)
-
-    previous_machine = {t for t in current_set if t in machine}
     return TagMerge(
         final=final,
         added=sorted(computed_set - previous_machine),
@@ -1447,7 +1518,12 @@ def _looks_like_seed(comment: CommentView, expected: str) -> bool:
     haystack = _normalize(comment.content)
     if not haystack:
         return False
-    return needle in haystack or (len(haystack) >= 8 and haystack in needle)
+    # 反向包含（评论是关键词的子串）只为一种情况存在：我方评论被平台截断后
+    # 比登记的全文短。要求评论至少有关键词一半长——不然别人一条「好用！」
+    # 恰好是我方长文案的子串，就会被认成我方评论，漏报置顶被顶掉。
+    return needle in haystack or (
+        len(haystack) >= 8 and 2 * len(haystack) >= len(needle) and haystack in needle
+    )
 
 
 class Pin(Enum):
@@ -1550,15 +1626,15 @@ def decide(
     count = snapshot.comment_count
 
     # —— 热度档位：互斥，取最高，且只升不降 ——
+    previous_best = max(
+        (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
+        key=t.rank,
+        default=None,
+    )
     if count is not None:
         tier = th.heat_tier(count, t)
         # 棘轮：算上表里已有的档位取最高。评论被删导致数字掉下去，不该让
         # 一条帖子从「大爆」退回「爆贴」——那是风控信号，由风控标签表达。
-        previous_best = max(
-            (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
-            key=t.rank,
-            default=None,
-        )
         best = max(
             (x for x in (tier, previous_best) if x),
             key=t.rank,
@@ -1570,6 +1646,16 @@ def decide(
                 verdict.notes.append(f"评论数 {count} → {best}")
             else:
                 verdict.notes.append(f"评论数 {count}，但曾达到「{best}」，保留高档位")
+    else:
+        # 评论数未知（抖音评论接口的 total 是 integer|null，detail 兜底又恰好
+        # 失败）——这一轮对热度和风控**没有获得任何新证据**。此时必须把已有的
+        # 档位和风控标签原样带上：verdict.tags 留空会让 merge 把它们整体摘掉，
+        # 等于用一次上游缺数抹掉「大爆」的棘轮历史和一条在生效的风控告警。
+        if previous_best:
+            verdict.tags.add(previous_best)
+        if t.risk in (current_tags or []):
+            verdict.tags.add(t.risk)
+        verdict.notes.append("本轮未取到评论数，热度/风控标签保持原样")
 
     # —— 掉量：评论被平台悄悄批量删除，往往比笔记整个失效早得多 ——
     if (
@@ -1596,24 +1682,36 @@ def decide(
     if note:
         verdict.notes.append(note)
     # 之前置顶成功过、现在掉了 —— 这是种草投放里最该被立刻发现的事之一。
+    # NO_SEED 也要排除：没填种子关键词时根本判不了「我方置顶在不在」，
+    # 这时报「已不在」和 comment_status_values 里「判不了就不下结论」的口径矛盾。
     if (
         settings.comment_status.ever_pinned(current_comment_status)
-        and verdict.pin is not Pin.SUCCESS
-        and verdict.pin is not Pin.UNSUPPORTED
+        and verdict.pin not in (Pin.SUCCESS, Pin.UNSUPPORTED, Pin.NO_SEED)
     ):
         verdict.notes.append("⚠ 此前已确认置顶成功，本轮我方置顶已不在")
 
     return verdict
 
 
-def gone_verdict(settings: Settings, reason: str = "") -> Verdict:
+def gone_verdict(settings: Settings, reason: str = "",
+                 current_tags: Optional[list[str]] = None) -> Verdict:
     """帖子确认取不到时的结论（已经过两击确认，不是第一次失败就走这里）。
 
     同时打 已失效 和 风控 ——「已失效」说明事实，「风控」是运营真正会去筛的那一列。
+    已有的热度档位原样保留：「爆过就是爆过」的棘轮不因帖子死了而清史——
+    一条大爆过的帖子被删，恰恰是最需要留着「大爆」标签供复盘的那种。
     """
     verdict = Verdict()
     verdict.tags.add(settings.tags.gone)
     verdict.tags.add(settings.tags.risk)
+    t = settings.tags
+    best = max(
+        (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
+        key=t.rank,
+        default=None,
+    )
+    if best:
+        verdict.tags.add(best)
     verdict.notes.append(reason or "接口返回内容不存在/已删除/无法访问")
     return verdict
 
@@ -1634,6 +1732,10 @@ def suspect_verdict(settings: Settings, strikes: int, reason: str = "") -> Verdi
 # =============================================================================
 #  来自 xhsearch/rows.py
 # =============================================================================
+
+# 直接导名字并写成一行（理由同 providers.py 顶部）：打包进扣子时模块被拼成
+# 扁平文件，`providers.xxx` 这种模块前缀在那边会 NameError。
+
 
 @dataclass
 class ToolCall:
@@ -1751,20 +1853,33 @@ def estimate_credits(rows: list[Row], settings: Settings, now: Optional[datetime
     return sum(len(plan_calls(row, settings, now)) for row in rows) * 10
 
 
-def estimate_yuan(rows: list[Row], settings: Settings, now: Optional[datetime] = None) -> float:
+def estimate_yuan(
+    rows: list[Row],
+    settings: Settings,
+    now: Optional[datetime] = None,
+    keys: Optional[dict[str, str]] = None,
+) -> float:
     """预估这一批要花多少钱，按每个平台**实际会走的那家**的单价算。
 
-    双通道之后两家单价差 10 倍（抖音），继续用「积分」这一个单位报数就是骗人。
+    「实际会走的那家」= 通道顺序里第一家**配了 key 且吃这种参数形态**的。
+    按配置主通道计价的话，只配了备胎 key 的部署（完全合法）会把
+    SocialDataX 的账按 TikHub 的单价报——抖音差 14 倍，一个天天报错账的
+    估算没人会信。keys 不传时退回按「第一家能接的」算。
     """
-
     total = 0.0
     for row in rows:
         for call in plan_calls(row, settings, now):
-            name = settings.channels.primary(call.platform)
-            try:
-                total += providers.get_provider(name).yuan_per_call(call.platform, call.purpose)
-            except ValueError:
-                total += providers.SOCIALDATAX_YUAN
+            for name in settings.channels.for_platform(call.platform):
+                if keys is not None and not keys.get(name):
+                    continue
+                try:
+                    provider = get_provider(name)
+                except ValueError:
+                    continue
+                if provider.can_handle(call.platform, call.purpose, call.arguments):
+                    total += provider.yuan_per_call(call.platform, call.purpose)
+                    break
+            # 一家都接不了：这一行实际会以「不支持的链接形态/没通道」失败，不产生费用
     return total
 
 
@@ -1792,17 +1907,85 @@ async def feishu_token(app_id: str, app_secret: str) -> str:
     return data["tenant_access_token"]
 
 
-async def feishu_search(token, app_token, table_id, field_names, filter_spec, page_size=BATCH_LIMIT):
-    url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search?page_size={page_size}"
+async def feishu_search(token, app_token, table_id, field_names, filter_spec,
+                        page_size=200, deadline=None, sort_field=None):
+    """按条件拉记录，**自动翻页**——语义与服务端 feishu.Bitable.search 一致。
+    返回 (records, 是否扫完)。
+
+    ⚠️ 这里绝不能只取一页：过滤条件只有「监控中」，到期判断在取回后才做。
+    只取一页的话每一轮看到的都是同样的前 N 条，第 N+1 条以后
+    **永远轮不到刷新**——「600 行按每轮 40 行排干」全靠这里拿到全量。
+
+    deadline：到点就带着已取到的页返回（第二个返回值 False）。扣子只有
+    60 秒，飞书响应慢时不能让翻页吃光处理和写回的预算。
+
+    sort_field：按这一列**升序**扫（传「最后更新时间」= 最久没刷的排最前）。
+    这是「部分扫描也不会饿死任何行」的关键：没有可持久化的翻页游标，
+    但把最饥饿的行排在最前面，游标就藏在数据自己身上——被刷过的行
+    时间戳更新后自动沉到队尾，下一轮的前缀永远是最该刷的那批。
+    不排序的话，慢响应下每轮都只扫到同一批前缀行，前缀刷完后
+    整个节点会一直报「没有到期的行」，而后面的行永远没人看。
+    """
+    items, page_token = [], ""
+    base = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
     body = {"field_names": list(field_names), "automatic_fields": False}
     if filter_spec:
         body["filter"] = filter_spec
-    response = await _post_json(url, {"Authorization": f"Bearer {token}",
-                                      "Content-Type": "application/json; charset=utf-8"}, body)
-    data = json.loads(response.text)
-    if data.get("code") not in (0, None):
-        raise RuntimeError(f"读表失败 [{data.get('code')}] {data.get('msg')}")
-    return (data.get("data") or {}).get("items") or []
+    if sort_field:
+        body["sort"] = [{"field_name": sort_field, "desc": False}]
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            return items, False
+        url = f"{base}?page_size={page_size}"
+        if page_token:
+            url += "&page_token=" + _quote(page_token)
+        response = await _post_json(url, {"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json; charset=utf-8"}, body)
+        data = json.loads(response.text)
+        if data.get("code") not in (0, None):
+            raise RuntimeError(f"读表失败 [{data.get('code')}] {data.get('msg')}")
+        payload = data.get("data") or {}
+        items.extend(payload.get("items") or [])
+        if not payload.get("has_more"):
+            return items, True
+        page_token = payload.get("page_token") or ""
+        if not page_token:
+            return items, True
+
+
+async def feishu_field_options(token, app_token, table_id, field_name):
+    """读某个多选字段已建的选项，读不到返回 None（= 不过滤，宁可试着写）。
+
+    这层过滤在扣子路径上尤其重要：batch_update 是全成功或全失败，
+    一个没建过的选项名（比如「大爆」没建，而某行评论数刚过 100）会让整批
+    几十行一起回滚——而且每一轮都重算出同一个标签、每一轮都整批失败，
+    钱照花、结果全丢，直到有人去把选项建好。服务端跑得了 doctor 能提前发现，
+    扣子跑不了，只能在这里挡。
+    """
+    page_token = ""
+    try:
+        while True:
+            url = (f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}"
+                   f"/fields?page_size=100")
+            if page_token:
+                url += "&page_token=" + _quote(page_token)
+            response = await requests.get(
+                url, headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+            data = json.loads(response.text)
+            if data.get("code") not in (0, None):
+                return None
+            payload = data.get("data") or {}
+            for item in payload.get("items") or []:
+                if item.get("field_name") == field_name:
+                    options = ((item.get("property") or {}).get("options")) or []
+                    return [o["name"] for o in options if isinstance(o, dict) and o.get("name")]
+            if not payload.get("has_more"):
+                return None
+            page_token = payload.get("page_token") or ""
+            if not page_token:
+                return None
+    except Exception:                                  # noqa: BLE001
+        return None
 
 
 async def feishu_batch_update(token, app_token, table_id, updates):
@@ -1864,8 +2047,18 @@ async def channel_call(keys: dict, settings, call: ToolCall, semaphore, deadline
         if time.monotonic() >= deadline:
             return Err(Failure.TRANSPORT, "deadline", "已到软截止，留给下一轮"), {}
 
-        order = usable_order(settings.channels, call.platform, keys, disabled)
+        usable = usable_order(settings.channels, call.platform, keys, disabled)
+        # 再按「这家吃不吃这种参数形态」过滤：TikHub 的抖音端点只收数字
+        # aweme_id 不收链接（图文/视频共用端点，形态无关），短链行让位给
+        # 直接吃链接的 SocialDataX。
+        order = [n for n in usable
+                 if get_provider(n).can_handle(call.platform, call.purpose, call.arguments)]
         if not order:
+            if usable:
+                # 行级问题（比如抖音短链提不出 ID），不能报 AUTH——那是 FATAL。
+                return Err(Failure.UNKNOWN, "unsupported_link",
+                           f"当前可用通道（{'、'.join(usable)}）不支持这种链接形态："
+                           "请贴含数字 ID 的完整链接，或配置 SocialDataX Key"), {}
             return Err(Failure.AUTH, "no_channel",
                        f"{call.platform} 没有可用的数据通道了", definitive=True), {}
 
@@ -1905,22 +2098,44 @@ async def main(args: Any) -> dict:
 
     mode = (p.get("mode") or "sweep").strip()
     wanted = [x.strip() for x in (p.get("record_ids") or "").split(",") if x.strip()]
+    if mode == "row" and not wanted:
+        # 静默退化成「无过滤全表刷新」比报错贵得多也危险得多。
+        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
+                "message": "mode=row 需要在 record_ids 里给出至少一个记录 ID"}
 
     try:
         token = await feishu_token(p["app_id"], p["app_secret"])
     except Exception as exc:                           # noqa: BLE001
         return {"ok": False, "processed": 0, "credits": 0, "balance": 0, "message": str(exc)}
 
+
     filter_spec = None
     if mode != "row":
         filter_spec = {"conjunction": "and", "conditions": [
             {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
 
-    try:
-        records = await feishu_search(token, p["app_token"], p["table_id"],
-                                      f.must_read(), filter_spec)
-    except Exception as exc:                           # noqa: BLE001
-        return {"ok": False, "processed": 0, "credits": 0, "balance": 0, "message": str(exc)}
+    # 读表 + 两个多选列的选项**并发**取：选项各有 15 秒超时，串行的话
+    # 慢响应会把读表的预算先吃光，扫出空表还报 ok:True。
+    # 读表按「最后更新时间」升序扫（最久没刷的最前），预算给到软截止的一半。
+    scan_deadline = deadline - SOFT_DEADLINE / 2
+    search_result, traffic_options, status_options = await asyncio.gather(
+        feishu_search(token, p["app_token"], p["table_id"], f.must_read(),
+                      filter_spec, deadline=scan_deadline, sort_field=f.last_updated),
+        feishu_field_options(token, p["app_token"], p["table_id"], f.traffic_status),
+        feishu_field_options(token, p["app_token"], p["table_id"], f.comment_status),
+        return_exceptions=True,
+    )
+    if isinstance(search_result, Exception):
+        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
+                "message": str(search_result)}
+    records, scan_complete = search_result
+    # 选项读取失败 = None = 不过滤（宁可试着写），与服务端语义一致。
+    if isinstance(traffic_options, Exception):
+        traffic_options = None
+    if isinstance(status_options, Exception):
+        status_options = None
+    scan_note = ("" if scan_complete
+                 else "；⚠ 读表未扫完（飞书响应慢），本轮按最久未刷的行优先，其余下一轮继续")
 
     rows = []
     for record in records:
@@ -1945,7 +2160,8 @@ async def main(args: Any) -> dict:
     rows = rows[:BATCH_LIMIT]
 
     if not rows:
-        return {"ok": True, "processed": 0, "credits": 0, "balance": 0, "message": "没有到期的行"}
+        return {"ok": True, "processed": 0, "credits": 0, "balance": 0,
+                "message": "没有到期的行" + scan_note}
 
     keys = {k: v for k, v in {
         "tikhub": (p.get("tikhub_key") or "").strip(),
@@ -1960,31 +2176,57 @@ async def main(args: Any) -> dict:
     disabled = set()
     results = await asyncio.gather(
         *[_process(row, keys, settings, now, semaphore, deadline, disabled,
-                   wanted=bool(wanted))
+                   traffic_options, status_options, wanted=bool(wanted))
           for row in rows],
         return_exceptions=True,
     )
 
-    updates, cents, balance, gone, used = [], 0, 0, 0, {}
+    # fen 用 float 累加、最后一次取整——按单次调用四舍五入的话，
+    # TikHub 抖音 0.72 分/次会被每次凑成 1 分，虚报近四成。
+    updates, fen, balance, used = [], 0.0, 0, {}
+    entries = []   # (update, 刷新状态) —— 熔断要能找到该撤销的那些行
+    attempted = gone = fatal_rows = 0
     for row, result in zip(rows, results):
         if isinstance(result, Exception):
             continue
-        fields, spent, bal, is_gone, tally = result
-        cents += spent
+        fields, spent, bal, status, tally = result
+        fen += spent
         balance = bal or balance
-        gone += 1 if is_gone else 0
+        # 熔断的分母只算真正打过上游的行：冷却/软截止顺延的行（fields None）
+        # 和坏链接/不支持的链接形态（跳过）没有产生「取不到内容」的观测，
+        # 混进去会稀释比例。
+        if status in ("正常", "已失效", "疑似受限", "刷新失败"):
+            attempted += 1
+        if status in ("已失效", "疑似受限"):
+            gone += 1
+        if status == "fatal":
+            fatal_rows += 1
         for name, count in tally.items():
             used[name] = used.get(name, 0) + count
         if fields:
-            updates.append({"record_id": row.record_id, "fields": fields})
+            update = {"record_id": row.record_id, "fields": fields}
+            updates.append(update)
+            entries.append((update, status))
 
     # 全局熔断：一批里失效比例异常偏高 → 上游故障，撤销所有标签写入。
-    tripped = len(updates) >= settings.safety.breaker_min_sample and \
-        gone / max(len(updates), 1) > settings.safety.breaker_gone_ratio
+    # 判据与服务端 runner._apply_circuit_breaker 一致（含疑似受限、分母为
+    # 实际尝试数），熔断后同样改写刷新状态并撤销计数增量——两条运行时对
+    # 同一批数据必须给出同一个结论。
+    tripped = attempted >= settings.safety.breaker_min_sample and \
+        gone / max(attempted, 1) > settings.safety.breaker_gone_ratio
     if tripped:
-        for update in updates:
+        note = (f"本批 {gone}/{attempted} 行都取不到内容，疑似上游故障而非内容失效，"
+                "本轮不改流量状态，请稍后复查")
+        for update, status in entries:
             update["fields"].pop(f.traffic_status, None)
+            if status in ("已失效", "疑似受限"):
+                update["fields"][f.refresh_status] = "刷新失败"
+                update["fields"].pop(f.consecutive_failures, None)
+                original = str(update["fields"].get(f.failure_reason) or "")
+                update["fields"][f.failure_reason] = \
+                    (f"{original}；{note}" if original else note)[:500]
 
+    cents = round(fen)
     try:
         written = await feishu_batch_update(token, p["app_token"], p["table_id"], updates)
     except Exception as exc:                           # noqa: BLE001
@@ -1992,37 +2234,66 @@ async def main(args: Any) -> dict:
                 "message": f"算完了但写回失败：{exc}"}
 
     via = "、".join(f"{k} {v} 次" for k, v in sorted(used.items())) or "无调用"
-    message = f"刷新 {written} 行，花费 ≈ ¥{cents / 100:.2f}（{via}）"
+    message = f"刷新 {written} 行，花费 ≈ ¥{fen / 100:.2f}（{via}）" + scan_note
     if disabled:
         message += f"；⚠ 本轮 {'、'.join(sorted(disabled))} 通道不可用，已降级"
     if tripped:
         message += "；⚠ 本批失效比例异常，已熔断，未改流量状态"
+    if fatal_rows:
+        # Key 失效 / 余额耗尽把通道全打死了：必须报 ok:False 让下游告警分支
+        # 接住——静默返回成功，半夜的故障就没人知道了。已完成的行照常写回。
+        message += (f"；❌ 数据通道全部不可用（Key 失效或余额耗尽），"
+                    f"{fatal_rows} 行未处理、未写回，修复后下一轮自动重捞")
+        return {"ok": False, "processed": written, "credits": cents,
+                "balance": balance, "message": message}
     return {"ok": True, "processed": written, "credits": cents,
             "balance": balance, "message": message}
 
 
-async def _process(row, keys, settings, now, semaphore, deadline, disabled, *, wanted):
-    """单行处理。返回（待写字段, 花费的分, 余额, 是否判定失效, 各通道调用次数）。"""
+async def _process(row, keys, settings, now, semaphore, deadline, disabled,
+                   traffic_options, status_options, *, wanted):
+    """单行处理。返回（待写字段|None, 花费的分(float), 余额, 刷新状态, 各通道调用次数）。
+
+    待写字段为 None = 这一行**完全不写回**（冷却、软截止顺延、通道全灭）：
+    最后更新时间保持原样，下一轮自然重捞——这是断点续跑的全部机制，
+    所以「没轮到」绝不能写成「刷新失败」。
+    """
     f = settings.fields
+    if time.monotonic() >= deadline:
+        return (None, 0.0, 0, "", {})
     if not row.parsed.usable:
         return (_base_fields(settings, "跳过", [row.parsed.describe_failure()], now),
-                0, 0, False, {})
+                0.0, 0, "跳过", {})
     if not wanted and row.in_cooldown(settings, now):
-        return (None, 0, 0, False, {})
+        return (None, 0.0, 0, "", {})
 
-    snapshot, error, cents, balance, tally = None, None, 0, 0, {}
+    snapshot, error, fen, balance, tally = None, None, 0.0, 0, {}
     for call in plan_calls(row, settings, now):
         result, billed = await channel_call(keys, settings, call, semaphore,
                                             deadline, disabled)
         for name, count in billed.items():
             tally[name] = tally.get(name, 0) + count
-            cents += count * round(get_provider(name).yuan_per_call(
-                call.platform, call.purpose) * 100)
+            # 不在这里取整：0.72 分/次逐次凑成 1 分，账会虚高近四成。
+            fen += count * get_provider(name).yuan_per_call(
+                call.platform, call.purpose) * 100
         if isinstance(result, Err):
+            if result.code == "deadline":
+                if snapshot is None:
+                    # 一个请求都没发出去：整行留给下一轮，不写回。
+                    return (None, fen, balance, "", tally)
+                break  # 评论已到手，detail 放弃，按已有数据完成本行
+            if result.code == "unsupported_link":
+                # 链接形态不被当前配置的通道支持（比如只配 TikHub 的抖音短链）：
+                # 这是链接/配置问题不是上游观测——按「跳过」处理，
+                # 不进熔断分母，不碰标签和定罪计数。
+                return (_base_fields(settings, "跳过", [result.operator_text()], now),
+                        fen, balance, "跳过", tally)
             if result.kind in FATAL:
-                # 走到这里说明所有通道都是 AUTH/QUOTA，备胎也没了。
-                return (_base_fields(settings, "刷新失败", [str(result)], now),
-                        cents, balance, False, tally)
+                # 所有通道都是 AUTH/QUOTA：这是通道故障，不是这一行的结论。
+                # 不写回——写「刷新失败」会顶掉最后更新时间、清掉排队勾，
+                # 等于替一次 Key 故障惩罚了这一行。状态标 "fatal"，
+                # 让 main 能把「Key 失效/余额耗尽」上报成 ok:False 而不是静默成功。
+                return (None, fen, balance, "fatal", tally)
             if result.kind is Failure.GONE and not (
                     snapshot and (snapshot.comments or snapshot.comment_count)):
                 # 死亡信号可能来自 detail（小红书 data 为 []、抖音 filter_list 命中）。
@@ -2044,20 +2315,23 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled, *, w
         strikes = (row.consecutive_failures or 0) + 1
         # 错误码 1008「内容已删除」是权威结论，规范明写不要重试 —— 直接定罪。
         convicted = error.definitive or strikes >= settings.safety.strikes_before_gone
-        verdict = gone_verdict(settings, error.operator_text()) if convicted \
+        verdict = gone_verdict(settings, error.operator_text(),
+                               current_tags=row.current_tags) if convicted \
             else suspect_verdict(settings, strikes, error.operator_text())
         # 第一击不碰流量状态：这一轮没获得关于这篇笔记的任何新信息，
         # 摘掉上一轮的标签等于用一次失败抹掉真实结论。
         fields = _render(row, verdict, None, settings, now,
-                         "已失效" if convicted else "疑似受限", touch_tags=convicted)
+                         "已失效" if convicted else "疑似受限",
+                         traffic_options, status_options, touch_tags=convicted)
         fields[f.consecutive_failures] = strikes
-        return (fields, cents, balance, convicted, tally)
+        return (fields, fen, balance, "已失效" if convicted else "疑似受限", tally)
 
     if snapshot is None:
         reason = error.operator_text() if error else "没有拿到任何数据"
         fields = _base_fields(settings, "刷新失败", [reason], now)
-        fields[f.consecutive_failures] = (row.consecutive_failures or 0) + 1
-        return (fields, cents, balance, False, tally)
+        # ⚠️ 刻意不动「连续失败次数」：超时/5xx/限流对「内容在不在」没有证据力，
+        # 计进去会为下一次非权威 GONE 嫌疑预热定罪计数（与服务端 runner 同口径）。
+        return (fields, fen, balance, "刷新失败", tally)
 
     verdict = decide(snapshot, settings,
                      previous_comment_count=row.previous_comment_count,
@@ -2067,9 +2341,10 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled, *, w
                      current_comment_status=row.comment_status)
     if snapshot.censored:
         verdict.notes.append("⚠ 上游把这条标成了审核中/受限，请人工确认")
-    fields = _render(row, verdict, snapshot, settings, now, "正常")
+    fields = _render(row, verdict, snapshot, settings, now, "正常",
+                     traffic_options, status_options)
     fields[f.consecutive_failures] = 0
-    return (fields, cents, balance, False, tally)
+    return (fields, fen, balance, "正常", tally)
 
 
 def _base_fields(settings, status, notes, now):
@@ -2082,17 +2357,34 @@ def _base_fields(settings, status, notes, now):
     }
 
 
-def _render(row, verdict, snapshot, settings, now, status, touch_tags=True):
+def _render(row, verdict, snapshot, settings, now, status,
+            traffic_options=None, status_options=None, touch_tags=True):
     f = settings.fields
     fields = _base_fields(settings, status, verdict.notes, now)
     if touch_tags:
-        merged = merge(row.current_tags, verdict.tags, settings.tags.namespace())
+        merged = merge(row.current_tags, verdict.tags, settings.tags.namespace(),
+                       known_options=traffic_options,
+                       exclusive=(settings.tags.heat_tiers(),))
+        if merged.dropped_unknown:
+            fields[f.failure_reason] = (
+                fields[f.failure_reason]
+                + f"；这些标签在「{f.traffic_status}」里还没建选项，已跳过："
+                + "、".join(merged.dropped_unknown)
+            )[:500]
         if merged.changed:
             fields[f.traffic_status] = merged.final
         wanted = comment_status_values(verdict.pin, row.comment_status, settings)
         if wanted is not None:
             merged_status = merge(row.comment_status, wanted,
-                                  settings.comment_status.namespace())
+                                  settings.comment_status.namespace(),
+                                  known_options=status_options,
+                                  exclusive=(settings.comment_status.namespace(),))
+            if merged_status.dropped_unknown:
+                fields[f.failure_reason] = (
+                    fields[f.failure_reason]
+                    + f"；这些值在「{f.comment_status}」里还没建选项，已跳过："
+                    + "、".join(merged_status.dropped_unknown)
+                )[:500]
             if merged_status.changed:
                 fields[f.comment_status] = merged_status.final
     if row.parsed.platform:

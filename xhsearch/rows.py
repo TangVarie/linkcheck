@@ -19,6 +19,9 @@ from typing import Any, Optional
 
 from .config import Settings
 from .links import ParsedLink, parse
+# 直接导名字并写成一行（理由同 providers.py 顶部）：打包进扣子时模块被拼成
+# 扁平文件，`providers.xxx` 这种模块前缀在那边会 NameError。
+from .providers import get_provider  # noqa: F401
 
 
 @dataclass
@@ -137,19 +140,31 @@ def estimate_credits(rows: list[Row], settings: Settings, now: Optional[datetime
     return sum(len(plan_calls(row, settings, now)) for row in rows) * 10
 
 
-def estimate_yuan(rows: list[Row], settings: Settings, now: Optional[datetime] = None) -> float:
+def estimate_yuan(
+    rows: list[Row],
+    settings: Settings,
+    now: Optional[datetime] = None,
+    keys: Optional[dict[str, str]] = None,
+) -> float:
     """预估这一批要花多少钱，按每个平台**实际会走的那家**的单价算。
 
-    双通道之后两家单价差 10 倍（抖音），继续用「积分」这一个单位报数就是骗人。
+    「实际会走的那家」= 通道顺序里第一家**配了 key 且吃这种参数形态**的。
+    按配置主通道计价的话，只配了备胎 key 的部署（完全合法）会把
+    SocialDataX 的账按 TikHub 的单价报——抖音差 14 倍，一个天天报错账的
+    估算没人会信。keys 不传时退回按「第一家能接的」算。
     """
-    from . import providers
-
     total = 0.0
     for row in rows:
         for call in plan_calls(row, settings, now):
-            name = settings.channels.primary(call.platform)
-            try:
-                total += providers.get_provider(name).yuan_per_call(call.platform, call.purpose)
-            except ValueError:
-                total += providers.SOCIALDATAX_YUAN
+            for name in settings.channels.for_platform(call.platform):
+                if keys is not None and not keys.get(name):
+                    continue
+                try:
+                    provider = get_provider(name)
+                except ValueError:
+                    continue
+                if provider.can_handle(call.platform, call.purpose, call.arguments):
+                    total += provider.yuan_per_call(call.platform, call.purpose)
+                    break
+            # 一家都接不了：这一行实际会以「不支持的链接形态/没通道」失败，不产生费用
     return total

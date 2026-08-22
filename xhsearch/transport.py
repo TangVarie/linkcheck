@@ -51,40 +51,57 @@ def post(
     """
     data = body.encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
-            return _read(resp)
-    except urllib.error.HTTPError as exc:
-        return _read(exc)
-    except urllib.error.URLError as exc:
-        return Response(0, "", f"网络错误：{exc.reason}")
-    except TimeoutError:
-        return Response(0, "", f"请求超时（{timeout}s）")
+    return _perform(request, timeout)
 
 
 def get(url: str, headers: dict[str, str], timeout: float = 30.0) -> Response:
     """发一个 GET，语义与 post() 一致：非 2xx 也返回 Response 而不是抛异常。"""
     request = urllib.request.Request(url, headers=headers, method="GET")
+    return _perform(request, timeout)
+
+
+def _perform(request: urllib.request.Request, timeout: float) -> Response:
+    """「永远返回 Response」的承诺在这里兑现。
+
+    urllib 只把**建连阶段**的 OSError 包成 URLError；状态行前被断开
+    （RemoteDisconnected）、读响应体中途连接被重置（ConnectionResetError /
+    IncompleteRead）、坏 gzip、服务端乱报 charset——这些都在读取阶段裸抛。
+    漏掉任何一个，一次网络毛刺就会炸穿整批：write_back 执行不到，
+    本轮已经花钱刷完的行一条都不写回。所以最后必须有 Exception 兜底。
+    """
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             return _read(resp)
     except urllib.error.HTTPError as exc:
-        return _read(exc)
+        try:
+            return _read(exc)
+        except Exception as read_exc:  # noqa: BLE001 —— 错误响应的 body 读不出来，至少保住状态码
+            return Response(getattr(exc, "code", 0) or 0, "",
+                            f"读取错误响应失败：{type(read_exc).__name__}: {read_exc}")
     except urllib.error.URLError as exc:
         return Response(0, "", f"网络错误：{exc.reason}")
     except TimeoutError:
         return Response(0, "", f"请求超时（{timeout}s）")
+    except Exception as exc:  # noqa: BLE001
+        return Response(0, "", f"网络错误：{type(exc).__name__}: {exc}")
 
 
 def _read(resp: Any) -> Response:
     raw = resp.read()
     if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
-        raw = gzip.decompress(raw)
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass  # 响应头声称 gzip 但 body 不是（或被截断）：按原样解码，交给上层解析层报错
     charset = resp.headers.get_content_charset() or "utf-8"
+    try:
+        body = raw.decode(charset, errors="replace")
+    except LookupError:  # 服务端乱报 charset 名
+        body = raw.decode("utf-8", errors="replace")
     return Response(
         status=getattr(resp, "status", None) or getattr(resp, "code", 0),
         content_type=resp.headers.get("Content-Type", ""),
-        body=raw.decode(charset, errors="replace"),
+        body=body,
         request_id=resp.headers.get("x-request-id", "") or "",
     )
 
