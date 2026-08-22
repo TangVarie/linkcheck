@@ -7,8 +7,9 @@
 * 小红书评论条目有 is_pinned / is_author_comment，且支持 sort_type=default
 * 抖音评论条目**没有 is_pinned**（只有 is_hot / is_folded），也**没有 sort_type**
 
-所以「置顶评论」和「置顶成功」在抖音侧做不到。这里不静默返回空值——
-空值会被运营读成「没置顶」，而真相是「这个接口根本看不到置顶」。
+所以「置顶状态」在抖音侧判不了。这里不静默写「无置顶」——
+那会被运营读成「没置顶」，而真相是「这个接口根本看不到置顶」，
+抖音行的置顶状态列完全不碰。
 """
 
 from __future__ import annotations
@@ -20,8 +21,6 @@ from typing import Any, Optional
 
 from .config import DigestFormat, Settings, Thresholds
 
-DOUYIN_PINNED_UNSUPPORTED = "—（抖音不支持置顶监控）"
-
 
 @dataclass
 class CommentView:
@@ -32,12 +31,14 @@ class CommentView:
     ip_location: str = ""
     author_name: str = ""
 
-    def one_line(self, fmt: DigestFormat) -> str:
+    def one_line(self, fmt: DigestFormat, extra_mark: str = "") -> str:
         text = re.sub(r"\s+", " ", self.content or "").strip()
         if len(text) > fmt.per_comment_chars:
             text = text[: fmt.per_comment_chars - 1] + "…"
 
         marks = []
+        if extra_mark:
+            marks.append(extra_mark)
         if self.is_pinned:
             marks.append("置顶")
         if self.is_author:
@@ -152,31 +153,30 @@ def merge_detail(snapshot: Snapshot, data: dict[str, Any]) -> Snapshot:
     return snapshot
 
 
-def format_pinned(snapshot: Snapshot) -> str:
-    if not snapshot.supports_pinned:
-        return DOUYIN_PINNED_UNSUPPORTED
-    pinned = snapshot.pinned
-    if pinned is None:
-        return ""
-    who = f"{pinned.author_name}: " if pinned.author_name else ""
-    body = re.sub(r"[ \t]+", " ", pinned.content or "").strip()
-    return f"{who}{body}"
-
-
-def format_digest(snapshot: Snapshot, fmt: DigestFormat) -> str:
+def format_digest(snapshot: Snapshot, fmt: DigestFormat,
+                  hit: Optional["SeedHit"] = None) -> str:
     """把前 N 条评论排成一格能读的文本。
 
-    置顶评论排在最前面——它在综合排序里通常就在第一位，但接口没有保证，
-    这里显式提到最前，免得运营在第 7 行才看到置顶。
+    排序：**命中关键词的那条排最前**（带「命中『词』」标记——运营一眼
+    看到我们的评论显示出来了、显示的是哪条），然后是置顶评论，其余
+    按原序接在后面。置顶在综合排序里通常就在第一位，但接口没有保证，
+    这里显式提前，免得在第 7 行才看到。
     """
     if not snapshot.comments:
         return "（暂无评论）"
 
-    ordered = sorted(snapshot.comments, key=lambda c: not c.is_pinned)
+    hit_comment: Optional[CommentView] = None
+    if hit is not None:
+        hit_comment = next(
+            (c for c in snapshot.comments if c.content == hit.comment), None)
+
+    ordered = sorted(snapshot.comments,
+                     key=lambda c: (c is not hit_comment, not c.is_pinned))
     lines: list[str] = []
     used = 0
     for index, comment in enumerate(ordered[: fmt.max_comments], start=1):
-        line = f"{index}. {comment.one_line(fmt)}"
+        mark = f"命中「{hit.keyword}」" if comment is hit_comment else ""
+        line = f"{index}. {comment.one_line(fmt, extra_mark=mark)}"
         if used + len(line) + 1 > fmt.total_chars:
             lines.append(f"…（还有 {len(ordered) - index + 1} 条未显示）")
             break
@@ -225,9 +225,9 @@ def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[See
 class Pin(Enum):
     """置顶判定结果。
 
-    帖子是我们自己发的，置顶评论必然是我方置顶的——所以不需要拿关键词
-    去核对置顶内容，只需要回答「置顶还在不在」。置顶的具体内容由
-    「置顶评论」列原样展示。
+    帖子是我们自己发的，置顶评论必然是我方置顶的——所以不需要核对
+    置顶内容，只需要回答「置顶还在不在」，落成「置顶状态」单选列。
+    置顶那条的内容在「评论区快照」里照常能看到（置顶排前）。
     """
 
     UNSUPPORTED = "unsupported"   # 抖音：接口没有 is_pinned，判不了
@@ -241,24 +241,39 @@ def decide_pin(snapshot: Snapshot) -> Pin:
     return Pin.PINNED if snapshot.pinned is not None else Pin.NONE_PINNED
 
 
-def comment_status_values(verdict: "Verdict", settings: Settings) -> Optional[set[str]]:
-    """算出「评论状态」这一列里机器该写的值——由关键词命中结果驱动。
+def comment_status_value(verdict: "Verdict", settings: Settings) -> Optional[str]:
+    """「评论状态」单选列该写的值——由关键词命中结果驱动，直接覆盖。
 
     命中 = 我们的种子评论显示出来了 → 显示评论；
-    配了关键词但一条没中 → 没有显示（「待评论」也会被这个结论替掉——
-    待评论本质上就是还没显示）。
+    配了关键词但一条没中 → 没有显示（「待评论」等旧值一并被覆盖——
+    单选只显示当前状态）。
 
-    返回 None 表示**这一轮不该碰这一列**，和「写一个空集合」完全不是一回事：
-    空集合会把上一轮的结论摘掉，None 是原样保留。没填关键词的行、
-    以及本轮没取到评论页内容的行都返回 None。
-
-    和置顶无关：置顶内容由「置顶评论」列单独展示。匹配的是第一页评论，
-    两个平台都拿得到，所以抖音行同样能判。
+    返回 None 表示**这一轮不该碰这一列**：没填关键词的行、以及本轮
+    没取到评论页内容的行都保持原样。匹配的是第一页评论，两个平台
+    都拿得到，所以抖音行同样能判。
     """
     if not verdict.seed_checked:
         return None
     cs = settings.comment_status
-    return {cs.displayed} if verdict.seed_hit is not None else {cs.not_displayed}
+    return cs.displayed if verdict.seed_hit is not None else cs.not_displayed
+
+
+def pin_status_value(verdict: "Verdict", current: str, settings: Settings) -> Optional[str]:
+    """「置顶状态」单选列该写的值——直接覆盖。
+
+    有置顶 → 置顶成功；没置顶时看这一列自己的历史：此前是 成功/掉了
+    → 置顶掉了（曾经置顶过这件事不抹掉），否则 → 无置顶。
+
+    返回 None 表示不碰这一列：抖音（接口没有置顶字段，pin_checked
+    恒为 False）和没看到评论页内容的空壳轮都保持原样——拿上游缺数
+    当「掉了」的证据会让运营白跑一趟。
+    """
+    if not verdict.pin_checked:
+        return None
+    ps = settings.pin_status
+    if verdict.pin is Pin.PINNED:
+        return ps.pinned_ok
+    return ps.pinned_lost if ps.ever_pinned(current) else ps.never_pinned
 
 
 @dataclass
@@ -266,9 +281,11 @@ class Verdict:
     tags: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
     pin: Pin = Pin.UNSUPPORTED
+    # 本轮有没有资格对置顶下结论：小红书且看到了评论页才为 True。
+    # False 时「置顶状态」列不碰（抖音判不了；空壳轮不能拿缺数当证据）。
+    pin_checked: bool = False
     # 关键词命中结果：seed_checked=True 且 seed_hit=None = 确认未命中；
-    # seed_checked=False（没填关键词、或本轮没看到评论页）时
-    # 「关键词命中」和「评论状态」两列都不碰。
+    # seed_checked=False（没填关键词、或本轮没看到评论页）时「评论状态」不碰。
     seed_hit: Optional[SeedHit] = None
     seed_checked: bool = False
 
@@ -281,7 +298,7 @@ def decide(
     age_hours: Optional[float],
     seed_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
-    previous_pinned: Optional[str] = None,
+    current_pin_status: str = "",
 ) -> Verdict:
     """算出这一行本次应有的机器标签和置顶判定。
 
@@ -348,17 +365,18 @@ def decide(
 
     # —— 置顶 ——
     verdict.pin = decide_pin(snapshot)
-    # 之前有过置顶、现在没了 —— 自家帖子的置顶掉了，最该被立刻发现。
-    # 「之前有过」看的是上一轮写进「置顶评论」列的内容：非空且不是
-    # 抖音的「不支持」占位，就说明上一轮确实看到过置顶。
-    # 和关键词命中同一道证据门槛：本轮连评论页都没看到（评论和评论数
-    # 都空）就没资格说「掉了」——现有通道上小红书的空壳在上游层就被
-    # 译成 GONE 到不了这里，这道闸防的是上游契约漂移。
+    # 只有小红书且本轮真的看到了评论页（有评论、或至少知道评论数）才有
+    # 资格对置顶下结论——空壳轮拿上游缺数当「掉了」的证据会误报；
+    # 现有通道上小红书的空壳在上游层就被译成 GONE 到不了这里，
+    # 这道闸防的是上游契约漂移。
+    verdict.pin_checked = snapshot.supports_pinned and bool(
+        snapshot.comments or snapshot.comment_count is not None)
+    # 掉落的那一轮在诊断信息里额外报一声——自家帖子的置顶掉了，
+    # 最该被立刻发现；之后每轮的状态由「置顶状态」列自己持续表达。
     if (
-        verdict.pin is Pin.NONE_PINNED
-        and (snapshot.comments or snapshot.comment_count is not None)
-        and previous_pinned
-        and previous_pinned != DOUYIN_PINNED_UNSUPPORTED
+        verdict.pin_checked
+        and verdict.pin is Pin.NONE_PINNED
+        and current_pin_status == settings.pin_status.pinned_ok
     ):
         verdict.notes.append("⚠ 此前已确认有置顶，本轮置顶已不在")
 
@@ -378,21 +396,6 @@ def decide(
         verdict.notes.append("本轮未取到评论页内容，关键词命中与评论状态保持原样")
 
     return verdict
-
-
-def format_seed_match(verdict: Verdict, snapshot: Snapshot) -> Optional[str]:
-    """「关键词命中」列的内容：只标命中的那一条（或明确未命中）。
-
-    None = 这一轮不碰这一列（没填关键词、或没看到评论页）。
-    完整的第一页评论在「评论区快照」里，那一列是看评论区氛围的，
-    这里不重复也不覆盖。
-    """
-    if not verdict.seed_checked:
-        return None
-    if verdict.seed_hit is not None:
-        excerpt = re.sub(r"\s+", " ", verdict.seed_hit.comment or "").strip()[:60]
-        return f"✅ 命中「{verdict.seed_hit.keyword}」：{excerpt}"
-    return f"❌ 未命中（第一页 {len(snapshot.comments)} 条评论）"
 
 
 def gone_verdict(settings: Settings, reason: str = "",

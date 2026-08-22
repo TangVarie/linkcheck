@@ -26,8 +26,8 @@ class TestDoctorSchema(unittest.TestCase):
         for column in (f.platform, f.comment_count, f.previous_comment_count,
                        f.like_count, f.previous_like_count,
                        f.collect_count, f.previous_collect_count,
-                       f.pinned_comment, f.comment_status, f.comment_digest,
-                       f.seed_match, f.traffic_status, f.refresh_status,
+                       f.pinned_status, f.comment_status, f.comment_digest,
+                       f.traffic_status, f.refresh_status,
                        f.failure_reason, f.last_updated, f.alive_confirmed,
                        f.consecutive_failures):
             self.assertIn(column, self.schema, f"doctor 的体检清单漏了要写的列「{column}」")
@@ -42,15 +42,17 @@ class TestDoctorSchema(unittest.TestCase):
         _, _, status_required, _ = self.schema[f.comment_status]
         for value in self.settings.comment_status.machine_written():
             self.assertIn(value, status_required)
-        # 「待评论」机器从不写，不该逼运营去建这个选项
-        self.assertNotIn(self.settings.comment_status.pending, status_required)
+        _, _, pin_required, _ = self.schema[f.pinned_status]
+        for value in self.settings.pin_status.machine_written():
+            self.assertIn(value, pin_required)
 
-    def test_multiselect_columns_must_be_multiselect(self):
-        """两个合并写入的列必须是多选（类型码 4）：建成单选，机器按列表
-        写入会让整批写回失败。"""
+    def test_column_types_match_write_semantics(self):
+        """流量状态按多选列表合并写入（必须类型码 4）；评论状态/置顶状态
+        按单选字符串覆盖写入（必须类型码 3）。类型和写法错配 = 整行写回失败。"""
         f = self.settings.fields
         self.assertEqual(self.schema[f.traffic_status][0], (4,))
-        self.assertEqual(self.schema[f.comment_status][0], (4,))
+        self.assertEqual(self.schema[f.comment_status][0], (3,))
+        self.assertEqual(self.schema[f.pinned_status][0], (3,))
 
 
 class TestOptionsFromMeta(unittest.TestCase):
@@ -93,9 +95,10 @@ class TestSchemaProblems(unittest.TestCase):
     def test_healthy_table_has_no_problems(self):
         self.assertEqual(cli._schema_problems(self.settings, self._healthy_meta()), [])
 
-    def test_single_select_comment_status_is_flagged(self):
+    def test_multiselect_comment_status_is_flagged(self):
+        """评论状态现在是单选覆盖写入：建成多选（旧口径的类型）要被点名。"""
         meta = self._healthy_meta()
-        meta[self.f.comment_status]["type"] = 3
+        meta[self.f.comment_status]["type"] = 4
         problems = cli._schema_problems(self.settings, meta)
         self.assertTrue(any(self.f.comment_status in p and "类型" in p for p in problems))
 
@@ -139,10 +142,10 @@ class TestSchemaProblems(unittest.TestCase):
     def test_missing_required_column_is_called_out_separately(self):
         meta = self._healthy_meta()
         del meta[self.f.link]
-        del meta[self.f.seed_match]
+        del meta[self.f.comment_digest]
         problems = cli._schema_problems(self.settings, meta)
         self.assertTrue(any("必备列" in p and self.f.link in p for p in problems))
-        self.assertTrue(any("自动跳过" in p and self.f.seed_match in p for p in problems))
+        self.assertTrue(any("自动跳过" in p and self.f.comment_digest in p for p in problems))
 
     def test_missing_timestamp_column_is_required(self):
         """「最近检查时间」缺失时 sweep 会失控全表重刷——必须按必备列报，

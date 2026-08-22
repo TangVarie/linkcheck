@@ -19,7 +19,7 @@ class FieldNames:
     默认值按 OKMAN 系列表的实际结构对齐（2026-08 以「OKMAN第一期」为准）：
     巡查三件套（是否巡查/巡查状态/最近检查时间）由本系统接管，
     「实时数据.评论数」是评论数落点。
-    表里还没有的列（评论关键词、关键词命中、上次点赞数等）要先在飞书里建好——
+    表里还没有的列（评论关键词、置顶状态、上次点赞数等）要先在飞书里建好——
     doctor 会列出缺哪些；没建的列会被自动跳过并在日志里提示，不会写坏表。
 
     ⚠️ 「蓝词字段」机器**完全不读不写**：蓝词（评论里变成超链接的词）
@@ -45,12 +45,14 @@ class FieldNames:
     previous_like_count: str = "上次点赞数"
     collect_count: str = "收藏数"
     previous_collect_count: str = "上次收藏数"
-    pinned_comment: str = "置顶评论"          # 实际置顶的那条内容（自家帖子，置顶必为我方）
-    comment_status: str = "评论状态"          # 由关键词命中驱动：命中=显示评论，
-                                              # 未命中=没有显示；没填关键词的行不碰
-    comment_digest: str = "评论区快照"
-    seed_match: str = "关键词命中"            # 命中了哪个词、命中在哪条评论（单独标明，
-                                              # 不覆盖「评论区快照」——快照是看氛围的）
+    pinned_status: str = "置顶状态"           # 单选：置顶成功/置顶掉了/无置顶。
+                                              # 自家帖子置顶必为我方，只记状态不记内容；
+                                              # 抖音接口没有置顶字段，抖音行不写
+    comment_status: str = "评论状态"          # 单选，由关键词命中驱动直接覆盖：
+                                              # 命中=显示评论，未命中=没有显示；
+                                              # 没填关键词的行不碰
+    comment_digest: str = "评论区快照"        # 命中的那条评论排最前并带「命中」标记，
+                                              # 其余按 置顶优先 接在后面
     traffic_status: str = "流量状态"          # 多选，人机共用（无水花等人工值不碰）
     refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
@@ -74,8 +76,7 @@ class FieldNames:
             self.collect_count,           # 搬「上次收藏数」同理
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
-            self.comment_status,          # 合并写回前要先读现值
-            self.pinned_comment,          # 判断置顶是不是刚掉的（和上一轮的置顶内容比）
+            self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
         ]
 
 
@@ -113,33 +114,52 @@ class Tags:
 
 @dataclass
 class CommentStatus:
-    """「评论状态」列的取值：我们的种子评论有没有显示出来。
+    """「评论状态」单选列的取值：我们的种子评论有没有显示出来。
 
-    判定完全由「评论关键词」的命中结果驱动（和置顶无关——置顶内容
-    由「置顶评论」列单独展示）：
+    判定完全由「评论关键词」的命中结果驱动，机器**直接覆盖**当前值
+    （单选只显示当前状态，「待评论」这类人工排期旧值一律被结论覆盖）：
 
         显示评论  —— 任一关键词出现在第一页任一条评论里
         没有显示  —— 配了关键词，但第一页一条都没命中
-        待评论    —— 人工排期用的旧值：机器**从不写**，但拿到结论时会
-                     替掉它——「待评论」本质上也是「还没显示」，有了
-                     自动巡查的结论就不需要人工再标了
 
-    三个值互斥。没填关键词的行机器完全不碰这一列。
+    没填关键词的行、以及本轮没看到评论页内容的行机器完全不碰这一列。
     两个平台都能判——匹配的是第一页评论内容，不依赖置顶字段，
     所以抖音行同样有效。
     """
 
     displayed: str = "显示评论"
     not_displayed: str = "没有显示"
-    pending: str = "待评论"
-
-    def namespace(self) -> list[str]:
-        """机器管辖的值（含只撤不写的「待评论」）。"""
-        return [self.displayed, self.not_displayed, self.pending]
 
     def machine_written(self) -> list[str]:
-        """机器实际会写入的值——doctor 检查选项是否建好用这个清单。"""
+        """机器会写入的值——doctor 检查选项是否建好用这个清单。"""
         return [self.displayed, self.not_displayed]
+
+
+@dataclass
+class PinStatus:
+    """「置顶状态」单选列的取值：我们的置顶评论还在不在。
+
+    自家帖子置顶必为我方，所以只记状态、不记内容，机器直接覆盖：
+
+        置顶成功  —— 本轮第一页有置顶评论
+        置顶掉了  —— 此前置顶成功过（本列历史是 成功/掉了），现在没了
+        无置顶    —— 从来没成功过，现在也没有
+
+    「掉了」和「从来没有」的区分全看这一列自己的历史；掉了之后一直
+    没恢复保持「置顶掉了」，不退回「无置顶」——曾经置顶过这件事不抹掉。
+    只有小红书能判（抖音评论接口没有置顶字段），抖音行完全不碰这一列；
+    本轮没看到评论页内容的空壳轮也不碰、不误报。
+    """
+
+    pinned_ok: str = "置顶成功"
+    pinned_lost: str = "置顶掉了"
+    never_pinned: str = "无置顶"
+
+    def machine_written(self) -> list[str]:
+        return [self.pinned_ok, self.pinned_lost, self.never_pinned]
+
+    def ever_pinned(self, current: str) -> bool:
+        return current in (self.pinned_ok, self.pinned_lost)
 
 
 @dataclass
@@ -283,6 +303,7 @@ class Settings:
     fields: FieldNames = field(default_factory=FieldNames)
     tags: Tags = field(default_factory=Tags)
     comment_status: CommentStatus = field(default_factory=CommentStatus)
+    pin_status: PinStatus = field(default_factory=PinStatus)
     thresholds: Thresholds = field(default_factory=Thresholds)
     digest: DigestFormat = field(default_factory=DigestFormat)
     refresh: RefreshTiers = field(default_factory=RefreshTiers)

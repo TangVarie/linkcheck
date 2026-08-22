@@ -198,10 +198,10 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         self.assertNotIn(f.seed_keywords, table.requested_fields)
         self.assertIn(f.link, table.requested_fields)
 
-    def test_pinned_comment_cell_is_read_as_text(self):
-        """「置顶评论」是掉落告警的对比基线。文本列读回来是富文本分段，
-        必须拼回纯文本——读错形态的话，告警要么永不触发（永远空串）、
-        要么每轮误报（永远真值）。"""
+    def test_pin_status_cell_is_read_as_text(self):
+        """「置顶状态」的现值是「掉了/从来没有」区分的唯一依据。
+        单选列读回来可能是字符串也可能是带 text 的对象，必须拼回纯文本——
+        读错形态的话，掉落判定要么永不触发、要么每轮误报。"""
         from xhsearch import runner
         from xhsearch.config import Settings
 
@@ -213,13 +213,13 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
                 self.requested = list(field_names)
                 return [{"record_id": "rec1", "fields": {
                     f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24,
-                    f.pinned_comment: [{"text": "官号: 戳主页领券", "type": "text"}],
+                    f.pinned_status: "置顶成功",
                 }}]
 
         table = _Table()
         rows = runner.load_rows(table, settings, only_due=False)
-        self.assertEqual(rows[0].pinned_comment, "官号: 戳主页领券")
-        self.assertIn(f.pinned_comment, table.requested)
+        self.assertEqual(rows[0].pin_status, "置顶成功")
+        self.assertIn(f.pinned_status, table.requested)
 
     def test_queue_mode_without_queued_column_does_nothing(self):
         """「排队刷新」列没建时 queue 模式必须空转——退化成无过滤全表刷新

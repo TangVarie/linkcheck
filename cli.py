@@ -148,11 +148,11 @@ def _expected_schema(settings: Settings) -> list[tuple]:
         (f.previous_like_count, (2,), "数字", None, None),
         (f.collect_count, (2,), "数字", None, None),
         (f.previous_collect_count, (2,), "数字", None, None),
-        (f.pinned_comment, (1,), "文本", None, None),
-        (f.comment_status, (4,), "多选", settings.comment_status.machine_written(),
-         "机器按多选合并写入——建成单选会让写回整批失败"),
+        (f.pinned_status, (3,), "单选", settings.pin_status.machine_written(),
+         "机器直接覆盖写入当前状态；抖音行不写这一列"),
+        (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
+         "机器直接覆盖写入当前状态（待评论等旧值会被覆盖）"),
         (f.comment_digest, (1,), "文本", None, None),
-        (f.seed_match, (1,), "文本", None, None),
         (f.traffic_status, (4,), "多选", settings.tags.namespace(),
          "机器按多选合并写入——建成单选会让写回整批失败"),
         (f.refresh_status, (3, 1), "单选或文本", statuses, None),
@@ -180,10 +180,11 @@ def _schema_problems(settings: Settings, meta: dict) -> list[str]:
     problems: list[str] = []
     missing_required: list[str] = []
     missing_optional: list[str] = []
-    # 这两列走 merge(known_options=...)：缺选项会被安全跳过。
-    # 其余带选项要求的列（平台/巡查状态）是直写字符串，没有写侧过滤，
-    # 缺选项的后果是写回可能失败——两种情况的文案必须如实区分。
-    filtered_columns = {f.traffic_status, f.comment_status}
+    # 这几列的写入有选项守卫（流量状态走 merge 过滤，评论状态/置顶状态
+    # 写前核对选项清单）：缺选项会被安全跳过。其余带选项要求的列
+    # （平台/巡查状态）是直写字符串，没有写侧守卫，缺选项的后果是
+    # 写回可能失败——两种情况的文案必须如实区分。
+    filtered_columns = {f.traffic_status, f.comment_status, f.pinned_status}
     for name, allowed, type_label, required_options, note in _expected_schema(settings):
         info = meta.get(name)
         if info is None:
@@ -391,6 +392,7 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
         now=now,
         known_options=_options_from_meta(fields_meta, settings.fields.traffic_status),
         comment_status_options=_options_from_meta(fields_meta, settings.fields.comment_status),
+        pin_status_options=_options_from_meta(fields_meta, settings.fields.pinned_status),
         forced=(record_ids is not None),
         progress=print,
     )

@@ -386,6 +386,7 @@ def refresh(
     now: Optional[datetime] = None,
     known_options: Optional[list[str]] = None,
     comment_status_options: Optional[list[str]] = None,
+    pin_status_options: Optional[list[str]] = None,
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
@@ -459,30 +460,28 @@ def refresh(
             if merged.changed:
                 fields[f.traffic_status] = merged.final
 
-        # 「评论状态」由关键词命中结果驱动（命中=显示评论，未命中=没有显示），
-        # 走和流量状态一模一样的合并算法：机器管三个值（含替掉「待评论」），
-        # 这一列里若有别的人工值原样保留。
+        # 「评论状态」「置顶状态」都是单选列，机器直接覆盖当前值——
+        # 单选只显示当前状态（「待评论」这类人工排期旧值一并被结论覆盖）。
+        # None = 这一轮判不了（没填关键词/抖音/空壳轮），保持原样。
+        # 选项还没建就跳过并提示，别让一个缺选项拖垮整行写回。
         if touch_tags:
-            wanted = analyze.comment_status_values(verdict, settings)
-            # None 表示这一轮判不了（没填关键词、或没看到评论页）——原样保留，
-            # 而不是写个空集合把上一轮的结论摘掉。
-            if wanted is not None:
-                merged_status = tags.merge(
-                    row.comment_status,
-                    wanted,
-                    settings.comment_status.namespace(),
-                    known_options=comment_status_options,
-                    # 显示评论/没有显示/待评论 三值互斥
-                    exclusive=(settings.comment_status.namespace(),),
-                )
-                if merged_status.changed:
-                    fields[f.comment_status] = merged_status.final
-                if merged_status.dropped_unknown:
+            for column, value, options in (
+                (f.comment_status,
+                 analyze.comment_status_value(verdict, settings),
+                 comment_status_options),
+                (f.pinned_status,
+                 analyze.pin_status_value(verdict, row.pin_status, settings),
+                 pin_status_options),
+            ):
+                if value is None:
+                    continue
+                if options is not None and value not in options:
                     fields[f.failure_reason] = (
                         fields[f.failure_reason]
-                        + f"；这些值在「{f.comment_status}」里还没建选项，已跳过："
-                        + "、".join(merged_status.dropped_unknown)
+                        + f"；「{column}」里还没建选项「{value}」，已跳过"
                     )[:500]
+                    continue
+                fields[column] = value
 
         if row.parsed.platform:
             fields[f.platform] = "小红书" if row.parsed.platform == "xhs" else "抖音"
@@ -503,15 +502,12 @@ def refresh(
                 if row.previous_collect_count is not None:
                     fields[f.previous_collect_count] = row.previous_collect_count
                 fields[f.collect_count] = snapshot.collect_count
-            # 置顶评论和快照只在看到了评论页（有评论、或至少知道评论数）时
-            # 更新：空壳轮写空串/「暂无评论」会把上一轮的真实内容抹掉——
-            # 「置顶评论」还是掉落告警的对比基线，清掉它等于把真掉落变漏报。
+            # 快照只在看到了评论页（有评论、或至少知道评论数）时更新：
+            # 空壳轮写「暂无评论」会把上一轮的真实快照抹掉。
+            # 命中关键词的那条评论排最前并带「命中」标记。
             if snapshot.comments or snapshot.comment_count is not None:
-                fields[f.pinned_comment] = analyze.format_pinned(snapshot)
-                fields[f.comment_digest] = analyze.format_digest(snapshot, settings.digest)
-            seed_match = analyze.format_seed_match(verdict, snapshot)
-            if seed_match is not None:
-                fields[f.seed_match] = seed_match
+                fields[f.comment_digest] = analyze.format_digest(
+                    snapshot, settings.digest, hit=verdict.seed_hit)
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
                        credits, cost_yuan)
@@ -601,7 +597,7 @@ def refresh(
             age_hours=row.age_hours(now),
             seed_keywords=row.seed_keywords,                  # 评论关键词组，任一命中即算命中
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
-            previous_pinned=row.pinned_comment,               # 判断置顶是不是刚掉的
+            current_pin_status=row.pin_status,                # 区分「掉了」和「从来没有」
         )
         if error is not None:
             verdict.notes.append(f"（detail 未取到：{error.operator_text()[:120]}）")
@@ -745,8 +741,7 @@ def load_rows(
             previous_collect_count=feishu.read_int(cells.get(f.collect_count)),
             last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
             consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
-            comment_status=feishu.read_multi_select(cells.get(f.comment_status)),
-            pinned_comment=feishu.read_text(cells.get(f.pinned_comment)),
+            pin_status=feishu.read_text(cells.get(f.pinned_status)),
             queued=feishu.read_bool(cells.get(f.queued)),
         )
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。

@@ -88,7 +88,11 @@ def probe(name: str, key: str, link: str, settings: Settings) -> bool:
     print(f"  点赞/收藏  {snapshot.like_count} / {snapshot.collect_count}")
     print(f"  上游审核标记 {snapshot.censored}"
           "（None = 这家不提供；只写进诊断信息，不参与打标签）")
-    print(f"  置顶评论   {analyze.format_pinned(snapshot) or '（无）'}")
+    if snapshot.supports_pinned:
+        pinned = snapshot.pinned
+        print(f"  置顶评论   {pinned.content if pinned else '（无）'}")
+    else:
+        print("  置顶评论   —（抖音接口没有置顶字段，「置顶状态」列不写）")
     print("  评论区快照：")
     for line in analyze.format_digest(snapshot, settings.digest).splitlines():
         print(f"    {line}")
