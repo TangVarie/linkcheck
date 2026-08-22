@@ -144,6 +144,14 @@ class TestSchemaProblems(unittest.TestCase):
         self.assertTrue(any("必备列" in p and self.f.link in p for p in problems))
         self.assertTrue(any("自动跳过" in p and self.f.seed_match in p for p in problems))
 
+    def test_missing_timestamp_column_is_required(self):
+        """「最近检查时间」缺失时 sweep 会失控全表重刷——必须按必备列报，
+        不能混进「会被自动跳过」的机器列清单里轻描淡写。"""
+        meta = self._healthy_meta()
+        del meta[self.f.last_updated]
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertTrue(any("必备列" in p and self.f.last_updated in p for p in problems))
+
 
 if __name__ == "__main__":
     unittest.main()

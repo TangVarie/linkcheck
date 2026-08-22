@@ -708,6 +708,12 @@ def load_rows(
         # 全表刷新——那会花掉一整轮 sweep 的钱。
         return []
 
+    if known_fields is not None and only_due and f.last_updated not in known_fields:
+        # 「最近检查时间」列还没建：分层刷新没有依据，每一行都会被判成
+        # 「该刷了」，一轮 sweep 就是全表重刷；写回侧又会把时间戳挡掉
+        # （列不存在），下一轮照样全刷——烧钱死循环。拒跑，调用方提示建列。
+        return []
+
     filter_spec: Optional[dict[str, Any]] = None
     if only_record_ids is None:
         conditions = [{"field_name": f.monitoring, "operator": "is", "value": ["true"]}]

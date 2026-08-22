@@ -187,8 +187,9 @@ def _schema_problems(settings: Settings, meta: dict) -> list[str]:
     for name, allowed, type_label, required_options, note in _expected_schema(settings):
         info = meta.get(name)
         if info is None:
-            # 没有链接和巡查开关，机器连一行都读不出来——单独点名。
-            (missing_required if name in (f.link, f.monitoring)
+            # 缺链接/巡查开关机器一行都读不出来；缺最近检查时间分层刷新
+            # 失去依据，每轮 sweep 都会全表重刷烧钱——这三列单独点名。
+            (missing_required if name in (f.link, f.monitoring, f.last_updated)
              else missing_optional).append(name)
             continue
         if info["type"] not in allowed:
@@ -225,8 +226,10 @@ def _schema_problems(settings: Settings, meta: dict) -> list[str]:
                     )
     if missing_required:
         problems.append(
-            f"表里缺必备列：{'、'.join(missing_required)}——没有它们机器一行都处理不了。"
-            "列名要和 config.py 逐字一致（含空格和标点）。"
+            f"表里缺必备列：{'、'.join(missing_required)}——"
+            f"缺「{f.link}」「{f.monitoring}」机器一行都读不出来；"
+            f"缺「{f.last_updated}」分层刷新失去依据，每轮 sweep 都会全表重刷烧钱"
+            "（sweep 会拒跑）。列名要和 config.py 逐字一致（含空格和标点）。"
         )
     if missing_optional:
         problems.append(
@@ -347,6 +350,11 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     if mode == "queue" and not row_list and known_fields is not None \
             and settings.fields.queued not in known_fields:
         print(f"⚠ 表里还没建「{settings.fields.queued}」列，queue 模式无法工作，先去建列")
+        return 1
+    if mode in ("sweep", "estimate") and not row_list and known_fields is not None \
+            and settings.fields.last_updated not in known_fields:
+        print(f"⚠ 表里还没建「{settings.fields.last_updated}」列：分层刷新没有依据，"
+              "每一轮 sweep 都会全表重刷烧钱，先去建列")
         return 1
     if record_ids:
         found = {r.record_id for r in row_list}

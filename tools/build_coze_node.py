@@ -148,7 +148,7 @@ async def feishu_search(token, app_token, table_id, field_names, filter_spec,
             return items, True
 
 
-async def feishu_fields(token, app_token, table_id):
+async def feishu_fields(token, app_token, table_id, deadline=None):
     """一次取回表的全部字段元数据：({列名集合}, {列名: 选项列表})。
     读不到返回 (None, {})——None = 不过滤，宁可试着写。
 
@@ -157,17 +157,23 @@ async def feishu_fields(token, app_token, table_id):
       还没建的机器列要在写回前挡下来（挡下的列在结果消息里提示）；
     * 选项列表：写一个没建过的多选选项（1254291）同样整批回滚。
     服务端跑得了 doctor 能提前发现这两类问题，扣子跑不了，只能在这里挡。
+
+    deadline：到点按「读不到」返回。元数据现在是读表前的串行步骤，
+    超过 100 列的表翻页慢时不能让它吃光读表和写回的预算。
     """
     page_token = ""
     names, options_map = set(), {}
     try:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None, {}
             url = (f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}"
                    f"/fields?page_size=100")
             if page_token:
                 url += "&page_token=" + _quote(page_token)
+            wait = 15.0 if deadline is None else max(1.0, min(15.0, deadline - time.monotonic()))
             response = await requests.get(
-                url, headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+                url, headers={"Authorization": f"Bearer {token}"}, timeout=wait)
             data = json.loads(response.text)
             if data.get("code") not in (0, None):
                 return None, {}
@@ -328,12 +334,21 @@ async def main(args: Any) -> dict:
 
     # 字段元数据必须先取：search 按名字请求列，请求一个还没建的列
     # （比如「点赞数」）会让整个 search 报 1254045、一行都读不到。
-    # 元数据失败 = 不过滤（宁可试着写），与服务端语义一致。
+    # 只给软截止的 1/6 当预算——它是读表前的串行步骤，不能饿死后面的
+    # 扫描和写回。超时/失败 = 不过滤（宁可试着写），与服务端语义一致。
     try:
         table_fields, options_map = await feishu_fields(
-            token, p["app_token"], p["table_id"])
+            token, p["app_token"], p["table_id"],
+            deadline=time.monotonic() + SOFT_DEADLINE / 6)
     except Exception:                                  # noqa: BLE001
         table_fields, options_map = None, {}
+    if mode != "row" and table_fields is not None and f.last_updated not in table_fields:
+        # 「最近检查时间」列还没建：分层刷新没有依据，每一行都会被判成
+        # 「该刷了」，一轮 sweep 就是全表重刷；写回侧又会把时间戳挡掉
+        # （列不存在），下一轮照样全刷——烧钱死循环，拒跑。
+        return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
+                "message": f"表里还没建「{f.last_updated}」列：分层刷新没有依据，"
+                           "每一轮都会全表重刷烧钱，先建好这一列再跑"}
     traffic_options = options_map.get(f.traffic_status)
     status_options = options_map.get(f.comment_status)
     wanted_fields = f.must_read()
@@ -446,12 +461,17 @@ async def main(args: Any) -> dict:
         for update, status in entries:
             update["fields"].pop(f.traffic_status, None)
             if status in ("已失效", "疑似受限"):
-                update["fields"][f.refresh_status] = "刷新失败"
                 update["fields"].pop(f.consecutive_failures, None)
                 update["fields"].pop(f.alive_confirmed, None)
-                original = str(update["fields"].get(f.failure_reason) or "")
-                update["fields"][f.failure_reason] = \\
-                    (f"{original}；{note}" if original else note)[:500]
+                # 只往表里真实存在的列写：entries 里的 fields 已按 table_fields
+                # 过滤过，熔断改写不能把被挡掉的列再塞回去——那会恰好在
+                # 上游故障（熔断要兜的时刻）让整批写回失败。
+                if table_fields is None or f.refresh_status in table_fields:
+                    update["fields"][f.refresh_status] = "刷新失败"
+                if table_fields is None or f.failure_reason in table_fields:
+                    original = str(update["fields"].get(f.failure_reason) or "")
+                    merged_note = f"{original}；{note}" if original else note
+                    update["fields"][f.failure_reason] = merged_note[:500]
 
     cents = round(fen)
     try:

@@ -234,6 +234,21 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIsNone(table.requested_fields)   # 连 search 都没发
 
+    def test_sweep_without_timestamp_column_does_nothing(self):
+        """「最近检查时间」列没建时 sweep 必须空转：分层刷新失去依据，
+        每一行都会被判成该刷，一轮就是全表重刷；写回侧又写不进时间戳，
+        下一轮照样全刷——烧钱死循环。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+        table = self._StubTable()
+        rows = runner.load_rows(table, settings, only_due=True,
+                                known_fields={f.link, f.monitoring, f.queued})
+        self.assertEqual(rows, [])
+        self.assertIsNone(table.requested_fields)   # 连 search 都没发
+
 
 class TestFieldsMeta(unittest.TestCase):
     """fields_meta 是 doctor 全量体检的地基：类型、选项都得原样带回来。"""
