@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from xhsearch import feishu, providers, rows as rows_mod, runner
 from xhsearch.config import Channels, Settings
+from xhsearch.envfile import load_dotenv
 
 
 def _env(name: str, *, required: bool = True, default: str = "") -> str:
@@ -426,6 +427,9 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # 本地跑时把仓库根的 .env 补进环境变量（已存在的环境变量优先）。
+    # Railway / Actions 由平台注入，这一步是空操作。
+    load_dotenv()
     if len(argv) < 2:
         print(__doc__)
         return 2

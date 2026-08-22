@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """拿一条真实的笔记/视频，把某条数据通道从头到尾走一遍。
 
-    # 两条通道都验（各花一次调用）
-    export TIKHUB_API_KEY=... SOCIALDATAX_API_KEY=...
+    # 两条通道都验（各花一次调用）。Key 从环境变量或仓库根的 .env 读
+    #（照 .env.example 填好即可，脚本会自动加载）：
     python3 tools/probe_channel.py https://www.xiaohongshu.com/explore/xxxxxxxx
 
     # 只验一条
@@ -23,6 +23,10 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from xhsearch.envfile import load_dotenv  # noqa: E402
+
+load_dotenv()   # 本地跑时补上 .env 里的 Key；已存在的环境变量优先
 
 from xhsearch import analyze, providers, transport  # noqa: E402
 from xhsearch.config import Settings  # noqa: E402
