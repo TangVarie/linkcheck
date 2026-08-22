@@ -53,5 +53,97 @@ class TestDoctorSchema(unittest.TestCase):
         self.assertEqual(self.schema[f.comment_status][0], (4,))
 
 
+class TestOptionsFromMeta(unittest.TestCase):
+    """None = 查不到别过滤；[] = 不是选择列全拦。写反任何一个分支，
+    要么未建选项写进表（整批回滚），要么机器值全部静默丢失。"""
+
+    def test_unreadable_meta_means_no_filter(self):
+        self.assertIsNone(cli._options_from_meta(None, "流量状态"))
+
+    def test_missing_column_means_no_filter(self):
+        self.assertIsNone(cli._options_from_meta({}, "流量状态"))
+
+    def test_non_select_column_blocks_everything(self):
+        meta = {"流量状态": {"type": 1, "ui_type": "Text", "options": None}}
+        self.assertEqual(cli._options_from_meta(meta, "流量状态"), [])
+
+    def test_select_column_returns_its_options(self):
+        meta = {"流量状态": {"type": 4, "ui_type": "MultiSelect", "options": ["爆贴"]}}
+        self.assertEqual(cli._options_from_meta(meta, "流量状态"), ["爆贴"])
+
+
+class TestSchemaProblems(unittest.TestCase):
+    """doctor 的判定逻辑本体：喂典型翻车样本，核对报没报、报得对不对。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        self.f = self.settings.fields
+
+    def _healthy_meta(self) -> dict:
+        meta = {}
+        for name, allowed, _label, options, _note in cli._expected_schema(self.settings):
+            field_type = allowed[0]
+            meta[name] = {
+                "type": field_type,
+                "ui_type": "",
+                "options": list(options or []) if field_type in (3, 4) else None,
+            }
+        return meta
+
+    def test_healthy_table_has_no_problems(self):
+        self.assertEqual(cli._schema_problems(self.settings, self._healthy_meta()), [])
+
+    def test_single_select_comment_status_is_flagged(self):
+        meta = self._healthy_meta()
+        meta[self.f.comment_status]["type"] = 3
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertTrue(any(self.f.comment_status in p and "类型" in p for p in problems))
+
+    def test_system_modified_time_is_flagged(self):
+        """「最近检查时间」建成系统的「最后更新时间」类型：机器写不进去，
+        且任何编辑都会刷新它——doctor 必须点名。"""
+        meta = self._healthy_meta()
+        meta[self.f.last_updated] = {"type": 1002, "ui_type": "ModifiedTime",
+                                     "options": None}
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertTrue(any(self.f.last_updated in p for p in problems))
+
+    def test_missing_machine_option_wording_depends_on_filtering(self):
+        """流量状态走 merge 过滤，缺选项=安全跳过；巡查状态是直写，
+        缺选项=可能整行写回失败。两种后果的文案必须如实区分。"""
+        meta = self._healthy_meta()
+        meta[self.f.traffic_status]["options"].remove("大爆")
+        meta[self.f.refresh_status]["options"].remove("跳过")
+        problems = cli._schema_problems(self.settings, meta)
+        traffic = next(p for p in problems if self.f.traffic_status in p)
+        status = next(p for p in problems if self.f.refresh_status in p)
+        self.assertIn("跳过（不会误写", traffic)
+        self.assertIn("写回失败", status)
+
+    def test_select_without_options_key_still_reports_missing(self):
+        """类型已确认是多选、但 API 没带 options 键（零选项的另一种形态）：
+        必须按空清单报缺选项，不能当成非选择列放行——运行时会全拦。"""
+        meta = self._healthy_meta()
+        meta[self.f.comment_status]["options"] = None
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertTrue(any(self.f.comment_status in p and "缺这些选项" in p
+                            for p in problems))
+
+    def test_exotic_number_subtype_is_flagged(self):
+        """评分字段和普通数字共用类型码 2，但封顶 5 星——光看类型码抓不到。"""
+        meta = self._healthy_meta()
+        meta[self.f.like_count]["ui_type"] = "Rating"
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertTrue(any(self.f.like_count in p and "评分" in p for p in problems))
+
+    def test_missing_required_column_is_called_out_separately(self):
+        meta = self._healthy_meta()
+        del meta[self.f.link]
+        del meta[self.f.seed_match]
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertTrue(any("必备列" in p and self.f.link in p for p in problems))
+        self.assertTrue(any("自动跳过" in p and self.f.seed_match in p for p in problems))
+
+
 if __name__ == "__main__":
     unittest.main()

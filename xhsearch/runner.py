@@ -472,7 +472,7 @@ def refresh(
                     wanted,
                     settings.comment_status.namespace(),
                     known_options=comment_status_options,
-                    # 置顶三值本身就是互斥组
+                    # 显示评论/没有显示/待评论 三值互斥
                     exclusive=(settings.comment_status.namespace(),),
                 )
                 if merged_status.changed:
@@ -503,8 +503,12 @@ def refresh(
                 if row.previous_collect_count is not None:
                     fields[f.previous_collect_count] = row.previous_collect_count
                 fields[f.collect_count] = snapshot.collect_count
-            fields[f.pinned_comment] = analyze.format_pinned(snapshot)
-            fields[f.comment_digest] = analyze.format_digest(snapshot, settings.digest)
+            # 置顶评论和快照只在看到了评论页（有评论、或至少知道评论数）时
+            # 更新：空壳轮写空串/「暂无评论」会把上一轮的真实内容抹掉——
+            # 「置顶评论」还是掉落告警的对比基线，清掉它等于把真掉落变漏报。
+            if snapshot.comments or snapshot.comment_count is not None:
+                fields[f.pinned_comment] = analyze.format_pinned(snapshot)
+                fields[f.comment_digest] = analyze.format_digest(snapshot, settings.digest)
             seed_match = analyze.format_seed_match(verdict, snapshot)
             if seed_match is not None:
                 fields[f.seed_match] = seed_match

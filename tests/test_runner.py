@@ -428,6 +428,42 @@ class TestPinnedTracking(RunnerTest):
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
 
+class TestFailurePathsLeaveKeywordColumnsAlone(RunnerTest):
+    """失败/存疑路径对「评论状态」「关键词命中」零发言权。
+
+    这条不变量此前只靠 seed_checked 的默认值隐式成立：一旦有人让失败路径
+    也下「没有显示」的结论，一次上游故障就会给全表配了关键词的行批量摘掉
+    「显示评论」，诱导运营无谓补评论——恰是新口径三令五申要防的。
+    """
+
+    def _row(self, *, strikes=0):
+        row = xhs_row(keywords=["艾时达口溶膜"])
+        row.comment_status = ["显示评论"]
+        row.consecutive_failures = strikes
+        return row
+
+    def assert_untouched(self, outcome):
+        self.assertNotIn(self.settings.fields.comment_status, outcome.fields)
+        self.assertNotIn(self.settings.fields.seed_match, outcome.fields)
+
+    def test_first_strike_suspect(self):
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [self._row()])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_SUSPECT)
+        self.assert_untouched(report.outcomes[0])
+
+    def test_convicted_gone(self):
+        report = self.run_with([err(200, 1008, "当前作品已删除。")],
+                               [self._row(strikes=1)])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_GONE)
+        self.assert_untouched(report.outcomes[0])
+
+    def test_network_failure(self):
+        blip = transport.Response(0, "", "网络错误：timed out")
+        report = self.run_with([blip] * 3, [self._row()])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
+        self.assert_untouched(report.outcomes[0])
+
+
 class TestSeedKeywordColumn(RunnerTest):
     """「关键词命中」列：表里填了评论关键词才写；任一词命中任一条评论即算命中。"""
 
@@ -460,6 +496,20 @@ class TestSeedKeywordColumn(RunnerTest):
             [xhs_row()],
         )
         self.assertNotIn(self.settings.fields.seed_match, report.outcomes[0].fields)
+
+    def test_zero_comment_page_is_a_real_miss(self):
+        """评论数确认为 0 的空页不是空壳：第一页真的什么都没有，
+        「没有显示」和「未命中」都是可靠结论，端到端也要落列。"""
+        page = {"items": [], "comment_count": 0, "top_level_comment_count": 0,
+                "next_page_token": "", "points": {"cost": 10, "balance": 1}}
+        report = self.run_with(
+            [sse(page), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(keywords=["艾时达口溶膜"])],
+        )
+        fields = report.outcomes[0].fields
+        self.assertEqual(fields[self.settings.fields.comment_status],
+                         [self.settings.comment_status.not_displayed])
+        self.assertIn("未命中", fields[self.settings.fields.seed_match])
 
 
 class TestPreviousMetricsShift(RunnerTest):
@@ -654,6 +704,9 @@ class TestUnknownCommentCount(RunnerTest):
         # 标签无变化 → 字段根本不进 payload（保持原样的最强形式）
         self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
         self.assertIn("保持原样", outcome.fields[self.settings.fields.failure_reason])
+        # 空壳轮也不该拿「暂无评论」/占位去覆盖上一轮的真实快照和置顶内容
+        self.assertNotIn(self.settings.fields.comment_digest, outcome.fields)
+        self.assertNotIn(self.settings.fields.pinned_comment, outcome.fields)
 
 
 class TestBreakerAccounting(RunnerTest):

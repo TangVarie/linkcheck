@@ -186,6 +186,11 @@ async def feishu_fields(token, app_token, table_id):
                     options_map[str(name)] = [
                         o["name"] for o in (prop.get("options") or [])
                         if isinstance(o, dict) and o.get("name")]
+                else:
+                    # 列存在但不是选择类字段（比如被误建成文本列）：记空表全拦。
+                    # 往文本列写多选列表本来就写不进去，拦下比整批回滚强——
+                    # 与服务端 cli 的口径一致。.get 返回 None 只留给「列不存在」。
+                    options_map[str(name)] = []
             if not payload.get("has_more"):
                 return names, options_map
             page_token = payload.get("page_token") or ""
@@ -634,8 +639,11 @@ def _render(row, verdict, snapshot, settings, now, status,
             if row.previous_collect_count is not None:
                 fields[f.previous_collect_count] = row.previous_collect_count
             fields[f.collect_count] = snapshot.collect_count
-        fields[f.pinned_comment] = format_pinned(snapshot)
-        fields[f.comment_digest] = format_digest(snapshot, settings.digest)
+        # 置顶评论和快照只在看到了评论页时更新：空壳轮写空串/「暂无评论」
+        # 会抹掉上一轮的真实内容，「置顶评论」还是掉落告警的对比基线。
+        if snapshot.comments or snapshot.comment_count is not None:
+            fields[f.pinned_comment] = format_pinned(snapshot)
+            fields[f.comment_digest] = format_digest(snapshot, settings.digest)
         seed_text = format_seed_match(verdict, snapshot)
         if seed_text is not None:
             fields[f.seed_match] = seed_text

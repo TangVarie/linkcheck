@@ -196,7 +196,7 @@ class TestPinnedState(unittest.TestCase):
 
 
 class TestSeedKeywordMatch(unittest.TestCase):
-    """蓝词组 × 第一页评论：任一词出现在任一条评论里即算命中，
+    """评论关键词组 × 第一页评论：任一词出现在任一条评论里即算命中，
     返回命中的词和那条评论。规则刻意简单，没有长度门槛。"""
 
     def _snap(self, texts):
@@ -428,6 +428,15 @@ class TestCommentStatusColumn(unittest.TestCase):
         v = analyze.decide(self._snap(), self.settings, previous_comment_count=None,
                            age_hours=10, previous_pinned="戳主页领券")
         self.assertTrue(any("置顶已不在" in n for n in v.notes))
+
+    def test_empty_shell_round_does_not_report_pin_loss(self):
+        """空壳轮（评论和评论数都没拿到）没资格说「置顶掉了」——
+        拿上游缺数当证据的假告警会让运营白跑一趟手机端核对。
+        与关键词命中同一道证据门槛。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, previous_pinned="戳主页领券")
+        self.assertFalse(any("置顶已不在" in n for n in v.notes))
 
     def test_douyin_placeholder_is_not_pin_history(self):
         """「—（抖音不支持置顶监控）」是占位不是置顶记录：链接被换过平台的行

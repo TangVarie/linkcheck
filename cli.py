@@ -165,6 +165,88 @@ def _expected_schema(settings: Settings) -> list[tuple]:
     ]
 
 
+# 这些 ui_type 和普通数字/文本共用类型码（2/1），但写入行为完全不同：
+# 评分字段封顶 5 星，写 like_count=3000 会失败或被截断。光看类型码抓不到。
+_EXOTIC_UI_TYPES = {"Progress": "进度", "Currency": "货币",
+                    "Rating": "评分", "Barcode": "条码"}
+
+
+def _schema_problems(settings: Settings, meta: dict) -> list[str]:
+    """按期望 schema 逐列核对 fields_meta 的结果，返回人话问题清单。
+
+    独立成纯函数：doctor 调用它，测试也能直接喂假 meta 驱动。
+    """
+    f = settings.fields
+    problems: list[str] = []
+    missing_required: list[str] = []
+    missing_optional: list[str] = []
+    # 这两列走 merge(known_options=...)：缺选项会被安全跳过。
+    # 其余带选项要求的列（平台/巡查状态）是直写字符串，没有写侧过滤，
+    # 缺选项的后果是写回可能失败——两种情况的文案必须如实区分。
+    filtered_columns = {f.traffic_status, f.comment_status}
+    for name, allowed, type_label, required_options, note in _expected_schema(settings):
+        info = meta.get(name)
+        if info is None:
+            # 没有链接和巡查开关，机器连一行都读不出来——单独点名。
+            (missing_required if name in (f.link, f.monitoring)
+             else missing_optional).append(name)
+            continue
+        if info["type"] not in allowed:
+            hint = f"。{note}" if note else ""
+            problems.append(
+                f"「{name}」的字段类型是「{_type_name(info['type'])}」，"
+                f"需要「{type_label}」——列名对了但类型不对，"
+                f"机器会读不到或写不进这一列{hint}"
+            )
+            continue
+        ui = info.get("ui_type") or ""
+        if ui in _EXOTIC_UI_TYPES:
+            problems.append(
+                f"「{name}」是「{_EXOTIC_UI_TYPES[ui]}」字段——它和普通"
+                f"「{type_label}」共用类型码，但写入行为不同（评分封顶 5 星、"
+                f"进度按百分比），请换成普通「{type_label}」"
+            )
+            continue
+        # 类型对了再看选项。零选项的选择列 options 可能是 [] 也可能整个
+        # 缺 options 键（API 行为未验证）——既然类型已确认是单选/多选，
+        # 一律按「已建选项清单」对待，缺键当成空清单，别放行。
+        if required_options and info["type"] in (3, 4):
+            missing = [v for v in required_options if v not in (info["options"] or [])]
+            if missing:
+                if name in filtered_columns:
+                    problems.append(
+                        f"「{name}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
+                        f"机器要写它们，没建就会被跳过（不会误写，但对应判定等于没生效）。"
+                    )
+                else:
+                    problems.append(
+                        f"「{name}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
+                        f"机器写这一列时**不做选项过滤**，缺选项可能让该行整行写回失败。"
+                    )
+    if missing_required:
+        problems.append(
+            f"表里缺必备列：{'、'.join(missing_required)}——没有它们机器一行都处理不了。"
+            "列名要和 config.py 逐字一致（含空格和标点）。"
+        )
+    if missing_optional:
+        problems.append(
+            f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_optional)}。"
+            "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
+        )
+    return problems
+
+
+def _options_from_meta(meta, column: str):
+    """从 fields_meta 的结果里取某列的选项清单，语义与旧 list_field_options 一致：
+    None = 查不到别过滤（元数据整体读不到、或列不存在）；
+    []   = 列存在但不是选择类字段，机器值全拦（写文本列本来就写不进多选列表）。
+    """
+    if meta is None or column not in meta:
+        return None
+    options = meta[column]["options"]
+    return options if options is not None else []
+
+
 def cmd_doctor() -> int:
     """上线前体检。不花一分钱，但能挡掉九成的「配好了跑不通」。"""
     settings = _settings()
@@ -183,8 +265,10 @@ def cmd_doctor() -> int:
 
     print("② 全量字段体检（列名、类型、选项）…", end=" ", flush=True)
     meta = table.fields_meta()
-    if meta is None:
-        print("读不到字段列表")
+    if not meta:
+        # None（读失败）和空 dict（0 列）同罪：多维表格的主字段不可删，
+        # 健康的表不可能一列都没有——空结果正是权限没配全的典型症状。
+        print("读不到字段列表" if meta is None else "字段列表为空")
         problems.append(
             f"读不到字段列表。多半是应用没被加进这张多维表格："
             f"表格右上角「…」→「添加文档应用」把应用加成协作者。"
@@ -193,41 +277,7 @@ def cmd_doctor() -> int:
         )
     else:
         print(f"OK（表里共 {len(meta)} 列）")
-        missing_required: list[str] = []
-        missing_optional: list[str] = []
-        for name, allowed, type_label, required_options, note in _expected_schema(settings):
-            info = meta.get(name)
-            if info is None:
-                # 没有链接和巡查开关，机器连一行都读不出来——单独点名。
-                (missing_required if name in (f.link, f.monitoring)
-                 else missing_optional).append(name)
-                continue
-            if info["type"] not in allowed:
-                hint = f"。{note}" if note else ""
-                problems.append(
-                    f"「{name}」的字段类型是「{_type_name(info['type'])}」，"
-                    f"需要「{type_label}」——列名对了但类型不对，"
-                    f"机器会读不到或写不进这一列{hint}"
-                )
-                continue
-            # 类型对了再看选项：只有实际建成选择类字段才需要检查。
-            if required_options and info["options"] is not None:
-                missing = [v for v in required_options if v not in info["options"]]
-                if missing:
-                    problems.append(
-                        f"「{name}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
-                        f"机器要写它们，没建就会被跳过（不会误写，但对应判定等于没生效）。"
-                    )
-        if missing_required:
-            problems.append(
-                f"表里缺必备列：{'、'.join(missing_required)}——没有它们机器一行都处理不了。"
-                "列名要和 config.py 逐字一致（含空格和标点）。"
-            )
-        if missing_optional:
-            problems.append(
-                f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_optional)}。"
-                "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
-            )
+        problems.extend(_schema_problems(settings, meta))
 
     print("③ 试读一行 …", end=" ", flush=True)
     try:
@@ -283,13 +333,6 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     # 选项清单也从同一份里取——省两次分页请求。
     fields_meta = table.fields_meta()
     known_fields = set(fields_meta) if fields_meta is not None else None
-
-    def _options_of(column: str):
-        """选择列的已建选项。None = 查不到别过滤；[] = 不是选择列，全拦。"""
-        if fields_meta is None or column not in fields_meta:
-            return None
-        options = fields_meta[column]["options"]
-        return options if options is not None else []
     row_list = runner.load_rows(
         table,
         settings,
@@ -338,8 +381,8 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     report = runner.refresh(
         row_list, api_keys, settings,
         now=now,
-        known_options=_options_of(settings.fields.traffic_status),
-        comment_status_options=_options_of(settings.fields.comment_status),
+        known_options=_options_from_meta(fields_meta, settings.fields.traffic_status),
+        comment_status_options=_options_from_meta(fields_meta, settings.fields.comment_status),
         forced=(record_ids is not None),
         progress=print,
     )

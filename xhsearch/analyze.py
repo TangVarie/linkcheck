@@ -351,8 +351,12 @@ def decide(
     # 之前有过置顶、现在没了 —— 自家帖子的置顶掉了，最该被立刻发现。
     # 「之前有过」看的是上一轮写进「置顶评论」列的内容：非空且不是
     # 抖音的「不支持」占位，就说明上一轮确实看到过置顶。
+    # 和关键词命中同一道证据门槛：本轮连评论页都没看到（评论和评论数
+    # 都空）就没资格说「掉了」——现有通道上小红书的空壳在上游层就被
+    # 译成 GONE 到不了这里，这道闸防的是上游契约漂移。
     if (
         verdict.pin is Pin.NONE_PINNED
+        and (snapshot.comments or snapshot.comment_count is not None)
         and previous_pinned
         and previous_pinned != DOUYIN_PINNED_UNSUPPORTED
     ):

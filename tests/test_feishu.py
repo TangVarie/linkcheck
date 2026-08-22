@@ -152,7 +152,7 @@ class TestReadKeywords(unittest.TestCase):
 
     def test_rich_text_list_is_not_swallowed(self):
         """单行文本列的返回形态是富文本分段（带 text 的对象）。
-        按多选取会全部丢掉——关键词静默消失，蓝词命中永远不更新。"""
+        按多选取会全部丢掉——关键词静默消失，「关键词命中」永远不更新。"""
         value = [{"text": "西地那非口溶膜、cGMP因子", "type": "text"}]
         self.assertEqual(feishu.read_keywords(value),
                          ["西地那非口溶膜", "cGMP因子"])
@@ -191,12 +191,35 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         table = self._StubTable()
         known = {f.link, f.publish_time, f.monitoring, f.queued,
                  f.traffic_status, f.comment_count, f.last_updated,
-                 f.consecutive_failures, f.comment_status}   # 缺 点赞数/收藏数/蓝词字段
+                 f.consecutive_failures, f.comment_status}   # 缺 点赞数/收藏数/评论关键词
         runner.load_rows(table, settings, known_fields=known)
         self.assertNotIn(f.like_count, table.requested_fields)
         self.assertNotIn(f.collect_count, table.requested_fields)
         self.assertNotIn(f.seed_keywords, table.requested_fields)
         self.assertIn(f.link, table.requested_fields)
+
+    def test_pinned_comment_cell_is_read_as_text(self):
+        """「置顶评论」是掉落告警的对比基线。文本列读回来是富文本分段，
+        必须拼回纯文本——读错形态的话，告警要么永不触发（永远空串）、
+        要么每轮误报（永远真值）。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                self.requested = list(field_names)
+                return [{"record_id": "rec1", "fields": {
+                    f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24,
+                    f.pinned_comment: [{"text": "官号: 戳主页领券", "type": "text"}],
+                }}]
+
+        table = _Table()
+        rows = runner.load_rows(table, settings, only_due=False)
+        self.assertEqual(rows[0].pinned_comment, "官号: 戳主页领券")
+        self.assertIn(f.pinned_comment, table.requested)
 
     def test_queue_mode_without_queued_column_does_nothing(self):
         """「排队刷新」列没建时 queue 模式必须空转——退化成无过滤全表刷新

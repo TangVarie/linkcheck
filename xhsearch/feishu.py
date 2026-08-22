@@ -266,6 +266,11 @@ class Bitable:
             if page_token:
                 url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
             resp = transport.get(url, self._headers(), timeout=self.timeout)
+            if resp.status == 0:
+                # 网络抖动重试一次：多页表翻到一半失败会让整份元数据变 None
+                # （=不过滤），未建选项被放行就是行级写回失败 + 二分放大。
+                time.sleep(1.0)
+                resp = transport.get(url, self._headers(), timeout=self.timeout)
             payload = resp.json()
             if not isinstance(payload, dict) or payload.get("code") not in (0, None):
                 return None
