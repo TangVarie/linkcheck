@@ -535,7 +535,9 @@ class TestSoftDeadline(RunnerTest):
     """
 
     def test_rows_past_deadline_are_not_written_back(self):
-        self.settings.soft_deadline_seconds = 0.0001
+        # 负值 = 起跑线上截止就已过。0.0001 这种「快到期」在快机器上会让
+        # 第一行赶在 100µs 内被派发出去，CI 上必挂——测试要的是确定性。
+        self.settings.soft_deadline_seconds = -1
         rows = [xhs_row(f"rec{i}") for i in range(3)]
         row_with_history = rows[1]
         row_with_history.consecutive_failures = 1
@@ -552,7 +554,7 @@ class TestSoftDeadline(RunnerTest):
         self.assertFalse(report.fatal)                   # 正常分批，不是故障
 
     def test_deferred_rows_do_not_trip_the_breaker(self):
-        self.settings.soft_deadline_seconds = 0.0001
+        self.settings.soft_deadline_seconds = -1
         rows = [xhs_row(f"rec{i}") for i in range(12)]
         with mock.patch.object(transport, "post"):
             report = runner.refresh(rows, "fake-key", self.settings, now=NOW)
