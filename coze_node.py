@@ -57,28 +57,41 @@ BATCH_LIMIT = 40  # 每轮最多处理多少行，按 60 秒上限反推
 
 @dataclass
 class FieldNames:
-    """多维表格列名。左边是代码里的角色，右边是表头文字。"""
+    """多维表格列名。左边是代码里的角色，右边是表头文字。
+
+    默认值按 OKMAN 系列表的实际结构对齐（2026-08 以「OKMAN第一期」为准）：
+    巡查三件套（是否巡查/巡查状态/最近检查时间）由本系统接管，
+    「蓝词字段」是关键词组的来源，「实时数据.评论数」是评论数落点。
+    表里还没有的列（蓝词命中、上次点赞数等）要先在飞书里建好——
+    doctor 会列出缺哪些；没建的列会被自动跳过并在日志里提示，不会写坏表。
+    """
 
     # —— 人工维护 ——
-    link: str = "链接"
+    link: str = "反馈链接"
     publish_time: str = "发布时间"
-    expected_pinned: str = "种子评论关键词"   # 选填；填了才做置顶内容比对
-    monitoring: str = "监控中"                # 复选框；取消勾选即停止刷新
+    seed_keywords: str = "蓝词字段"           # 多选或文本（顿号/逗号分隔）：一组蓝词，
+                                              # 任一出现在第一页评论里即算命中
+    monitoring: str = "是否巡查"              # 复选框；取消勾选即停止刷新
     queued: str = "排队刷新"                  # 复选框；勾上=手动请求刷新，机器处理完自动清掉
 
     # —— 机器写入 · 运营主视图 ——
     platform: str = "平台"
-    comment_count: str = "评论数"
+    comment_count: str = "实时数据.评论数"
     previous_comment_count: str = "上次评论数"
     like_count: str = "点赞数"
+    previous_like_count: str = "上次点赞数"
     collect_count: str = "收藏数"
-    pinned_comment: str = "置顶评论"
-    comment_status: str = "评论状态"          # 多选，人机共用：机器管置顶三值，人工值不碰
+    previous_collect_count: str = "上次收藏数"
+    pinned_comment: str = "置顶评论"          # 实际置顶的那条内容（自家帖子，置顶必为我方）
+    comment_status: str = "评论状态"          # 多选，人机共用：机器管置顶三值，
+                                              # 显示评论/待评论/没有显示等人工值不碰
     comment_digest: str = "评论区快照"
-    traffic_status: str = "流量状态"          # 多选，人机共用
-    refresh_status: str = "刷新状态"
+    seed_match: str = "蓝词命中"              # 命中了哪个蓝词、命中在哪条评论
+    traffic_status: str = "流量状态"          # 多选，人机共用（无水花等人工值不碰）
+    refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
-    last_updated: str = "最后更新时间"
+    last_updated: str = "最近检查时间"
+    alive_confirmed: str = "已确认存活"       # 复选框：本轮取到数=勾上，确认失效=取消
 
     # —— 机器写入 · 系统列（建议在运营视图里隐藏）——
     consecutive_failures: str = "连续失败次数"   # 两击定罪的计数器
@@ -88,11 +101,13 @@ class FieldNames:
         return [
             self.link,
             self.publish_time,
-            self.expected_pinned,
+            self.seed_keywords,
             self.monitoring,
             self.queued,
             self.traffic_status,          # 合并多选必须先读现值
             self.comment_count,           # 判定掉量必须知道上一次的数
+            self.like_count,              # 搬「上次点赞数」要先读现值
+            self.collect_count,           # 搬「上次收藏数」同理
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
             self.comment_status,          # 判断置顶是不是刚掉的
@@ -1497,79 +1512,57 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat) -> str:
 
 
 def _normalize(text: str) -> str:
-    """比对置顶文案用的归一化：去空白、去标点、统一大小写。
+    """比对文本用的归一化：去空白、去标点、统一大小写。
 
-    运营在小红书 App 里发的置顶评论，跟表里登记的「期望置顶文案」几乎不可能
-    逐字一致（emoji、换行、被平台吞掉的符号），所以只做宽松包含匹配。
+    表里登记的蓝词和评论区里实际打出来的字几乎不可能逐字一致
+    （大小写、emoji、被平台吞掉的符号），所以只做宽松包含匹配——
+    实际数据里「cGMP因子」和「cgmp因子」就是混着写的。
     """
     return re.sub(r"[\s\W_]+", "", (text or "")).lower()
 
 
-def _looks_like_seed(comment: CommentView, expected: str) -> bool:
-    """这条评论是不是我们种下去的那条。
+@dataclass
+class SeedHit:
+    """蓝词命中结果：哪个词、命中在哪条评论。"""
 
-    运营在 App 里发的置顶评论，跟表里登记的关键词几乎不可能逐字一致
-    （emoji、换行、被平台吞掉的符号、事后追加编辑），所以做宽松匹配。
+    keyword: str
+    comment: str
+
+
+def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[SeedHit]:
+    """蓝词组 × 第一页评论的包含匹配。
+
+    规则刻意简单：任一关键词（归一化后）出现在任一条评论里就算命中，
+    按关键词在表里的顺序取第一个命中的。没有长度门槛、没有辨识度要求——
+    这一列维护的是「西地那非口溶膜」这类蓝词，词本身就有辨识度。
     """
-    needle = _normalize(expected)
-    if len(needle) < 4:
-        # 太短的关键词误命中概率太高，宁可判不出也不要认错人。
-        return False
-    haystack = _normalize(comment.content)
-    if not haystack:
-        return False
-    # 反向包含（评论是关键词的子串）只为一种情况存在：我方评论被平台截断后
-    # 比登记的全文短。要求评论至少有关键词一半长——不然别人一条「好用！」
-    # 恰好是我方长文案的子串，就会被认成我方评论，漏报置顶被顶掉。
-    return needle in haystack or (
-        len(haystack) >= 8 and 2 * len(haystack) >= len(needle) and haystack in needle
-    )
+    for keyword in keywords:
+        needle = _normalize(keyword)
+        if not needle:
+            continue
+        for comment in snapshot.comments:
+            if needle in _normalize(comment.content):
+                return SeedHit(keyword, comment.content)
+    return None
 
 
 class Pin(Enum):
-    """置顶判定结果。"""
+    """置顶判定结果。
+
+    帖子是我们自己发的，置顶评论必然是我方置顶的——所以不需要拿关键词
+    去核对置顶内容，只需要回答「置顶还在不在」。置顶的具体内容由
+    「置顶评论」列原样展示。
+    """
 
     UNSUPPORTED = "unsupported"   # 抖音：接口没有 is_pinned，判不了
-    NO_SEED = "no_seed"           # 没填种子关键词，无从比对
-    SUCCESS = "success"           # 置顶的就是我们那条
-    REPLACED = "replaced"         # 有置顶，但被换成了别人的
-    LOST = "lost"                 # 置顶没了，但我方评论还在首页
-    SEED_MISSING = "seed_missing"  # 首页找不到我方评论
-    NONE_PINNED = "none_pinned"   # 压根没有置顶评论
+    PINNED = "pinned"             # 有置顶
+    NONE_PINNED = "none_pinned"   # 没有置顶
 
 
-def decide_pin(snapshot: Snapshot, expected: str) -> tuple[Pin, str]:
-    """判定置顶。返回（结果, 写进诊断信息的补充说明）。
-
-    这里刻意不只回答「置顶成功了吗」。对品牌方来说最该立刻知道的那种情况是
-    **置顶还在，但被换成了别人的评论**——只看「我们的置顶在不在」会完全错过这一幕。
-    """
+def decide_pin(snapshot: Snapshot) -> Pin:
     if not snapshot.supports_pinned:
-        return Pin.UNSUPPORTED, ""
-
-    pinned = snapshot.pinned
-    seeded = (expected or "").strip()
-
-    if not seeded:
-        if pinned is None:
-            return Pin.NONE_PINNED, ""
-        return Pin.NO_SEED, "未填写种子评论关键词，只能确认存在置顶评论，无法确认是不是我方的"
-
-    position = next(
-        (i for i, c in enumerate(snapshot.comments, start=1) if _looks_like_seed(c, seeded)),
-        None,
-    )
-
-    if pinned is not None:
-        if _looks_like_seed(pinned, seeded):
-            return Pin.SUCCESS, ""
-        if position:
-            return Pin.REPLACED, f"⚠ 置顶位被他人占据，我方评论掉到第 {position} 条"
-        return Pin.REPLACED, "⚠ 置顶位被他人占据，且首页未找到我方评论"
-
-    if position:
-        return Pin.LOST, f"⚠ 置顶已掉，我方评论现在排在第 {position} 条"
-    return Pin.SEED_MISSING, "⚠ 首页未找到我方种子评论（可能已被删除，或不在第一页）"
+        return Pin.UNSUPPORTED
+    return Pin.PINNED if snapshot.pinned is not None else Pin.NONE_PINNED
 
 
 def comment_status_values(
@@ -1581,19 +1574,14 @@ def comment_status_values(
 
     返回 None 表示**这一轮不该碰这一列**，和「写一个空集合」完全不是一回事：
     空集合会把机器上一轮写的置顶结论摘掉，None 是原样保留。
-
-    两种必须返回 None 的情况：
-      * 抖音 —— 接口没有 is_pinned，判不了
-      * 有置顶但没填种子关键词 —— 分不清是我方的还是别人的，
-        写「置顶成功」是撒谎，写「没有置顶」也是撒谎
+    抖音必须返回 None——接口没有 is_pinned，判不了。
     """
     cs = settings.comment_status
-    if pin in (Pin.UNSUPPORTED, Pin.NO_SEED):
+    if pin is Pin.UNSUPPORTED:
         return None
-    if pin is Pin.SUCCESS:
+    if pin is Pin.PINNED:
         return {cs.pinned_ok}
-    # 剩下的都是「我方置顶现在不在」：置顶被别人顶了、掉了、种子评论找不到、
-    # 压根没有置顶。区分只看历史——成功过就是掉了，没成功过就是从来没有。
+    # 没有置顶：区分「掉了」和「从来没有」只看这一行的历史。
     return {cs.pinned_lost} if cs.ever_pinned(current) else {cs.never_pinned}
 
 
@@ -1602,6 +1590,10 @@ class Verdict:
     tags: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
     pin: Pin = Pin.UNSUPPORTED
+    # 蓝词命中结果：None 且 keywords 非空 = 未命中；表里没填蓝词时保持 None
+    # 且 seed_checked=False（此时不碰「蓝词命中」列）。
+    seed_hit: Optional[SeedHit] = None
+    seed_checked: bool = False
 
 
 def decide(
@@ -1610,7 +1602,7 @@ def decide(
     *,
     previous_comment_count: Optional[int],
     age_hours: Optional[float],
-    expected_pinned: str = "",
+    seed_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
     current_comment_status: Optional[list[str]] = None,
 ) -> Verdict:
@@ -1678,19 +1670,35 @@ def decide(
         )
 
     # —— 置顶 ——
-    verdict.pin, note = decide_pin(snapshot, expected_pinned)
-    if note:
-        verdict.notes.append(note)
-    # 之前置顶成功过、现在掉了 —— 这是种草投放里最该被立刻发现的事之一。
-    # NO_SEED 也要排除：没填种子关键词时根本判不了「我方置顶在不在」，
-    # 这时报「已不在」和 comment_status_values 里「判不了就不下结论」的口径矛盾。
+    verdict.pin = decide_pin(snapshot)
+    # 之前有过置顶、现在没了 —— 自家帖子的置顶掉了，最该被立刻发现。
     if (
         settings.comment_status.ever_pinned(current_comment_status)
-        and verdict.pin not in (Pin.SUCCESS, Pin.UNSUPPORTED, Pin.NO_SEED)
+        and verdict.pin is Pin.NONE_PINNED
     ):
-        verdict.notes.append("⚠ 此前已确认置顶成功，本轮我方置顶已不在")
+        verdict.notes.append("⚠ 此前已确认有置顶，本轮置顶已不在")
+
+    # —— 蓝词命中：任一关键词出现在第一页任一条评论里即算命中 ——
+    if seed_keywords:
+        verdict.seed_checked = True
+        verdict.seed_hit = match_seed_keywords(snapshot, seed_keywords)
+        if verdict.seed_hit is None:
+            verdict.notes.append(
+                f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何蓝词"
+                f"（共 {len(seed_keywords)} 个词）"
+            )
 
     return verdict
+
+
+def format_seed_match(verdict: Verdict, snapshot: Snapshot) -> Optional[str]:
+    """「蓝词命中」列的内容。None = 这一轮不碰这一列（表里没填蓝词）。"""
+    if not verdict.seed_checked:
+        return None
+    if verdict.seed_hit is not None:
+        excerpt = re.sub(r"\s+", " ", verdict.seed_hit.comment or "").strip()[:60]
+        return f"✅ 命中「{verdict.seed_hit.keyword}」：{excerpt}"
+    return f"❌ 未命中（第一页 {len(snapshot.comments)} 条评论）"
 
 
 def gone_verdict(settings: Settings, reason: str = "",
@@ -1749,9 +1757,14 @@ class Row:
     record_id: str
     link_cell: str
     publish_time_ms: Optional[int] = None
-    expected_pinned: str = ""
+    # 蓝词组：任一出现在第一页评论里即算命中（不区分大小写）。
+    seed_keywords: list[str] = field(default_factory=list)
     current_tags: list[str] = field(default_factory=list)
     previous_comment_count: Optional[int] = None
+    # 当前点赞/收藏的现值：写新值前要搬进「上次点赞数/上次收藏数」，
+    # 和评论数的搬移完全对称。
+    previous_like_count: Optional[int] = None
+    previous_collect_count: Optional[int] = None
     last_updated_ms: Optional[int] = None
     consecutive_failures: int = 0
     comment_status: list[str] = field(default_factory=list)
@@ -1953,16 +1966,18 @@ async def feishu_search(token, app_token, table_id, field_names, filter_spec,
             return items, True
 
 
-async def feishu_field_options(token, app_token, table_id, field_name):
-    """读某个多选字段已建的选项，读不到返回 None（= 不过滤，宁可试着写）。
+async def feishu_fields(token, app_token, table_id):
+    """一次取回表的全部字段元数据：({列名集合}, {列名: 选项列表})。
+    读不到返回 (None, {})——None = 不过滤，宁可试着写。
 
-    这层过滤在扣子路径上尤其重要：batch_update 是全成功或全失败，
-    一个没建过的选项名（比如「大爆」没建，而某行评论数刚过 100）会让整批
-    几十行一起回滚——而且每一轮都重算出同一个标签、每一轮都整批失败，
-    钱照花、结果全丢，直到有人去把选项建好。服务端跑得了 doctor 能提前发现，
-    扣子跑不了，只能在这里挡。
+    两个用途，都是防「表级错误让整批回滚」：
+    * 列名集合：按名字写一个表里不存在的列（1254045）会让整批写回失败，
+      还没建的机器列要在写回前挡下来（挡下的列在结果消息里提示）；
+    * 选项列表：写一个没建过的多选选项（1254291）同样整批回滚。
+    服务端跑得了 doctor 能提前发现这两类问题，扣子跑不了，只能在这里挡。
     """
     page_token = ""
+    names, options_map = set(), {}
     try:
         while True:
             url = (f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}"
@@ -1973,19 +1988,24 @@ async def feishu_field_options(token, app_token, table_id, field_name):
                 url, headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
             data = json.loads(response.text)
             if data.get("code") not in (0, None):
-                return None
+                return None, {}
             payload = data.get("data") or {}
             for item in payload.get("items") or []:
-                if item.get("field_name") == field_name:
-                    options = ((item.get("property") or {}).get("options")) or []
-                    return [o["name"] for o in options if isinstance(o, dict) and o.get("name")]
+                name = item.get("field_name")
+                if not name:
+                    continue
+                names.add(str(name))
+                options = ((item.get("property") or {}).get("options")) or []
+                if options:
+                    options_map[str(name)] = [
+                        o["name"] for o in options if isinstance(o, dict) and o.get("name")]
             if not payload.get("has_more"):
-                return None
+                return names, options_map
             page_token = payload.get("page_token") or ""
             if not page_token:
-                return None
+                return names, options_map
     except Exception:                                  # noqa: BLE001
-        return None
+        return None, {}
 
 
 async def feishu_batch_update(token, app_token, table_id, updates):
@@ -2118,22 +2138,20 @@ async def main(args: Any) -> dict:
     # 慢响应会把读表的预算先吃光，扫出空表还报 ok:True。
     # 读表按「最后更新时间」升序扫（最久没刷的最前），预算给到软截止的一半。
     scan_deadline = deadline - SOFT_DEADLINE / 2
-    search_result, traffic_options, status_options = await asyncio.gather(
+    search_result, fields_result = await asyncio.gather(
         feishu_search(token, p["app_token"], p["table_id"], f.must_read(),
                       filter_spec, deadline=scan_deadline, sort_field=f.last_updated),
-        feishu_field_options(token, p["app_token"], p["table_id"], f.traffic_status),
-        feishu_field_options(token, p["app_token"], p["table_id"], f.comment_status),
+        feishu_fields(token, p["app_token"], p["table_id"]),
         return_exceptions=True,
     )
     if isinstance(search_result, Exception):
         return {"ok": False, "processed": 0, "credits": 0, "balance": 0,
                 "message": str(search_result)}
     records, scan_complete = search_result
-    # 选项读取失败 = None = 不过滤（宁可试着写），与服务端语义一致。
-    if isinstance(traffic_options, Exception):
-        traffic_options = None
-    if isinstance(status_options, Exception):
-        status_options = None
+    # 字段元数据读取失败 = 不过滤（宁可试着写），与服务端语义一致。
+    table_fields, options_map = (None, {}) if isinstance(fields_result, Exception)         else fields_result
+    traffic_options = options_map.get(f.traffic_status)
+    status_options = options_map.get(f.comment_status)
     scan_note = ("" if scan_complete
                  else "；⚠ 读表未扫完（飞书响应慢），本轮按最久未刷的行优先，其余下一轮继续")
 
@@ -2147,9 +2165,11 @@ async def main(args: Any) -> dict:
             record_id=record_id,
             link_cell=_cell_text(cells.get(f.link)),
             publish_time_ms=_cell_ms(cells.get(f.publish_time)),
-            expected_pinned=_cell_text(cells.get(f.expected_pinned)),
+            seed_keywords=_cell_keywords(cells.get(f.seed_keywords)),
             current_tags=_cell_tags(cells.get(f.traffic_status)),
             previous_comment_count=_cell_int(cells.get(f.comment_count)),
+            previous_like_count=_cell_int(cells.get(f.like_count)),
+            previous_collect_count=_cell_int(cells.get(f.collect_count)),
             last_updated_ms=_cell_ms(cells.get(f.last_updated)),
             consecutive_failures=_cell_int(cells.get(f.consecutive_failures)) or 0,
             comment_status=_cell_tags(cells.get(f.comment_status)),
@@ -2184,6 +2204,7 @@ async def main(args: Any) -> dict:
     # fen 用 float 累加、最后一次取整——按单次调用四舍五入的话，
     # TikHub 抖音 0.72 分/次会被每次凑成 1 分，虚报近四成。
     updates, fen, balance, used = [], 0.0, 0, {}
+    dropped_columns = set()
     entries = []   # (update, 刷新状态) —— 熔断要能找到该撤销的那些行
     attempted = gone = fatal_rows = 0
     for row, result in zip(rows, results):
@@ -2203,6 +2224,13 @@ async def main(args: Any) -> dict:
             fatal_rows += 1
         for name, count in tally.items():
             used[name] = used.get(name, 0) + count
+        if fields and table_fields is not None:
+            # 表里还没建的机器列挡下来：按名字写不存在的列是表级错误，
+            # 会让整批写回失败。挡下的列名在结果消息里提示。
+            missing = set(fields) - table_fields
+            if missing:
+                dropped_columns |= missing
+                fields = {k: v for k, v in fields.items() if k in table_fields}
         if fields:
             update = {"record_id": row.record_id, "fields": fields}
             updates.append(update)
@@ -2239,6 +2267,9 @@ async def main(args: Any) -> dict:
         message += f"；⚠ 本轮 {'、'.join(sorted(disabled))} 通道不可用，已降级"
     if tripped:
         message += "；⚠ 本批失效比例异常，已熔断，未改流量状态"
+    if dropped_columns:
+        message += ("；⚠ 这些列在表里还没建，本轮已跳过："
+                    + "、".join(sorted(dropped_columns)))
     if fatal_rows:
         # Key 失效 / 余额耗尽把通道全打死了：必须报 ok:False 让下游告警分支
         # 接住——静默返回成功，半夜的故障就没人知道了。已完成的行照常写回。
@@ -2324,6 +2355,8 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
                          "已失效" if convicted else "疑似受限",
                          traffic_options, status_options, touch_tags=convicted)
         fields[f.consecutive_failures] = strikes
+        if convicted:
+            fields[f.alive_confirmed] = False
         return (fields, fen, balance, "已失效" if convicted else "疑似受限", tally)
 
     if snapshot is None:
@@ -2336,7 +2369,7 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
     verdict = decide(snapshot, settings,
                      previous_comment_count=row.previous_comment_count,
                      age_hours=row.age_hours(now),
-                     expected_pinned=row.expected_pinned,
+                     seed_keywords=row.seed_keywords,
                      current_tags=row.current_tags,
                      current_comment_status=row.comment_status)
     if snapshot.censored:
@@ -2344,6 +2377,7 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
     fields = _render(row, verdict, snapshot, settings, now, "正常",
                      traffic_options, status_options)
     fields[f.consecutive_failures] = 0
+    fields[f.alive_confirmed] = True
     return (fields, fen, balance, "正常", tally)
 
 
@@ -2394,12 +2428,20 @@ def _render(row, verdict, snapshot, settings, now, status,
             if row.previous_comment_count is not None:
                 fields[f.previous_comment_count] = row.previous_comment_count
             fields[f.comment_count] = snapshot.comment_count
+        # 点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
         if snapshot.like_count is not None:
+            if row.previous_like_count is not None:
+                fields[f.previous_like_count] = row.previous_like_count
             fields[f.like_count] = snapshot.like_count
         if snapshot.collect_count is not None:
+            if row.previous_collect_count is not None:
+                fields[f.previous_collect_count] = row.previous_collect_count
             fields[f.collect_count] = snapshot.collect_count
         fields[f.pinned_comment] = format_pinned(snapshot)
         fields[f.comment_digest] = format_digest(snapshot, settings.digest)
+        seed_text = format_seed_match(verdict, snapshot)
+        if seed_text is not None:
+            fields[f.seed_match] = seed_text
     return fields
 
 
@@ -2423,6 +2465,22 @@ def _cell_tags(value):
         return [v if isinstance(v, str) else str((v or {}).get("name") or "")
                 for v in value if v]
     return [value] if isinstance(value, str) and value else []
+
+
+def _cell_keywords(value):
+    """蓝词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分（不按空格，
+    「cGMP 因子」这类带空格的词组不能拆碎）。"""
+    if isinstance(value, list):
+        raw = _cell_tags(value)
+    else:
+        raw = re.split(r"[，,、;；\n]+", _cell_text(value))
+    seen, out = set(), []
+    for word in raw:
+        word = (word or "").strip()
+        if word and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
 
 
 def _cell_int(value):

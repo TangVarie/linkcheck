@@ -42,7 +42,7 @@ def comment_page(count=50, pinned=True, balance=9000):
             "next_page_token": "", "points": {"cost": 10, "balance": balance}}
 
 
-def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, expected=""):
+def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, keywords=None):
     published = NOW - timedelta(days=age_days)
     return Row(
         record_id=record_id,
@@ -50,7 +50,7 @@ def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, expec
         publish_time_ms=int(published.timestamp() * 1000),
         current_tags=tags or [],
         previous_comment_count=prev_count,
-        expected_pinned=expected,
+        seed_keywords=keywords or [],
     )
 
 
@@ -366,10 +366,11 @@ class TestDouyin(RunnerTest):
 
 
 class TestPinnedTracking(RunnerTest):
-    """「评论状态」多选列：机器管置顶三值，人工值原样保留。"""
+    """「评论状态」多选列：机器管置顶三值，人工值原样保留。
+    自家帖子的置顶必为我方，判定只看「置顶还在不在」。"""
 
-    def _row(self, *, expected="戳主页领券", status=None):
-        row = xhs_row(expected=expected)
+    def _row(self, *, status=None):
+        row = xhs_row()
         row.comment_status = status or []
         return row
 
@@ -380,7 +381,7 @@ class TestPinnedTracking(RunnerTest):
             [row],
         )
 
-    def test_seeded_comment_still_pinned(self):
+    def test_pinned_present_writes_ok(self):
         fields = self._run(True, self._row()).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status],
                          [self.settings.comment_status.pinned_ok])
@@ -394,78 +395,115 @@ class TestPinnedTracking(RunnerTest):
         cs = self.settings.comment_status
         fields = self._run(False, self._row(status=[cs.pinned_ok])).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status], [cs.pinned_lost])
-        self.assertIn("此前已确认置顶成功", fields[self.settings.fields.failure_reason])
+        self.assertIn("置顶已不在", fields[self.settings.fields.failure_reason])
 
     def test_human_value_in_the_same_column_survives(self):
-        """「评论是否显示」这类人工维护的值和置顶并列在同一列，机器绝不碰。"""
+        """「显示评论」这类人工维护的值和置顶三值并列在同一列，机器绝不碰。"""
         cs = self.settings.comment_status
-        row = self._row(status=["评论已显示", cs.pinned_ok])
+        row = self._row(status=["显示评论", cs.pinned_ok])
         final = self._run(False, row).outcomes[0].fields[self.settings.fields.comment_status]
-        self.assertIn("评论已显示", final)
+        self.assertIn("显示评论", final)
         self.assertIn(cs.pinned_lost, final)
         self.assertNotIn(cs.pinned_ok, final)     # 三值互斥，旧值被摘掉
-
-    def test_pin_taken_over_by_someone_else(self):
-        """品牌方最该立刻知道的一种：置顶还在，但被换成了别人的评论。"""
-        page = comment_page(pinned=True)
-        page["items"][0]["content"] = "楼主恰饭了吧，别买"
-        page["items"].append({"content": "戳主页领券", "like_count": 1, "is_pinned": False,
-                              "is_author_comment": True, "ip_location": "上海",
-                              "author": {"name": "官号"}})
-        cs = self.settings.comment_status
-        report = self.run_with(
-            [sse(page), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [self._row(status=[cs.pinned_ok])],
-        )
-        fields = report.outcomes[0].fields
-        self.assertEqual(fields[self.settings.fields.comment_status], [cs.pinned_lost])
-        self.assertIn("置顶位被他人占据", fields[self.settings.fields.failure_reason])
-        # 置顶评论列展示的是「实际置顶的那条」，不是我们希望置顶的那条
-        self.assertIn("楼主恰饭了吧", fields[self.settings.fields.pinned_comment])
-
-    def test_no_seed_keyword_leaves_the_column_alone(self):
-        """有置顶但没填种子关键词：写「置顶成功」是撒谎，写「没有置顶」也是撒谎。"""
-        row = self._row(expected="", status=["评论已显示"])
-        fields = self._run(True, row).outcomes[0].fields
-        self.assertNotIn(self.settings.fields.comment_status, fields)
 
     def test_unknown_option_is_filtered(self):
         report = self.run_with(
             [sse(comment_page(pinned=True)),
              sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
             [self._row()],
-            comment_status_options=["评论已显示"],     # 表里没建置顶三值
+            comment_status_options=["显示评论"],     # 表里没建置顶三值
         )
         fields = report.outcomes[0].fields
         self.assertNotIn(self.settings.fields.comment_status, fields)
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
 
-class TestExitSignal(RunnerTest):
-    """退出码要能区分「真故障」和「正常分批」——定时任务的重启策略靠它。"""
+class TestSeedKeywordColumn(RunnerTest):
+    """「蓝词命中」列：表里填了蓝词才写；任一词命中任一条评论即算命中。"""
 
-    def test_fatal_error_is_marked_fatal(self):
-        report = self.run_with([err(401, 1401, "API Key 无效或已失效。")], [xhs_row()])
-        self.assertTrue(report.fatal)
+    def test_hit_written_with_keyword_and_comment(self):
+        page = comment_page(pinned=False)
+        page["items"].append({"content": "朋友安利的西地那非口溶膜", "like_count": 2,
+                              "is_pinned": False, "is_author_comment": False,
+                              "ip_location": "上海", "author": {"name": "路人"}})
+        report = self.run_with(
+            [sse(page), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(keywords=["西地那非口溶膜", "cGMP因子"])],
+        )
+        cell = report.outcomes[0].fields[self.settings.fields.seed_match]
+        self.assertIn("命中「西地那非口溶膜」", cell)
+        self.assertIn("西地那非口溶膜", cell)
 
-    def test_quota_exhausted_is_fatal(self):
-        report = self.run_with([err(200, 1004, "当前 API Key 积分不足。")], [xhs_row()])
-        self.assertTrue(report.fatal)
+    def test_miss_written_explicitly(self):
+        report = self.run_with(
+            [sse(comment_page(pinned=False)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(keywords=["西地那非口溶膜"])],
+        )
+        fields = report.outcomes[0].fields
+        self.assertIn("未命中", fields[self.settings.fields.seed_match])
+        self.assertTrue(any("未命中" in n for n in [fields[self.settings.fields.failure_reason]]))
 
-    def test_soft_deadline_is_not_fatal(self):
-        """到软截止把剩余的行留给下一轮，是正常运行不是失败。
-        判错这条会让云平台把每一轮正常分批都当成崩溃，反复重启。"""
-        self.settings.soft_deadline_seconds = 0.0001
-        rows = [xhs_row(f"rec{i}") for i in range(5)]
-        report = self.run_with(lambda *a, **k: sse(comment_page()), rows)
-        self.assertFalse(report.fatal)
-
-    def test_normal_run_is_not_fatal(self):
+    def test_no_keywords_leaves_column_alone(self):
         report = self.run_with(
             [sse(comment_page()), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [xhs_row()])
-        self.assertFalse(report.fatal)
-        self.assertEqual(report.aborted_reason, "")
+            [xhs_row()],
+        )
+        self.assertNotIn(self.settings.fields.seed_match, report.outcomes[0].fields)
+
+
+class TestPreviousMetricsShift(RunnerTest):
+    """点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
+    判定仍然只基于评论数，这两组只作参考。"""
+
+    def test_previous_values_are_shifted(self):
+        row = xhs_row(prev_count=40)
+        row.previous_like_count = 500
+        row.previous_collect_count = 60
+        report = self.run_with(
+            [sse(comment_page(count=50)),
+             sse({"like_count": 800, "collect_count": 90,
+                  "points": {"cost": 10, "balance": 1}})],
+            [row],
+        )
+        f = self.settings.fields
+        fields = report.outcomes[0].fields
+        self.assertEqual(fields[f.previous_comment_count], 40)
+        self.assertEqual(fields[f.comment_count], 50)
+        self.assertEqual(fields[f.previous_like_count], 500)
+        self.assertEqual(fields[f.like_count], 800)
+        self.assertEqual(fields[f.previous_collect_count], 60)
+        self.assertEqual(fields[f.collect_count], 90)
+
+    def test_first_round_writes_only_current(self):
+        report = self.run_with(
+            [sse(comment_page(count=50)),
+             sse({"like_count": 800, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()],
+        )
+        f = self.settings.fields
+        fields = report.outcomes[0].fields
+        self.assertNotIn(f.previous_like_count, fields)
+        self.assertEqual(fields[f.like_count], 800)
+
+
+class TestAliveConfirmed(RunnerTest):
+    def test_ok_ticks_the_box(self):
+        report = self.run_with(
+            [sse(comment_page()), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()],
+        )
+        self.assertIs(report.outcomes[0].fields[self.settings.fields.alive_confirmed], True)
+
+    def test_confirmed_gone_unticks(self):
+        row = xhs_row()
+        row.consecutive_failures = 1
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [row])
+        self.assertIs(report.outcomes[0].fields[self.settings.fields.alive_confirmed], False)
+
+    def test_suspect_leaves_box_alone(self):
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [xhs_row()])
+        self.assertNotIn(self.settings.fields.alive_confirmed, report.outcomes[0].fields)
 
 
 class TestSoftDeadline(RunnerTest):

@@ -109,10 +109,11 @@ class TestCozeBundle(unittest.TestCase):
             "points": {"cost": 10, "balance": 500},
         })
         verdict = ns["decide"](snapshot, settings, previous_comment_count=10,
-                               age_hours=20, expected_pinned="戳主页领券")
+                               age_hours=20, seed_keywords=["戳主页领券"])
         self.assertIn("爆贴", verdict.tags)          # 88 条落在 50–99 档
         self.assertNotIn("大爆", verdict.tags)       # 档位互斥
-        self.assertIs(verdict.pin, ns["Pin"].SUCCESS)
+        self.assertIs(verdict.pin, ns["Pin"].PINNED)  # 自家帖子：有置顶即成功
+        self.assertEqual(verdict.seed_hit.keyword, "戳主页领券")   # 蓝词命中
         self.assertIn("置顶", ns["format_digest"](snapshot, settings.digest))
 
     def test_heat_tiers_match_the_agreed_thresholds(self):

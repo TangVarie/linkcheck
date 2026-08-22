@@ -14,28 +14,41 @@ from dataclasses import dataclass, field
 
 @dataclass
 class FieldNames:
-    """多维表格列名。左边是代码里的角色，右边是表头文字。"""
+    """多维表格列名。左边是代码里的角色，右边是表头文字。
+
+    默认值按 OKMAN 系列表的实际结构对齐（2026-08 以「OKMAN第一期」为准）：
+    巡查三件套（是否巡查/巡查状态/最近检查时间）由本系统接管，
+    「蓝词字段」是关键词组的来源，「实时数据.评论数」是评论数落点。
+    表里还没有的列（蓝词命中、上次点赞数等）要先在飞书里建好——
+    doctor 会列出缺哪些；没建的列会被自动跳过并在日志里提示，不会写坏表。
+    """
 
     # —— 人工维护 ——
-    link: str = "链接"
+    link: str = "反馈链接"
     publish_time: str = "发布时间"
-    expected_pinned: str = "种子评论关键词"   # 选填；填了才做置顶内容比对
-    monitoring: str = "监控中"                # 复选框；取消勾选即停止刷新
+    seed_keywords: str = "蓝词字段"           # 多选或文本（顿号/逗号分隔）：一组蓝词，
+                                              # 任一出现在第一页评论里即算命中
+    monitoring: str = "是否巡查"              # 复选框；取消勾选即停止刷新
     queued: str = "排队刷新"                  # 复选框；勾上=手动请求刷新，机器处理完自动清掉
 
     # —— 机器写入 · 运营主视图 ——
     platform: str = "平台"
-    comment_count: str = "评论数"
+    comment_count: str = "实时数据.评论数"
     previous_comment_count: str = "上次评论数"
     like_count: str = "点赞数"
+    previous_like_count: str = "上次点赞数"
     collect_count: str = "收藏数"
-    pinned_comment: str = "置顶评论"
-    comment_status: str = "评论状态"          # 多选，人机共用：机器管置顶三值，人工值不碰
+    previous_collect_count: str = "上次收藏数"
+    pinned_comment: str = "置顶评论"          # 实际置顶的那条内容（自家帖子，置顶必为我方）
+    comment_status: str = "评论状态"          # 多选，人机共用：机器管置顶三值，
+                                              # 显示评论/待评论/没有显示等人工值不碰
     comment_digest: str = "评论区快照"
-    traffic_status: str = "流量状态"          # 多选，人机共用
-    refresh_status: str = "刷新状态"
+    seed_match: str = "蓝词命中"              # 命中了哪个蓝词、命中在哪条评论
+    traffic_status: str = "流量状态"          # 多选，人机共用（无水花等人工值不碰）
+    refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
-    last_updated: str = "最后更新时间"
+    last_updated: str = "最近检查时间"
+    alive_confirmed: str = "已确认存活"       # 复选框：本轮取到数=勾上，确认失效=取消
 
     # —— 机器写入 · 系统列（建议在运营视图里隐藏）——
     consecutive_failures: str = "连续失败次数"   # 两击定罪的计数器
@@ -45,11 +58,13 @@ class FieldNames:
         return [
             self.link,
             self.publish_time,
-            self.expected_pinned,
+            self.seed_keywords,
             self.monitoring,
             self.queued,
             self.traffic_status,          # 合并多选必须先读现值
             self.comment_count,           # 判定掉量必须知道上一次的数
+            self.like_count,              # 搬「上次点赞数」要先读现值
+            self.collect_count,           # 搬「上次收藏数」同理
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
             self.comment_status,          # 判断置顶是不是刚掉的

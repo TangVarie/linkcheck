@@ -140,6 +140,26 @@ def cmd_doctor() -> int:
                 f"没建的话机器会跳过它们（不会误写），但对应的判定就等于没生效。"
             )
 
+    names = table.field_names()
+    if names is not None:
+        wanted_columns = [
+            # 人工维护
+            f.link, f.publish_time, f.seed_keywords, f.monitoring, f.queued,
+            # 机器写入
+            f.platform, f.comment_count, f.previous_comment_count,
+            f.like_count, f.previous_like_count,
+            f.collect_count, f.previous_collect_count,
+            f.pinned_comment, f.comment_status, f.comment_digest, f.seed_match,
+            f.traffic_status, f.refresh_status, f.failure_reason,
+            f.last_updated, f.alive_confirmed, f.consecutive_failures,
+        ]
+        missing_columns = [c for c in wanted_columns if c not in names]
+        if missing_columns:
+            problems.append(
+                f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_columns)}。"
+                "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
+            )
+
     status_options = table.list_field_options(f.comment_status)
     if status_options is not None:
         print(f"   「{f.comment_status}」有 {len(status_options)} 个选项："
@@ -252,14 +272,20 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     print(report.summary())
 
     write_errors: list = []
+    dropped_fields: set = set()
     try:
-        written = runner.write_back(table, report, errors=write_errors)
+        written = runner.write_back(table, report, errors=write_errors,
+                                    known_fields=table.field_names(),
+                                    dropped_fields=dropped_fields)
     except feishu.FeishuError as exc:
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
         print(f"❌ 写回失败（表级错误）：{exc}")
         return 1
     print(f"已写回 {written} 行")
+    if dropped_fields:
+        print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
+              f"{'、'.join(sorted(dropped_fields))}")
     if write_errors:
         print(f"⚠ {len(write_errors)} 行写回失败（其余行不受影响）：")
         for record_id, exc in write_errors:

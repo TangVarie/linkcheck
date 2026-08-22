@@ -36,9 +36,14 @@ class Row:
     record_id: str
     link_cell: str
     publish_time_ms: Optional[int] = None
-    expected_pinned: str = ""
+    # 蓝词组：任一出现在第一页评论里即算命中（不区分大小写）。
+    seed_keywords: list[str] = field(default_factory=list)
     current_tags: list[str] = field(default_factory=list)
     previous_comment_count: Optional[int] = None
+    # 当前点赞/收藏的现值：写新值前要搬进「上次点赞数/上次收藏数」，
+    # 和评论数的搬移完全对称。
+    previous_like_count: Optional[int] = None
+    previous_collect_count: Optional[int] = None
     last_updated_ms: Optional[int] = None
     consecutive_failures: int = 0
     comment_status: list[str] = field(default_factory=list)

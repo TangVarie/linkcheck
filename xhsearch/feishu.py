@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -247,6 +248,33 @@ class Bitable:
             mid = len(chunk) // 2
             return self._submit(chunk[:mid], errors) + self._submit(chunk[mid:], errors)
 
+    def field_names(self) -> Optional[set[str]]:
+        """这张表实际存在的全部列名；读不到返回 None（= 不过滤，宁可试着写）。
+
+        用来在写回前挡掉表里还没建的机器列——按名字写一个不存在的列是
+        **表级错误**（1254045），会让整批写回失败。挡下来的列在日志里提示，
+        运营按提示建好列，下一轮自然补上。
+        """
+        page_token = ""
+        names: set[str] = set()
+        while True:
+            url = self._url("fields?page_size=100")
+            if page_token:
+                url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
+            resp = transport.get(url, self._headers(), timeout=self.timeout)
+            payload = resp.json()
+            if not isinstance(payload, dict) or payload.get("code") not in (0, None):
+                return None
+            data = payload.get("data") or {}
+            for field in data.get("items") or []:
+                if field.get("field_name"):
+                    names.add(str(field["field_name"]))
+            if not data.get("has_more"):
+                return names
+            page_token = data.get("page_token") or ""
+            if not page_token:
+                return names
+
     def list_field_options(self, field_name: str) -> Optional[list[str]]:
         """读某个单选/多选字段已配置的选项，读不到返回 None。
 
@@ -300,6 +328,26 @@ def read_text(value: Any) -> str:
         # 链接列形如 {"link": "...", "text": "..."}
         return str(value.get("link") or value.get("text") or "")
     return str(value)
+
+
+def read_keywords(value: Any) -> list[str]:
+    """读一组关键词：多选列直接取选项名；文本列按 顿号/逗号/分号/换行 拆分。
+
+    刻意不按空格拆——「cGMP 因子」这种带空格的词组会被拆碎。
+    单个词里的前后空白剥掉，空项丢弃，保序去重。
+    """
+    if isinstance(value, list):
+        raw = read_multi_select(value)
+    else:
+        raw = re.split(r"[，,、;；\n]+", read_text(value))
+    seen: set[str] = set()
+    out: list[str] = []
+    for word in raw:
+        word = (word or "").strip()
+        if word and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
 
 
 def read_multi_select(value: Any) -> list[str]:

@@ -492,12 +492,21 @@ def refresh(
                 if row.previous_comment_count is not None:
                     fields[f.previous_comment_count] = row.previous_comment_count
                 fields[f.comment_count] = snapshot.comment_count
+            # 点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
+            # 判定仍然只基于评论数，这两组只作参考。
             if snapshot.like_count is not None:
+                if row.previous_like_count is not None:
+                    fields[f.previous_like_count] = row.previous_like_count
                 fields[f.like_count] = snapshot.like_count
             if snapshot.collect_count is not None:
+                if row.previous_collect_count is not None:
+                    fields[f.previous_collect_count] = row.previous_collect_count
                 fields[f.collect_count] = snapshot.collect_count
             fields[f.pinned_comment] = analyze.format_pinned(snapshot)
             fields[f.comment_digest] = analyze.format_digest(snapshot, settings.digest)
+            seed_match = analyze.format_seed_match(verdict, snapshot)
+            if seed_match is not None:
+                fields[f.seed_match] = seed_match
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
                        credits, cost_yuan)
@@ -554,6 +563,7 @@ def refresh(
                                                current_tags=row.current_tags)
                 outcome = finish(row, verdict, None, status=STATUS_GONE,
                                  credits=credits, cost_yuan=cost_yuan)
+                outcome.fields[f.alive_confirmed] = False
             else:
                 verdict = analyze.suspect_verdict(settings, strikes, error.operator_text())
                 outcome = finish(row, verdict, None, status=STATUS_SUSPECT,
@@ -584,7 +594,7 @@ def refresh(
             settings,
             previous_comment_count=row.previous_comment_count,
             age_hours=row.age_hours(now),
-            expected_pinned=row.expected_pinned,
+            seed_keywords=row.seed_keywords,                  # 蓝词组，任一命中即算命中
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
             current_comment_status=row.comment_status,        # 区分「掉了」和「从来没有」
         )
@@ -599,6 +609,7 @@ def refresh(
         outcome = finish(row, verdict, snapshot, status=STATUS_OK,
                          credits=credits, cost_yuan=cost_yuan)
         outcome.fields[f.consecutive_failures] = 0
+        outcome.fields[f.alive_confirmed] = True
         return outcome
 
     pending = list(rows)
@@ -697,9 +708,11 @@ def load_rows(
             record_id=record_id,
             link_cell=feishu.read_text(cells.get(f.link)),
             publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
-            expected_pinned=feishu.read_text(cells.get(f.expected_pinned)),
+            seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
             current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
             previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
+            previous_like_count=feishu.read_int(cells.get(f.like_count)),
+            previous_collect_count=feishu.read_int(cells.get(f.collect_count)),
             last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
             consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
             comment_status=feishu.read_multi_select(cells.get(f.comment_status)),
@@ -716,12 +729,27 @@ def write_back(
     report: RunReport,
     *,
     errors: Optional[list] = None,
+    known_fields: Optional[set[str]] = None,
+    dropped_fields: Optional[set[str]] = None,
 ) -> int:
     """写回。errors 传一个列表进来可以收集失败的行（(record_id, FeishuError)），
-    不传则在所有行都尝试过之后抛汇总异常——见 feishu.Bitable.batch_update。"""
-    updates = [
-        {"record_id": o.record_id, "fields": o.fields}
-        for o in report.outcomes
-        if o.fields
-    ]
+    不传则在所有行都尝试过之后抛汇总异常——见 feishu.Bitable.batch_update。
+
+    known_fields 传入表里实际存在的列名（table.field_names()）时，会把表里
+    还没建的机器列挡下来（记进 dropped_fields 供调用方提示）——按名字写
+    不存在的列是表级错误，会让整批写回失败。None = 不过滤，宁可试着写。
+    """
+    updates = []
+    for o in report.outcomes:
+        fields = o.fields
+        if not fields:
+            continue
+        if known_fields is not None:
+            missing = set(fields) - known_fields
+            if missing:
+                if dropped_fields is not None:
+                    dropped_fields |= missing
+                fields = {k: v for k, v in fields.items() if k in known_fields}
+        if fields:
+            updates.append({"record_id": o.record_id, "fields": fields})
     return table.batch_update(updates, errors=errors) if updates else 0
