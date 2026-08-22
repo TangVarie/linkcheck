@@ -61,16 +61,22 @@ class FieldNames:
 
     默认值按 OKMAN 系列表的实际结构对齐（2026-08 以「OKMAN第一期」为准）：
     巡查三件套（是否巡查/巡查状态/最近检查时间）由本系统接管，
-    「蓝词字段」是关键词组的来源，「实时数据.评论数」是评论数落点。
-    表里还没有的列（蓝词命中、上次点赞数等）要先在飞书里建好——
+    「实时数据.评论数」是评论数落点。
+    表里还没有的列（评论关键词、关键词命中、上次点赞数等）要先在飞书里建好——
     doctor 会列出缺哪些；没建的列会被自动跳过并在日志里提示，不会写坏表。
+
+    ⚠️ 「蓝词字段」机器**完全不读不写**：蓝词（评论里变成超链接的词）
+    是人工在手机端自查的，和「评论关键词」（查我们自己的种子评论有没有
+    显示出来）是两回事。接口数据里目前拿不到「这个词有没有变成超链接」，
+    所以两者没有任何关联（见 docs/待验证清单.md）。
     """
 
     # —— 人工维护 ——
     link: str = "反馈链接"
     publish_time: str = "发布时间"
-    seed_keywords: str = "蓝词字段"           # 多选或文本（顿号/逗号分隔）：一组蓝词，
-                                              # 任一出现在第一页评论里即算命中
+    seed_keywords: str = "评论关键词"         # 多选或文本（顿号/逗号分隔）：一组词，
+                                              # 任一出现在第一页任一条评论里 = 我们的
+                                              # 评论显示出来了。注意不是「蓝词字段」！
     monitoring: str = "是否巡查"              # 复选框；取消勾选即停止刷新
     queued: str = "排队刷新"                  # 复选框；勾上=手动请求刷新，机器处理完自动清掉
 
@@ -83,10 +89,11 @@ class FieldNames:
     collect_count: str = "收藏数"
     previous_collect_count: str = "上次收藏数"
     pinned_comment: str = "置顶评论"          # 实际置顶的那条内容（自家帖子，置顶必为我方）
-    comment_status: str = "评论状态"          # 多选，人机共用：机器管置顶三值，
-                                              # 显示评论/待评论/没有显示等人工值不碰
+    comment_status: str = "评论状态"          # 由关键词命中驱动：命中=显示评论，
+                                              # 未命中=没有显示；没填关键词的行不碰
     comment_digest: str = "评论区快照"
-    seed_match: str = "蓝词命中"              # 命中了哪个蓝词、命中在哪条评论
+    seed_match: str = "关键词命中"            # 命中了哪个词、命中在哪条评论（单独标明，
+                                              # 不覆盖「评论区快照」——快照是看氛围的）
     traffic_status: str = "流量状态"          # 多选，人机共用（无水花等人工值不碰）
     refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
@@ -110,7 +117,8 @@ class FieldNames:
             self.collect_count,           # 搬「上次收藏数」同理
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
-            self.comment_status,          # 判断置顶是不是刚掉的
+            self.comment_status,          # 合并写回前要先读现值
+            self.pinned_comment,          # 判断置顶是不是刚掉的（和上一轮的置顶内容比）
         ]
 
 
@@ -148,35 +156,33 @@ class Tags:
 
 @dataclass
 class CommentStatus:
-    """「评论状态」多选列里**机器管辖**的三个值。
+    """「评论状态」列的取值：我们的种子评论有没有显示出来。
 
-    这一列是人机共用的：置顶结论由机器每轮重算并覆盖，而「评论是否显示」
-    这类人工维护的值并列在同一列里，机器读得到但永远不碰。
-    用的是和 流量状态 完全相同的合并算法。
+    判定完全由「评论关键词」的命中结果驱动（和置顶无关——置顶内容
+    由「置顶评论」列单独展示）：
 
-    三个值互斥，每轮只写一个：
+        显示评论  —— 任一关键词出现在第一页任一条评论里
+        没有显示  —— 配了关键词，但第一页一条都没命中
+        待评论    —— 人工排期用的旧值：机器**从不写**，但拿到结论时会
+                     替掉它——「待评论」本质上也是「还没显示」，有了
+                     自动巡查的结论就不需要人工再标了
 
-        置顶成功  —— 置顶的确认是我方种子评论
-        置顶掉了  —— 之前置顶成功过，现在我方的置顶不在了
-        没有置顶  —— 从来没成功过，现在也没有
-
-    只有小红书能判（抖音评论接口没有 is_pinned 字段），抖音行完全不碰这一列。
+    三个值互斥。没填关键词的行机器完全不碰这一列。
+    两个平台都能判——匹配的是第一页评论内容，不依赖置顶字段，
+    所以抖音行同样有效。
     """
 
-    pinned_ok: str = "置顶成功"
-    pinned_lost: str = "置顶掉了"
-    never_pinned: str = "没有置顶"
+    displayed: str = "显示评论"
+    not_displayed: str = "没有显示"
+    pending: str = "待评论"
 
     def namespace(self) -> list[str]:
-        return [self.pinned_ok, self.pinned_lost, self.never_pinned]
+        """机器管辖的值（含只撤不写的「待评论」）。"""
+        return [self.displayed, self.not_displayed, self.pending]
 
-    def ever_pinned(self, current: list[str] | None) -> bool:
-        """这一行历史上有没有成功置顶过。
-
-        「置顶掉了」本身也算证据——掉了之后一直没恢复，下一轮不该退回
-        「没有置顶」，那等于把曾经置顶过这件事抹掉。
-        """
-        return bool({self.pinned_ok, self.pinned_lost} & set(current or []))
+    def machine_written(self) -> list[str]:
+        """机器实际会写入的值——doctor 检查选项是否建好用这个清单。"""
+        return [self.displayed, self.not_displayed]
 
 
 @dataclass
@@ -1514,7 +1520,7 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat) -> str:
 def _normalize(text: str) -> str:
     """比对文本用的归一化：去空白、去标点、统一大小写。
 
-    表里登记的蓝词和评论区里实际打出来的字几乎不可能逐字一致
+    表里登记的关键词和评论区里实际打出来的字几乎不可能逐字一致
     （大小写、emoji、被平台吞掉的符号），所以只做宽松包含匹配——
     实际数据里「cGMP因子」和「cgmp因子」就是混着写的。
     """
@@ -1523,18 +1529,20 @@ def _normalize(text: str) -> str:
 
 @dataclass
 class SeedHit:
-    """蓝词命中结果：哪个词、命中在哪条评论。"""
+    """关键词命中结果：哪个词、命中在哪条评论。"""
 
     keyword: str
     comment: str
 
 
 def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[SeedHit]:
-    """蓝词组 × 第一页评论的包含匹配。
+    """评论关键词组 × 第一页评论的包含匹配。
 
+    这查的是**我们自己的种子评论有没有显示出来**（和「蓝词」无关——
+    蓝词指评论里变成超链接的词，那是人工在手机端自查的）。
     规则刻意简单：任一关键词（归一化后）出现在任一条评论里就算命中，
     按关键词在表里的顺序取第一个命中的。没有长度门槛、没有辨识度要求——
-    这一列维护的是「西地那非口溶膜」这类蓝词，词本身就有辨识度。
+    「西地那非口溶膜」这类词本身就有辨识度。
     """
     for keyword in keywords:
         needle = _normalize(keyword)
@@ -1565,24 +1573,24 @@ def decide_pin(snapshot: Snapshot) -> Pin:
     return Pin.PINNED if snapshot.pinned is not None else Pin.NONE_PINNED
 
 
-def comment_status_values(
-    pin: Pin,
-    current: Optional[list[str]],
-    settings: Settings,
-) -> Optional[set[str]]:
-    """算出「评论状态」这一列里机器该写的值。
+def comment_status_values(verdict: "Verdict", settings: Settings) -> Optional[set[str]]:
+    """算出「评论状态」这一列里机器该写的值——由关键词命中结果驱动。
+
+    命中 = 我们的种子评论显示出来了 → 显示评论；
+    配了关键词但一条没中 → 没有显示（「待评论」也会被这个结论替掉——
+    待评论本质上就是还没显示）。
 
     返回 None 表示**这一轮不该碰这一列**，和「写一个空集合」完全不是一回事：
-    空集合会把机器上一轮写的置顶结论摘掉，None 是原样保留。
-    抖音必须返回 None——接口没有 is_pinned，判不了。
+    空集合会把上一轮的结论摘掉，None 是原样保留。没填关键词的行、
+    以及本轮没取到评论页内容的行都返回 None。
+
+    和置顶无关：置顶内容由「置顶评论」列单独展示。匹配的是第一页评论，
+    两个平台都拿得到，所以抖音行同样能判。
     """
-    cs = settings.comment_status
-    if pin is Pin.UNSUPPORTED:
+    if not verdict.seed_checked:
         return None
-    if pin is Pin.PINNED:
-        return {cs.pinned_ok}
-    # 没有置顶：区分「掉了」和「从来没有」只看这一行的历史。
-    return {cs.pinned_lost} if cs.ever_pinned(current) else {cs.never_pinned}
+    cs = settings.comment_status
+    return {cs.displayed} if verdict.seed_hit is not None else {cs.not_displayed}
 
 
 @dataclass
@@ -1590,8 +1598,9 @@ class Verdict:
     tags: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
     pin: Pin = Pin.UNSUPPORTED
-    # 蓝词命中结果：None 且 keywords 非空 = 未命中；表里没填蓝词时保持 None
-    # 且 seed_checked=False（此时不碰「蓝词命中」列）。
+    # 关键词命中结果：seed_checked=True 且 seed_hit=None = 确认未命中；
+    # seed_checked=False（没填关键词、或本轮没看到评论页）时
+    # 「关键词命中」和「评论状态」两列都不碰。
     seed_hit: Optional[SeedHit] = None
     seed_checked: bool = False
 
@@ -1604,7 +1613,7 @@ def decide(
     age_hours: Optional[float],
     seed_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
-    current_comment_status: Optional[list[str]] = None,
+    previous_pinned: Optional[str] = None,
 ) -> Verdict:
     """算出这一行本次应有的机器标签和置顶判定。
 
@@ -1672,27 +1681,40 @@ def decide(
     # —— 置顶 ——
     verdict.pin = decide_pin(snapshot)
     # 之前有过置顶、现在没了 —— 自家帖子的置顶掉了，最该被立刻发现。
+    # 「之前有过」看的是上一轮写进「置顶评论」列的内容：非空且不是
+    # 抖音的「不支持」占位，就说明上一轮确实看到过置顶。
     if (
-        settings.comment_status.ever_pinned(current_comment_status)
-        and verdict.pin is Pin.NONE_PINNED
+        verdict.pin is Pin.NONE_PINNED
+        and previous_pinned
+        and previous_pinned != DOUYIN_PINNED_UNSUPPORTED
     ):
         verdict.notes.append("⚠ 此前已确认有置顶，本轮置顶已不在")
 
-    # —— 蓝词命中：任一关键词出现在第一页任一条评论里即算命中 ——
-    if seed_keywords:
+    # —— 关键词命中：任一关键词出现在第一页任一条评论里即算命中 ——
+    # 只在真的看到了评论页（有评论、或至少知道评论数）时才下结论：
+    # 空壳轮（items 空 + 评论数也没拿到）写「未命中/没有显示」是拿
+    # 上游缺数当证据，会诱导运营去无谓补评论。
+    if seed_keywords and (snapshot.comments or snapshot.comment_count is not None):
         verdict.seed_checked = True
         verdict.seed_hit = match_seed_keywords(snapshot, seed_keywords)
         if verdict.seed_hit is None:
             verdict.notes.append(
-                f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何蓝词"
-                f"（共 {len(seed_keywords)} 个词）"
+                f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何关键词"
+                f"（共 {len(seed_keywords)} 个词）→ 评论没有显示"
             )
+    elif seed_keywords:
+        verdict.notes.append("本轮未取到评论页内容，关键词命中与评论状态保持原样")
 
     return verdict
 
 
 def format_seed_match(verdict: Verdict, snapshot: Snapshot) -> Optional[str]:
-    """「蓝词命中」列的内容。None = 这一轮不碰这一列（表里没填蓝词）。"""
+    """「关键词命中」列的内容：只标命中的那一条（或明确未命中）。
+
+    None = 这一轮不碰这一列（没填关键词、或没看到评论页）。
+    完整的第一页评论在「评论区快照」里，那一列是看评论区氛围的，
+    这里不重复也不覆盖。
+    """
     if not verdict.seed_checked:
         return None
     if verdict.seed_hit is not None:
@@ -1757,7 +1779,7 @@ class Row:
     record_id: str
     link_cell: str
     publish_time_ms: Optional[int] = None
-    # 蓝词组：任一出现在第一页评论里即算命中（不区分大小写）。
+    # 评论关键词组：任一出现在第一页评论里即算命中（不区分大小写）。
     seed_keywords: list[str] = field(default_factory=list)
     current_tags: list[str] = field(default_factory=list)
     previous_comment_count: Optional[int] = None
@@ -1768,6 +1790,9 @@ class Row:
     last_updated_ms: Optional[int] = None
     consecutive_failures: int = 0
     comment_status: list[str] = field(default_factory=list)
+    # 上一轮写进「置顶评论」列的内容：非空（且不是抖音的「不支持」占位）
+    # 而本轮没有置顶，就是「置顶刚掉」——最该被立刻发现的告警。
+    pinned_comment: str = ""
     queued: bool = False
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)
@@ -2183,6 +2208,7 @@ async def main(args: Any) -> dict:
             last_updated_ms=_cell_ms(cells.get(f.last_updated)),
             consecutive_failures=_cell_int(cells.get(f.consecutive_failures)) or 0,
             comment_status=_cell_tags(cells.get(f.comment_status)),
+            pinned_comment=_cell_text(cells.get(f.pinned_comment)),
             queued=bool(cells.get(f.queued)),
         )
         if wanted or row.queued or row.is_due(settings, now):
@@ -2382,7 +2408,7 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
                      age_hours=row.age_hours(now),
                      seed_keywords=row.seed_keywords,
                      current_tags=row.current_tags,
-                     current_comment_status=row.comment_status)
+                     previous_pinned=row.pinned_comment)
     if snapshot.censored:
         verdict.notes.append("⚠ 上游把这条标成了审核中/受限，请人工确认")
     fields = _render(row, verdict, snapshot, settings, now, "正常",
@@ -2420,7 +2446,8 @@ def _render(row, verdict, snapshot, settings, now, status,
             )[:500]
         if merged.changed:
             fields[f.traffic_status] = merged.final
-        wanted = comment_status_values(verdict.pin, row.comment_status, settings)
+        # 「评论状态」由关键词命中结果驱动（命中=显示评论，未命中=没有显示）。
+        wanted = comment_status_values(verdict, settings)
         if wanted is not None:
             merged_status = merge(row.comment_status, wanted,
                                   settings.comment_status.namespace(),
@@ -2481,8 +2508,8 @@ def _cell_tags(value):
 
 
 def _cell_keywords(value):
-    """蓝词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分（不按空格，
-    「cGMP 因子」这类带空格的词组不能拆碎）。"""
+    """评论关键词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分
+    （不按空格，「cGMP 因子」这类带空格的词组不能拆碎）。"""
     raw = [w for w in _cell_tags(value) if w] if isinstance(value, list) else []
     if not raw:
         # 富文本分段（单行文本列的返回形态）走文本拼接再拆，

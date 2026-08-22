@@ -36,7 +36,7 @@ class Row:
     record_id: str
     link_cell: str
     publish_time_ms: Optional[int] = None
-    # 蓝词组：任一出现在第一页评论里即算命中（不区分大小写）。
+    # 评论关键词组：任一出现在第一页评论里即算命中（不区分大小写）。
     seed_keywords: list[str] = field(default_factory=list)
     current_tags: list[str] = field(default_factory=list)
     previous_comment_count: Optional[int] = None
@@ -47,6 +47,9 @@ class Row:
     last_updated_ms: Optional[int] = None
     consecutive_failures: int = 0
     comment_status: list[str] = field(default_factory=list)
+    # 上一轮写进「置顶评论」列的内容：非空（且不是抖音的「不支持」占位）
+    # 而本轮没有置顶，就是「置顶刚掉」——最该被立刻发现的告警。
+    pinned_comment: str = ""
     queued: bool = False
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)

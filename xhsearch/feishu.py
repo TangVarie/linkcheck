@@ -248,16 +248,20 @@ class Bitable:
             mid = len(chunk) // 2
             return self._submit(chunk[:mid], errors) + self._submit(chunk[mid:], errors)
 
-    def field_names(self) -> Optional[set[str]]:
-        """这张表实际存在的全部列名；读不到返回 None（= 不过滤，宁可试着写）。
+    def fields_meta(self) -> Optional[dict[str, dict]]:
+        """这张表全部字段的元数据：列名 → {"type", "ui_type", "options"}。
 
-        用来在写回前挡掉表里还没建的机器列——按名字写一个不存在的列是
-        **表级错误**（1254045），会让整批写回失败。挡下来的列在日志里提示，
-        运营按提示建好列，下一轮自然补上。
+        读不到（权限/网络）返回 None。options 的三种取值必须区分：
+        列表（可能为空）= 这是个选择类字段，列出已建的选项名；
+        None = 这个字段没有「选项」概念（文本/数字/日期……）。
+
+        doctor 用它做全量体检（列在不在、类型对不对、选项建没建），
+        跑批入口用它一次拿全 列名清单 + 两个选择列的选项，省两次分页请求。
         """
         page_token = ""
-        names: set[str] = set()
+        meta: dict[str, dict] = {}
         while True:
+            # 列出字段接口的 page_size 上限是 100（比记录接口低），超了会被拒。
             url = self._url("fields?page_size=100")
             if page_token:
                 url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
@@ -267,13 +271,36 @@ class Bitable:
                 return None
             data = payload.get("data") or {}
             for field in data.get("items") or []:
-                if field.get("field_name"):
-                    names.add(str(field["field_name"]))
+                name = field.get("field_name")
+                if not name:
+                    continue
+                prop = field.get("property") if isinstance(field.get("property"), dict) else {}
+                options: Optional[list[str]] = None
+                if isinstance(prop, dict) and "options" in prop:
+                    # 空列表要保留：「建了选择列但一个选项都没配」和
+                    # 「不是选择列」是两回事。
+                    options = [o["name"] for o in (prop.get("options") or [])
+                               if isinstance(o, dict) and o.get("name")]
+                meta[str(name)] = {
+                    "type": field.get("type"),
+                    "ui_type": str(field.get("ui_type") or ""),
+                    "options": options,
+                }
             if not data.get("has_more"):
-                return names
+                return meta
             page_token = data.get("page_token") or ""
             if not page_token:
-                return names
+                return meta
+
+    def field_names(self) -> Optional[set[str]]:
+        """这张表实际存在的全部列名；读不到返回 None（= 不过滤，宁可试着写）。
+
+        用来在写回前挡掉表里还没建的机器列——按名字写一个不存在的列是
+        **表级错误**（1254045），会让整批写回失败。挡下来的列在日志里提示，
+        运营按提示建好列，下一轮自然补上。
+        """
+        meta = self.fields_meta()
+        return None if meta is None else set(meta)
 
     def list_field_options(self, field_name: str) -> Optional[list[str]]:
         """读某个单选/多选字段已配置的选项，读不到返回 None。
@@ -284,27 +311,13 @@ class Bitable:
         返回 None 表示「查不到，别过滤」而不是「没有选项」，两者必须区分：
         前者应放行（宁可试着写），后者应全部拦下。
         """
-        page_token = ""
-        while True:
-            # 列出字段接口的 page_size 上限是 100（比记录接口低），超了会被拒。
-            url = self._url("fields?page_size=100")
-            if page_token:
-                url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
-            resp = transport.get(url, self._headers(), timeout=self.timeout)
-            payload = resp.json()
-            if not isinstance(payload, dict) or payload.get("code") not in (0, None):
-                return None
-
-            data = payload.get("data") or {}
-            for field in data.get("items") or []:
-                if field.get("field_name") == field_name:
-                    options = ((field.get("property") or {}).get("options")) or []
-                    return [o["name"] for o in options if isinstance(o, dict) and o.get("name")]
-            if not data.get("has_more"):
-                return None
-            page_token = data.get("page_token") or ""
-            if not page_token:
-                return None
+        meta = self.fields_meta()
+        if meta is None or field_name not in meta:
+            return None
+        options = meta[field_name]["options"]
+        # 沿用旧行为：列存在但不是选择类字段时返回 []（全拦）——
+        # 往文本列里写多选列表本来就写不进去。
+        return options if options is not None else []
 
 
 # ---------- 单元格取值 / 赋值 ----------

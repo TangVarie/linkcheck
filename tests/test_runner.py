@@ -358,7 +358,8 @@ class TestDouyin(RunnerTest):
         self.assertIn("抖音不支持置顶监控", pinned)
 
     def test_douyin_never_touches_comment_status(self):
-        """抖音判不了置顶，就绝不能碰运营手工维护的「评论状态」列。"""
+        """没填关键词的抖音行判不了「显示没显示」，绝不能碰「评论状态」列。
+        （填了关键词的抖音行现在能判——匹配的是第一页评论，不依赖置顶字段。）"""
         page = {"items": [], "comment_count": 5, "points": {"cost": 10, "balance": 1}}
         report = self.run_with([sse(page), sse({"comment_count": 5, "points": {"cost": 10, "balance": 1}})],
                                [self._row()])
@@ -366,12 +367,13 @@ class TestDouyin(RunnerTest):
 
 
 class TestPinnedTracking(RunnerTest):
-    """「评论状态」多选列：机器管置顶三值，人工值原样保留。
-    自家帖子的置顶必为我方，判定只看「置顶还在不在」。"""
+    """「评论状态」由关键词命中驱动（命中=显示评论，未命中=没有显示）；
+    置顶只看「置顶评论」列的内容变化，掉了在诊断信息里报警。"""
 
-    def _row(self, *, status=None):
-        row = xhs_row()
+    def _row(self, *, status=None, keywords=None, pinned_cell=""):
+        row = xhs_row(keywords=keywords)
         row.comment_status = status or []
+        row.pinned_comment = pinned_cell
         return row
 
     def _run(self, pinned, row):
@@ -381,37 +383,45 @@ class TestPinnedTracking(RunnerTest):
             [row],
         )
 
-    def test_pinned_present_writes_ok(self):
-        fields = self._run(True, self._row()).outcomes[0].fields
+    def test_hit_writes_displayed(self):
+        fields = self._run(True, self._row(keywords=["好用"])).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status],
-                         [self.settings.comment_status.pinned_ok])
+                         [self.settings.comment_status.displayed])
 
-    def test_never_pinned(self):
-        fields = self._run(False, self._row()).outcomes[0].fields
+    def test_miss_writes_not_displayed(self):
+        fields = self._run(True, self._row(keywords=["艾时达口溶膜"])).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status],
-                         [self.settings.comment_status.never_pinned])
+                         [self.settings.comment_status.not_displayed])
 
-    def test_pin_fell_off_after_success(self):
+    def test_no_keywords_leaves_column_alone(self):
+        """没填关键词的行判不了「显示没显示」，这一列绝不能碰。"""
+        fields = self._run(False, self._row(status=["待评论"])).outcomes[0].fields
+        self.assertNotIn(self.settings.fields.comment_status, fields)
+
+    def test_verdict_replaces_pending(self):
+        """「待评论」本质上是还没显示：机器拿到结论后替掉它；
+        这一列里其他人工值原样保留。"""
         cs = self.settings.comment_status
-        fields = self._run(False, self._row(status=[cs.pinned_ok])).outcomes[0].fields
-        self.assertEqual(fields[self.settings.fields.comment_status], [cs.pinned_lost])
+        row = self._row(status=[cs.pending, "重点盯"], keywords=["好用"])
+        final = self._run(True, row).outcomes[0].fields[self.settings.fields.comment_status]
+        self.assertIn(cs.displayed, final)
+        self.assertNotIn(cs.pending, final)
+        self.assertIn("重点盯", final)
+
+    def test_pin_fell_off_is_reported(self):
+        """上一轮「置顶评论」里有内容、这一轮没有 → 置顶刚掉，诊断里报警，
+        「置顶评论」列清空（下一轮就不再重复报）。"""
+        row = self._row(pinned_cell="官号: 戳主页领券")
+        fields = self._run(False, row).outcomes[0].fields
         self.assertIn("置顶已不在", fields[self.settings.fields.failure_reason])
-
-    def test_human_value_in_the_same_column_survives(self):
-        """「显示评论」这类人工维护的值和置顶三值并列在同一列，机器绝不碰。"""
-        cs = self.settings.comment_status
-        row = self._row(status=["显示评论", cs.pinned_ok])
-        final = self._run(False, row).outcomes[0].fields[self.settings.fields.comment_status]
-        self.assertIn("显示评论", final)
-        self.assertIn(cs.pinned_lost, final)
-        self.assertNotIn(cs.pinned_ok, final)     # 三值互斥，旧值被摘掉
+        self.assertEqual(fields[self.settings.fields.pinned_comment], "")
 
     def test_unknown_option_is_filtered(self):
         report = self.run_with(
             [sse(comment_page(pinned=True)),
              sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [self._row()],
-            comment_status_options=["显示评论"],     # 表里没建置顶三值
+            [self._row(keywords=["好用"])],
+            comment_status_options=["待评论"],     # 表里没建「显示评论」选项
         )
         fields = report.outcomes[0].fields
         self.assertNotIn(self.settings.fields.comment_status, fields)
@@ -419,7 +429,7 @@ class TestPinnedTracking(RunnerTest):
 
 
 class TestSeedKeywordColumn(RunnerTest):
-    """「蓝词命中」列：表里填了蓝词才写；任一词命中任一条评论即算命中。"""
+    """「关键词命中」列：表里填了评论关键词才写；任一词命中任一条评论即算命中。"""
 
     def test_hit_written_with_keyword_and_comment(self):
         page = comment_page(pinned=False)

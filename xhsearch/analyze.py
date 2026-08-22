@@ -188,7 +188,7 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat) -> str:
 def _normalize(text: str) -> str:
     """比对文本用的归一化：去空白、去标点、统一大小写。
 
-    表里登记的蓝词和评论区里实际打出来的字几乎不可能逐字一致
+    表里登记的关键词和评论区里实际打出来的字几乎不可能逐字一致
     （大小写、emoji、被平台吞掉的符号），所以只做宽松包含匹配——
     实际数据里「cGMP因子」和「cgmp因子」就是混着写的。
     """
@@ -197,18 +197,20 @@ def _normalize(text: str) -> str:
 
 @dataclass
 class SeedHit:
-    """蓝词命中结果：哪个词、命中在哪条评论。"""
+    """关键词命中结果：哪个词、命中在哪条评论。"""
 
     keyword: str
     comment: str
 
 
 def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[SeedHit]:
-    """蓝词组 × 第一页评论的包含匹配。
+    """评论关键词组 × 第一页评论的包含匹配。
 
+    这查的是**我们自己的种子评论有没有显示出来**（和「蓝词」无关——
+    蓝词指评论里变成超链接的词，那是人工在手机端自查的）。
     规则刻意简单：任一关键词（归一化后）出现在任一条评论里就算命中，
     按关键词在表里的顺序取第一个命中的。没有长度门槛、没有辨识度要求——
-    这一列维护的是「西地那非口溶膜」这类蓝词，词本身就有辨识度。
+    「西地那非口溶膜」这类词本身就有辨识度。
     """
     for keyword in keywords:
         needle = _normalize(keyword)
@@ -239,24 +241,24 @@ def decide_pin(snapshot: Snapshot) -> Pin:
     return Pin.PINNED if snapshot.pinned is not None else Pin.NONE_PINNED
 
 
-def comment_status_values(
-    pin: Pin,
-    current: Optional[list[str]],
-    settings: Settings,
-) -> Optional[set[str]]:
-    """算出「评论状态」这一列里机器该写的值。
+def comment_status_values(verdict: "Verdict", settings: Settings) -> Optional[set[str]]:
+    """算出「评论状态」这一列里机器该写的值——由关键词命中结果驱动。
+
+    命中 = 我们的种子评论显示出来了 → 显示评论；
+    配了关键词但一条没中 → 没有显示（「待评论」也会被这个结论替掉——
+    待评论本质上就是还没显示）。
 
     返回 None 表示**这一轮不该碰这一列**，和「写一个空集合」完全不是一回事：
-    空集合会把机器上一轮写的置顶结论摘掉，None 是原样保留。
-    抖音必须返回 None——接口没有 is_pinned，判不了。
+    空集合会把上一轮的结论摘掉，None 是原样保留。没填关键词的行、
+    以及本轮没取到评论页内容的行都返回 None。
+
+    和置顶无关：置顶内容由「置顶评论」列单独展示。匹配的是第一页评论，
+    两个平台都拿得到，所以抖音行同样能判。
     """
-    cs = settings.comment_status
-    if pin is Pin.UNSUPPORTED:
+    if not verdict.seed_checked:
         return None
-    if pin is Pin.PINNED:
-        return {cs.pinned_ok}
-    # 没有置顶：区分「掉了」和「从来没有」只看这一行的历史。
-    return {cs.pinned_lost} if cs.ever_pinned(current) else {cs.never_pinned}
+    cs = settings.comment_status
+    return {cs.displayed} if verdict.seed_hit is not None else {cs.not_displayed}
 
 
 @dataclass
@@ -264,8 +266,9 @@ class Verdict:
     tags: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
     pin: Pin = Pin.UNSUPPORTED
-    # 蓝词命中结果：None 且 keywords 非空 = 未命中；表里没填蓝词时保持 None
-    # 且 seed_checked=False（此时不碰「蓝词命中」列）。
+    # 关键词命中结果：seed_checked=True 且 seed_hit=None = 确认未命中；
+    # seed_checked=False（没填关键词、或本轮没看到评论页）时
+    # 「关键词命中」和「评论状态」两列都不碰。
     seed_hit: Optional[SeedHit] = None
     seed_checked: bool = False
 
@@ -278,7 +281,7 @@ def decide(
     age_hours: Optional[float],
     seed_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
-    current_comment_status: Optional[list[str]] = None,
+    previous_pinned: Optional[str] = None,
 ) -> Verdict:
     """算出这一行本次应有的机器标签和置顶判定。
 
@@ -346,27 +349,40 @@ def decide(
     # —— 置顶 ——
     verdict.pin = decide_pin(snapshot)
     # 之前有过置顶、现在没了 —— 自家帖子的置顶掉了，最该被立刻发现。
+    # 「之前有过」看的是上一轮写进「置顶评论」列的内容：非空且不是
+    # 抖音的「不支持」占位，就说明上一轮确实看到过置顶。
     if (
-        settings.comment_status.ever_pinned(current_comment_status)
-        and verdict.pin is Pin.NONE_PINNED
+        verdict.pin is Pin.NONE_PINNED
+        and previous_pinned
+        and previous_pinned != DOUYIN_PINNED_UNSUPPORTED
     ):
         verdict.notes.append("⚠ 此前已确认有置顶，本轮置顶已不在")
 
-    # —— 蓝词命中：任一关键词出现在第一页任一条评论里即算命中 ——
-    if seed_keywords:
+    # —— 关键词命中：任一关键词出现在第一页任一条评论里即算命中 ——
+    # 只在真的看到了评论页（有评论、或至少知道评论数）时才下结论：
+    # 空壳轮（items 空 + 评论数也没拿到）写「未命中/没有显示」是拿
+    # 上游缺数当证据，会诱导运营去无谓补评论。
+    if seed_keywords and (snapshot.comments or snapshot.comment_count is not None):
         verdict.seed_checked = True
         verdict.seed_hit = match_seed_keywords(snapshot, seed_keywords)
         if verdict.seed_hit is None:
             verdict.notes.append(
-                f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何蓝词"
-                f"（共 {len(seed_keywords)} 个词）"
+                f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何关键词"
+                f"（共 {len(seed_keywords)} 个词）→ 评论没有显示"
             )
+    elif seed_keywords:
+        verdict.notes.append("本轮未取到评论页内容，关键词命中与评论状态保持原样")
 
     return verdict
 
 
 def format_seed_match(verdict: Verdict, snapshot: Snapshot) -> Optional[str]:
-    """「蓝词命中」列的内容。None = 这一轮不碰这一列（表里没填蓝词）。"""
+    """「关键词命中」列的内容：只标命中的那一条（或明确未命中）。
+
+    None = 这一轮不碰这一列（没填关键词、或没看到评论页）。
+    完整的第一页评论在「评论区快照」里，那一列是看评论区氛围的，
+    这里不重复也不覆盖。
+    """
     if not verdict.seed_checked:
         return None
     if verdict.seed_hit is not None:

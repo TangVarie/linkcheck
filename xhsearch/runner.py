@@ -459,12 +459,13 @@ def refresh(
             if merged.changed:
                 fields[f.traffic_status] = merged.final
 
-        # 「评论状态」也是人机共用的多选列，走和流量状态一模一样的合并算法：
-        # 机器管置顶那三个值，人工维护的「评论是否显示」之类原样保留。
+        # 「评论状态」由关键词命中结果驱动（命中=显示评论，未命中=没有显示），
+        # 走和流量状态一模一样的合并算法：机器管三个值（含替掉「待评论」），
+        # 这一列里若有别的人工值原样保留。
         if touch_tags:
-            wanted = analyze.comment_status_values(verdict.pin, row.comment_status, settings)
-            # None 表示这一轮判不了（抖音、或没填种子关键词）——原样保留，
-            # 而不是写个空集合把上一轮的置顶结论摘掉。
+            wanted = analyze.comment_status_values(verdict, settings)
+            # None 表示这一轮判不了（没填关键词、或没看到评论页）——原样保留，
+            # 而不是写个空集合把上一轮的结论摘掉。
             if wanted is not None:
                 merged_status = tags.merge(
                     row.comment_status,
@@ -594,9 +595,9 @@ def refresh(
             settings,
             previous_comment_count=row.previous_comment_count,
             age_hours=row.age_hours(now),
-            seed_keywords=row.seed_keywords,                  # 蓝词组，任一命中即算命中
+            seed_keywords=row.seed_keywords,                  # 评论关键词组，任一命中即算命中
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
-            current_comment_status=row.comment_status,        # 区分「掉了」和「从来没有」
+            previous_pinned=row.pinned_comment,               # 判断置顶是不是刚掉的
         )
         if error is not None:
             verdict.notes.append(f"（detail 未取到：{error.operator_text()[:120]}）")
@@ -735,6 +736,7 @@ def load_rows(
             last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
             consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
             comment_status=feishu.read_multi_select(cells.get(f.comment_status)),
+            pinned_comment=feishu.read_text(cells.get(f.pinned_comment)),
             queued=feishu.read_bool(cells.get(f.queued)),
         )
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。

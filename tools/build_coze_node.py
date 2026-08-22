@@ -365,6 +365,7 @@ async def main(args: Any) -> dict:
             last_updated_ms=_cell_ms(cells.get(f.last_updated)),
             consecutive_failures=_cell_int(cells.get(f.consecutive_failures)) or 0,
             comment_status=_cell_tags(cells.get(f.comment_status)),
+            pinned_comment=_cell_text(cells.get(f.pinned_comment)),
             queued=bool(cells.get(f.queued)),
         )
         if wanted or row.queued or row.is_due(settings, now):
@@ -564,7 +565,7 @@ async def _process(row, keys, settings, now, semaphore, deadline, disabled,
                      age_hours=row.age_hours(now),
                      seed_keywords=row.seed_keywords,
                      current_tags=row.current_tags,
-                     current_comment_status=row.comment_status)
+                     previous_pinned=row.pinned_comment)
     if snapshot.censored:
         verdict.notes.append("⚠ 上游把这条标成了审核中/受限，请人工确认")
     fields = _render(row, verdict, snapshot, settings, now, "正常",
@@ -602,7 +603,8 @@ def _render(row, verdict, snapshot, settings, now, status,
             )[:500]
         if merged.changed:
             fields[f.traffic_status] = merged.final
-        wanted = comment_status_values(verdict.pin, row.comment_status, settings)
+        # 「评论状态」由关键词命中结果驱动（命中=显示评论，未命中=没有显示）。
+        wanted = comment_status_values(verdict, settings)
         if wanted is not None:
             merged_status = merge(row.comment_status, wanted,
                                   settings.comment_status.namespace(),
@@ -663,8 +665,8 @@ def _cell_tags(value):
 
 
 def _cell_keywords(value):
-    """蓝词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分（不按空格，
-    「cGMP 因子」这类带空格的词组不能拆碎）。"""
+    """评论关键词组：多选列取选项名；文本列按 顿号/逗号/分号/换行 拆分
+    （不按空格，「cGMP 因子」这类带空格的词组不能拆碎）。"""
     raw = [w for w in _cell_tags(value) if w] if isinstance(value, list) else []
     if not raw:
         # 富文本分段（单行文本列的返回形态）走文本拼接再拆，

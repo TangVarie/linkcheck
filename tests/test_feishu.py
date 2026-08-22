@@ -212,6 +212,31 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         self.assertIsNone(table.requested_fields)   # 连 search 都没发
 
 
+class TestFieldsMeta(unittest.TestCase):
+    """fields_meta 是 doctor 全量体检的地基：类型、选项都得原样带回来。"""
+
+    def test_types_and_options_are_preserved(self):
+        page = ok({"items": [
+            {"field_name": "反馈链接", "type": 1, "ui_type": "Text"},
+            {"field_name": "流量状态", "type": 4, "ui_type": "MultiSelect",
+             "property": {"options": [{"name": "爆贴"}, {"name": "大爆"}]}},
+            {"field_name": "评论状态", "type": 4, "ui_type": "MultiSelect",
+             "property": {"options": []}},
+        ], "has_more": False})
+        with mock.patch.object(transport, "get", return_value=page):
+            meta = make_table().fields_meta()
+        self.assertEqual(meta["反馈链接"]["type"], 1)
+        # None = 没有「选项」概念的字段；空列表 = 建了选择列但零选项。两者不能混。
+        self.assertIsNone(meta["反馈链接"]["options"])
+        self.assertEqual(meta["流量状态"]["options"], ["爆贴", "大爆"])
+        self.assertEqual(meta["评论状态"]["options"], [])
+
+    def test_unreadable_returns_none(self):
+        with mock.patch.object(transport, "get",
+                               return_value=transport.Response(403, "", "denied")):
+            self.assertIsNone(make_table().fields_meta())
+
+
 class TestFieldOptionsPagination(unittest.TestCase):
     def test_field_on_second_page_is_found(self):
         pages = [

@@ -105,6 +105,66 @@ def _settings() -> Settings:
     return settings
 
 
+# 飞书多维表格字段类型码 → 界面上的叫法。体检报错时把数字翻译成人话。
+_FIELD_TYPE_NAMES = {
+    1: "文本", 2: "数字", 3: "单选", 4: "多选", 5: "日期", 7: "复选框",
+    11: "人员", 13: "电话号码", 15: "超链接", 17: "附件", 18: "单向关联",
+    19: "查找引用", 20: "公式", 21: "双向关联", 22: "地理位置", 23: "群组",
+    1001: "创建时间", 1002: "最后更新时间", 1003: "创建人", 1004: "修改人",
+    1005: "自动编号",
+}
+
+
+def _type_name(code) -> str:
+    return _FIELD_TYPE_NAMES.get(code, f"未知类型 {code}")
+
+
+def _expected_schema(settings: Settings) -> list[tuple]:
+    """每一列的期望配置：(列名, 允许的类型码, 类型的人话, 必备选项, 备注)。
+
+    「表面对了，内在配置没对」通常就死在类型上：列名一字不差，
+    但「最近检查时间」建成了系统的「最后更新时间」类型（机器写不进去），
+    或「评论状态」建成了单选（机器按多选合并写入会整批失败）。
+    这张清单就是 docs/表结构.md 的机器可执行版。
+    """
+    f = settings.fields
+    statuses = [runner.STATUS_OK, runner.STATUS_SUSPECT, runner.STATUS_GONE,
+                runner.STATUS_FAILED, runner.STATUS_SKIPPED]
+    return [
+        # —— 人工维护 ——
+        (f.link, (1,), "文本", None,
+         "别建成「超链接」字段——它会规范化链接，可能吞掉小红书短链里的 token"),
+        (f.publish_time, (5,), "日期", None,
+         "要手填的普通日期字段；建成「创建时间」类型拿到的是建行时间，不是发布时间"),
+        (f.seed_keywords, (4, 1), "多选或文本", None,
+         "文本列时用顿号/逗号/分号分隔多个词"),
+        (f.monitoring, (7,), "复选框", None, None),
+        (f.queued, (7,), "复选框", None, None),
+        # —— 机器写入 ——
+        (f.platform, (3, 1), "单选或文本", ["小红书", "抖音"], None),
+        (f.comment_count, (2,), "数字", None, None),
+        (f.previous_comment_count, (2,), "数字", None, None),
+        (f.like_count, (2,), "数字", None, None),
+        (f.previous_like_count, (2,), "数字", None, None),
+        (f.collect_count, (2,), "数字", None, None),
+        (f.previous_collect_count, (2,), "数字", None, None),
+        (f.pinned_comment, (1,), "文本", None, None),
+        (f.comment_status, (4,), "多选", settings.comment_status.machine_written(),
+         "机器按多选合并写入——建成单选会让写回整批失败"),
+        (f.comment_digest, (1,), "文本", None, None),
+        (f.seed_match, (1,), "文本", None, None),
+        (f.traffic_status, (4,), "多选", settings.tags.namespace(),
+         "机器按多选合并写入——建成单选会让写回整批失败"),
+        (f.refresh_status, (3, 1), "单选或文本", statuses, None),
+        (f.failure_reason, (1,), "文本", None, None),
+        (f.last_updated, (5,), "日期", None,
+         "必须是普通「日期」字段——建成系统的「最后更新时间」类型机器写不进去，"
+         "而且任何人工编辑都会刷新它，分层刷新的节奏会被打乱"),
+        (f.alive_confirmed, (7,), "复选框", None, None),
+        (f.consecutive_failures, (2,), "数字", None, None),
+    ]
+
+
 def cmd_doctor() -> int:
     """上线前体检。不花一分钱，但能挡掉九成的「配好了跑不通」。"""
     settings = _settings()
@@ -121,9 +181,9 @@ def cmd_doctor() -> int:
         print(f"   {exc}")
         return 1
 
-    print("② 读表字段 …", end=" ", flush=True)
-    options = table.list_field_options(f.traffic_status)
-    if options is None:
+    print("② 全量字段体检（列名、类型、选项）…", end=" ", flush=True)
+    meta = table.fields_meta()
+    if meta is None:
         print("读不到字段列表")
         problems.append(
             f"读不到字段列表。多半是应用没被加进这张多维表格："
@@ -132,43 +192,41 @@ def cmd_doctor() -> int:
             f"漏这一步的表现是读到空结果而不是报错。"
         )
     else:
-        print(f"OK（「{f.traffic_status}」有 {len(options)} 个选项：{'、'.join(options)}）")
-        missing = [t for t in settings.tags.namespace() if t not in options]
-        if missing:
+        print(f"OK（表里共 {len(meta)} 列）")
+        missing_required: list[str] = []
+        missing_optional: list[str] = []
+        for name, allowed, type_label, required_options, note in _expected_schema(settings):
+            info = meta.get(name)
+            if info is None:
+                # 没有链接和巡查开关，机器连一行都读不出来——单独点名。
+                (missing_required if name in (f.link, f.monitoring)
+                 else missing_optional).append(name)
+                continue
+            if info["type"] not in allowed:
+                hint = f"。{note}" if note else ""
+                problems.append(
+                    f"「{name}」的字段类型是「{_type_name(info['type'])}」，"
+                    f"需要「{type_label}」——列名对了但类型不对，"
+                    f"机器会读不到或写不进这一列{hint}"
+                )
+                continue
+            # 类型对了再看选项：只有实际建成选择类字段才需要检查。
+            if required_options and info["options"] is not None:
+                missing = [v for v in required_options if v not in info["options"]]
+                if missing:
+                    problems.append(
+                        f"「{name}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
+                        f"机器要写它们，没建就会被跳过（不会误写，但对应判定等于没生效）。"
+                    )
+        if missing_required:
             problems.append(
-                f"「{f.traffic_status}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
-                f"没建的话机器会跳过它们（不会误写），但对应的判定就等于没生效。"
+                f"表里缺必备列：{'、'.join(missing_required)}——没有它们机器一行都处理不了。"
+                "列名要和 config.py 逐字一致（含空格和标点）。"
             )
-
-    names = table.field_names()
-    if names is not None:
-        wanted_columns = [
-            # 人工维护
-            f.link, f.publish_time, f.seed_keywords, f.monitoring, f.queued,
-            # 机器写入
-            f.platform, f.comment_count, f.previous_comment_count,
-            f.like_count, f.previous_like_count,
-            f.collect_count, f.previous_collect_count,
-            f.pinned_comment, f.comment_status, f.comment_digest, f.seed_match,
-            f.traffic_status, f.refresh_status, f.failure_reason,
-            f.last_updated, f.alive_confirmed, f.consecutive_failures,
-        ]
-        missing_columns = [c for c in wanted_columns if c not in names]
-        if missing_columns:
+        if missing_optional:
             problems.append(
-                f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_columns)}。"
+                f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_optional)}。"
                 "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
-            )
-
-    status_options = table.list_field_options(f.comment_status)
-    if status_options is not None:
-        print(f"   「{f.comment_status}」有 {len(status_options)} 个选项："
-              f"{'、'.join(status_options)}")
-        missing = [v for v in settings.comment_status.namespace() if v not in status_options]
-        if missing:
-            problems.append(
-                f"「{f.comment_status}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
-                f"机器要往这一列写它们，没建就写不进去（不会误写，但置顶判定等于没生效）。"
             )
 
     print("③ 试读一行 …", end=" ", flush=True)
@@ -220,9 +278,18 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     now = datetime.now(timezone.utc)
 
     print(f"读表（模式：{mode}）…")
-    # 列名清单读一次、读写两侧共用：读侧过滤 search 请求的列（请求不存在的
-    # 列会让整个 search 失败），写侧过滤还没建的机器列。
-    known_fields = table.field_names()
+    # 字段元数据读一次、处处共用：读侧过滤 search 请求的列（请求不存在的
+    # 列会让整个 search 失败），写侧过滤还没建的机器列，两个选择列的
+    # 选项清单也从同一份里取——省两次分页请求。
+    fields_meta = table.fields_meta()
+    known_fields = set(fields_meta) if fields_meta is not None else None
+
+    def _options_of(column: str):
+        """选择列的已建选项。None = 查不到别过滤；[] = 不是选择列，全拦。"""
+        if fields_meta is None or column not in fields_meta:
+            return None
+        options = fields_meta[column]["options"]
+        return options if options is not None else []
     row_list = runner.load_rows(
         table,
         settings,
@@ -271,8 +338,8 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     report = runner.refresh(
         row_list, api_keys, settings,
         now=now,
-        known_options=table.list_field_options(settings.fields.traffic_status),
-        comment_status_options=table.list_field_options(settings.fields.comment_status),
+        known_options=_options_of(settings.fields.traffic_status),
+        comment_status_options=_options_of(settings.fields.comment_status),
         forced=(record_ids is not None),
         progress=print,
     )
