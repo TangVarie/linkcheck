@@ -55,6 +55,50 @@ class TestDoctorSchema(unittest.TestCase):
         self.assertEqual(self.schema[f.pinned_status][0], (3,))
 
 
+class TestLoadDotenv(unittest.TestCase):
+    """本地跑 doctor/row 的前提：.env 真的会被读进环境变量。
+    没有这个加载器，文档里「填好 .env 就能跑」在本地是空头支票。"""
+
+    def test_reads_env_file_without_overriding_real_env(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch.envfile import load_dotenv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_text(
+                "# 注释行\n"
+                "TEST_ENVFILE_A=hello\n"
+                'TEST_ENVFILE_B="quoted"\n'
+                "TEST_ENVFILE_EXISTING=from-file\n"
+                "TEST_ENVFILE_EMPTY=\n"
+                "没有等号的行\n",
+                encoding="utf-8")
+            os.environ["TEST_ENVFILE_EXISTING"] = "from-real-env"
+            try:
+                load_dotenv(Path(tmp))
+                self.assertEqual(os.environ["TEST_ENVFILE_A"], "hello")
+                self.assertEqual(os.environ["TEST_ENVFILE_B"], "quoted")
+                # 已存在的环境变量优先——.env 只补缺不覆盖
+                self.assertEqual(os.environ["TEST_ENVFILE_EXISTING"], "from-real-env")
+                # 空值不写入，免得把「没填」变成「填了空串」
+                self.assertNotIn("TEST_ENVFILE_EMPTY", os.environ)
+            finally:
+                for name in ("TEST_ENVFILE_A", "TEST_ENVFILE_B",
+                             "TEST_ENVFILE_EXISTING", "TEST_ENVFILE_EMPTY"):
+                    os.environ.pop(name, None)
+
+    def test_missing_file_is_silently_skipped(self):
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch.envfile import load_dotenv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            load_dotenv(Path(tmp))   # 没有 .env：不抛异常即通过
+
+
 class TestOptionsFromMeta(unittest.TestCase):
     """None = 查不到别过滤；[] = 不是选择列全拦。写反任何一个分支，
     要么未建选项写进表（整批回滚），要么机器值全部静默丢失。"""

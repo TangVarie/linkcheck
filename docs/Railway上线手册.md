@@ -244,6 +244,14 @@ python3 cli.py row recXXXXXXXX     # 真刷一行
 （仓库里那个空的 `requirements.txt` 就是给它认「这是 Python 项目」用的，别删。
 这个项目零第三方依赖，没有东西要装。）
 
+> **如果构建报 `No start command detected`**：这个项目是纯 CLI、没有
+> `main.py`，Railway 的构建器（Railpack）猜不出启动命令。仓库里已带
+> `railpack.json`（默认启动命令 = `python3 cli.py doctor`，不花钱），
+> 拉到这个文件之后不会再报；报了就说明你的克隆还没有它——去服务的
+> `Settings` → `Deploy` → **Custom Start Command** 手工填 `python3 cli.py doctor`
+> 再 Deploy 一次即可。后面两个正式服务本来就要各自改 Start Command，
+> 界面上填的值**优先于** railpack.json 的默认值。
+
 ### 5.2 填环境变量（项目级，两个服务共用）
 
 项目页 → `Variables`（**项目级的，不是服务级的**，这样建第二个服务时不用再填一遍）
