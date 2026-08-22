@@ -93,12 +93,15 @@ _CODES: dict[int, tuple[Failure, bool]] = {
 
 # 兜底：错误码没命中时，从描述文案里找线索。有了官方错误码表之后，
 # 这里只是防御——正常情况下不该走到。
+# ⚠️ 顺序即优先级：TRANSPORT 必须排在 GONE 前面——「当前内容暂时不可用」这类
+# 瞬时故障文案包含「不可用」三个字，GONE 在前会把一次临时故障计成死亡一击，
+# 两击定罪的第一击就这么被白送了。
 _MESSAGE_HINTS: list[tuple[tuple[str, ...], Failure]] = [
     (("积分不足", "余额不足", "insufficient"), Failure.QUOTA),
     (("过于频繁", "频率", "rate limit"), Failure.RATE_LIMIT),
+    (("暂时不可用", "稍后重试", "service", "网络错误", "超时", "timed out"), Failure.TRANSPORT),
     (("不存在", "已删除", "已下架", "不可用", "违规", "not found", "deleted"), Failure.GONE),
     (("API Key", "鉴权", "unauthorized"), Failure.AUTH),
-    (("暂时不可用", "稍后重试", "service"), Failure.TRANSPORT),
 ]
 
 
@@ -161,7 +164,10 @@ def _classify(code: Any, message: str, http_status: Optional[int]) -> tuple[Fail
             return Failure.GONE, False
         if http_status == 429:
             return Failure.RATE_LIMIT, True
-        if http_status >= 500:
+        if http_status >= 500 or http_status == 0:
+            # 0 = 传输层的超时/拒连/DNS 失败（transport.py 的约定）。
+            # 漏掉这条会把网络故障归成 UNKNOWN——既不重试也不降级，
+            # SocialDataX 作主通道时双通道就白配了（TikHub 侧一直有对应规则）。
             return Failure.TRANSPORT, True
 
     return Failure.UNKNOWN, False

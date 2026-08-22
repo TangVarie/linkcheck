@@ -119,6 +119,25 @@ class Request:
     body: str = ""
 
 
+def _handles_everything(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
+    return True
+
+
+def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
+    """TikHub 吃不吃这种参数形态。
+
+    抖音的图文和视频共用同一对端点（aweme 本来就两种都算），**形态无关**；
+    但这对端点只收数字 aweme_id，不收链接——OpenAPI 写明 aweme_id 是「作品id」，
+    解析分享链接是另外的端点。把 v.douyin.com 短链塞进 aweme_id 必然失败，
+    还会被归一化成 GONE 嫌疑：两轮之后一条活着的内容就被标成「已失效」，钱照扣。
+    所以这种行让 TikHub 直接让位给吃链接的 SocialDataX。
+    小红书不受影响：share_text 参数长链短链分享文案都吃（实测）。
+    """
+    if platform == "douyin" and not arguments.get("aweme_id"):
+        return False
+    return True
+
+
 @dataclass
 class Provider:
     name: str
@@ -134,6 +153,9 @@ class Provider:
     # 这里保守当作不收——宁可少报一点点备胎的钱，也不要凭猜测把账单虚高，
     # 一个天天虚报成本的监控没人会信。验完见 docs/待验证清单.md 第 6 项。
     bills_failed_lookups: bool = False
+    # 这家能不能处理这种（平台, 用途, 参数）组合。挑通道时先过这一关，
+    # 免得把请求发给一个注定报错的端点——白花钱还可能把行判成失效。
+    can_handle: Callable[[str, str, dict[str, Any]], bool] = _handles_everything
 
 
 # =============================================================================
@@ -249,10 +271,12 @@ def _tikhub_error(payload: dict[str, Any], http_status: int, api_key: str) -> Er
     # 成功和失败是两套信封：成功时 code/message 在顶层，失败时整个塞进 detail。
     envelope = payload.get("detail") if isinstance(payload.get("detail"), dict) else payload
     code = envelope.get("code", http_status)
+    # 先脱敏再截断（反过来的话 Key 横跨截断边界时会有半截漏出去）。
     message = _redact(
-        str(envelope.get("message_zh") or envelope.get("message") or json.dumps(payload, ensure_ascii=False)[:300]),
+        str(envelope.get("message_zh") or envelope.get("message")
+            or json.dumps(payload, ensure_ascii=False)),
         api_key,
-    )
+    )[:300]
     request_id = str(envelope.get("request_id") or "")
 
     # TikHub 没有公开的业务错误码表，只能按 HTTP 状态 + 文案归类。
@@ -342,8 +366,9 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
                       http_status: int, request_id: str, api_key: str) -> Result:
     inner = payload.get("data")
     if not isinstance(inner, dict):
+        # 先脱敏再截断：反过来的话，Key 恰好横跨截断边界时会有半截漏出去。
         return Err(Failure.UNKNOWN, "no_data",
-                   _redact(json.dumps(payload, ensure_ascii=False)[:300], api_key),
+                   _redact(json.dumps(payload, ensure_ascii=False), api_key)[:300],
                    http_status=http_status, request_id=request_id)
 
     if platform == "xhs" and purpose == "comments":
@@ -367,6 +392,12 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
     if platform == "xhs" and purpose == "detail":
         core = inner.get("data")
         note_list = core[0].get("note_list") if isinstance(core, list) and core and isinstance(core[0], dict) else None
+        if note_list and not isinstance(note_list, list):
+            # 有内容但形状不认识（比如上游把 list 改成了 dict）：这是协议漂移，
+            # 不是「笔记没了」。硬下 [0] 会 KeyError 炸穿；按 GONE 定罪更是误杀。
+            return Err(Failure.UNKNOWN, "unexpected_shape",
+                       _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
+                       http_status=http_status, request_id=request_id)
         if not note_list:
             # 干净的死亡信号：不存在的笔记，data 直接是 []（实测）。
             return Err(Failure.GONE, "no_note", "详情接口没有返回任何笔记，笔记已不存在或不可见",
@@ -437,10 +468,16 @@ def _tikhub_parse(platform: str, purpose: str, http_status: int, content_type: s
     try:
         payload = json.loads(body or "")
     except json.JSONDecodeError:
+        # 非 JSON 的 403 基本只有一种来源：Cloudflare 的 HTML 拦截页
+        # （TikHub 的业务错误全是 JSON）。那是这条出口被拦，不是 Key 的问题，
+        # 归 TRANSPORT 才能降级到备胎；归 UNKNOWN 会把行判死还不换通道。
+        kind = (Failure.TRANSPORT
+                if http_status >= 500 or http_status == 0 or http_status == 403
+                else Failure.UNKNOWN)
         return Err(
-            Failure.TRANSPORT if http_status >= 500 or http_status == 0 else Failure.UNKNOWN,
+            kind,
             f"http_{http_status}",
-            _redact((body or f"HTTP {http_status}")[:500], api_key),
+            _redact(body or f"HTTP {http_status}", api_key)[:500],
             http_status=http_status, request_id=request_id,
         )
 
@@ -469,7 +506,7 @@ REGISTRY: dict[str, Provider] = {
     SOCIALDATAX: Provider(SOCIALDATAX, "SocialDataX", _sdx_build, _sdx_parse, _sdx_yuan,
                           bills_failed_lookups=False),
     TIKHUB: Provider(TIKHUB, "TikHub", _tikhub_build, _tikhub_parse, _tikhub_yuan,
-                     bills_failed_lookups=True),
+                     bills_failed_lookups=True, can_handle=_tikhub_can_handle),
 }
 
 

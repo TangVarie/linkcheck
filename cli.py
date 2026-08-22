@@ -27,6 +27,17 @@ def _env(name: str, *, required: bool = True, default: str = "") -> str:
     return value
 
 
+def _numeric_env(name: str, cast, default):
+    """数值型环境变量。填错时给一句能看懂的话，而不是一屏 ValueError 回溯。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        sys.exit(f"环境变量 {name} 的值 {raw!r} 不是数字（参考 .env.example）")
+
+
 def _apply_endpoint_overrides() -> None:
     """按部署位置切 TikHub 的接入域名。
 
@@ -62,25 +73,35 @@ def _settings() -> Settings:
     _apply_endpoint_overrides()
     settings = Settings()
     # 独立服务跑批量不需要软截止（那是给扣子 60 秒硬上限准备的）。
-    settings.soft_deadline_seconds = float(os.environ.get("SOFT_DEADLINE_SECONDS", "0") or 0)
-    if os.environ.get("MAX_CONCURRENCY"):
-        settings.max_concurrency = int(os.environ["MAX_CONCURRENCY"])
-    if os.environ.get("DETAIL_WITHIN_DAYS"):
-        settings.detail_within_days = int(os.environ["DETAIL_WITHIN_DAYS"])
+    settings.soft_deadline_seconds = _numeric_env("SOFT_DEADLINE_SECONDS", float, 0.0)
+    settings.max_concurrency = _numeric_env("MAX_CONCURRENCY", int, settings.max_concurrency)
+    settings.detail_within_days = _numeric_env("DETAIL_WITHIN_DAYS", int, settings.detail_within_days)
     # CHANNEL_ORDER="xhs=tikhub,socialdatax; douyin=tikhub"
     # 想把某个平台钉死在一家时用，不改代码。
+    # 在**默认配置的基础上合并**：只写 douyin 就只改 douyin，
+    # 没提到的平台保持默认双通道——整体替换会让缺席的平台静默退回
+    # socialdatax 单通道，既贵又丢掉降级能力，且没有任何提示。
     spec = os.environ.get("CHANNEL_ORDER", "").strip()
     if spec:
-        order = {}
+        order = dict(Channels().order)
         for chunk in spec.split(";"):
-            if "=" not in chunk:
+            if not chunk.strip():
                 continue
+            if "=" not in chunk:
+                sys.exit(f"CHANNEL_ORDER 里这一段看不懂：{chunk.strip()!r}。"
+                         "格式：平台=第一家,第二家；平台=……（参考 .env.example）")
             platform, names = chunk.split("=", 1)
+            platform = platform.strip().lower()
+            if platform not in ("xhs", "douyin"):
+                sys.exit(f"CHANNEL_ORDER 里的平台 {platform!r} 不认识，可选：xhs、douyin")
             picked = [n.strip().lower() for n in names.split(",") if n.strip()]
+            for name in picked:
+                if name not in providers.REGISTRY:
+                    sys.exit(f"CHANNEL_ORDER 里的供应商 {name!r} 不存在，"
+                             f"可选：{'、'.join(sorted(providers.REGISTRY))}")
             if picked:
-                order[platform.strip()] = picked
-        if order:
-            settings.channels = Channels(order=order)
+                order[platform] = picked
+        settings.channels = Channels(order=order)
     return settings
 
 
@@ -183,15 +204,24 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
         table,
         settings,
         only_record_ids=record_ids,
-        only_due=(mode == "sweep"),
+        # estimate 的语义是「这一轮要花多少钱」，所以必须和 sweep 用同一套
+        # 到期筛选——把未到期、已归档的行也算进去，报出来的数字会虚高一个量级。
+        only_due=(mode in ("sweep", "estimate")),
         only_queued=(mode == "queue"),
         now=now,
     )
+    if record_ids:
+        found = {r.record_id for r in row_list}
+        missing = [rid for rid in record_ids if rid not in found]
+        if missing:
+            print(f"⚠ 这些 record_id 在表里没找到（可能拼错或已删除）：{'、'.join(missing)}")
+            if not row_list:
+                return 1
     if not row_list:
         print("没有需要刷新的行。")
         return 0
 
-    yuan = rows_mod.estimate_yuan(row_list, settings, now)
+    yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
     print(f"待刷 {len(row_list)} 行，预计花费 ≈ ¥{yuan:.2f}"
           f"（按每个平台的主通道单价算："
           f"小红书走 {settings.channels.primary('xhs')}，"
@@ -211,8 +241,13 @@ def _run(mode: str, record_ids: list[str] | None) -> int:
     print()
     print(report.summary())
 
-    written = runner.write_back(table, report)
+    write_errors: list = []
+    written = runner.write_back(table, report, errors=write_errors)
     print(f"已写回 {written} 行")
+    if write_errors:
+        print(f"⚠ {len(write_errors)} 行写回失败（其余行不受影响）：")
+        for record_id, exc in write_errors:
+            print(f"  {record_id}: {exc}")
     # 只有真故障才返回非零。到软截止后「留给下一轮」是正常运行，
     # 返回非零会让 cron / 云平台的重启策略把它当失败反复重启。
     return 1 if report.fatal else 0

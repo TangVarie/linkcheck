@@ -183,11 +183,18 @@ class RefreshTiers:
     archive_after_days: int = 30     # 超过就不再自动刷，只保留手动触发
 
     def interval_hours_for_age(self, age_days: float) -> int | None:
-        """返回该年龄的帖子应有的刷新间隔；None 表示已归档。"""
+        """返回该年龄的帖子应有的刷新间隔；None 表示已归档。
+
+        归档界线由 archive_after_days 决定；tiers 只决定归档前的刷新节奏，
+        超出最后一档年龄但还没到归档线的，沿用最后一档的间隔。
+        （默认两者都是 30 天，行为不变；把 archive_after_days 调大才有差别。）
+        """
+        if age_days > self.archive_after_days:
+            return None
         for max_age_days, interval_hours in self.tiers:
             if age_days <= max_age_days:
                 return interval_hours
-        return None
+        return self.tiers[-1][1] if self.tiers else None
 
 
 @dataclass

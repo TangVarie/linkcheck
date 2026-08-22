@@ -68,12 +68,19 @@ def merge(
             "放行会导致这个标签之后永远无法撤回。"
         )
 
+    previous_machine = {t for t in current_set if t in machine}
+
     dropped: list[str] = []
     if known_options is not None:
         options = set(known_options)
         allowed = {t for t in computed_set if t in options}
         dropped = sorted(computed_set - allowed)
         computed_set = allowed
+        if dropped:
+            # 想写的标签写不进去（选项没建）时，这一轮**不摘任何旧机器标签**：
+            # 「评论数到了大爆、但大爆选项没建」不该把行上的「爆贴」顺手清掉——
+            # 那会让一次配置疏漏抹掉行上仅存的热度/风控信息。
+            computed_set |= previous_machine
 
     # 保序：先按原顺序留下人工标签，再追加机器标签，表里看起来才稳定。
     human = [t for t in current_set if t not in machine]
@@ -83,8 +90,6 @@ def merge(
         if tag not in seen:
             seen.add(tag)
             final.append(tag)
-
-    previous_machine = {t for t in current_set if t in machine}
     return TagMerge(
         final=final,
         added=sorted(computed_set - previous_machine),

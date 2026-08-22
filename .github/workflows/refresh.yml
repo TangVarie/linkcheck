@@ -64,6 +64,9 @@ jobs:
           # 双通道：两个都配就自动降级；只配一个也能跑，没配 Key 的通道会被自动滤掉。
           TIKHUB_API_KEY: ${{ secrets.TIKHUB_API_KEY }}
           SOCIALDATAX_API_KEY: ${{ secrets.SOCIALDATAX_API_KEY }}
+          # GitHub Actions 的机器在境外：按 TikHub 的要求切主域名
+          # （api.tikhub.dev 是给境内的，跨区用会慢；.env.example 里有同样的说明）
+          TIKHUB_BASE: https://api.tikhub.io
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}

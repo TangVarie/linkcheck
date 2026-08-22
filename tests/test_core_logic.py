@@ -617,6 +617,116 @@ class TestProtocol(unittest.TestCase):
         self.assertIsInstance(result, protocol.Ok)
         self.assertEqual(result.data["comment_count"], 7)
 
+    # —— 传输层网络失败（status=0）的分类 ——
+
+    def test_network_failure_is_transport_and_retryable(self):
+        """transport 层把超时/拒连表示成 status=0。归 UNKNOWN 的话既不重试
+        也不降级——SocialDataX 作主通道时双通道就白配了。"""
+        for body in ("请求超时（30.0s）", "网络错误：Connection refused",
+                     "网络错误：timed out"):
+            result = protocol.parse_response(0, "", body)
+            self.assertEqual(result.kind, protocol.Failure.TRANSPORT, body)
+            self.assertIn(result.kind, protocol.RETRYABLE)
+
+    def test_transient_unavailable_hint_beats_gone_hint(self):
+        """「当前页面暂时不可用」含「不可用」三个字。GONE 的 hint 排在前面的话，
+        一次临时故障会被计成死亡一击——两击定罪的第一击就这么被白送了。"""
+        result = self.rest(200, {"code": 9999, "message": "当前页面暂时不可用，请稍后重试"})
+        self.assertEqual(result.kind, protocol.Failure.TRANSPORT)
+
+
+class TestGoneKeepsHeatHistory(unittest.TestCase):
+    """「爆过就是爆过」：帖子被删恰恰是最需要留着热度档位供复盘的时候。"""
+
+    def test_gone_verdict_preserves_the_tier(self):
+        settings = Settings()
+        verdict = analyze.gone_verdict(settings, "已删除", current_tags=["大爆", "已复盘"])
+        self.assertEqual(verdict.tags, {"已失效", "风控中", "大爆"})
+
+    def test_gone_verdict_without_history_stays_minimal(self):
+        settings = Settings()
+        self.assertEqual(analyze.gone_verdict(settings).tags, {"已失效", "风控中"})
+
+
+class TestMergeWithMissingOptions(unittest.TestCase):
+    NS = ["评估中", "爆贴", "大爆", "风控中", "已失效"]
+
+    def test_dropped_computed_tag_does_not_strip_existing_machine_tags(self):
+        """想写「大爆」但选项没建：这一轮不能顺手把行上的「爆贴」摘掉——
+        一次配置疏漏不该抹掉行上仅存的热度信息。"""
+        result = tags.merge(["爆贴", "已复盘"], {"大爆"}, self.NS,
+                            known_options=["评估中", "爆贴", "风控中", "已失效"])
+        self.assertIn("爆贴", result.final)
+        self.assertIn("已复盘", result.final)
+        self.assertEqual(result.dropped_unknown, ["大爆"])
+        self.assertEqual(result.removed, [])
+
+    def test_normal_upgrade_still_swaps_the_tier(self):
+        """选项齐全时行为不变：升档照样换标签。"""
+        result = tags.merge(["爆贴"], {"大爆"}, self.NS, known_options=self.NS)
+        self.assertIn("大爆", result.final)
+        self.assertNotIn("爆贴", result.final)
+
+
+class TestUrlBoundary(unittest.TestCase):
+    def test_cjk_text_glued_to_url_is_not_swallowed(self):
+        """「看这条https://v.douyin.com/xxx很火」这种没有空格的写法，
+        右边界不排 CJK 就会把「很火」吞进 URL，短链直接 404。"""
+        parsed = links.parse("看这条https://v.douyin.com/iRxYzAb很火")
+        self.assertEqual(parsed.platform, "douyin")
+        self.assertEqual(parsed.url, "https://v.douyin.com/iRxYzAb")
+
+    def test_fullwidth_left_bracket_terminates(self):
+        parsed = links.parse("链接https://xhslink.com/a/AbC123（点开看）")
+        self.assertEqual(parsed.url, "https://xhslink.com/a/AbC123")
+
+
+class TestArchiveCutoff(unittest.TestCase):
+    def test_archive_after_days_actually_extends_the_window(self):
+        settings = Settings()
+        settings.refresh.archive_after_days = 60
+        # 超出最后一档（30 天）但没到归档线：沿用最后一档的间隔
+        self.assertEqual(settings.refresh.interval_hours_for_age(45), 72)
+        self.assertIsNone(settings.refresh.interval_hours_for_age(61))
+
+    def test_default_behaviour_is_unchanged(self):
+        settings = Settings()
+        self.assertEqual(settings.refresh.interval_hours_for_age(20), 72)
+        self.assertIsNone(settings.refresh.interval_hours_for_age(31))
+
+
+class TestEstimateByActualChannel(unittest.TestCase):
+    def _xhs_row(self):
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+        return rows.Row(record_id="r",
+                        link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24,
+                        publish_time_ms=int((now - timedelta(days=30)).timestamp() * 1000)), now
+
+    def test_price_follows_the_channel_that_will_actually_run(self):
+        """只配了 SocialDataX 的 key：估算就得按 SDX 的 ¥0.10 报，
+        按配置主通道 TikHub 的 ¥0.072 报就是错账。"""
+        row, now = self._xhs_row()
+        settings = Settings()
+        yuan = rows.estimate_yuan([row], settings, now, keys={"socialdatax": "s"})
+        self.assertAlmostEqual(yuan, 0.10)
+
+    def test_douyin_short_link_is_priced_at_socialdatax(self):
+        """抖音短链行 TikHub 接不了，实际会走 SDX——估算要跟着能力路由走。"""
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+        row = rows.Row(record_id="r", link_cell="https://v.douyin.com/iRxYzAb/",
+                       publish_time_ms=int((now - timedelta(days=1)).timestamp() * 1000))
+        settings = Settings()
+        yuan = rows.estimate_yuan([row], settings, now,
+                                  keys={"tikhub": "t", "socialdatax": "s"})
+        self.assertAlmostEqual(yuan, 0.20)   # 评论 + detail 各 ¥0.10
+
+    def test_row_no_channel_can_handle_costs_nothing(self):
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+        row = rows.Row(record_id="r", link_cell="https://v.douyin.com/iRxYzAb/",
+                       publish_time_ms=int((now - timedelta(days=1)).timestamp() * 1000))
+        yuan = rows.estimate_yuan([row], Settings(), now, keys={"tikhub": "t"})
+        self.assertEqual(yuan, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

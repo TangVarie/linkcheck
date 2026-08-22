@@ -283,14 +283,22 @@ class TestFatalErrorsStopTheBatch(RunnerTest):
             return err(401, 1401, "API Key 无效或已失效。")
 
         report = self.run_with(responder, [xhs_row("rec1"), xhs_row("rec2"), xhs_row("rec3")])
-        self.assertEqual(len(report.outcomes), 1)              # 第一行的结果保住了
-        self.assertEqual(report.outcomes[0].record_id, "rec1")
+        # 第一行的结果保住了；中止后的行产出「留待下一轮」的空结果，**不写回**——
+        # 它们的最后更新时间保持原样，Key 修好后下一轮自然重捞。
+        written = [o for o in report.outcomes if o.fields]
+        self.assertEqual([o.record_id for o in written], ["rec1"])
+        self.assertEqual(written[0].status, runner.STATUS_OK)
+        deferred = [o for o in report.outcomes if o.status == runner.STATUS_DEFERRED]
+        self.assertEqual({o.record_id for o in deferred}, {"rec2", "rec3"})
         self.assertIn("1401", report.aborted_reason)
+        self.assertTrue(report.fatal)
 
     def test_insufficient_balance_aborts(self):
         report = self.run_with([err(200, 1004, "当前 API Key 积分不足。")], [xhs_row()])
-        self.assertEqual(report.outcomes, [])
+        # 中止的行不写回任何字段，只在报告里留痕。
+        self.assertEqual([o for o in report.outcomes if o.fields], [])
         self.assertIn("积分不足", report.aborted_reason)
+        self.assertTrue(report.fatal)
 
 
 class TestRateLimit(RunnerTest):
@@ -433,10 +441,6 @@ class TestPinnedTracking(RunnerTest):
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestExitSignal(RunnerTest):
     """退出码要能区分「真故障」和「正常分批」——定时任务的重启策略靠它。"""
 
@@ -462,3 +466,161 @@ class TestExitSignal(RunnerTest):
             [xhs_row()])
         self.assertFalse(report.fatal)
         self.assertEqual(report.aborted_reason, "")
+
+
+class TestSoftDeadline(RunnerTest):
+    """软截止的承诺是「没跑到的行**不写回**，留给下一轮」。
+
+    写成「刷新失败」会顶掉最后更新时间（行要等满整个分层间隔才再被捞）、
+    清掉排队勾（运营的手动请求被静默吞掉）、给失败计数 +1（为下一次
+    非权威 GONE 一击定罪铺路）——断点续跑就全毁了。
+    """
+
+    def test_rows_past_deadline_are_not_written_back(self):
+        self.settings.soft_deadline_seconds = 0.0001
+        rows = [xhs_row(f"rec{i}") for i in range(3)]
+        row_with_history = rows[1]
+        row_with_history.consecutive_failures = 1
+        row_with_history.queued = True
+
+        with mock.patch.object(transport, "post") as posted:
+            report = runner.refresh(rows, "fake-key", self.settings, now=NOW)
+
+        posted.assert_not_called()                       # 一个请求都没发，一分钱没花
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_DEFERRED)
+            self.assertEqual(outcome.fields, {})         # 不写回 = 不动任何列
+        self.assertIn("留给下一轮", report.aborted_reason)
+        self.assertFalse(report.fatal)                   # 正常分批，不是故障
+
+    def test_deferred_rows_do_not_trip_the_breaker(self):
+        self.settings.soft_deadline_seconds = 0.0001
+        rows = [xhs_row(f"rec{i}") for i in range(12)]
+        with mock.patch.object(transport, "post"):
+            report = runner.refresh(rows, "fake-key", self.settings, now=NOW)
+        self.assertFalse(report.breaker_tripped)
+
+
+class TestStrikeSemantics(RunnerTest):
+    """「连续失败次数」是两击定罪的计数器，只有 GONE 观测才有资格累加。
+
+    超时、5xx 这类失败对「内容在不在」没有证据力：计进去的话，
+    一次网络抖动 + 一次非权威空壳嫌疑就能把活帖标成「已失效」。
+    """
+
+    def test_network_failure_does_not_touch_the_counter(self):
+        blip = transport.Response(0, "", "网络错误：timed out")
+        report = self.run_with([blip] * 3, [xhs_row()])
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_FAILED)
+        self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+
+    def test_network_failure_does_not_erase_previous_gone_strike(self):
+        """已经有一击 GONE 在案，中间隔一次网络故障：计数保持 1，不清零也不 +1。"""
+        row = xhs_row()
+        row.consecutive_failures = 1
+        blip = transport.Response(0, "", "网络错误：timed out")
+        report = self.run_with([blip] * 3, [row])
+        self.assertNotIn(self.settings.fields.consecutive_failures,
+                         report.outcomes[0].fields)
+
+    def test_two_gone_strikes_still_convict_across_a_blip(self):
+        """GONE → (网络故障，不计) → GONE：两次「取不到内容」的观测依然定罪。"""
+        row = xhs_row()
+        row.consecutive_failures = 1          # 上一轮的 GONE 一击
+        report = self.run_with([err(200, 1003, "未找到对应内容")], [row])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_GONE)
+
+
+class TestRateLimitThenGone(RunnerTest):
+    def test_definitive_death_after_rate_limit_retry_still_convicts(self):
+        """限流退避重试拿到的结果必须走同一套分类。
+
+        之前的写法在重试后直接 return，权威的 1008「内容已删除」会被
+        降级成一条备注、行状态「正常」、计数清零——一次限流抖动就让
+        该死的行漏判。
+        """
+        queue = [
+            transport.Response(429, "application/json", json.dumps(
+                {"code": 1429, "message": "请求过于频繁，请稍后重试。",
+                 "retry_after_seconds": 0})),
+            err(200, 1008, "当前作品已删除。"),
+        ]
+        with mock.patch.object(transport, "post", side_effect=lambda *a, **k: queue.pop(0)), \
+             mock.patch("time.sleep"):
+            report = runner.refresh([xhs_row()], "fake-key", self.settings, now=NOW)
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_GONE)
+        self.assertIn("已失效", outcome.fields[self.settings.fields.traffic_status])
+
+
+class TestUnknownCommentCount(RunnerTest):
+    """comment_count 为 None 的「成功」轮：热度/风控标签必须保持原样。
+
+    抖音评论接口的 total 是 integer|null，detail 兜底又恰好失败时，
+    这一轮对热度没有获得任何新证据——merge 把「大爆」「风控中」摘掉，
+    等于用一次上游缺数抹掉棘轮历史和一条在生效的告警。
+    """
+
+    def _douyin_row(self):
+        return Row(record_id="d1",
+                   link_cell="https://www.douyin.com/video/7123456789012345678",
+                   publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000),
+                   current_tags=["大爆", "风控中", "已复盘"])
+
+    def test_null_count_with_failed_detail_keeps_tags(self):
+        calls = {"n": 0}
+
+        def responder(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return sse({"items": [], "comment_count": None,
+                            "points": {"cost": 10, "balance": 100}})
+            return err(500, 1005, "服务暂时不可用，请稍后重试")
+
+        report = self.run_with(responder, [self._douyin_row()])
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_OK)
+        # 标签无变化 → 字段根本不进 payload（保持原样的最强形式）
+        self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
+        self.assertIn("保持原样", outcome.fields[self.settings.fields.failure_reason])
+
+
+class TestBreakerAccounting(RunnerTest):
+    def _gone_rows(self, n):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"gone{i}")
+            row.consecutive_failures = 1
+            rows.append(row)
+        return rows
+
+    def _cooldown_rows(self, n):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"cool{i}")
+            row.last_updated_ms = int((NOW - timedelta(seconds=30)).timestamp() * 1000)
+            rows.append(row)
+        return rows
+
+    def test_cooldown_rows_do_not_dilute_the_ratio(self):
+        """分母只算真正打过上游的行。9 行全失效 + 3 行冷却 = 样本 9，
+        不到 10 就不该熔断（旧算法会把冷却行混进分母凑够样本）。"""
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(9) + self._cooldown_rows(3))
+        self.assertFalse(report.breaker_tripped)
+
+    def test_breaker_voids_strike_increment_and_keeps_diagnostics(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(12))
+        self.assertTrue(report.breaker_tripped)
+        for outcome in report.outcomes:
+            # 判定作废，这一轮的计数增量也要一并撤销
+            self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+            reason = outcome.fields[self.settings.fields.failure_reason]
+            self.assertIn("未找到对应内容", reason)     # 原始错误（含 request_id 线索）还在
+            self.assertIn("疑似上游故障", reason)       # 熔断说明是追加的，不是覆盖
+
+
+if __name__ == "__main__":
+    unittest.main()

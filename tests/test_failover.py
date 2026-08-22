@@ -296,6 +296,118 @@ class TestSecrets(FailoverTest):
         self.assertNotIn("t-key", blob)
         self.assertNotIn("t-key", report.summary())
 
+    def test_redaction_actually_fires_without_a_backup_channel(self):
+        """单通道版本：泄漏文案没有备胎可以顶替，必然要落进报告——
+        这才是真正逼 _redact 出手的场景（双通道版本里 TikHub 的文案
+        会被 SDX 的结果顶掉，脱敏根本没被触发也能过）。
+
+        Key 要用真实长度：_redact 对 6 个字符以下的 key 不做替换。
+        """
+        secret = "tikhub-secret-key-1234567890"
+        leaky = transport.Response(401, "application/json", json.dumps({
+            "detail": {"code": 401,
+                       "message_zh": f"无效的API令牌，您提交的API令牌为 {secret}。"},
+        }, ensure_ascii=False), "th-e")
+        report = self.run_with(
+            on_get=lambda i: leaky,
+            on_post=lambda i: self.fail("只配了 TikHub，不该打到 SDX"),
+            keys={"tikhub": secret},
+        )
+        # 单通道 AUTH = 整批中止；中止原因也是人会看到的文本，同样不能带 Key。
+        self.assertTrue(report.fatal)
+        self.assertNotIn(secret, report.aborted_reason)
+        self.assertIn("***", report.aborted_reason)
+
+
+class TestDouyinLinkOnlyRows(FailoverTest):
+    """抖音短链（提不出数字 ID）的行。
+
+    TikHub 的抖音端点只收 aweme_id、不收链接——图文和视频共用同一对端点，
+    形态无关，问题只在参数形状。这种行必须直接让给吃链接的 SocialDataX，
+    而不是把 URL 塞进 aweme_id 白花一次钱、再被空响应骗成「已失效」。
+    """
+
+    def _short_link_row(self):
+        return Row(
+            record_id="dy-url",
+            link_cell="7.86 复制打开抖音，看看作品 https://v.douyin.com/iRxYzAb/",
+            publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000),
+        )
+
+    def _sdx_douyin(self, i):
+        if i % 2 == 0:
+            return transport.Response(200, "application/json", json.dumps({
+                "items": [{"content": "好", "like_count": 1, "ip_location": "上海",
+                           "author": {"name": "路人"}}],
+                "comment_count": 5, "points": {"cost": 10, "balance": 100},
+            }, ensure_ascii=False), "sdx-dy")
+        return transport.Response(200, "application/json", json.dumps({
+            "like_count": 10, "comment_count": 5, "points": {"cost": 10, "balance": 90},
+        }), "sdx-dy2")
+
+    def test_short_link_goes_straight_to_socialdatax(self):
+        report = self.run_with(
+            on_get=lambda i: self.fail("TikHub 不吃链接，就不该打它"),
+            on_post=self._sdx_douyin,
+            rows=[self._short_link_row()],
+        )
+        self.assertEqual(self.get_calls, [])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.used_providers, {"socialdatax": 2})
+        # 这是能力路由，不是主通道故障，不该算进「降级」指标——
+        # 运营手册教人看到降级不为 0 就去查主通道。
+        self.assertEqual(report.failovers, 0)
+
+    def test_tikhub_only_deployment_fails_the_row_cleanly(self):
+        """只配了 TikHub：这行没法刷，但要败得明白——
+        行级「刷新失败」+ 说清原因，不烧钱、不中止整批、不碰定罪计数。"""
+        report = self.run_with(
+            on_get=lambda i: self.fail("不该发出任何请求"),
+            on_post=lambda i: self.fail("没配 SDX 的 key"),
+            rows=[self._short_link_row()],
+            keys={"tikhub": "t-key"},
+        )
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_FAILED)
+        self.assertFalse(report.fatal)
+        self.assertEqual(report.cost_yuan, 0.0)
+        self.assertIn("不支持这种链接形态", outcome.fields[self.settings.fields.failure_reason])
+        self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+
+    def test_full_video_link_still_uses_tikhub(self):
+        """带数字 ID 的完整链接不受影响，照走便宜的主通道。"""
+        row = Row(record_id="dy-id",
+                  link_cell="https://www.douyin.com/video/7123456789012345678",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        tik_comments = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"comments": [], "total": 5}}), "th-dy")
+        tik_detail = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"aweme_detail": {
+                "statistics": {"digg_count": 10, "comment_count": 5}}}}), "th-dy2")
+        report = self.run_with(
+            on_get=lambda i: [tik_comments, tik_detail][i],
+            on_post=lambda i: self.fail("不该降级"),
+            rows=[row],
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.used_providers, {"tikhub": 2})
+
+
+class TestFailoverMetricHonesty(FailoverTest):
+    def test_running_on_the_only_configured_channel_is_not_a_failover(self):
+        """只配了备胎 key 的部署完全合法：每次成功调用都不是「降级」。
+
+        报成降级的话，运营会按手册去查一个根本不存在的主通道故障。
+        """
+        report = self.run_with(
+            on_get=lambda i: self.fail("没配 TikHub 的 key"),
+            on_post=lambda i: [sdx_ok_comments(), sdx_ok_detail()][i],
+            keys={"socialdatax": "s-key"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.failovers, 0)
+        self.assertNotIn("降级", report.summary())
+
 
 if __name__ == "__main__":
     unittest.main()

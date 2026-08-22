@@ -207,7 +207,12 @@ def _looks_like_seed(comment: CommentView, expected: str) -> bool:
     haystack = _normalize(comment.content)
     if not haystack:
         return False
-    return needle in haystack or (len(haystack) >= 8 and haystack in needle)
+    # 反向包含（评论是关键词的子串）只为一种情况存在：我方评论被平台截断后
+    # 比登记的全文短。要求评论至少有关键词一半长——不然别人一条「好用！」
+    # 恰好是我方长文案的子串，就会被认成我方评论，漏报置顶被顶掉。
+    return needle in haystack or (
+        len(haystack) >= 8 and 2 * len(haystack) >= len(needle) and haystack in needle
+    )
 
 
 class Pin(Enum):
@@ -310,15 +315,15 @@ def decide(
     count = snapshot.comment_count
 
     # —— 热度档位：互斥，取最高，且只升不降 ——
+    previous_best = max(
+        (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
+        key=t.rank,
+        default=None,
+    )
     if count is not None:
         tier = th.heat_tier(count, t)
         # 棘轮：算上表里已有的档位取最高。评论被删导致数字掉下去，不该让
         # 一条帖子从「大爆」退回「爆贴」——那是风控信号，由风控标签表达。
-        previous_best = max(
-            (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
-            key=t.rank,
-            default=None,
-        )
         best = max(
             (x for x in (tier, previous_best) if x),
             key=t.rank,
@@ -330,6 +335,16 @@ def decide(
                 verdict.notes.append(f"评论数 {count} → {best}")
             else:
                 verdict.notes.append(f"评论数 {count}，但曾达到「{best}」，保留高档位")
+    else:
+        # 评论数未知（抖音评论接口的 total 是 integer|null，detail 兜底又恰好
+        # 失败）——这一轮对热度和风控**没有获得任何新证据**。此时必须把已有的
+        # 档位和风控标签原样带上：verdict.tags 留空会让 merge 把它们整体摘掉，
+        # 等于用一次上游缺数抹掉「大爆」的棘轮历史和一条在生效的风控告警。
+        if previous_best:
+            verdict.tags.add(previous_best)
+        if t.risk in (current_tags or []):
+            verdict.tags.add(t.risk)
+        verdict.notes.append("本轮未取到评论数，热度/风控标签保持原样")
 
     # —— 掉量：评论被平台悄悄批量删除，往往比笔记整个失效早得多 ——
     if (
@@ -356,24 +371,36 @@ def decide(
     if note:
         verdict.notes.append(note)
     # 之前置顶成功过、现在掉了 —— 这是种草投放里最该被立刻发现的事之一。
+    # NO_SEED 也要排除：没填种子关键词时根本判不了「我方置顶在不在」，
+    # 这时报「已不在」和 comment_status_values 里「判不了就不下结论」的口径矛盾。
     if (
         settings.comment_status.ever_pinned(current_comment_status)
-        and verdict.pin is not Pin.SUCCESS
-        and verdict.pin is not Pin.UNSUPPORTED
+        and verdict.pin not in (Pin.SUCCESS, Pin.UNSUPPORTED, Pin.NO_SEED)
     ):
         verdict.notes.append("⚠ 此前已确认置顶成功，本轮我方置顶已不在")
 
     return verdict
 
 
-def gone_verdict(settings: Settings, reason: str = "") -> Verdict:
+def gone_verdict(settings: Settings, reason: str = "",
+                 current_tags: Optional[list[str]] = None) -> Verdict:
     """帖子确认取不到时的结论（已经过两击确认，不是第一次失败就走这里）。
 
     同时打 已失效 和 风控 ——「已失效」说明事实，「风控」是运营真正会去筛的那一列。
+    已有的热度档位原样保留：「爆过就是爆过」的棘轮不因帖子死了而清史——
+    一条大爆过的帖子被删，恰恰是最需要留着「大爆」标签供复盘的那种。
     """
     verdict = Verdict()
     verdict.tags.add(settings.tags.gone)
     verdict.tags.add(settings.tags.risk)
+    t = settings.tags
+    best = max(
+        (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
+        key=t.rank,
+        default=None,
+    )
+    if best:
+        verdict.tags.add(best)
     verdict.notes.append(reason or "接口返回内容不存在/已删除/无法访问")
     return verdict
 
