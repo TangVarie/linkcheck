@@ -37,8 +37,13 @@ class TestDoctorSchema(unittest.TestCase):
         漏一个，那个值就会被 known_options 静默拦下，判定等于没生效。"""
         f = self.settings.fields
         _, _, traffic_required, _ = self.schema[f.traffic_status]
-        for tag in self.settings.tags.namespace():
+        for tag in self.settings.tags.machine_written():
             self.assertIn(tag, traffic_required)
+        # 退役标签（已失效）只留在 merge 的管辖范围里用于摘掉旧值，
+        # 不该被 doctor 要求建选项——新表根本不需要它。
+        for tag in self.settings.tags.retired:
+            self.assertNotIn(tag, traffic_required)
+            self.assertIn(tag, self.settings.tags.namespace())
         _, _, status_required, _ = self.schema[f.comment_status]
         for value in self.settings.comment_status.machine_written():
             self.assertIn(value, status_required)
@@ -53,6 +58,71 @@ class TestDoctorSchema(unittest.TestCase):
         self.assertEqual(self.schema[f.traffic_status][0], (4,))
         self.assertEqual(self.schema[f.comment_status][0], (3,))
         self.assertEqual(self.schema[f.pinned_status][0], (3,))
+
+
+class TestTablesFromEnv(unittest.TestCase):
+    """FEISHU_TABLES 解析：这是多表部署的唯一配置入口，
+    解析错一项就是少刷一整张表（静默）或整个进程起不来（吵闹）——
+    必须吵闹，且报错要说得清哪一项、该怎么写。"""
+
+    def test_single_table_fallback(self):
+        entries = cli._tables_from_env(
+            {"FEISHU_APP_TOKEN": "bascnA", "FEISHU_TABLE_ID": "tblX"})
+        self.assertEqual(entries, [("tblX", "bascnA", "tblX")])
+
+    def test_multi_with_labels_and_both_forms(self):
+        spec = ("OKMAN一期=bascnA:tbl1; "
+                "OKMAN二期=https://xx.feishu.cn/base/bascnA?table=tbl2&view=vewZ;"
+                "bascnB:tbl3")
+        entries = cli._tables_from_env({"FEISHU_TABLES": spec})
+        self.assertEqual(entries, [
+            ("OKMAN一期", "bascnA", "tbl1"),
+            ("OKMAN二期", "bascnA", "tbl2"),
+            ("tbl3", "bascnB", "tbl3"),      # 不带标签时标签取 table_id
+        ])
+
+    def test_tables_wins_over_single_vars(self):
+        entries = cli._tables_from_env({
+            "FEISHU_TABLES": "甲=bascnA:tbl1",
+            "FEISHU_APP_TOKEN": "bascnZ", "FEISHU_TABLE_ID": "tblZ"})
+        self.assertEqual(entries, [("甲", "bascnA", "tbl1")])
+
+    def test_newline_and_chinese_semicolon_separators(self):
+        entries = cli._tables_from_env(
+            {"FEISHU_TABLES": "甲=bascnA:tbl1\n乙=bascnA:tbl2；丙=bascnB:tbl3"})
+        self.assertEqual([e[0] for e in entries], ["甲", "乙", "丙"])
+
+    def test_nothing_configured_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env({})
+
+    def test_garbage_entry_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env({"FEISHU_TABLES": "甲=看不懂的东西"})
+
+    def test_url_without_table_param_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env(
+                {"FEISHU_TABLES": "甲=https://xx.feishu.cn/base/bascnA"})
+
+    def test_duplicate_table_exits(self):
+        """同一张表配两遍会被两轮 cron 各刷一次——纯白花钱，必须拦。"""
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env(
+                {"FEISHU_TABLES": "甲=bascnA:tbl1; 乙=bascnA:tbl1"})
+
+    def test_duplicate_label_exits(self):
+        with self.assertRaises(SystemExit):
+            cli._tables_from_env(
+                {"FEISHU_TABLES": "甲=bascnA:tbl1; 甲=bascnB:tbl2"})
+
+
+class TestMainArgs(unittest.TestCase):
+    def test_empty_table_filter_exits(self):
+        """「--table ,」解析出空清单，和「没传 --table」在下游没法区分，
+        会静默变成全表都跑——必须当场拒绝。"""
+        with self.assertRaises(SystemExit):
+            cli.main(["cli.py", "sweep", "--table", ","])
 
 
 class TestLoadDotenv(unittest.TestCase):

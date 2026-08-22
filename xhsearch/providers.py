@@ -408,8 +408,9 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
             "collect_count": note.get("collected_count"),
             "share_count": note.get("shared_count"),
             "comment_count": note.get("comments_count"),
-            # 上游自己的审核标记。语义还没实地验过（只见过 false），
-            # 所以只写进诊断信息给人看，不参与打标签。见 docs/待验证清单.md。
+            # 上游自己的审核标记。运营定的口径：返回 True 就打「风控中」
+            # （analyze.decide 负责）。语义还没实地验过（只见过 false），
+            # 所以打标签的同时诊断信息里仍请人工确认。见 docs/待验证清单.md。
             "_censored": note.get("in_censor"),
         }, request_id=request_id)
 

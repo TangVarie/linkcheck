@@ -53,7 +53,7 @@ class FieldNames:
                                               # 没填关键词的行不碰
     comment_digest: str = "评论区快照"        # 命中的那条评论排最前并带「命中」标记，
                                               # 其余按 置顶优先 接在后面
-    traffic_status: str = "流量状态"          # 多选，人机共用（无水花等人工值不碰）
+    traffic_status: str = "流量状态"          # 多选，人机共用（爆帖预备等人工值不碰）
     refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
     last_updated: str = "最近检查时间"
@@ -84,27 +84,41 @@ class FieldNames:
 class Tags:
     """机器管辖的标签。必须穷举——漏一个，那个标签就再也撤不回来。
 
-    热度三档（评估中 / 爆贴 / 大爆）是**互斥**的：一条帖子同时挂着三个没有意义，
-    所以每轮只留最高的那一个。而且只升不降（棘轮）——爆过就是爆过，
-    评论被删导致数字掉下去不该让它从「大爆」退回「爆贴」，
-    那种情况该由 风控 标签来表达。
+    热度档位（无水花 / 评估中 / 爆贴 / 大爆）是**互斥**的：一条帖子同时
+    挂着几个没有意义，所以每轮只留最高的那一个。而且只升不降（棘轮）——
+    爆过就是爆过，评论被删导致数字掉下去不该让它从「大爆」退回「爆贴」，
+    那种异常该由 疑似限流 表达。「无水花」是发出去够久还起不来的最低档。
 
-    风控 / 已失效反映**当前状态**，每轮重算，恢复正常要能自动摘掉，
+    风控中只认两种**硬证据**：上游返回了审查/受限标记，或链接已失效
+    （两击定罪之后）。评论数的异常都不进风控——腰斩是 疑似限流，
+    起不来是 无水花，口径分开，运营才知道每个标签背后是什么证据。
+
+    风控中 / 疑似限流反映**当前状态**，每轮重算，恢复正常要能自动摘掉，
     否则表会越来越红，最后没人看。
     """
 
+    flop: str = "无水花"
     evaluating: str = "评估中"
     hot: str = "爆贴"
     super_hot: str = "大爆"
     risk: str = "风控中"
-    gone: str = "已失效"
+    throttled: str = "疑似限流"
+
+    # 已退役的机器标签：不再产出，但仍算机器管辖——留在 namespace 里，
+    # 旧行上残留的「已失效」才会在下一轮被自动摘掉（失效现在并入「风控中」）。
+    retired: tuple[str, ...] = ("已失效",)
 
     def heat_tiers(self) -> list[str]:
         """热度档位，由低到高。互斥，同时只留一个。"""
-        return [self.evaluating, self.hot, self.super_hot]
+        return [self.flop, self.evaluating, self.hot, self.super_hot]
 
     def namespace(self) -> list[str]:
-        return [*self.heat_tiers(), self.risk, self.gone]
+        """机器管辖的全部标签（含退役标签）。merge 的可撤回范围。"""
+        return [*self.heat_tiers(), self.risk, self.throttled, *self.retired]
+
+    def machine_written(self) -> list[str]:
+        """机器仍会写的标签。doctor 只要求表里建这些选项，退役的不用建。"""
+        return [*self.heat_tiers(), self.risk, self.throttled]
 
     def rank(self, tag: str) -> int:
         """热度档位的高低。不是热度标签返回 -1。"""
@@ -181,8 +195,9 @@ class Thresholds:
     # 上次评论数低于这个值时不做掉量判定——从 3 掉到 1 没有意义。
     risk_drop_min_baseline: int = 20
 
-    # 发布多久之后仍然零评论，判定疑似限流。太短会把正常冷启动误报成风控。
-    risk_zero_comment_hours: int = 48
+    # 发布这么多小时后评论数仍够不上「评估中」门槛，判「无水花」。
+    # 太短会把正常冷启动误标——刚发两小时只有几条评论再正常不过。
+    flop_hours: int = 48
 
     def heat_tier(self, count: int, tags: "Tags") -> str | None:
         """按评论数算热度档位。返回 None 表示还够不上最低档。"""
