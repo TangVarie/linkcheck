@@ -6,6 +6,11 @@ name: 刷新监控表
 # 两边会同时刷同一张表 —— 重复花钱，还可能互相覆盖写入。
 # 一套定时只能有一个地方跑，这是硬规矩。
 #
+# ⚠️ 仓库里的运行租约（xhsearch/runlock.py）**挡不住这种情况**：
+# 它是文件锁，只在同一台机器/同一个文件系统上生效。Actions runner
+# 和 Railway 容器之间没有共享盘，两边同时跑就是两个付费执行者。
+# 所以「一套定时只能有一个地方跑」是部署纪律，不是代码能兜住的事。
+#
 # 手动触发这条永远留着，它是「人在外面、手机上也能刷一把」的逃生口，
 # 跟你把定时放哪无关。
 #
@@ -32,28 +37,43 @@ on:
   #   # 北京时间 08:05 / 16:05 / 00:05 各巡检一次（cron 走 UTC）
   #   - cron: "5 0,8,16 * * *"
 
+# 最小权限（SUP-006）：这个工作流持有**生产 secrets**，权限面比测试
+# 工作流更值得收紧。它只需要 checkout 代码，不写任何 GitHub 资源。
+permissions:
+  contents: read
+
 concurrency:
   # 同一时刻只允许一个刷新在跑。两个实例同时写同一张表会互相覆盖，
   # 而且会重复花钱。后来的排队等前一个跑完，不取消（取消会丢掉已算的结果）。
+  # ⚠️ 这个 group 只约束**本工作流**：Railway / VPS 上的定时不受它管。
   group: xhsearch-refresh
   cancel-in-progress: false
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    # 硬超时。软截止（下面 SOFT_DEADLINE_SECONDS）必须明显小于它，
+    # 否则被硬杀时本轮已经付过费、还没写回的结果会全部丢掉。
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Action 钉到 commit SHA（SUP-006）。这个工作流能读到生产 Key，
+      # 上游 Action 被改指的后果比测试工作流严重得多。
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955   # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
 
       - name: 决定运行模式
         id: mode
+        env:
+          # 走环境变量而不是把 ${{ }} 直接插进 shell：表达式插值会把
+          # 输入原样拼进脚本，是 Actions 上最经典的注入面。
+          INPUT_MODE: ${{ inputs.mode }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ -n "${{ inputs.mode }}" ]; then
-            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "5 0,8,16 * * *" ]; then
+          if [ -n "$INPUT_MODE" ]; then
+            echo "value=$INPUT_MODE" >> "$GITHUB_OUTPUT"
+          elif [ "$SCHEDULE" = "5 0,8,16 * * *" ]; then
             echo "value=sweep" >> "$GITHUB_OUTPUT"
           else
             echo "value=queue" >> "$GITHUB_OUTPUT"
@@ -71,6 +91,15 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
           FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
-          # 独立进程跑批量，不需要软截止
-          SOFT_DEADLINE_SECONDS: "0"
-        run: python3 cli.py ${{ steps.mode.outputs.value }}
+          # ⚠️ 必须显式设一个软截止，而且要留足写回时间（ROB-002）。
+          # 原来这里是 0（不限）：job 在第 30 分钟被硬杀时，本轮所有
+          # 已经付费、还攒在内存里的结果一条都不写回，下一轮再付一次。
+          # 25 分钟停止派发新行 + 5 分钟把已完成的结果写回。
+          SOFT_DEADLINE_SECONDS: "1500"
+          # 单轮硬预算：Actions 上跑的多半是临时补刷，给一个明确上界，
+          # 免得一次误操作（比如全表被勾上「排队刷新」）在这里烧起来。
+          MAX_RECORDS_PER_RUN: "300"
+          # 结构化日志，方便在 Actions 的日志里按 run_id 聚合。
+          RUN_LOG_JSON: "1"
+          MODE: ${{ steps.mode.outputs.value }}
+        run: python3 cli.py "$MODE"

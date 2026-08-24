@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -20,14 +21,32 @@ Platform = Literal["xhs", "douyin"]
 # 小红书笔记 ID 固定 24 位小写十六进制。
 _XHS_NOTE_ID = r"[0-9a-f]{24}"
 
-_XHS_DOMAINS = re.compile(
-    r"(?:xiaohongshu\.com|xhslink\.com|xhslink\.cn|xhsurl\.com|xhsurl\.cn)",
-    re.I,
-)
-_DOUYIN_DOMAINS = re.compile(
-    r"(?:douyin\.com|iesdouyin\.com)",
-    re.I,
-)
+# 域名白名单。匹配规则是 **hostname 等于它、或是它的子域**，
+# 不是「字符串里出现过这几个字」——后者会把
+# https://xiaohongshu.com.evil.example/ 认成小红书，
+# 于是我们拿着运营的链接去给一个陌生域名发付费请求。
+XHS_DOMAINS = ("xiaohongshu.com", "xhslink.com", "xhslink.cn",
+               "xhsurl.com", "xhsurl.cn")
+DOUYIN_DOMAINS = ("douyin.com", "iesdouyin.com")
+
+
+def _bare_domain_re(domains: tuple[str, ...]) -> re.Pattern[str]:
+    """没有 scheme 的裸域名匹配（运营有时只贴 `xiaohongshu.com/explore/xxx`）。
+
+    左边界不许接字母数字和连字符（挡掉 `evil-xiaohongshu.com`），
+    但允许 `.` 前缀，因为 `www.xiaohongshu.com` 是合法子域；
+    右边界不许接字母数字连字符，也不许接 `.字母`
+    （挡掉 `xiaohongshu.com.evil.example`）。
+    """
+    alternatives = "|".join(re.escape(d) for d in domains)
+    return re.compile(
+        rf"(?<![A-Za-z0-9-])(?:[A-Za-z0-9-]+\.)*(?:{alternatives})(?![A-Za-z0-9-])(?!\.[A-Za-z])",
+        re.I,
+    )
+
+
+_XHS_BARE = _bare_domain_re(XHS_DOMAINS)
+_DOUYIN_BARE = _bare_domain_re(DOUYIN_DOMAINS)
 
 # 按优先级排列：越靠前的形式越明确。
 _XHS_ID_PATTERNS = [
@@ -50,6 +69,10 @@ _DOUYIN_ID_PATTERNS = [
 # 「看这条https://v.douyin.com/xxx很火」这种没有空格的写法，
 # 不排 CJK 就会把「很火」吞进 URL 里，短链直接 404。
 _URL_RE = re.compile(r"https?://[^\s，。、！？；：）】》（《【\"'<>一-鿿]+", re.I)
+
+# URL 尾巴上要剥掉的标点。半角右括号必须在内：`(https://xhslink.com/abc)`
+# 这种写法在飞书表里很常见，`)` 留在里面短链直接 404。
+_TRAILING_PUNCT = ".,;:!?)]}>\"'）】》」』"
 
 # 裸 ID：整格就是一个 ID 的情况（运营有时只贴 ID）。
 _BARE_XHS_ID = re.compile(rf"^\s*({_XHS_NOTE_ID})\s*$", re.I)
@@ -81,10 +104,48 @@ class ParsedLink:
         return "已识别平台但没有可用的 ID 或链接"
 
 
-def _first_url(text: str, domain_re: re.Pattern[str]) -> Optional[str]:
-    for candidate in _URL_RE.findall(text):
-        if domain_re.search(candidate):
-            return candidate.rstrip(".,;")
+def _clean_url(candidate: str) -> str:
+    """剥掉粘在 URL 尾巴上的标点。
+
+    只剥**不配对**的收尾标点：`…/abc123)` 里的 `)` 是外面那对括号的右半边，
+    但 `…/path_(x)` 里的 `)` 属于 URL 自己。判据是左右括号数量是否相等。
+    """
+    url = candidate
+    while url and url[-1] in _TRAILING_PUNCT:
+        tail = url[-1]
+        pair = {")": "(", "]": "[", "}": "{", "）": "（", "】": "【",
+                "》": "《", "」": "「", "』": "『"}.get(tail)
+        if pair and url.count(pair) >= url.count(tail):
+            break   # 括号是配对的，属于 URL 本身
+        url = url[:-1]
+    return url
+
+
+def _urls(text: str) -> list[str]:
+    return [_clean_url(u) for u in _URL_RE.findall(text)]
+
+
+def _host_matches(url: str, domains: tuple[str, ...]) -> bool:
+    """URL 的 hostname 是不是白名单域名本身或它的子域。
+
+    用 urlsplit 取 hostname 而不是在整串里搜字符串：后者会被
+    `https://xiaohongshu.com.evil.example/x`（子串命中）、
+    `https://evil.example/?u=xiaohongshu.com`（查询串命中）
+    骗过去，然后我们拿着运营的链接去给陌生域名发付费请求。
+    urlsplit 也顺带处理掉 userinfo（`https://xiaohongshu.com@evil.example/`
+    的真实 host 是 evil.example）。
+    """
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _first_url(text: str, domains: tuple[str, ...]) -> Optional[str]:
+    for candidate in _urls(text):
+        if _host_matches(candidate, domains):
+            return candidate
     return None
 
 
@@ -113,28 +174,40 @@ def parse(cell: str) -> ParsedLink:
     if bare_xhs:
         return ParsedLink("xhs", bare_xhs.group(1).lower(), None, raw)
 
-    has_xhs_domain = bool(_XHS_DOMAINS.search(text))
-    has_douyin_domain = bool(_DOUYIN_DOMAINS.search(text))
+    # 平台判定的依据分两层，顺序不能反：
+    # 1. 文本里有 http(s) 链接 → 只按**链接的 hostname** 判，其余文字一律不算数。
+    #    这样 `https://evil.example/?u=xiaohongshu.com` 不会被认成小红书。
+    # 2. 文本里一个 http(s) 链接都没有 → 才退回裸域名匹配（带边界），
+    #    照顾「只粘了 xiaohongshu.com/explore/xxx」这种录入方式。
+    xhs_url = _first_url(text, XHS_DOMAINS)
+    douyin_url = _first_url(text, DOUYIN_DOMAINS)
+    if _urls(text):
+        has_xhs_domain, has_douyin_domain = bool(xhs_url), bool(douyin_url)
+    else:
+        has_xhs_domain = bool(_XHS_BARE.search(text))
+        has_douyin_domain = bool(_DOUYIN_BARE.search(text))
 
     # 同时命中两个平台的域名 —— 拒绝猜测。
     if has_xhs_domain and has_douyin_domain:
         return ParsedLink(None, None, None, raw)
 
     if has_xhs_domain:
-        note_id = _match_id(text, _XHS_ID_PATTERNS)
+        # ID 只在**已确认属于这个平台**的那段文本里找：在整格文本里搜
+        # `/explore/<24位十六进制>` 会把别的域名下的路径也当成笔记 ID。
+        note_id = _match_id(xhs_url or text, _XHS_ID_PATTERNS)
         return ParsedLink(
             "xhs",
             note_id.lower() if note_id else None,
-            None if note_id else (_first_url(text, _XHS_DOMAINS) or raw),
+            None if note_id else (xhs_url or raw),
             raw,
         )
 
     if has_douyin_domain:
-        aweme_id = _match_id(text, _DOUYIN_ID_PATTERNS)
+        aweme_id = _match_id(douyin_url or text, _DOUYIN_ID_PATTERNS)
         return ParsedLink(
             "douyin",
             aweme_id,
-            None if aweme_id else (_first_url(text, _DOUYIN_DOMAINS) or raw),
+            None if aweme_id else (douyin_url or raw),
             raw,
         )
 

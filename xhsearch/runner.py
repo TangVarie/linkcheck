@@ -15,14 +15,15 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from . import analyze, feishu, protocol, providers, tags, transport
-from .config import Settings
-from .rows import Row, ToolCall, plan_calls
+from .config import Budget, Settings
+from .rows import Row, ToolCall, plan_calls, estimate_yuan
 
 STATUS_OK = "正常"
 STATUS_SUSPECT = "疑似受限"
@@ -39,6 +40,28 @@ _NOT_ATTEMPTED = frozenset({STATUS_COOLDOWN, STATUS_SKIPPED, STATUS_DEFERRED})
 
 
 @dataclass
+class TagPlan:
+    """写回前重算「流量状态」需要的全部材料。
+
+    存在的理由是 lost update：标签是**读-改-写**的（飞书多选没有原子 append），
+    而读发生在整轮开始、写发生在整轮结束，中间可能隔着几分钟。运营在这几分钟里
+    手工加的「客户已确认」，会被按旧快照算出来的整列值覆盖掉——
+    「人工标签永远不动」这个承诺只在没有并发编辑时成立。
+
+    有了它，write_back 可以在真正写之前重读一次现值，用**新鲜的**人工标签
+    重做一次 merge（见 _reconcile_tags）。
+    """
+
+    field_name: str
+    computed: list[str]
+    namespace: list[str]
+    known_options: Optional[list[str]]
+    exclusive: tuple[tuple[str, ...], ...] = ()
+    # 读表那一刻的现值，用来判断「这中间有没有人动过」。
+    snapshot_tags: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Outcome:
     record_id: str
     status: str
@@ -48,6 +71,15 @@ class Outcome:
     # 唯一能跨供应商相加的单位是钱，所以真正的账在 cost_yuan 上。
     credits: int = 0
     cost_yuan: float = 0.0
+    # 写回前重算标签的材料；None = 这一行本轮不碰标签列。
+    tag_plan: Optional[TagPlan] = None
+    # 这一行失败的错误码（GONE 路径才填）。小样本熔断靠它识别
+    # 「所有行都栽在同一个错误上」这种上游漂移形态。
+    failure_code: str = ""
+    # 上游给的是不是**权威**结论（1008「内容已删除」、xhs detail 返回空列表）。
+    # 权威信号不参与小样本熔断：那是有契约的死讯，不是启发式误判，
+    # 否则一张只有三行、三条都真被删了的表会永远等不到「已失效」。
+    failure_definitive: bool = False
 
 
 @dataclass
@@ -64,10 +96,19 @@ class RunReport:
     # 作废会把 GONE/SUSPECT 改成 FAILED，事后从 outcomes 里就数不出来了。
     breaker_attempted: int = 0
     breaker_gone: int = 0
+    # 判了失效/嫌疑、**且信号是启发式（非权威）**的行各自栽在哪个错误码上。
+    # 小样本熔断看的是「是不是全都栽在同一个码上」——那是上游漂移，
+    # 不是内容真没了。权威死讯（1008 等）不进这张表，见 Outcome.failure_definitive。
+    breaker_soft_codes: dict[str, int] = field(default_factory=dict)
     points_balance: Optional[int] = None
     # 本轮实际用过的供应商，以及降级次数——写进日志，免得「怎么突然贵/便宜了」查不出来。
     used_providers: dict[str, int] = field(default_factory=dict)
     failovers: int = 0
+    # 本轮判定为不可用的平台（COR-004）：{平台: 原因}。
+    # 一个平台的通道全倒不该让另一个平台的健康行也停摆。
+    dead_platforms: dict[str, str] = field(default_factory=dict)
+    # 预算触顶的原因（SUP-001）。非空 = 还有行没轮到，但它们完全没被写过。
+    budget_stopped: str = ""
 
     @property
     def credits(self) -> int:
@@ -96,23 +137,93 @@ class RunReport:
             line += f"，SocialDataX 余额 {self.points_balance} 积分 ≈ ¥{self.points_balance / 100:.2f}"
         if self.breaker_tripped:
             line += "\n🛑 已熔断：本批失效比例异常偏高，所有流量状态写入已作废"
+        if self.budget_stopped:
+            line += f"\n💰 预算触顶：{self.budget_stopped}"
+        for platform, reason in sorted(self.dead_platforms.items()):
+            line += f"\n⚠ {platform} 平台本轮无可用通道：{reason[:150]}"
         if self.aborted_reason:
             line += f"\n⚠ 提前中止：{self.aborted_reason}"
         return line
 
 
 class _Abort(Exception):
-    """整批必须停下（key 失效 / 积分耗尽）。已完成的结果照常写回。
+    """这个**平台**必须停下（它的通道全部 key 失效 / 积分耗尽）。
+
+    刻意是平台级而不是整批级：xhs 只配了一个已失效的 TikHub、douyin 配了
+    健康的 SocialDataX 时，整批级中止会让抖音那些本来能跑完的行全部顺延，
+    一个平台的配置故障拖停另一个平台。
 
     带上这一行已经花掉的钱：中止的行也可能已经产生过成功（并计费）的调用，
     丢掉这笔账就会少报成本。
     """
 
-    def __init__(self, reason: str, credits: int = 0, yuan: float = 0.0):
+    def __init__(self, reason: str, platform: str = "", credits: int = 0, yuan: float = 0.0):
         self.reason = reason
+        self.platform = platform
         self.credits = credits
         self.yuan = yuan
         super().__init__(reason)
+
+
+class RunBudget:
+    """一次运行的硬预算，**发请求之前**预留（SUP-001）。
+
+    「预留」而不是「事后统计」是关键：等花完再统计，钱已经花出去了。
+    每一行在开跑前先把自己要花的调用数/金额记在账上，记不下就不跑——
+    没跑的行完全不写回，queued / 到期状态保持原样，下一轮自然继续。
+
+    线程安全：refresh() 的线程池会并发调用 reserve()。
+    """
+
+    def __init__(self, budget: Budget):
+        self._budget = budget
+        self._lock = threading.Lock()
+        self.records = 0
+        self.calls = 0
+        self.yuan = 0.0
+        self.stopped_reason = ""
+
+    @property
+    def limits(self) -> Budget:
+        return self._budget
+
+    def reserve(self, calls: int, yuan: float) -> bool:
+        """给一行预留额度。返回 False = 预算不够，这一行不该跑。"""
+        b = self._budget
+        with self._lock:
+            if b.max_records_per_run and self.records + 1 > b.max_records_per_run:
+                self.stopped_reason = (
+                    f"已达本轮行数上限 {b.max_records_per_run} 行，剩余行留给下一轮")
+                return False
+            if b.max_calls_per_run and self.calls + calls > b.max_calls_per_run:
+                self.stopped_reason = (
+                    f"已达本轮调用次数上限 {b.max_calls_per_run} 次，剩余行留给下一轮")
+                return False
+            if b.max_yuan_per_run and self.yuan + yuan > b.max_yuan_per_run + 1e-9:
+                self.stopped_reason = (
+                    f"已达本轮金额上限 ¥{b.max_yuan_per_run:.2f}，剩余行留给下一轮")
+                return False
+            self.records += 1
+            self.calls += calls
+            self.yuan += yuan
+            return True
+
+    def settle(self, reserved_yuan: float, actual_yuan: float,
+               reserved_calls: int, actual_calls: int) -> None:
+        """一行跑完后按**实际**花销校正账面。
+
+        预留是按「此刻看起来会走哪家」算的，但一行跑到一半仍可能降级到更贵的
+        那家（预留时它还是健康的），或者少发一个请求。不校正的话账面会持续
+        偏离真实开销，后面的行就是拿一个假的余量在放行——
+        广告出去的硬上限必须真的是上限。
+        """
+        with self._lock:
+            self.yuan += max(0.0, actual_yuan) - max(0.0, reserved_yuan)
+            self.calls += max(0, actual_calls) - max(0, reserved_calls)
+            if self.yuan < 0:
+                self.yuan = 0.0
+            if self.calls < 0:
+                self.calls = 0
 
 
 def _looks_alive(snapshot: Optional[analyze.Snapshot]) -> bool:
@@ -157,6 +268,9 @@ class _Spend:
     yuan: float = 0.0
     provider: str = ""
     tally: dict[str, int] = field(default_factory=dict)
+    # 实际发出去的 HTTP 请求数（含传输层重试和降级到备胎的那几次）。
+    # 预算的调用闸门按它记账，而不是按「计划里有几个调用」。
+    requests: int = 0
 
 
 def _was_billed(provider_name: str, result: protocol.Result) -> bool:
@@ -185,7 +299,12 @@ def _call_once(
     *,
     deadline: Optional[float],
     timeout: float,
-) -> protocol.Result:
+) -> tuple[protocol.Result, int]:
+    """打一次供应商接口。返回（解析结果, **实际发出的 HTTP 请求数**）。
+
+    请求数要如实返回：传输层的一次重试也是一个真实请求，按「计划调用数」记账
+    会让 MAX_CALLS_PER_RUN 名不副实。
+    """
     provider = providers.get_provider(provider_name)
     request = provider.build(api_key, call.platform, call.purpose, call.arguments)
     response = transport.request_with_retry(
@@ -197,13 +316,23 @@ def _call_once(
         deadline=deadline,
         # 传输层只按 HTTP 状态判重试。业务错误可能走 HTTP 200 + body 里的字段，
         # 传输层看不见，必须由下面按解析结果处理。
+        # 429 刻意**不**在这里重试：限流要按 retry_after 等待，那是 _fetch_one
+        # 的职责（它还要照顾软截止）。传输层的退避对它太短。
         should_retry=lambda r: r.status == 0 or r.status >= 500,
     )
-    return provider.parse(
+    result = provider.parse(
         call.platform, call.purpose,
         response.status, response.content_type, response.body,
         response.request_id, api_key,
     )
+    # 把标准的 Retry-After 响应头补进 Err：只有 SocialDataX 会在 body 里给
+    # retry_after_seconds，TikHub 只给响应头。不补的话，一个明确告诉我们
+    # 「等 30 秒」的 429 会被按默认的 5 秒重试，撞回同一堵墙。
+    if (isinstance(result, protocol.Err)
+            and result.retry_after_seconds is None
+            and response.retry_after is not None):
+        result.retry_after_seconds = response.retry_after
+    return result, max(1, response.attempts)
 
 
 def _call(
@@ -249,7 +378,9 @@ def _call(
 
     last: protocol.Result = protocol.Err(protocol.Failure.UNKNOWN, "no_attempt", "没有发起任何请求")
     for index, name in enumerate(order):
-        result = _call_once(name, keys[name], call, deadline=deadline, timeout=timeout)
+        result, attempts = _call_once(name, keys[name], call,
+                                      deadline=deadline, timeout=timeout)
+        spend.requests += attempts
 
         if isinstance(result, protocol.Ok) or _was_billed(name, result):
             spend.provider = name
@@ -284,32 +415,37 @@ def _fetch_one(
     disabled: set[str],
     tally: dict[str, int],
     lock: Optional[threading.Lock] = None,
-) -> tuple[Optional[analyze.Snapshot], Optional[protocol.Err], int, float, int]:
+) -> tuple[Optional[analyze.Snapshot], Optional[protocol.Err], int, float, int, int]:
     """跑完一行需要的全部调用。
 
-    返回（快照, 终局错误, 消耗积分, 花费元, 降级次数）。
+    返回（快照, 终局错误, 消耗积分, 花费元, 降级次数, 实际发出的请求数）。
     终局错误 code == "deadline" 且无快照 = 这一行根本没开始，留给下一轮。
     """
     calls = plan_calls(row, settings, now)
     if not calls:
         return None, protocol.Err(
             protocol.Failure.UNKNOWN, "bad_link", row.parsed.describe_failure()
-        ), 0, 0.0, 0
+        ), 0, 0.0, 0, 0
 
     snapshot: Optional[analyze.Snapshot] = None
     credits = 0
     yuan = 0.0
     failovers = 0
+    requests = 0
     guard = lock or threading.Lock()
 
     def attempt(c: ToolCall) -> protocol.Result:
-        nonlocal credits, yuan, failovers
+        nonlocal credits, yuan, failovers, requests
         spend = _Spend()
         # 「降级」的基准是**此刻真正可用**的第一家，而不是配置里写的主通道：
         # 只配了备胎 key 的部署（完全合法）每一次成功调用都不是降级，
         # 报成降级会让运营按手册去查一个不存在的主通道故障。
+        #
+        # disabled 必须一起传进来：主通道在本轮早些时候已经被判死之后，
+        # 后面每一行都直接走备胎，那不是「这一行发生了降级」。漏传它会让
+        # 降级次数被持续高估——而降级率正是判断主通道健康度的那个指标。
         candidates = [
-            n for n in providers.usable_order(settings.channels, c.platform, keys)
+            n for n in providers.usable_order(settings.channels, c.platform, keys, disabled)
             if providers.get_provider(n).can_handle(c.platform, c.purpose, c.arguments)
         ]
         expected = candidates[0] if candidates else ""
@@ -320,6 +456,7 @@ def _fetch_one(
         with guard:
             credits += spend.credits
             yuan += spend.yuan
+            requests += spend.requests
             for name, count in spend.tally.items():
                 tally[name] = tally.get(name, 0) + count
         if spend.provider and expected and spend.provider != expected:
@@ -332,7 +469,7 @@ def _fetch_one(
                 # 一个请求都还没发：整行留给下一轮，绝不写回。
                 return None, protocol.Err(
                     protocol.Failure.UNKNOWN, "deadline", "已到软截止，本行留给下一轮"
-                ), credits, yuan, failovers
+                ), credits, yuan, failovers, requests
             break  # 评论已到手，detail 放弃：按已有数据完成本行
 
         result = attempt(call)
@@ -340,7 +477,9 @@ def _fetch_one(
         if isinstance(result, protocol.Err) and result.kind is protocol.Failure.RATE_LIMIT:
             # 退避一次再试。等待时间不能越过软截止——设了软截止的运行时里，
             # 一次 30 秒的 retry_after 睡过头会把整轮拖超时。
-            wait = result.retry_after_seconds or 5.0
+            # retry_after 已在 protocol.clamp_retry_after 里过滤过负数/NaN/超大值：
+            # 直接把上游给的数字传给 time.sleep 会被一个 -1 或 NaN 打挂。
+            wait = protocol.clamp_retry_after(result.retry_after_seconds) or 5.0
             if deadline is not None:
                 wait = min(wait, max(0.0, deadline - time.monotonic()))
             time.sleep(wait)
@@ -352,7 +491,7 @@ def _fetch_one(
                     return None, protocol.Err(
                         protocol.Failure.UNKNOWN, "deadline",
                         "限流等待中到达软截止，本行留给下一轮"
-                    ), credits, yuan, failovers
+                    ), credits, yuan, failovers, requests
                 break  # 评论已到手：detail 放弃，按已有数据完成本行
             result = attempt(call)
 
@@ -360,11 +499,12 @@ def _fetch_one(
             # 重试后的结果也走同一套分类——之前的写法在这里直接 return，
             # 导致「限流 → 重试拿到权威 1008」时死亡信号被降级成一条备注。
             if result.kind in protocol.FATAL:
-                # 走到这里说明**所有**通道都是 AUTH/QUOTA，备胎也没了。
-                raise _Abort(str(result), credits, yuan)
+                # 走到这里说明**这个平台**所有通道都是 AUTH/QUOTA，备胎也没了。
+                # 只停这个平台：另一个平台可能配着完全健康的通道。
+                raise _Abort(str(result), call.platform, credits, yuan)
             if result.kind is protocol.Failure.RATE_LIMIT:
                 # 二连限流：把这一行留给下一轮，别拖垮整批。
-                return snapshot, result, credits, yuan, failovers
+                return snapshot, result, credits, yuan, failovers, requests
             if result.kind is protocol.Failure.GONE and not _looks_alive(snapshot):
                 # 「内容没了」是行级结论，不管它是从评论接口还是 detail 冒出来的。
                 # TikHub 通道上最干净的死亡信号恰恰在 detail 里（小红书 data 为 []、
@@ -374,11 +514,11 @@ def _fetch_one(
                 # 但只在**没有活着的证据**时才认：评论接口刚拿回 200 条评论、
                 # detail 却说笔记不存在，那是上游自相矛盾，这时候信 detail
                 # 就是拿一次上游抖动去杀一条好帖子。
-                return None, result, credits, yuan, failovers
+                return None, result, credits, yuan, failovers, requests
             # 评论接口失败 = 这一行的结论；detail 失败只是少几个数字，
             # 已经拿到的评论数据仍然有效，不该整行判死。
             if call.purpose == "comments":
-                return snapshot, result, credits, yuan, failovers
+                return snapshot, result, credits, yuan, failovers, requests
             continue
 
         assert isinstance(result, protocol.Ok)
@@ -387,7 +527,7 @@ def _fetch_one(
         elif snapshot is not None:
             analyze.merge_detail(snapshot, result.data)
 
-    return snapshot, None, credits, yuan, failovers
+    return snapshot, None, credits, yuan, failovers, requests
 
 
 def _base_fields(settings: Settings, *, status: str, notes: list[str], now: datetime) -> dict[str, Any]:
@@ -416,6 +556,8 @@ def refresh(
     progress: Optional[Callable[[str], None]] = None,
     deadline: Optional[float] = None,
     disabled: Optional[set[str]] = None,
+    budget: Optional[RunBudget] = None,
+    stop: Optional[threading.Event] = None,
 ) -> RunReport:
     """刷新一批行。不写回，只算结果——写回由调用方决定时机。
 
@@ -427,10 +569,18 @@ def refresh(
     到软截止就停止派发新行；没跑到的行**不会**被写回，因此它们的
     「最后更新时间」保持原样，下一轮自然会被重新捞起来。这是断点续跑的全部机制。
 
-    deadline / disabled 是给多表调用方用的：软截止是整次运行的预算而不是
-    每张表各一份，deadline 传入绝对的 time.monotonic() 截止点让各表共享；
+    deadline / disabled / budget 是给多表调用方用的：软截止是整次运行的预算
+    而不是每张表各一份，deadline 传入绝对的 time.monotonic() 截止点让各表共享；
     disabled 传入同一个集合，「某家 Key 已失效/余额耗尽」的结论就能跨表
-    生效，不用每张表都花一次真实请求重新发现。都不传时行为与单表一致。
+    生效，不用每张表都花一次真实请求重新发现；budget 同理，行数/调用/金额
+    的硬上限是**整次运行**的，不是每张表各领一份。都不传时行为与单表一致。
+
+    stop 是优雅停机的开关（SIGTERM/SIGINT）：置位后不再派发新行，
+    已经在跑的行跑完，结果照常返回给调用方写回。
+
+    结构化事件不在这里发：熔断（尤其是跨表熔断，发生在调用方那一层）会把
+    已失效/疑似受限改写成刷新失败，在这里发等于让告警看到一个比实际落表
+    **更吓人**的结论。用 emit_run_events()，在所有熔断都定案之后再发。
     """
     now = now or datetime.now(timezone.utc)
     if deadline is None:
@@ -451,9 +601,12 @@ def refresh(
     tally: dict[str, int] = {}
     # tally / report 计数的读-改-写要过这把锁（见 _fetch_one.attempt）。
     lock = threading.Lock()
-    # 第一个触发 FATAL 的行在这里登记原因；之后的行看到非空就直接顺延，
+    # 触发 FATAL 的**平台**在这里登记原因；同平台后来的行看到就直接顺延，
     # 不再穿透 pool.map——那样会把已完成但还没取出的结果一起丢掉。
-    abort: dict[str, str] = {}
+    # 按平台分粒度是刻意的：xhs 的通道全倒，不该让 douyin 的健康行陪葬。
+    dead_platforms: dict[str, str] = {}
+    if budget is None:
+        budget = RunBudget(settings.budget)
 
     def finish(
         row: Row,
@@ -473,6 +626,7 @@ def refresh(
         抹掉上一次的真实结论。
         """
         fields = _base_fields(settings, status=status, notes=verdict.notes, now=now)
+        tag_plan: Optional[TagPlan] = None
 
         if touch_tags:
             merged = tags.merge(
@@ -481,6 +635,16 @@ def refresh(
                 settings.tags.namespace(),
                 known_options=known_options,
                 exclusive=(settings.tags.heat_tiers(),),
+            )
+            # 记下重算所需的材料：写回前会拿**那一刻**的现值再 merge 一次，
+            # 这样运行期间运营新加的人工标签不会被旧快照算出的整列值覆盖。
+            tag_plan = TagPlan(
+                field_name=f.traffic_status,
+                computed=sorted(verdict.tags),
+                namespace=list(settings.tags.namespace()),
+                known_options=None if known_options is None else list(known_options),
+                exclusive=(tuple(settings.tags.heat_tiers()),),
+                snapshot_tags=list(row.current_tags or []),
             )
             if merged.dropped_unknown:
                 fields[f.failure_reason] = (
@@ -543,11 +707,19 @@ def refresh(
                     snapshot, settings.digest, hit=verdict.seed_hit)
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
-                       credits, cost_yuan)
+                       credits, cost_yuan, tag_plan=tag_plan)
 
     def work(row: Row) -> Outcome:
-        if abort:
-            return Outcome(row.record_id, STATUS_DEFERRED, {}, "整批已中止，留给下一轮", 0)
+        platform = row.parsed.platform or ""
+        with lock:
+            dead_reason = dead_platforms.get(platform)
+        if dead_reason:
+            return Outcome(row.record_id, STATUS_DEFERRED, {},
+                           f"{platform} 平台本轮无可用通道，留给下一轮", 0)
+        if stop is not None and stop.is_set():
+            # 收到 SIGTERM：停止派发新行，**不写回任何字段**——
+            # 和软截止完全同一套语义，下一轮自然重捞。
+            return Outcome(row.record_id, STATUS_DEFERRED, {}, "运行被终止，留给下一轮", 0)
         if deadline is not None and time.monotonic() >= deadline:
             # 到软截止：**不写回任何字段**。最后更新时间保持原样，下一轮自然重捞；
             # 排队勾保留，运营的手动请求不会被静默吞掉。
@@ -561,16 +733,41 @@ def refresh(
             return Outcome(row.record_id, STATUS_COOLDOWN, {},
                            f"{settings.safety.cooldown_seconds} 秒内刚刷过，跳过（不计费）", 0)
 
+        # —— 预算：在发请求**之前**预留（SUP-001）——
+        # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
+        # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
+        # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
+        # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
+        planned = plan_calls(row, settings, now)
+        reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
+                                      disabled=disabled, worst_case=True)
+        # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
+        # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
+        reserved_calls = len(planned) * max(1, len(
+            providers.usable_order(settings.channels, platform, keys, disabled)))
+        if not budget.reserve(reserved_calls, reserved_yuan):
+            return Outcome(row.record_id, STATUS_DEFERRED, {},
+                           budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
+
         try:
-            snapshot, error, credits, cost_yuan, failovers = _fetch_one(
+            snapshot, error, credits, cost_yuan, failovers, made_requests = _fetch_one(
                 row, keys, settings, now=now, deadline=deadline, timeout=timeout,
                 disabled=disabled, tally=tally, lock=lock,
             )
         except _Abort as exc:
-            abort.setdefault("reason", exc.reason)
+            # 中止的行也可能已经花过钱：按实际花销校正账面再走。
+            # 请求数按预留值保守留着——中止路径拿不到真实计数，宁可多算。
+            budget.settle(reserved_yuan, exc.yuan, reserved_calls, reserved_calls)
+            with lock:
+                dead_platforms.setdefault(exc.platform or platform, exc.reason)
             # 这一行没有完整结论，不写回；但已经花掉的钱要入账。
             return Outcome(row.record_id, STATUS_DEFERRED, {},
-                           f"整批中止：{exc.reason[:150]}", exc.credits, exc.yuan)
+                           f"{exc.platform or platform} 平台中止：{exc.reason[:150]}",
+                           exc.credits, exc.yuan)
+        # 按**实际**值校正账面：金额是真花掉的，请求数是真发出去的
+        # （含传输层重试和降级到备胎的那几次）。悲观预留的差额在这里退还，
+        # 后面的行才是拿真实余量在放行。
+        budget.settle(reserved_yuan, cost_yuan, reserved_calls, made_requests)
         with lock:
             report.failovers += failovers
 
@@ -603,6 +800,9 @@ def refresh(
                 outcome = finish(row, verdict, None, status=STATUS_SUSPECT,
                                  credits=credits, cost_yuan=cost_yuan, touch_tags=False)
             outcome.fields[f.consecutive_failures] = strikes
+            # 记下失败签名：小样本熔断靠「是不是全都栽在同一个码上」识别上游漂移。
+            outcome.failure_code = f"{error.code}"
+            outcome.failure_definitive = bool(error.definitive)
             return outcome
 
         # —— 取不到内容且不是「确认不存在」：只记，绝不打标签 ——
@@ -635,7 +835,14 @@ def refresh(
         if error is not None:
             verdict.notes.append(f"（detail 未取到：{error.operator_text()[:120]}）")
         if snapshot.points_balance is not None:
-            report.points_balance = snapshot.points_balance
+            with lock:
+                # 取**最小**值而不是「最后一个线程写的那个」：余额随消费单调下降，
+                # 最小值就是这一轮结束时的真实余额。裸赋值的结果由线程完成顺序
+                # 决定，可能显示一个较高的旧余额——一个会高报余额的资金监控
+                # 比没有监控更危险。
+                report.points_balance = (
+                    snapshot.points_balance if report.points_balance is None
+                    else min(report.points_balance, snapshot.points_balance))
 
         outcome = finish(row, verdict, snapshot, status=STATUS_OK,
                          credits=credits, cost_yuan=cost_yuan)
@@ -647,23 +854,81 @@ def refresh(
             outcome.fields[f.alive_confirmed] = True
         return outcome
 
+    def guarded(row: Row) -> Outcome:
+        """行级异常隔离（ROB-003）。
+
+        `work` 里除了 _Abort 之外的任何异常，原来会经 pool.map 重新抛出，
+        refresh() 直接不返回 report——这张表所有**已经花过钱**的行一条都不写回，
+        多表时还会阻断后续的表。一条脏数据、一次上游形状漂移就能造成这个后果。
+
+        所以这里兜住 Exception（不兜 BaseException：KeyboardInterrupt /
+        SystemExit 该照常穿透），把这一行记成「刷新失败」并带上 traceback 摘要。
+        与其它 STATUS_FAILED 路径一致：写状态和诊断、推进最近检查时间、
+        清排队勾——让它按正常节奏重试，而不是每一轮都在同一个 bug 上重复花钱。
+        """
+        try:
+            return work(row)
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}"
+            say(f"  ⚠ {row.record_id} 处理时抛异常：{detail}")
+            say("    " + traceback.format_exc().strip().replace("\n", "\n    "))
+            reason = f"内部错误，本行已跳过：{detail}"[:300]
+            return Outcome(
+                row.record_id,
+                STATUS_FAILED,
+                _base_fields(settings, status=STATUS_FAILED, notes=[reason], now=now),
+                reason,
+            )
+
     pending = list(rows)
     with ThreadPoolExecutor(max_workers=max(1, settings.max_concurrency)) as pool:
-        for outcome in pool.map(work, pending):
+        for outcome in pool.map(guarded, pending):
             report.outcomes.append(outcome)
             say(f"  {outcome.record_id} → {outcome.status} {outcome.reason}".rstrip())
 
-    if abort:
-        report.aborted_reason = abort["reason"]
+    report.dead_platforms = dict(dead_platforms)
+    report.budget_stopped = budget.stopped_reason
+    if dead_platforms:
+        report.aborted_reason = "；".join(
+            f"{platform}：{reason}" for platform, reason in sorted(dead_platforms.items()))
         report.fatal = True
     else:
         deferred = sum(1 for o in report.outcomes if o.status == STATUS_DEFERRED)
         if deferred:
-            report.aborted_reason = f"{deferred} 行未处理（到达软截止），留给下一轮"
+            cause = budget.stopped_reason or "到达软截止"
+            report.aborted_reason = f"{deferred} 行未处理（{cause}），留给下一轮"
 
     report.used_providers = dict(tally)
     _apply_circuit_breaker(report, settings)
     return report
+
+
+def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]], None]],
+                    **context: Any) -> None:
+    """把这份 report 的每一行发成一条结构化事件。
+
+    **必须在所有熔断都定案之后调用**（单表熔断在 refresh 末尾、跨表熔断在
+    调用方那一层）。在行跑完时就发的话，一旦事后触发熔断，
+    原本记成「已失效」的行会被改写成「刷新失败」再落表——
+    看板和告警消费到的就是一个比表里更吓人的结论，
+    而这恰恰发生在上游故障、最不该误报的时候。
+    """
+    if sink is None:
+        return
+    for outcome in report.outcomes:
+        try:
+            sink({
+                **context,
+                "record_id": outcome.record_id,
+                "status": outcome.status,
+                "reason": outcome.reason,
+                "cost_yuan": round(outcome.cost_yuan, 6),
+                "credits": outcome.credits,
+                "failure_code": outcome.failure_code,
+                "breaker_tripped": report.breaker_tripped,
+            })
+        except Exception:  # noqa: BLE001 —— 日志出问题绝不能影响业务流程
+            pass
 
 
 def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
@@ -676,14 +941,47 @@ def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
     # 「取不到内容」的观测，混进分母会稀释失效比例，让该熔的批熔不了。
     attempted = [o for o in report.outcomes if o.status not in _NOT_ATTEMPTED]
     total = len(attempted)
-    gone = sum(1 for o in attempted if o.status in (STATUS_GONE, STATUS_SUSPECT))
+    suspects = [o for o in attempted if o.status in (STATUS_GONE, STATUS_SUSPECT)]
+    gone = len(suspects)
+    soft_codes: dict[str, int] = {}
+    for outcome in suspects:
+        if outcome.failure_definitive:
+            continue
+        key = outcome.failure_code or "unknown"
+        soft_codes[key] = soft_codes.get(key, 0) + 1
     # 样本先记在 report 上再决定熔不熔：跨表熔断要用作废前的原始计数。
     report.breaker_attempted, report.breaker_gone = total, gone
-    if total < settings.safety.breaker_min_sample:
+    report.breaker_soft_codes = soft_codes
+    if total >= settings.safety.breaker_min_sample:
+        if gone / total > settings.safety.breaker_gone_ratio:
+            _void_gone_writes(report, settings, gone, total)
         return
-    if gone / total <= settings.safety.breaker_gone_ratio:
-        return
-    _void_gone_writes(report, settings, gone, total)
+    if _uniform_failure(total, soft_codes, settings):
+        _void_gone_writes(report, settings, gone, total,
+                          extra="、且全部栽在同一个非权威错误码上")
+
+
+def _uniform_failure(total: int, soft_codes: dict[str, int], settings: Settings) -> bool:
+    """小样本的第二道熔断（ROB-010）。
+
+    比例闸门要 10 行样本才生效，而 queue 模式一批常常只有三五行——
+    上游把所有笔记都译成 empty_shell 的那种漂移，在小批次上完全没有保护，
+    两轮之后一批活帖就全被标成「已失效」。
+
+    判据有三条，缺一不可：
+    1. 打过上游的行数够小样本线（默认 3）；
+    2. **每一行**都判了失效/嫌疑；
+    3. 全部栽在**同一个非权威错误码**上。
+
+    第 3 条里的「非权威」是这道闸不误伤真实死讯的关键：真被删掉的内容拿到的是
+    有契约的权威码（SocialDataX 1008、TikHub 小红书 detail 空列表 / 抖音
+    filter_list 命中），它们不进这张表，所以「一张只有三行、三条都真被删了」
+    的表照常能判「已失效」。被挡住的是启发式信号（empty_shell、not_found）
+    整批一致命中——那是上游改了话术或 schema，不是内容集体消失。
+    """
+    if total < settings.safety.breaker_uniform_min_sample:
+        return False
+    return len(soft_codes) == 1 and sum(soft_codes.values()) == total
 
 
 def apply_cross_run_breaker(reports: list[RunReport], settings: Settings) -> bool:
@@ -696,42 +994,65 @@ def apply_cross_run_breaker(reports: list[RunReport], settings: Settings) -> boo
     但它的样本照常计入全局比例。触发时返回 True，调用方据此提示。
     """
     total = sum(r.breaker_attempted for r in reports)
-    if total < settings.safety.breaker_min_sample:
-        return False
     gone = sum(r.breaker_gone for r in reports)
-    if gone / total <= settings.safety.breaker_gone_ratio:
+    soft_codes: dict[str, int] = {}
+    for report in reports:
+        for code, count in report.breaker_soft_codes.items():
+            soft_codes[code] = soft_codes.get(code, 0) + count
+
+    uniform = False
+    if total < settings.safety.breaker_min_sample:
+        uniform = _uniform_failure(total, soft_codes, settings)
+        if not uniform:
+            return False
+    elif gone / total <= settings.safety.breaker_gone_ratio:
         return False
+
     for report in reports:
         if not report.breaker_tripped:
-            _void_gone_writes(report, settings, gone, total)
+            _void_gone_writes(
+                report, settings, gone, total,
+                extra="、且全部栽在同一个非权威错误码上" if uniform else "")
     return True
 
 
-def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: int) -> None:
+def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: int,
+                      *, extra: str = "") -> None:
     """熔断的执行动作：撤销这份 report 里所有失效判定的写入。
 
     gone/total 是触发熔断的样本（单表熔断是本表的，跨表熔断是全局合计的），
     只用于诊断文案，让运营看到判定被作废的依据。
+
+    ⚠️ 「作废」必须**彻底**：被保护的行不能只撤掉标签，却仍然带着
+    「最近检查时间=现在」和「排队刷新=False」落表——那等于告诉调度器
+    「这一行本轮处理完了」，运营的手动请求被吞掉，sweep 还要再等 8–72 小时
+    才会复查。承诺的是「宁可这一轮什么都不写」，就要真的什么都不写：
+    只留状态和诊断两列。
     """
     report.breaker_tripped = True
-    field_name = settings.fields.traffic_status
+    f = settings.fields
     for outcome in report.outcomes:
-        outcome.fields.pop(field_name, None)
+        outcome.fields.pop(f.traffic_status, None)
         if outcome.status in (STATUS_GONE, STATUS_SUSPECT):
             outcome.status = STATUS_FAILED
-            outcome.fields[settings.fields.refresh_status] = STATUS_FAILED
             # 判定作废，计数增量也要一并撤销——否则熔断轮照样给每行 +1，
             # 上游故障一恢复，下一次单个非权威 GONE 就能一击定罪。
-            outcome.fields.pop(settings.fields.consecutive_failures, None)
+            outcome.fields.pop(f.consecutive_failures, None)
             # 「已确认存活=取消」同理作废：上游故障轮不能把一批活帖的勾全摘掉。
-            outcome.fields.pop(settings.fields.alive_confirmed, None)
+            outcome.fields.pop(f.alive_confirmed, None)
+            # 不推进最近检查时间、不清排队勾：这一行**没有**得到有效结论。
+            outcome.fields.pop(f.last_updated, None)
+            outcome.fields.pop(f.queued, None)
+            # 标签重算材料也要撤销：这一行本轮不碰标签列了。
+            outcome.tag_plan = None
             # 追加而不是覆盖：原始错误文案里带着 request_id，是找厂商排查的唯一凭据。
-            original = str(outcome.fields.get(settings.fields.failure_reason) or "")
+            original = str(outcome.fields.get(f.failure_reason) or "")
             note = (
-                f"本批 {gone}/{total} 行都取不到内容，疑似上游故障而非内容失效，"
-                "本轮不改流量状态，请稍后复查"
+                f"本批 {gone}/{total} 行都取不到内容{extra}，疑似上游故障而非内容失效，"
+                "本轮不改流量状态、不推进检查时间，请稍后复查"
             )
-            outcome.fields[settings.fields.failure_reason] = (
+            outcome.fields[f.refresh_status] = STATUS_FAILED
+            outcome.fields[f.failure_reason] = (
                 f"{original}；{note}" if original else note
             )[:500]
 
@@ -783,7 +1104,12 @@ def load_rows(
     if known_fields is not None:
         wanted_fields = [c for c in wanted_fields if c in known_fields]
 
-    records = table.search(wanted_fields, filter_spec=filter_spec, max_records=max_records)
+    if only_record_ids:
+        # 定点读（SUP-003）：原来是「把表里所有 monitoring 行都读回来再本地筛
+        # record_id」，多表时每张表都全量扫一遍。手动刷一行不该是 O(全表×表数)。
+        records = table.batch_get(only_record_ids)
+    else:
+        records = table.search(wanted_fields, filter_spec=filter_spec, max_records=max_records)
 
     wanted = set(only_record_ids or [])
     result: list[Row] = []
@@ -812,6 +1138,67 @@ def load_rows(
     return result
 
 
+def _reconcile_tags(
+    table: feishu.Bitable,
+    report: RunReport,
+    *,
+    say: Callable[[str], None] = lambda _: None,
+) -> None:
+    """写回**之前**重读一次流量状态，用新鲜的人工标签重做 merge（COR-002）。
+
+    为什么必须有这一步：飞书多选字段没有原子 append，写入是整列覆盖，
+    所以每次都得读-改-写。而这一轮的「读」发生在开跑时、「写」发生在收尾时，
+    中间隔着几分钟的付费调用。运营在这几分钟里手工加的「客户已确认」，
+    会被按开跑那一刻的旧快照算出来的整列值直接抹掉——
+    「人工标签永远不动」这个承诺原本只在没有并发编辑时成立。
+
+    重读失败（网络、权限、接口不支持）时**不写这一列**，而不是拿旧快照赌一把：
+    宁可这一轮少打一个机器标签（下一轮自动补上），也不能覆盖掉人手打的标签。
+    """
+    targets = [o for o in report.outcomes
+               if o.tag_plan is not None and o.tag_plan.field_name in o.fields]
+    if not targets:
+        return
+
+    try:
+        fresh = {r.get("record_id"): (r.get("fields") or {})
+                 for r in table.batch_get([o.record_id for o in targets])}
+    except Exception as exc:  # noqa: BLE001 —— 重读失败不该炸穿写回
+        say(f"⚠ 写回前重读「流量状态」失败（{type(exc).__name__}: {exc}）："
+            "本轮不改这一列，避免覆盖运营刚打的人工标签；下一轮会自动补上")
+        for outcome in targets:
+            outcome.fields.pop(outcome.tag_plan.field_name, None)
+        return
+
+    changed_rows = 0
+    for outcome in targets:
+        plan = outcome.tag_plan
+        cells = fresh.get(outcome.record_id)
+        if cells is None:
+            # 这一行在我们跑的这几分钟里被删了：整行交给 batch_update 去报
+            # 1254043 并被隔离，不必在这里特殊处理。
+            continue
+        current = feishu.read_multi_select(cells.get(plan.field_name))
+        if sorted(current) == sorted(plan.snapshot_tags):
+            continue   # 没人动过，开跑时算出来的值仍然成立
+        merged = tags.merge(
+            current,
+            plan.computed,
+            plan.namespace,
+            known_options=plan.known_options,
+            exclusive=plan.exclusive,
+        )
+        changed_rows += 1
+        if merged.changed:
+            outcome.fields[plan.field_name] = merged.final
+        else:
+            # 拿新鲜现值重算后无需改动：那就一列都别写。
+            outcome.fields.pop(plan.field_name, None)
+    if changed_rows:
+        say(f"ℹ 写回前发现 {changed_rows} 行的「流量状态」在本轮运行期间被改过，"
+            "已按最新现值重算标签（人工标签原样保留）")
+
+
 def write_back(
     table: feishu.Bitable,
     report: RunReport,
@@ -819,6 +1206,7 @@ def write_back(
     errors: Optional[list] = None,
     known_fields: Optional[set[str]] = None,
     dropped_fields: Optional[set[str]] = None,
+    say: Callable[[str], None] = lambda _: None,
 ) -> int:
     """写回。errors 传一个列表进来可以收集失败的行（(record_id, FeishuError)），
     不传则在所有行都尝试过之后抛汇总异常——见 feishu.Bitable.batch_update。
@@ -827,6 +1215,7 @@ def write_back(
     还没建的机器列挡下来（记进 dropped_fields 供调用方提示）——按名字写
     不存在的列是表级错误，会让整批写回失败。None = 不过滤，宁可试着写。
     """
+    _reconcile_tags(table, report, say=say)
     updates = []
     for o in report.outcomes:
         fields = o.fields

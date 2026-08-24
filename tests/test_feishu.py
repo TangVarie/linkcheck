@@ -117,6 +117,137 @@ class TestBatchUpdateIsolation(unittest.TestCase):
         self.assertEqual(calls["n"], 1)   # 没有失败就不该有二分开销
 
 
+class TestErrorCodeContract(unittest.TestCase):
+    """错误码契约（COR-001）。这张表校对自官方 batch_update 文档：
+    1254043 是行级的「记录不存在」，1254291 是**整块**的写冲突。
+    把冲突当行级错误二分，会在冲突最严重的时候用最大的请求量去捶打同一张表。"""
+
+    def test_write_conflict_retries_the_whole_chunk_without_bisecting(self):
+        bodies: list[list[str]] = []
+
+        def fake_post(url, headers, body, timeout=30.0):
+            records = json.loads(body).get("records") or []
+            bodies.append([r["record_id"] for r in records])
+            # 前两次冲突，第三次成功
+            if len(bodies) <= 2:
+                return feishu_err(1254291, "write conflict")
+            return ok({})
+
+        updates = [{"record_id": f"rec{i}", "fields": {"x": 1}} for i in range(8)]
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            written = make_table().batch_update(updates, errors=[])
+
+        self.assertEqual(written, 8)
+        # 三次请求，每次都是**同样的 8 行**——一次都没有被拆开
+        self.assertEqual(len(bodies), 3)
+        for sent in bodies:
+            self.assertEqual(len(sent), 8)
+
+    def test_write_conflict_that_never_clears_raises_and_still_does_not_bisect(self):
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            self.assertEqual(len(json.loads(body)["records"]), 8)
+            return feishu_err(1254291, "write conflict")
+
+        updates = [{"record_id": f"rec{i}", "fields": {"x": 1}} for i in range(8)]
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError) as ctx:
+                make_table().batch_update(updates, errors=[])
+        self.assertEqual(ctx.exception.code, 1254291)
+        # 退避次数有上界；旧写法这里是 2n-1 = 15 次立即请求
+        self.assertEqual(calls["n"], feishu._CONFLICT_ATTEMPTS)
+
+    def test_record_id_not_found_is_the_code_that_gets_bisected(self):
+        """1254043 RecordIdNotFound：这一行的问题不影响别的行，隔离出来其余照写。"""
+        def fake_post(url, headers, body, timeout=30.0):
+            records = json.loads(body).get("records") or []
+            if any(r["record_id"] == "deleted" for r in records):
+                return feishu_err(1254043, "RecordIdNotFound")
+            return ok({})
+
+        updates = [{"record_id": rid, "fields": {"x": 1}}
+                   for rid in ("a", "b", "c", "deleted", "e", "f", "g", "h")]
+        errors: list = []
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            written = make_table().batch_update(updates, errors=errors)
+        self.assertEqual(written, 7)
+        self.assertEqual([rid for rid, _ in errors], ["deleted"])
+        self.assertEqual(errors[0][1].code, 1254043)
+
+
+class TestNonNumericCode(unittest.TestCase):
+    """上游/代理返回一个非数字 code 时，必须是 FeishuError 而不是裸 ValueError
+    ——后者不是 FeishuError，会绕过 CLI 的按表隔离，整轮异常退出（COR-011）。"""
+
+    def test_check_wraps_bad_code_in_feishu_error(self):
+        resp = transport.Response(
+            200, "application/json",
+            json.dumps({"code": "oops", "msg": "网关改写了响应",
+                        "request_id": "req-xyz"}),
+            "req-header")
+        with self.assertRaises(feishu.FeishuError) as ctx:
+            feishu._check(resp)
+        self.assertEqual(ctx.exception.code, -1)
+        self.assertIn("oops", str(ctx.exception))       # 原始 code 还在
+        self.assertIn("req-xyz", str(ctx.exception))    # request_id 还在
+
+    def test_parse_code_handles_every_shape(self):
+        self.assertEqual(feishu.parse_code(1254043), 1254043)
+        self.assertEqual(feishu.parse_code("1254043"), 1254043)
+        self.assertEqual(feishu.parse_code("oops"), -1)
+        self.assertEqual(feishu.parse_code(None), -1)
+        self.assertEqual(feishu.parse_code(True), -1)   # bool 不是错误码
+
+
+class TestPaginationGuards(unittest.TestCase):
+    """上游/代理反复返回同一个 page_token 时不能无限翻页——
+    进程会被挂住，后续的 cron 会因为「上一轮还在跑」被永远跳过（ROB-008）。"""
+
+    def test_page_guard_can_always_reach_the_record_cap(self):
+        """两道闸必须对得上。页数闸写死 200 页时，默认 page_size=200 只能翻到
+        40,000 行——一张 45,000 行的合法大表会被页数闸拦下，
+        而它明明没超过 50,000 行的行数硬上限。"""
+        for page_size in (100, 200, 500):
+            with self.subTest(page_size=page_size):
+                reachable = feishu._page_limit(page_size) * page_size
+                self.assertGreaterEqual(reachable, feishu.MAX_RECORDS_HARD_CAP)
+
+    def test_repeated_page_token_aborts(self):
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            return ok({"items": [{"record_id": f"rec{calls['n']}"}],
+                       "has_more": True, "page_token": "same-token"})
+
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError) as ctx:
+                make_table().search(["链接"])
+        self.assertIn("重复的 page_token", str(ctx.exception))
+        self.assertLessEqual(calls["n"], 3)   # 两页之内就收手
+
+
+class TestTimestampRange(unittest.TestCase):
+    """超范围的日期值必须在读的时候就变成 None：
+    留到 datetime.fromtimestamp 那一步会抛 OverflowError，
+    而那个调用发生在**选行阶段**，一格脏数据能让整张表一行都刷不了（COR-007）。"""
+
+    def test_absurd_values_become_none(self):
+        for value in (10 ** 30, -(10 ** 30), 10 ** 18):
+            self.assertIsNone(feishu.read_timestamp_ms(value), value)
+
+    def test_normal_values_survive(self):
+        self.assertEqual(feishu.read_timestamp_ms(1_755_000_000_000), 1_755_000_000_000)
+        # 秒级时间戳照旧宽松兼容
+        self.assertEqual(feishu.read_timestamp_ms(1_755_000_000), 1_755_000_000_000)
+
+
 class TestTokenRetry(unittest.TestCase):
     def test_one_network_blip_does_not_kill_the_run(self):
         responses = [

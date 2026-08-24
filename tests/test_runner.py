@@ -753,6 +753,20 @@ class TestUnknownCommentCount(RunnerTest):
         self.assertNotIn(self.settings.fields.pinned_status, outcome.fields)
 
 
+def mixed_gone(counter={"n": 0}):
+    """交替返回两个不同的失效错误码。
+
+    小样本一致性熔断（ROB-010）看的是「是不是全都栽在同一个非权威码上」，
+    所以凡是要测**比例**闸门的用例都必须让错误码有分歧，否则一致性闸门
+    会先一步触发，测出来的就不是比例闸门了。
+    """
+    def responder(*args, **kwargs):
+        counter["n"] += 1
+        return (err(200, 1003, "未找到对应内容") if counter["n"] % 2
+                else err(200, 1006, "内容当前不可读"))
+    return responder
+
+
 class TestBreakerAccounting(RunnerTest):
     def _gone_rows(self, n):
         rows = []
@@ -773,8 +787,37 @@ class TestBreakerAccounting(RunnerTest):
     def test_cooldown_rows_do_not_dilute_the_ratio(self):
         """分母只算真正打过上游的行。9 行全失效 + 3 行冷却 = 样本 9，
         不到 10 就不该熔断（旧算法会把冷却行混进分母凑够样本）。"""
-        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+        report = self.run_with(mixed_gone({"n": 0}),
                                self._gone_rows(9) + self._cooldown_rows(3))
+        self.assertFalse(report.breaker_tripped)
+        self.assertEqual(report.breaker_attempted, 9)
+
+    def test_small_batch_all_failing_the_same_way_trips(self):
+        """ROB-010：比例闸门要 10 行样本，queue 一批常常只有三五行。
+        三行全部栽在同一个**非权威**码上 = 上游漂移的形态，必须熔断。"""
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(3))
+        self.assertTrue(report.breaker_tripped)
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_FAILED)
+
+    def test_small_batch_with_mixed_codes_does_not_trip(self):
+        """错误码有分歧 = 更像内容各自出了各自的事，不是上游整体漂移。"""
+        report = self.run_with(mixed_gone({"n": 0}), self._gone_rows(4))
+        self.assertFalse(report.breaker_tripped)
+
+    def test_definitive_death_is_never_blocked_by_the_small_sample_breaker(self):
+        """一张只有三行、三条都**真被删了**的表必须能判「已失效」。
+        权威死讯（1008，规范明写不要重试）不参与小样本一致性熔断。"""
+        report = self.run_with(lambda *a, **k: err(200, 1008, "内容已删除"),
+                               self._gone_rows(3))
+        self.assertFalse(report.breaker_tripped)
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_GONE)
+
+    def test_small_batch_below_uniform_sample_stays_calm(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(2))
         self.assertFalse(report.breaker_tripped)
 
     def test_breaker_voids_strike_increment_and_keeps_diagnostics(self):
@@ -796,13 +839,15 @@ class TestCrossRunBreaker(RunnerTest):
     """多表部署：单表可能只有三五行，永远凑不满熔断的最小样本——
     但上游故障是通道级的，跟行分在哪张表没关系，样本要全局算。"""
 
-    def _gone_report(self, n, prefix):
+    def _gone_report(self, n, prefix, responder=None):
         rows = []
         for i in range(n):
             row = xhs_row(f"{prefix}{i}")
             row.consecutive_failures = 1
             rows.append(row)
-        return self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
+        # 默认让错误码有分歧：这一组测的是**比例**闸门跨表加总，
+        # 不掺分歧的话小样本一致性闸门会先在单表里触发。
+        return self.run_with(responder or mixed_gone({"n": 0}), rows)
 
     def test_small_tables_add_up_and_trip_together(self):
         r1 = self._gone_report(6, "a")
@@ -863,6 +908,327 @@ class TestSharedRunBudget(RunnerTest):
         self.run_with([err(401, 1401, "API Key 无效或已失效。")], [xhs_row()],
                       disabled=shared)
         self.assertIn("socialdatax", shared)
+
+
+class TestBreakerLeavesSchedulingUntouched(RunnerTest):
+    """COR-003：熔断承诺的是「宁可这一轮什么都不写」，那就要真的什么都不写。
+
+    只撤销标签、却仍然带着「最近检查时间=现在」和「排队刷新=False」落表，
+    等于告诉调度器这一行本轮处理完了：运营的手动请求被吞掉，
+    sweep 下一次还要等 8–72 小时才复查。"""
+
+    def _queued_gone_rows(self, n):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"q{i}")
+            row.consecutive_failures = 1
+            row.queued = True
+            rows.append(row)
+        return rows
+
+    def test_tripped_rows_do_not_advance_time_or_clear_the_queue_flag(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._queued_gone_rows(12))
+        self.assertTrue(report.breaker_tripped)
+        f = self.settings.fields
+        for outcome in report.outcomes:
+            self.assertNotIn(f.last_updated, outcome.fields,
+                             "熔断行不该推进最近检查时间")
+            self.assertNotIn(f.queued, outcome.fields,
+                             "熔断行不该清掉排队刷新的勾")
+            # 状态和诊断仍要写：运营得看得见发生了什么
+            self.assertEqual(outcome.fields[f.refresh_status], runner.STATUS_FAILED)
+            self.assertIn("疑似上游故障", outcome.fields[f.failure_reason])
+
+    def test_healthy_rows_in_the_same_batch_still_advance_time(self):
+        """熔断只作废失效判定，同一批里正常完成的行照常落表。"""
+        rows = self._queued_gone_rows(11) + [xhs_row("ok1")]
+        responses = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            responses["n"] += 1
+            if responses["n"] <= 11:
+                return err(200, 1003, "未找到对应内容")
+            return sse(comment_page(count=150))
+
+        report = self.run_with(responder, rows)
+        self.assertTrue(report.breaker_tripped)
+        healthy = [o for o in report.outcomes if o.record_id == "ok1"][0]
+        self.assertEqual(healthy.status, runner.STATUS_OK)
+        self.assertIn(self.settings.fields.last_updated, healthy.fields)
+
+
+class TestRowLevelExceptionIsolation(RunnerTest):
+    """ROB-003：一行抛出未预期的异常，不该让整表已经付过钱的结果一条都不写回。"""
+
+    def test_one_exploding_row_does_not_take_down_the_batch(self):
+        boom = xhs_row("boom")
+
+        real_plan = runner.plan_calls
+
+        def flaky_plan(row, settings, now=None):
+            if row.record_id == "boom":
+                raise RuntimeError("上游形状漂移导致的内部错误")
+            return real_plan(row, settings, now)
+
+        with mock.patch.object(runner, "plan_calls", side_effect=flaky_plan):
+            report = self.run_with(
+                lambda *a, **k: sse(comment_page(count=150)),
+                [xhs_row("a"), boom, xhs_row("c")])
+
+        by_id = {o.record_id: o for o in report.outcomes}
+        self.assertEqual(len(report.outcomes), 3)
+        self.assertEqual(by_id["a"].status, runner.STATUS_OK)
+        self.assertEqual(by_id["c"].status, runner.STATUS_OK)
+        self.assertEqual(by_id["boom"].status, runner.STATUS_FAILED)
+        self.assertIn("RuntimeError", by_id["boom"].reason)
+
+
+class TestPointsBalanceIsNotRaceDependent(RunnerTest):
+    """ROB-012：余额随消费单调下降，最终该显示**最小**的那个，
+    而不是「最后一个线程恰好写进去的那个」——一个会高报余额的资金监控
+    比没有监控更危险。"""
+
+    def test_lowest_balance_wins(self):
+        balances = [1000, 980, 990]
+        state = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            index = state["n"] % len(balances)
+            state["n"] += 1
+            return sse(comment_page(count=30, balance=balances[index]))
+
+        self.settings.detail_within_days = 0     # 每行只发一个请求，balance 一一对应
+        report = self.run_with(responder, [xhs_row(f"r{i}") for i in range(3)])
+        self.assertEqual(report.points_balance, 980)
+
+
+class TestRunBudget(RunnerTest):
+    """SUP-001：预算是**发请求之前**预留的，不是事后统计。"""
+
+    def test_row_limit_stops_dispatch_and_leaves_the_rest_untouched(self):
+        self.settings.budget.max_records_per_run = 2
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return sse(comment_page(count=30))
+
+        self.settings.detail_within_days = 0
+        rows = [xhs_row(f"r{i}") for i in range(5)]
+        report = self.run_with(responder, rows)
+        done = [o for o in report.outcomes if o.status == runner.STATUS_OK]
+        deferred = [o for o in report.outcomes if o.status == runner.STATUS_DEFERRED]
+        self.assertEqual(len(done), 2)
+        self.assertEqual(len(deferred), 3)
+        self.assertEqual(posts["n"], 2, "超预算的行一个请求都不该发")
+        # 顺延的行完全不写回：排队勾和最近检查时间都保持原样
+        for outcome in deferred:
+            self.assertEqual(outcome.fields, {})
+        self.assertIn("行数上限", report.budget_stopped)
+
+    def test_yuan_limit_is_reserved_before_spending(self):
+        self.settings.detail_within_days = 0
+        # SocialDataX 一次调用 ¥0.10，预算 ¥0.25 只够两行
+        self.settings.budget.max_yuan_per_run = 0.25
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return sse(comment_page(count=30))
+
+        report = self.run_with(responder, [xhs_row(f"r{i}") for i in range(5)])
+        self.assertEqual(posts["n"], 2)
+        self.assertIn("金额上限", report.budget_stopped)
+
+    def test_reservation_uses_the_channel_that_will_actually_run(self):
+        """主通道已被判死时，这一行**实际**走的是备胎，两家单价能差 14 倍。
+
+        按被禁用的便宜通道预留，`MAX_YUAN_PER_RUN` 就不再是上限：
+        抖音一行按 TikHub 预留 ¥0.0144、实际按 SocialDataX 花 ¥0.20，
+        预算 ¥1 能放行十几倍的开销。
+        """
+        from xhsearch.rows import estimate_yuan
+
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7412345678901234567",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        keys = {"tikhub": "t", "socialdatax": "s"}
+        cheap = estimate_yuan([row], self.settings, NOW, keys=keys)
+        after_tikhub_died = estimate_yuan([row], self.settings, NOW, keys=keys,
+                                          disabled={"tikhub"})
+        self.assertLess(cheap, after_tikhub_died)
+        self.assertAlmostEqual(after_tikhub_died, 0.20, places=6)
+
+    def test_reservation_is_pessimistic_so_the_cap_cannot_be_crossed(self):
+        """预留时主通道健康、跑到一半它倒了 —— 这一行就走了贵十几倍的备胎。
+
+        乐观预留下 settle() 是**事后**校正：等它反应过来，钱已经花出去，
+        MAX_YUAN_PER_RUN 在这一行上已经被越过。所以预留必须按
+        「可能走到的最贵那家」算。
+        """
+        from xhsearch.rows import estimate_yuan
+
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7412345678901234567",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        keys = {"tikhub": "t", "socialdatax": "s"}
+        optimistic = estimate_yuan([row], self.settings, NOW, keys=keys)
+        pessimistic = estimate_yuan([row], self.settings, NOW, keys=keys, worst_case=True)
+        self.assertAlmostEqual(optimistic, 0.0144, places=4)   # TikHub 两次
+        self.assertAlmostEqual(pessimistic, 0.20, places=4)    # SocialDataX 两次
+
+        # 上限落在两者之间时，悲观预留必须把这一行拦下
+        budget = runner.RunBudget(runner.Budget(max_yuan_per_run=0.10))
+        self.assertFalse(budget.reserve(2, pessimistic))
+        self.assertIn("金额上限", budget.stopped_reason)
+
+    def test_optimistic_estimate_stays_the_default_for_human_facing_numbers(self):
+        """报给人看的「预计花费」仍用乐观口径——按最贵的报会让每次估算虚高。"""
+        from xhsearch.rows import estimate_yuan
+
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7412345678901234567",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        keys = {"tikhub": "t", "socialdatax": "s"}
+        self.assertLess(estimate_yuan([row], self.settings, NOW, keys=keys),
+                        estimate_yuan([row], self.settings, NOW, keys=keys, worst_case=True))
+
+    def test_transport_retries_are_counted_as_real_calls(self):
+        """一个「计划中的调用」在传输层可能变成 3 个真实请求，降级还会再打
+        另一家。按计划数记账会让 MAX_CALLS_PER_RUN 名不副实。"""
+        budget = runner.RunBudget(runner.Budget(max_calls_per_run=100))
+        self.assertTrue(budget.reserve(2, 0.0))
+        self.assertEqual(budget.calls, 2)
+        budget.settle(0.0, 0.0, 2, 6)      # 实际发了 6 个 HTTP 请求
+        self.assertEqual(budget.calls, 6)
+
+    def test_actual_spend_is_settled_back_into_the_budget(self):
+        """跑到一半降级到更贵的那家（预留时它还健康）会超出预留额。
+        不校正的话，后面的行是拿一个假的余量在放行。"""
+        budget = runner.RunBudget(runner.Budget(max_yuan_per_run=1.0))
+        self.assertTrue(budget.reserve(2, 0.02))
+        self.assertAlmostEqual(budget.yuan, 0.02, places=6)
+        budget.settle(0.02, 0.20, 2, 2)      # 实际按备胎的价花掉了
+        self.assertAlmostEqual(budget.yuan, 0.20, places=6)
+
+    def test_budget_is_shared_across_tables(self):
+        """预算是整次运行的，不是每张表各领一份。"""
+        self.settings.detail_within_days = 0
+        budget = runner.RunBudget(runner.Budget(max_records_per_run=2))
+        first = self.run_with(lambda *a, **k: sse(comment_page(count=30)),
+                              [xhs_row("a1"), xhs_row("a2")], budget=budget)
+        second = self.run_with(lambda *a, **k: sse(comment_page(count=30)),
+                               [xhs_row("b1")], budget=budget)
+        self.assertEqual(first.counts().get(runner.STATUS_OK), 2)
+        self.assertEqual(second.outcomes[0].status, runner.STATUS_DEFERRED)
+
+
+class TestGracefulStop(RunnerTest):
+    """ROB-009：收到 SIGTERM 后停止派发新行，语义和软截止完全一致——
+    没轮到的行一个字段都不写，下一轮自然重捞。"""
+
+    def test_stop_event_defers_remaining_rows(self):
+        import threading
+
+        stop = threading.Event()
+        stop.set()
+        with mock.patch.object(transport, "post") as posted:
+            report = runner.refresh([xhs_row()], "fake-key", self.settings,
+                                    now=NOW, stop=stop)
+        posted.assert_not_called()
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_DEFERRED)
+        self.assertEqual(report.outcomes[0].fields, {})
+
+
+class TestStructuredEventsSeeTheFinalStatus(RunnerTest):
+    """事件必须在**所有**熔断定案之后才发。
+
+    在行跑完时就发的话，一旦事后触发熔断，原本记成「已失效」的行会被
+    改写成「刷新失败」再落表——看板和告警消费到的就是一个比表里更吓人的
+    结论，而这恰恰发生在上游故障、最不该误报的时候。
+    """
+
+    def _gone_rows(self, n):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"g{i}")
+            row.consecutive_failures = 1
+            rows.append(row)
+        return rows
+
+    def test_events_report_the_post_breaker_status(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(12))
+        self.assertTrue(report.breaker_tripped)
+
+        events: list = []
+        runner.emit_run_events(report, events.append, table="表A")
+        self.assertEqual(len(events), 12)
+        for event in events:
+            self.assertEqual(event["status"], runner.STATUS_FAILED)
+            self.assertTrue(event["breaker_tripped"])
+            self.assertEqual(event["table"], "表A")
+
+    def test_a_broken_sink_never_breaks_the_run(self):
+        report = self.run_with([sse(comment_page(count=150)),
+                                sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+                               [xhs_row()])
+
+        def exploding(_event):
+            raise RuntimeError("日志后端挂了")
+
+        runner.emit_run_events(report, exploding)   # 不抛异常即通过
+
+
+class TestTagWriteBackIsOptimisticallyConcurrent(RunnerTest):
+    """COR-002：读表和写回之间隔着几分钟的付费调用。运营在这几分钟里
+    手工加的人工标签，绝不能被按旧快照算出来的整列值覆盖。"""
+
+    class _FakeTable:
+        def __init__(self, fresh_tags, field_name, fail=False):
+            self.fresh_tags = fresh_tags
+            self.field_name = field_name
+            self.fail = fail
+            self.updates = None
+
+        def batch_get(self, record_ids):
+            if self.fail:
+                raise RuntimeError("重读失败")
+            return [{"record_id": rid, "fields": {self.field_name: list(self.fresh_tags)}}
+                    for rid in record_ids]
+
+        def batch_update(self, updates, errors=None):
+            self.updates = updates
+            return len(updates)
+
+    def _report_with_tags(self):
+        return self.run_with(
+            [sse(comment_page(count=150)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(tags=["已复盘"])])
+
+    def test_tag_added_during_the_run_survives(self):
+        f = self.settings.fields
+        report = self._report_with_tags()
+        self.assertIn("已复盘", report.outcomes[0].fields[f.traffic_status])
+        # 运行期间运营又加了「客户已确认」
+        table = self._FakeTable(["已复盘", "客户已确认"], f.traffic_status)
+        runner.write_back(table, report)
+        written = table.updates[0]["fields"][f.traffic_status]
+        self.assertIn("已复盘", written)
+        self.assertIn("客户已确认", written, "运行期间新增的人工标签被覆盖了")
+        self.assertIn("大爆", written)          # 机器标签照常写
+
+    def test_reread_failure_leaves_the_column_alone(self):
+        """重读失败时宁可这一轮不打机器标签，也不能拿旧快照赌一把。"""
+        f = self.settings.fields
+        report = self._report_with_tags()
+        table = self._FakeTable([], f.traffic_status, fail=True)
+        runner.write_back(table, report)
+        self.assertNotIn(f.traffic_status, table.updates[0]["fields"])
+        # 其余列照常写，不受影响
+        self.assertIn(f.refresh_status, table.updates[0]["fields"])
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -56,17 +57,42 @@ TIKHUB = "tikhub"
 # 跑在境外就设环境变量 TIKHUB_BASE=https://api.tikhub.io。
 TIKHUB_BASE = "https://api.tikhub.dev"
 
+# 允许把 Authorization 头发过去的主机。改 base 等于改「API Key 发到哪台机器」，
+# 一个拼错的域名或一个 http:// 就是把生产 Key 明文送给别人。
+TIKHUB_ALLOWED_HOSTS = frozenset({"api.tikhub.dev", "api.tikhub.io"})
 
-def set_tikhub_base(url: str) -> None:
+
+class EndpointRejected(ValueError):
+    """给定的接入地址不安全，拒绝使用。"""
+
+
+def set_tikhub_base(url: str, *, allow_unsafe: bool = False) -> None:
     """改 TikHub 的接入域名。
 
     做成函数而不是在这里读环境变量：宿主（cli.py）负责从环境里读，
     库代码保持与运行环境无关（历史上也因此能整段粘进无环境变量的运行时）。
+
+    只接受 HTTPS + 白名单主机。真要指到自建代理/测试端点，
+    调用方显式传 allow_unsafe=True（cli 里对应
+    ALLOW_UNSAFE_ENDPOINT_OVERRIDE=1，并且会打印醒目告警）。
     """
     global TIKHUB_BASE
     cleaned = (url or "").strip().rstrip("/")
-    if cleaned:
-        TIKHUB_BASE = cleaned
+    if not cleaned:
+        return
+    parsed = urllib.parse.urlsplit(cleaned)
+    host = (parsed.hostname or "").lower()
+    if not allow_unsafe:
+        if parsed.scheme != "https":
+            raise EndpointRejected(
+                f"TIKHUB_BASE 必须是 https://（当前 {cleaned!r}）——"
+                "明文 HTTP 等于把 API Key 摊在网络上")
+        if host not in TIKHUB_ALLOWED_HOSTS:
+            raise EndpointRejected(
+                f"TIKHUB_BASE 的主机 {host!r} 不在白名单里"
+                f"（可选：{'、'.join(sorted(TIKHUB_ALLOWED_HOSTS))}）。"
+                "确实要指向别的端点就设 ALLOW_UNSAFE_ENDPOINT_OVERRIDE=1")
+    TIKHUB_BASE = cleaned
 
 # Cloudflare 会按 UA 拦截，裸的 Python-urllib/3.x 直接 403。
 _BROWSER_UA = (
@@ -86,9 +112,35 @@ TIKHUB_PATHS = {
 # 单价（元/次）。TikHub 的数字来自它自己公开免鉴权的计价接口
 # https://api.tikhub.dev/api/v1/tikhub/user/get_all_endpoints_info
 # ⚠️ 小红书那两个端点 allow_discount=0，走量折扣对它们不生效。
+#
+# 价格和汇率**会变**，而「预计花费」一旦不可信就等于没有。所以：
+# 1. 这里的数字带一个核对日期，看到就知道它有多旧；
+# 2. 部署方可以用环境变量覆盖（见 cli._apply_pricing_overrides），
+#    不必改代码重新发版。
+PRICING_CHECKED_ON = "2026-08-24"
 _USD_TO_CNY = 7.2
 TIKHUB_USD = {"xhs": 0.010, "douyin": 0.001}
 SOCIALDATAX_YUAN = 0.10   # 10 积分 × ¥0.01，全平台统一价
+
+
+def set_pricing(*, usd_to_cny: Optional[float] = None,
+                tikhub_usd: Optional[dict[str, float]] = None,
+                socialdatax_yuan: Optional[float] = None) -> None:
+    """覆盖计价参数。只接受有限正数——一个 0 或 NaN 会让预算闸门直接失效。"""
+    global _USD_TO_CNY, SOCIALDATAX_YUAN
+
+    def _positive(value: Any, label: str) -> float:
+        number = float(value)
+        if not (number > 0) or number in (float("inf"),):
+            raise ValueError(f"{label} 必须是正的有限数字，当前 {value!r}")
+        return number
+
+    if usd_to_cny is not None:
+        _USD_TO_CNY = _positive(usd_to_cny, "汇率")
+    if socialdatax_yuan is not None:
+        SOCIALDATAX_YUAN = _positive(socialdatax_yuan, "SocialDataX 单价")
+    for platform, price in (tikhub_usd or {}).items():
+        TIKHUB_USD[platform] = _positive(price, f"TikHub {platform} 单价")
 
 
 _SAFE = frozenset(
@@ -180,9 +232,52 @@ def _sdx_build(api_key: str, platform: str, purpose: str, arguments: dict[str, A
     )
 
 
+def _has_number(data: dict[str, Any], *keys: str) -> bool:
+    return any(isinstance(data.get(k), (int, float)) and not isinstance(data.get(k), bool)
+               for k in keys)
+
+
+def _sdx_shape_error(platform: str, purpose: str, data: dict[str, Any]) -> Optional[str]:
+    """成功响应的形状对不对。返回 None = 通过，返回字符串 = 哪里不对。
+
+    ⚠️ 这道闸是**失败关闭**的，故意的。原来的写法是失败开放：任何
+    HTTP<400、能解析成 dict、又没有 `code` 字段的 body 都被当成成功——
+    网关返回 `{"message":"gateway fallback"}` 也算。后果不是「少一条数据」，
+    而是这一行被记成巡查正常：死亡计数清零、最近检查时间推进、排队勾清掉，
+    表上看起来一切正常，实际这一轮什么都没量到。
+    """
+    if purpose == "comments":
+        # items 必须在，且必须是列表。空列表是合法的（真的零评论）。
+        if not isinstance(data.get("items"), list):
+            return "评论页响应里没有 items 列表"
+        return None
+    # detail：至少要有一个互动数字，否则这次调用没有任何业务价值。
+    if not _has_number(data, "like_count", "collect_count", "share_count", "comment_count"):
+        return "详情响应里一个互动数字都没有"
+    return None
+
+
 def _sdx_parse(platform: str, purpose: str, http_status: int, content_type: str,
                body: str, request_id: str = "", api_key: str = "") -> Result:
-    return parse_response(http_status, content_type, body, request_id)
+    result = parse_response(http_status, content_type, body, request_id)
+    if not isinstance(result, Ok):
+        return result
+    problem = _sdx_shape_error(platform, purpose, result.data)
+    if problem is None:
+        return result
+    # 形状不符：记成行级失败并把脱敏后的片段带上，方便对着 request_id 找厂商。
+    #
+    # 分类用 TRANSPORT 而不是 UNKNOWN，因为 Failure 决定的是「这次失败该怎么办」
+    # 而不是「错在哪」：这是**这一家**的契约坏了，正确处置就是换另一家试试。
+    # 归 UNKNOWN 的话它不在 FAILOVER_KINDS 里，配好的备胎一次都不会被尝试——
+    # 主通道 schema 一漂移就是整轮全灭，而旁边有条好通道闲着，
+    # 那正好否定了双通道存在的理由。
+    snippet = json.dumps(result.data, ensure_ascii=False)[:300]
+    return Err(
+        Failure.TRANSPORT, "unexpected_shape",
+        f"{platform}/{purpose} 的成功响应形状不对（{problem}）：{snippet}",
+        http_status=http_status, request_id=result.request_id or request_id,
+    )
 
 
 # =============================================================================
@@ -367,7 +462,9 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
     inner = payload.get("data")
     if not isinstance(inner, dict):
         # 先脱敏再截断：反过来的话，Key 恰好横跨截断边界时会有半截漏出去。
-        return Err(Failure.UNKNOWN, "no_data",
+        # TRANSPORT（而不是 UNKNOWN）：成功信封里连 data 都没有 = 这家的契约坏了，
+        # 该换另一家试试，而不是把行判死然后接着捶同一个坏通道。
+        return Err(Failure.TRANSPORT, "no_data",
                    _redact(json.dumps(payload, ensure_ascii=False), api_key)[:300],
                    http_status=http_status, request_id=request_id)
 
@@ -395,7 +492,8 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
         if note_list and not isinstance(note_list, list):
             # 有内容但形状不认识（比如上游把 list 改成了 dict）：这是协议漂移，
             # 不是「笔记没了」。硬下 [0] 会 KeyError 炸穿；按 GONE 定罪更是误杀。
-            return Err(Failure.UNKNOWN, "unexpected_shape",
+            # 分类同 _sdx_shape_error：这家的契约坏了 → 换另一家试试。
+            return Err(Failure.TRANSPORT, "unexpected_shape",
                        _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
                        http_status=http_status, request_id=request_id)
         if not note_list:

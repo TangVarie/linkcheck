@@ -5,6 +5,7 @@
 """
 
 import unittest
+from unittest import mock
 
 import cli
 from xhsearch.config import Settings
@@ -131,6 +132,82 @@ class TestMainArgs(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.main(["cli.py", "sweep", "--table", ","])
 
+    def test_duplicate_table_label_exits(self):
+        """COR-010：`--table A,A` 会让同一张表被读两遍、付费刷两遍，
+        两次结果还可能互相覆盖。仓库对 FEISHU_TABLES 里的重复物理表
+        已经是报错处理，这里保持同一口径。"""
+        with self.assertRaises(SystemExit) as ctx:
+            cli.main(["cli.py", "sweep", "--table", "A,A"])
+        self.assertIn("重复", str(ctx.exception))
+
+
+class TestNumericEnvBounds(unittest.TestCase):
+    """ROB-005：越界要**拒绝**，不能静默 clamp。
+
+    静默 clamp 会让人以为自己设的值生效了，然后按一个从没生效过的配置
+    去解释运行结果。没有这道闸时，这里接受过 MAX_CONCURRENCY=1000
+    （线程/FD 耗尽 + 把供应商限流打出来）和 SOFT_DEADLINE_SECONDS=-1
+    （每一行都立刻「留待下一轮」，任务表面正常、实际一行都不刷）。
+    """
+
+    def setUp(self):
+        import os
+        self._saved = {}
+        for name in ("MAX_CONCURRENCY", "SOFT_DEADLINE_SECONDS", "DETAIL_WITHIN_DAYS",
+                     "MAX_RECORDS_PER_RUN", "TIKHUB_BASE", "CHANNEL_ORDER"):
+            self._saved[name] = os.environ.pop(name, None)
+
+    def tearDown(self):
+        import os
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _settings_with(self, **env):
+        import os
+        for key, value in env.items():
+            os.environ[key] = value
+        return cli.build_settings()
+
+    def test_concurrency_out_of_range_is_rejected(self):
+        for value in ("0", "4", "1000", "-1"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self._settings_with(MAX_CONCURRENCY=value)
+
+    def test_negative_deadline_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._settings_with(SOFT_DEADLINE_SECONDS="-1")
+
+    def test_negative_detail_days_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._settings_with(DETAIL_WITHIN_DAYS="-3")
+
+    def test_legal_values_are_accepted(self):
+        settings = self._settings_with(MAX_CONCURRENCY="3", SOFT_DEADLINE_SECONDS="1500",
+                                       DETAIL_WITHIN_DAYS="0", MAX_RECORDS_PER_RUN="40")
+        self.assertEqual(settings.max_concurrency, 3)
+        self.assertEqual(settings.soft_deadline_seconds, 1500.0)
+        self.assertEqual(settings.detail_within_days, 0)
+        self.assertEqual(settings.budget.max_records_per_run, 40)
+
+    def test_duplicate_provider_in_channel_order_is_rejected(self):
+        """COR-010：同一家排两遍 = 可降级错误发生后再打它一次，
+        白花一次钱拿到同一个答案。"""
+        with self.assertRaises(SystemExit) as ctx:
+            self._settings_with(CHANNEL_ORDER="xhs=tikhub,tikhub,socialdatax")
+        self.assertIn("重复", str(ctx.exception))
+
+    def test_non_https_tikhub_base_is_rejected(self):
+        """SUP-007：改 base 等于改「API Key 发到哪台机器」。"""
+        with self.assertRaises(SystemExit):
+            self._settings_with(TIKHUB_BASE="http://api.tikhub.io")
+
+    def test_unlisted_tikhub_host_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._settings_with(TIKHUB_BASE="https://evil.example")
+
 
 class TestLoadDotenv(unittest.TestCase):
     """本地跑 doctor/row 的前提：.env 真的会被读进环境变量。
@@ -174,6 +251,222 @@ class TestLoadDotenv(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             load_dotenv(Path(tmp))   # 没有 .env：不抛异常即通过
+
+
+class TestDotenvParsing(unittest.TestCase):
+    """SUP-009：旧解析器只做 strip('"').strip("'")，一个引号或一个井号的
+    差别就会产生「看起来配好了、实际值不对」的部署，而且完全不报错。"""
+
+    def parse(self, line):
+        from xhsearch.envfile import parse_line
+        return parse_line(line)
+
+    def test_inline_comment_needs_whitespace(self):
+        self.assertEqual(self.parse("KEY=value  # 说明")[:2], ("KEY", "value"))
+        # 值里本来就有 # 时不能被当注释切掉——Key 里带 # 很常见
+        self.assertEqual(self.parse("KEY=abc#def")[:2], ("KEY", "abc#def"))
+
+    def test_quotes_preserve_spaces_and_hashes(self):
+        self.assertEqual(self.parse('KEY="a # b"')[:2], ("KEY", "a # b"))
+        self.assertEqual(self.parse("KEY='a # b'")[:2], ("KEY", "a # b"))
+
+    def test_double_quotes_handle_escapes_single_quotes_do_not(self):
+        self.assertEqual(self.parse(r'KEY="a\nb"')[1], "a\nb")
+        self.assertEqual(self.parse(r"KEY='a\nb'")[1], r"a\nb")
+
+    def test_export_prefix_is_accepted(self):
+        self.assertEqual(self.parse("export KEY=value")[:2], ("KEY", "value"))
+
+    def test_unterminated_quote_is_reported_not_guessed(self):
+        name, value, problem = self.parse('KEY="未闭合')
+        self.assertIsNone(name)
+        self.assertIn("未配对的引号", problem)
+
+    def test_illegal_name_is_reported(self):
+        name, _, problem = self.parse("2BAD=value")
+        self.assertIsNone(name)
+        self.assertIn("不合法", problem)
+
+    def test_comment_and_blank_lines_are_not_problems(self):
+        for line in ("", "   ", "# 注释"):
+            name, value, problem = self.parse(line)
+            self.assertIsNone(name)
+            self.assertEqual(problem, "")
+
+    def test_load_collects_issues(self):
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch.envfile import load_dotenv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_text("没有等号的行\nOK_KEY=1\n", encoding="utf-8")
+            issues: list = []
+            load_dotenv(Path(tmp), issues=issues)
+            self.assertEqual(len(issues), 1)
+            self.assertIn("第 1 行", issues[0])
+
+    def test_real_callers_refuse_to_start_on_a_malformed_line(self):
+        """严格解析器只有在调用方真的去看 issues 时才有意义。
+
+        悄悄跳过一行畸形配置，产生的是一个「看起来配好了、实际值不对」的
+        部署：`MAX_YUAN_PER_RUN="10`（引号没配对）被跳过，这一轮就按
+        「不限金额」跑，而运维以为自己设了上限。
+        """
+        def fake_load(directory=None, *, issues=None):
+            if issues is not None:
+                issues.append('.env 第 3 行：MAX_YUAN_PER_RUN 的值有未配对的引号')
+
+        with mock.patch.object(cli, "load_dotenv", side_effect=fake_load):
+            with self.assertRaises(SystemExit):
+                cli.load_env_or_exit()
+
+    def test_clean_env_file_starts_normally(self):
+        with mock.patch.object(cli, "load_dotenv", side_effect=lambda *a, **k: None):
+            cli.load_env_or_exit()   # 不抛即通过
+
+
+class TestRunLock(unittest.TestCase):
+    """ROB-001：两个进程同时刷同一张表 = 重复花钱 + 互相覆盖写入 + 写冲突。"""
+
+    def test_second_acquirer_is_refused_and_told_who_holds_it(self):
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "run.lock")
+            first = runlock.acquire("cli.py sweep", path=path)
+            try:
+                with self.assertRaises(runlock.Busy) as ctx:
+                    runlock.acquire("cli.py queue", path=path)
+                self.assertIn("cli.py sweep", str(ctx.exception))
+                self.assertIsNotNone(ctx.exception.holder)
+            finally:
+                first.release()
+
+    def test_normal_release_is_recorded_so_the_ttl_path_can_tell(self):
+        """没有 fcntl 的平台（Windows）完全靠 released 标记判断上一任是不是
+        正常收工的。不写这个标记、只看 TTL 的话，一次正常跑完的运行会把
+        后面 30 分钟内的每一次调用都误挡成 Busy。"""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.lock"
+            runlock.acquire("first", path=str(path)).release()
+            self.assertTrue(json.loads(path.read_text())["released"])
+
+            # 模拟没有 fcntl 的平台：正常释放过的租约必须能被立刻接管
+            with mock.patch.object(runlock, "fcntl", None):
+                with runlock.acquire("second", path=str(path)) as second:
+                    self.assertEqual(second.info.owner, "second")
+
+    def test_ttl_path_still_blocks_a_crashed_holder(self):
+        """反面：上一任**没有**正常释放（崩了），TTL 之内仍然要挡住。"""
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.lock"
+            crashed = runlock.acquire("crashed", path=str(path))
+            crashed._fd = -1          # 假装进程没走 release 就没了
+            with mock.patch.object(runlock, "fcntl", None):
+                with self.assertRaises(runlock.Busy):
+                    runlock.acquire("next", path=str(path))
+
+    def test_lock_file_open_refuses_to_follow_symlinks(self):
+        """锁文件路径是可预测的，而我们随后会 ftruncate + 写它。
+        跟着符号链接走 = 把「清空并覆盖任意文件」的能力交给任何能在
+        这个目录里建文件的人。"""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        if not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("这个平台没有 O_NOFOLLOW")
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("不该被清空的内容", encoding="utf-8")
+            path = Path(tmp) / "run.lock"
+            os.symlink(victim, path)
+            with self.assertRaises(OSError):
+                runlock.acquire("attacker", path=str(path))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "不该被清空的内容")
+
+    def test_unsupported_flock_is_not_reported_as_contention(self):
+        """有些文件系统（部分 NFS 配置、容器挂载）根本不支持 flock，会给
+        ENOTSUP/ENOLCK。把它们当成 Busy 的话，CLI 会安静地跳过**每一次**
+        定时运行并返回 0——一个部署可以就这样永远不刷表而没人发现。"""
+        import errno
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        if runlock.fcntl is None:
+            self.skipTest("这个平台没有 fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "run.lock")
+            with mock.patch.object(runlock.fcntl, "flock",
+                                   side_effect=OSError(errno.ENOTSUP, "not supported")):
+                with self.assertRaises(OSError) as ctx:
+                    runlock.acquire("me", path=path)
+            self.assertNotIsInstance(ctx.exception, runlock.Busy)
+            self.assertEqual(ctx.exception.errno, errno.ENOTSUP)
+
+    def test_real_contention_is_still_reported_as_busy(self):
+        """反面：EAGAIN/EACCES 是真的「别人占着」，必须照旧报 Busy。"""
+        import errno
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        if runlock.fcntl is None:
+            self.skipTest("这个平台没有 fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "run.lock")
+            for code in (errno.EAGAIN, errno.EACCES):
+                with self.subTest(code=code):
+                    with mock.patch.object(runlock.fcntl, "flock",
+                                           side_effect=OSError(code, "locked")):
+                        with self.assertRaises(runlock.Busy):
+                            runlock.acquire("me", path=path)
+
+    def test_default_path_is_a_private_per_user_directory(self):
+        """默认不能是 /tmp 里一个所有人都能预测、都能抢先建立的固定文件名。"""
+        import os
+
+        from xhsearch import runlock
+
+        default = runlock.default_path()
+        self.assertTrue(default.endswith("run.lock"))
+        if hasattr(os, "getuid"):
+            self.assertIn(str(os.getuid()), default)
+
+    def test_released_lease_can_be_taken_again_with_a_higher_token(self):
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "run.lock")
+            with runlock.acquire("first", path=path) as first:
+                first_token = first.token
+            with runlock.acquire("second", path=path) as second:
+                # fencing token 单调递增：一个「以为自己还持有租约」的僵尸
+                # 进程拿着旧 token，凭它可以在日志里被认出来
+                self.assertGreater(second.token, first_token)
 
 
 class TestOptionsFromMeta(unittest.TestCase):

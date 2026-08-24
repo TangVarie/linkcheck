@@ -11,6 +11,7 @@ from xhsearch import analyze, links, protocol, rows, tags
 from xhsearch.config import Settings
 
 UTC = timezone.utc
+NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 
 
 class TestLinkParsing(unittest.TestCase):
@@ -808,6 +809,113 @@ class TestUrlBoundary(unittest.TestCase):
     def test_fullwidth_left_bracket_terminates(self):
         parsed = links.parse("链接https://xhslink.com/a/AbC123（点开看）")
         self.assertEqual(parsed.url, "https://xhslink.com/a/AbC123")
+
+    def test_halfwidth_bracket_is_stripped_from_the_tail(self):
+        """`(https://xhslink.com/abc123)` 在飞书表里很常见。
+        `)` 留在 URL 里，短链直接 404。"""
+        parsed = links.parse("(https://xhslink.com/abc123)")
+        self.assertEqual(parsed.url, "https://xhslink.com/abc123")
+
+    def test_paired_brackets_inside_the_url_are_kept(self):
+        parsed = links.parse("https://xhslink.com/a_(b)")
+        self.assertEqual(parsed.url, "https://xhslink.com/a_(b)")
+
+
+class TestDomainSpoofing(unittest.TestCase):
+    """COR-006：平台判定必须按 URL 的 **hostname** 做边界匹配，
+    不能在整串文本里搜子串。搜子串会让我们拿着运营贴的链接，
+    带着 API Key 去给一个陌生域名发付费请求。"""
+
+    NOTE = "0123456789abcdef01234567"
+
+    def test_lookalike_suffix_domain_is_rejected(self):
+        parsed = links.parse(f"https://xiaohongshu.com.evil.example/explore/{self.NOTE}")
+        self.assertFalse(parsed.usable)
+        self.assertIsNone(parsed.platform)
+
+    def test_lookalike_prefix_domain_is_rejected(self):
+        parsed = links.parse(f"https://evil-xiaohongshu.com/explore/{self.NOTE}")
+        self.assertFalse(parsed.usable)
+
+    def test_userinfo_trick_is_rejected(self):
+        """`https://xiaohongshu.com@evil.example/x` 的真实 host 是 evil.example。"""
+        parsed = links.parse("https://xiaohongshu.com@evil.example/x")
+        self.assertFalse(parsed.usable)
+
+    def test_domain_in_query_string_does_not_count(self):
+        parsed = links.parse("https://evil.example/?u=xiaohongshu.com")
+        self.assertFalse(parsed.usable)
+
+    def test_real_subdomain_still_works(self):
+        parsed = links.parse(f"https://www.xiaohongshu.com/explore/{self.NOTE}")
+        self.assertEqual(parsed.platform, "xhs")
+        self.assertEqual(parsed.content_id, self.NOTE)
+
+    def test_bare_domain_without_scheme_still_works(self):
+        """运营有时只粘域名开头的一段，没有 http://。"""
+        parsed = links.parse(f"xiaohongshu.com/explore/{self.NOTE}")
+        self.assertEqual(parsed.platform, "xhs")
+
+    def test_bare_lookalike_domain_is_still_rejected(self):
+        parsed = links.parse(f"xiaohongshu.com.evil.example/explore/{self.NOTE}")
+        self.assertFalse(parsed.usable)
+
+
+class TestNumericGuards(unittest.TestCase):
+    """COR-012：上游给的数字必须先过一道类型/范围闸。"""
+
+    def test_bool_is_not_a_count(self):
+        """True 在 Python 里是 int：`comment_count: true` 会被当成「1 条评论」，
+        于是一条爆文被判成「无水花」。"""
+        snapshot = analyze.read_comment_page("xhs", {"items": [], "comment_count": True})
+        self.assertIsNone(snapshot.comment_count)
+
+    def test_negative_and_absurd_counts_are_rejected(self):
+        for value in (-5, 10 ** 12):
+            snapshot = analyze.read_comment_page("xhs", {"items": [], "comment_count": value})
+            self.assertIsNone(snapshot.comment_count, value)
+
+    def test_retry_after_is_clamped(self):
+        self.assertEqual(protocol.clamp_retry_after(-1), 0.0)
+        self.assertIsNone(protocol.clamp_retry_after(float("nan")))
+        self.assertIsNone(protocol.clamp_retry_after(float("inf")))
+        self.assertIsNone(protocol.clamp_retry_after(True))
+        self.assertIsNone(protocol.clamp_retry_after("30"))
+        self.assertEqual(protocol.clamp_retry_after(3600),
+                         protocol.MAX_RETRY_AFTER_SECONDS)
+        self.assertEqual(protocol.clamp_retry_after(12.5), 12.5)
+
+    def test_rate_limit_error_carries_a_safe_retry_after(self):
+        result = protocol.parse_response(
+            200, "application/json",
+            json.dumps({"code": 1429, "message": "过于频繁", "retry_after_seconds": -3}))
+        self.assertIsInstance(result, protocol.Err)
+        self.assertEqual(result.retry_after_seconds, 0.0)
+
+
+class TestRowTimestampSafety(unittest.TestCase):
+    """COR-007：脏日期不能在选行阶段抛异常，那会让整张表一行都刷不了。"""
+
+    def test_absurd_publish_time_does_not_explode(self):
+        row = rows.Row(record_id="r", link_cell="x", publish_time_ms=10 ** 30)
+        self.assertIsNone(row.age_hours(NOW))
+        self.assertIsNone(row.age_days(NOW))
+        self.assertTrue(row.is_due(Settings(), NOW))   # 算不出年龄按「该刷」处理
+
+    def test_absurd_last_updated_does_not_explode(self):
+        row = rows.Row(record_id="r", link_cell="x", last_updated_ms=-(10 ** 30))
+        self.assertFalse(row.in_cooldown(Settings(), NOW))
+        self.assertTrue(row.is_due(Settings(), NOW))
+
+    def test_future_last_updated_does_not_lock_the_row_forever(self):
+        """表里的「最近检查时间」被填成未来：这一行必须还能被刷，
+        否则它会被那个未来时间锁死到那天为止，而且没人会发现。"""
+        future = int((NOW + timedelta(days=30)).timestamp() * 1000)
+        row = rows.Row(record_id="r", link_cell="x",
+                       publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000),
+                       last_updated_ms=future)
+        self.assertFalse(row.in_cooldown(Settings(), NOW))
+        self.assertTrue(row.is_due(Settings(), NOW))
 
 
 class TestArchiveCutoff(unittest.TestCase):
