@@ -753,6 +753,20 @@ class TestUnknownCommentCount(RunnerTest):
         self.assertNotIn(self.settings.fields.pinned_status, outcome.fields)
 
 
+def mixed_gone(counter={"n": 0}):
+    """交替返回两个不同的失效错误码。
+
+    小样本一致性熔断（ROB-010）看的是「是不是全都栽在同一个非权威码上」，
+    所以凡是要测**比例**闸门的用例都必须让错误码有分歧，否则一致性闸门
+    会先一步触发，测出来的就不是比例闸门了。
+    """
+    def responder(*args, **kwargs):
+        counter["n"] += 1
+        return (err(200, 1003, "未找到对应内容") if counter["n"] % 2
+                else err(200, 1006, "内容当前不可读"))
+    return responder
+
+
 class TestBreakerAccounting(RunnerTest):
     def _gone_rows(self, n):
         rows = []
@@ -773,8 +787,37 @@ class TestBreakerAccounting(RunnerTest):
     def test_cooldown_rows_do_not_dilute_the_ratio(self):
         """分母只算真正打过上游的行。9 行全失效 + 3 行冷却 = 样本 9，
         不到 10 就不该熔断（旧算法会把冷却行混进分母凑够样本）。"""
-        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+        report = self.run_with(mixed_gone({"n": 0}),
                                self._gone_rows(9) + self._cooldown_rows(3))
+        self.assertFalse(report.breaker_tripped)
+        self.assertEqual(report.breaker_attempted, 9)
+
+    def test_small_batch_all_failing_the_same_way_trips(self):
+        """ROB-010：比例闸门要 10 行样本，queue 一批常常只有三五行。
+        三行全部栽在同一个**非权威**码上 = 上游漂移的形态，必须熔断。"""
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(3))
+        self.assertTrue(report.breaker_tripped)
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_FAILED)
+
+    def test_small_batch_with_mixed_codes_does_not_trip(self):
+        """错误码有分歧 = 更像内容各自出了各自的事，不是上游整体漂移。"""
+        report = self.run_with(mixed_gone({"n": 0}), self._gone_rows(4))
+        self.assertFalse(report.breaker_tripped)
+
+    def test_definitive_death_is_never_blocked_by_the_small_sample_breaker(self):
+        """一张只有三行、三条都**真被删了**的表必须能判「已失效」。
+        权威死讯（1008，规范明写不要重试）不参与小样本一致性熔断。"""
+        report = self.run_with(lambda *a, **k: err(200, 1008, "内容已删除"),
+                               self._gone_rows(3))
+        self.assertFalse(report.breaker_tripped)
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_GONE)
+
+    def test_small_batch_below_uniform_sample_stays_calm(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(2))
         self.assertFalse(report.breaker_tripped)
 
     def test_breaker_voids_strike_increment_and_keeps_diagnostics(self):
@@ -796,13 +839,15 @@ class TestCrossRunBreaker(RunnerTest):
     """多表部署：单表可能只有三五行，永远凑不满熔断的最小样本——
     但上游故障是通道级的，跟行分在哪张表没关系，样本要全局算。"""
 
-    def _gone_report(self, n, prefix):
+    def _gone_report(self, n, prefix, responder=None):
         rows = []
         for i in range(n):
             row = xhs_row(f"{prefix}{i}")
             row.consecutive_failures = 1
             rows.append(row)
-        return self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
+        # 默认让错误码有分歧：这一组测的是**比例**闸门跨表加总，
+        # 不掺分歧的话小样本一致性闸门会先在单表里触发。
+        return self.run_with(responder or mixed_gone({"n": 0}), rows)
 
     def test_small_tables_add_up_and_trip_together(self):
         r1 = self._gone_report(6, "a")

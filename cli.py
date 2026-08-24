@@ -16,14 +16,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
-from xhsearch import feishu, providers, rows as rows_mod, runner
-from xhsearch.config import Channels, Settings
+from xhsearch import feishu, providers, rows as rows_mod, runlock, runner
+from xhsearch.config import Budget, Channels, Settings
 from xhsearch.envfile import load_dotenv
 
 
@@ -34,15 +37,32 @@ def _env(name: str, *, required: bool = True, default: str = "") -> str:
     return value
 
 
-def _numeric_env(name: str, cast, default):
-    """数值型环境变量。填错时给一句能看懂的话，而不是一屏 ValueError 回溯。"""
+def _numeric_env(name: str, cast, default, *, minimum=None, maximum=None):
+    """数值型环境变量，带合法区间。
+
+    越界**拒绝**而不是静默 clamp：clamp 会让人以为自己设的值生效了，
+    然后按一个从没生效过的配置去解释运行结果。
+
+    没有边界检查时，这里接受过 `MAX_CONCURRENCY=1000`（线程/FD 耗尽 +
+    把供应商限流打出来）和 `SOFT_DEADLINE_SECONDS=-1`（每一行都立刻
+    「留待下一轮」，任务表面正常、实际一行都不刷）。
+    """
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
-        return cast(raw)
+        value = cast(raw)
     except ValueError:
         sys.exit(f"环境变量 {name} 的值 {raw!r} 不是数字（参考 .env.example）")
+    if value != value or value in (float("inf"), float("-inf")):
+        sys.exit(f"环境变量 {name} 的值 {raw!r} 不是有限数字")
+    if minimum is not None and value < minimum:
+        sys.exit(f"环境变量 {name} 的值 {raw} 太小，合法区间是 "
+                 f"[{minimum}, {maximum if maximum is not None else '∞'}]")
+    if maximum is not None and value > maximum:
+        sys.exit(f"环境变量 {name} 的值 {raw} 太大，合法区间是 "
+                 f"[{minimum if minimum is not None else '-∞'}, {maximum}]")
+    return value
 
 
 def _apply_endpoint_overrides() -> None:
@@ -51,8 +71,39 @@ def _apply_endpoint_overrides() -> None:
     对方文档要求「请勿跨区使用，会影响访问速度」：
         境内（国内 VPS）        → api.tikhub.dev（默认，不用设）
         境外（Railway、Actions）→ TIKHUB_BASE=https://api.tikhub.io
+
+    只放行 HTTPS + 官方域名：改 base 等于改「API Key 发到哪台机器」，
+    一个拼错的域名就是把生产 Key 明文送给别人。真要指到自建代理，
+    显式设 ALLOW_UNSAFE_ENDPOINT_OVERRIDE=1。
     """
-    providers.set_tikhub_base(os.environ.get("TIKHUB_BASE", ""))
+    unsafe = os.environ.get("ALLOW_UNSAFE_ENDPOINT_OVERRIDE", "").strip() in ("1", "true", "yes")
+    raw = os.environ.get("TIKHUB_BASE", "")
+    try:
+        providers.set_tikhub_base(raw, allow_unsafe=unsafe)
+    except providers.EndpointRejected as exc:
+        sys.exit(f"TIKHUB_BASE 被拒绝：{exc}")
+    if unsafe and raw.strip():
+        print(f"⚠️⚠️ 已允许非官方 TikHub 端点：{providers.TIKHUB_BASE}"
+              "——API Key 会发到这个地址，确认这是你自己的机器")
+
+
+def _apply_pricing_overrides() -> None:
+    """计价参数的环境变量覆盖。供应商改价时不用改代码重新发版。"""
+    overrides = {}
+    if os.environ.get("TIKHUB_USD_XHS", "").strip():
+        overrides["xhs"] = _numeric_env("TIKHUB_USD_XHS", float, None, minimum=0.0000001)
+    if os.environ.get("TIKHUB_USD_DOUYIN", "").strip():
+        overrides["douyin"] = _numeric_env("TIKHUB_USD_DOUYIN", float, None, minimum=0.0000001)
+    try:
+        providers.set_pricing(
+            usd_to_cny=(_numeric_env("USD_TO_CNY", float, None, minimum=0.01, maximum=100.0)
+                        if os.environ.get("USD_TO_CNY", "").strip() else None),
+            tikhub_usd=overrides or None,
+            socialdatax_yuan=(_numeric_env("SOCIALDATAX_YUAN", float, None, minimum=0.0000001)
+                              if os.environ.get("SOCIALDATAX_YUAN", "").strip() else None),
+        )
+    except ValueError as exc:
+        sys.exit(f"计价配置不合法：{exc}")
 
 
 def _api_keys() -> dict[str, str]:
@@ -152,13 +203,44 @@ def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable
             for label, app_token, table_id in entries]
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    sys.exit(f"环境变量 {name} 的值 {raw!r} 看不懂，填 1/0（或 true/false）")
+
+
 def _settings() -> Settings:
     _apply_endpoint_overrides()
+    _apply_pricing_overrides()
     settings = Settings()
     # 独立服务跑批量不需要软截止（那是给有执行时限的运行时准备的）。
-    settings.soft_deadline_seconds = _numeric_env("SOFT_DEADLINE_SECONDS", float, 0.0)
-    settings.max_concurrency = _numeric_env("MAX_CONCURRENCY", int, settings.max_concurrency)
-    settings.detail_within_days = _numeric_env("DETAIL_WITHIN_DAYS", int, settings.detail_within_days)
+    # 负数会让每一行立刻「留待下一轮」——一个看起来在跑、实际一行都不刷的任务。
+    settings.soft_deadline_seconds = _numeric_env(
+        "SOFT_DEADLINE_SECONDS", float, 0.0, minimum=0.0, maximum=86400.0)
+    # 上限 3 是 SocialDataX 官方 skill 的明文要求（最多 3 并发，不要突发请求）。
+    settings.max_concurrency = _numeric_env(
+        "MAX_CONCURRENCY", int, settings.max_concurrency, minimum=1, maximum=3)
+    settings.detail_within_days = _numeric_env(
+        "DETAIL_WITHIN_DAYS", int, settings.detail_within_days, minimum=0, maximum=3650)
+
+    # —— 单轮硬预算（0 = 不限）——
+    settings.budget = Budget(
+        max_records_per_run=_numeric_env("MAX_RECORDS_PER_RUN", int, 0, minimum=0),
+        max_calls_per_run=_numeric_env("MAX_CALLS_PER_RUN", int, 0, minimum=0),
+        max_yuan_per_run=_numeric_env("MAX_YUAN_PER_RUN", float, 0.0, minimum=0.0),
+    )
+
+    # —— 评论区快照的数据最小化开关 ——
+    settings.digest.show_author_name = _bool_env(
+        "DIGEST_SHOW_AUTHOR_NAME", settings.digest.show_author_name)
+    settings.digest.show_ip_location = _bool_env(
+        "DIGEST_SHOW_IP_LOCATION", settings.digest.show_ip_location)
+
     # CHANNEL_ORDER="xhs=tikhub,socialdatax; douyin=tikhub"
     # 想把某个平台钉死在一家时用，不改代码。
     # 在**默认配置的基础上合并**：只写 douyin 就只改 douyin，
@@ -182,6 +264,11 @@ def _settings() -> Settings:
                 if name not in providers.REGISTRY:
                     sys.exit(f"CHANNEL_ORDER 里的供应商 {name!r} 不存在，"
                              f"可选：{'、'.join(sorted(providers.REGISTRY))}")
+            if len(set(picked)) != len(picked):
+                # 同一家写两遍 = 可降级错误发生后再打它一次，白花一次钱
+                # 拿到同一个答案。这是配置笔误，报出来而不是默默去重。
+                sys.exit(f"CHANNEL_ORDER 里 {platform} 的通道有重复："
+                         f"{'、'.join(picked)}——同一家排两遍会重复花钱")
             if picked:
                 order[platform] = picked
         settings.channels = Channels(order=order)
@@ -424,7 +511,10 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                    api_keys: dict[str, str], table: feishu.Bitable, now: datetime,
                    *, quiet_missing: bool = False,
                    deadline: float | None = None,
-                   disabled: set[str] | None = None):
+                   disabled: set[str] | None = None,
+                   budget: runner.RunBudget | None = None,
+                   stop: threading.Event | None = None,
+                   on_event=None):
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
@@ -440,7 +530,16 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     # 列会让整个 search 失败），写侧过滤还没建的机器列，两个选择列的
     # 选项清单也从同一份里取——省两次分页请求。
     fields_meta = table.fields_meta()
-    known_fields = set(fields_meta) if fields_meta is not None else None
+    if fields_meta is None:
+        # 失败关闭（ROB-007）：元数据读不到时，读侧不知道该请求哪些列、
+        # 写侧不知道该挡掉哪些列、两个选择列的选项清单也拿不到。
+        # 原来的行为是「不过滤，宁可试着写」——那等于先花钱把整表刷一遍，
+        # 再赌写回不会撞上不存在的列/选项。宁可这一轮不跑。
+        print("❌ 读不到这张表的字段元数据（权限或网络问题），本轮不跑："
+              "没有列清单就无法安全地读写，继续下去会先花钱、再赌写回。"
+              "先跑 `python3 cli.py doctor` 看具体原因")
+        return 1, set(), 0, 0.0, None
+    known_fields = set(fields_meta)
     row_list = runner.load_rows(
         table,
         settings,
@@ -486,6 +585,8 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
           f"小红书主走 {_display_channel('xhs')}，"
           f"抖音主走 {_display_channel('douyin')}；"
           "提不出数字 ID 的抖音链接按 socialdatax 计）")
+    if settings.budget.describe() != "无上限":
+        print(f"  本轮硬预算：{settings.budget.describe()}（超出的行保持原样，留给下一轮）")
 
     if mode == "estimate":
         return 0, found, len(row_list), yuan, None
@@ -500,6 +601,9 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         progress=print,
         deadline=deadline,
         disabled=disabled,
+        budget=budget,
+        stop=stop,
+        on_event=on_event,
     )
     return 0, found, len(row_list), yuan, (report, known_fields)
 
@@ -515,7 +619,8 @@ def _write_back_table(table: feishu.Bitable, report,
     try:
         written = runner.write_back(table, report, errors=write_errors,
                                     known_fields=known_fields,
-                                    dropped_fields=dropped_fields)
+                                    dropped_fields=dropped_fields,
+                                    say=print)
     except feishu.FeishuError as exc:
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
@@ -536,6 +641,49 @@ def _write_back_table(table: feishu.Bitable, report,
     return 1 if (report.fatal or write_errors) else 0
 
 
+def _install_stop_handlers(stop: threading.Event) -> None:
+    """SIGTERM / SIGINT → 只置一个标志位，不在信号处理器里干活（ROB-009）。
+
+    收到信号后：停止派发新行、让在跑的行跑完、把**已经付过钱**的结果照常
+    写回，然后正常退出。原来没有这一步，Railway redeploy / 容器回收 /
+    人工 Ctrl-C 都会让本轮所有未写回的付费结果直接蒸发，下一轮再付一次。
+
+    信号处理器里只做 set()：它跑在主线程的任意指令边界上，
+    在里面写飞书或打大段日志是重入地雷。
+    """
+    def handler(signum, _frame):
+        if not stop.is_set():
+            stop.set()
+            name = signal.Signals(signum).name
+            print(f"\n⚠ 收到 {name}：停止派发新行，把已完成的结果写回后退出", flush=True)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # 非主线程 / 平台不支持：优雅停机降级为不可用，不影响主流程。
+            pass
+
+
+def _event_sink():
+    """结构化运行日志（SUP-004）。RUN_LOG_JSON=1 时每行一条 JSON。
+
+    控制台文本是给人看的，按 run/table/provider 聚合、定义 SLO、报警
+    都需要机器可读的一行一条。写到 stderr，不和业务输出混在一起。
+    """
+    if not _bool_env("RUN_LOG_JSON", False):
+        return None, ""
+    run_id = f"{int(time.time())}-{os.getpid()}"
+    context: dict[str, str] = {}
+
+    def sink(event: dict) -> None:
+        payload = {"run_id": run_id, "ts": round(time.time(), 3), **context, **event}
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
+    sink.context = context      # type: ignore[attr-defined]
+    return sink, run_id
+
+
 def _run(mode: str, record_ids: list[str] | None,
          selected: list[str] | None = None) -> int:
     settings = _settings()
@@ -543,6 +691,30 @@ def _run(mode: str, record_ids: list[str] | None,
     if not api_keys:
         sys.exit("一个数据通道的 Key 都没配：需要 TIKHUB_API_KEY 或 SOCIALDATAX_API_KEY"
                  "（参考 .env.example）")
+
+    # —— 运行租约（ROB-001）：同一时刻只允许一个付费执行者 ——
+    # 拿不到就干净退出，一个付费请求都不发。RUN_LOCK_DISABLED=1 可以关掉
+    # （只在明确知道自己在做什么时用，比如在两台机器上分别跑不同的表）。
+    lease = None
+    if not _bool_env("RUN_LOCK_DISABLED", False):
+        try:
+            lease = runlock.acquire(f"cli.py {mode}")
+        except runlock.Busy as exc:
+            print(f"⏭ {exc}\n"
+                  "  本轮跳过：两个进程同时刷同一张表会重复花钱、互相覆盖写入。"
+                  "  如果这是误报（比如上一轮真的挂死了），删掉锁文件即可；"
+                  "  锁文件路径可用 RUN_LOCK_PATH 指定。")
+            return 0     # 正常跳过，不是失败——返回非零会让云平台反复重启
+    try:
+        return _run_locked(mode, record_ids, selected, settings, api_keys)
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+def _run_locked(mode: str, record_ids: list[str] | None,
+                selected: list[str] | None,
+                settings: Settings, api_keys: dict[str, str]) -> int:
     tables = _tables(selected)
     now = datetime.now(timezone.utc)
     multi = len(tables) > 1
@@ -554,6 +726,11 @@ def _run(mode: str, record_ids: list[str] | None,
     # 「某家 Key 失效/余额耗尽」的死讯同理跨表共享：第一张表用真实
     # 请求换来的结论，后面的表直接沿用，不再逐表花钱重新发现。
     disabled: set[str] = set()
+    # 硬预算同理是整次运行的，不是每张表各领一份。
+    budget = runner.RunBudget(settings.budget)
+    stop = threading.Event()
+    _install_stop_handlers(stop)
+    on_event, run_id = _event_sink()
 
     worst = 0
     found_all: set[str] = set()
@@ -561,32 +738,52 @@ def _run(mode: str, record_ids: list[str] | None,
     # 先把所有表都刷完、攒起来，写回放到跨表熔断之后（见下）。
     pending: list[tuple[str, feishu.Bitable, runner.RunReport, set[str] | None]] = []
     channels_dead = False
-    for index, (label, table) in enumerate(tables):
-        if multi:
-            print(("\n" if index else "") + f"━━━━ 表：{label} ━━━━")
-        if channels_dead:
-            print("⚠ 数据通道已全部不可用（Key 失效或余额耗尽），这张表本轮"
-                  "不再尝试；行都没动过，修好通道后下一轮自然补上")
-            worst = 1
-            continue
-        try:
-            code, found, row_count, yuan, prep = _refresh_table(
-                mode, record_ids, settings, api_keys, table, now,
-                quiet_missing=multi, deadline=deadline, disabled=disabled)
-        except feishu.FeishuError as exc:
-            # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
-            print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
-            worst = 1
-            continue
-        worst = max(worst, code)
-        found_all |= found
-        total_rows += row_count
-        total_yuan += yuan
-        if prep is not None:
-            report, known_fields = prep
-            pending.append((label, table, report, known_fields))
-            if report.fatal and not [k for k in api_keys if k not in disabled]:
-                channels_dead = True
+    try:
+        for index, (label, table) in enumerate(tables):
+            if multi:
+                print(("\n" if index else "") + f"━━━━ 表：{label} ━━━━")
+            if channels_dead:
+                print("⚠ 数据通道已全部不可用（Key 失效或余额耗尽），这张表本轮"
+                      "不再尝试；行都没动过，修好通道后下一轮自然补上")
+                worst = 1
+                continue
+            if stop.is_set():
+                print("⚠ 运行已被终止，这张表本轮不再尝试；行都没动过，下一轮自然补上")
+                worst = 1
+                continue
+            if on_event is not None:
+                on_event.context["table"] = label   # type: ignore[attr-defined]
+            try:
+                code, found, row_count, yuan, prep = _refresh_table(
+                    mode, record_ids, settings, api_keys, table, now,
+                    quiet_missing=multi, deadline=deadline, disabled=disabled,
+                    budget=budget, stop=stop, on_event=on_event)
+            except feishu.FeishuError as exc:
+                # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
+                print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
+                worst = 1
+                continue
+            worst = max(worst, code)
+            found_all |= found
+            total_rows += row_count
+            total_yuan += yuan
+            if prep is not None:
+                report, known_fields = prep
+                pending.append((label, table, report, known_fields))
+                if report.fatal and not [k for k in api_keys if k not in disabled]:
+                    channels_dead = True
+    except BaseException:
+        # 刷新阶段炸了（含 KeyboardInterrupt）：**已经付过钱**的表照样写回，
+        # 再把异常抛出去。不这么做的话，一次意外就让这一轮花的钱全部蒸发，
+        # 下一轮按原样的 last_updated 再付一次。
+        if pending:
+            print("\n⚠ 运行中断，先把已经完成的表写回（避免已付费的结果丢失）…")
+            for label, table, report, known_fields in pending:
+                try:
+                    _write_back_table(table, report, known_fields)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"❌ 表 {label} 写回失败：{exc}")
+        raise
 
     # 跨表熔断：单表可能只有三五行，永远凑不满熔断的最小样本，但上游
     # 故障是通道级的——把这一轮所有表的观测合起来再判一次，该作废的
@@ -608,6 +805,12 @@ def _run(mode: str, record_ids: list[str] | None,
             worst = 1
             continue
         worst = max(worst, code)
+
+    if run_id:
+        print(f"\nrun_id={run_id}（结构化日志已写到 stderr）")
+    if budget.stopped_reason:
+        print(f"💰 {budget.stopped_reason}"
+              f"（本轮实际：{budget.records} 行 / {budget.calls} 次调用 / ≈¥{budget.yuan:.2f}）")
 
     if record_ids and multi:
         missing = [rid for rid in record_ids if rid not in found_all]
@@ -636,6 +839,12 @@ def main(argv: list[str]) -> int:
             # 「--table ,」这类写法解析出空清单。空清单和「没传 --table」
             # 在下游没法区分，会静默变成全表都跑——必须在这里吵闹。
             sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
+        if len(set(selected)) != len(selected):
+            # `--table A,A` 会让同一张表被读两遍、付费刷两遍，两次结果还可能
+            # 互相覆盖。仓库对 FEISHU_TABLES 里的重复物理表已经是报错处理，
+            # 这里保持同一口径。
+            sys.exit(f"--table 里有重复的表标签：{'、'.join(selected)}——"
+                     "同一张表刷两次是白花钱")
         del args[index:index + 2]
     if not args:
         print(__doc__)

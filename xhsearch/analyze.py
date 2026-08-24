@@ -49,7 +49,9 @@ class CommentView:
             marks.append(self.ip_location)
 
         prefix = f"[{' · '.join(marks)}] " if marks else ""
-        who = f"{self.author_name}: " if self.author_name else ""
+        # 昵称是个人信息：关掉 show_author_name 后一格都不落库
+        # （见 DigestFormat 里的数据最小化说明）。
+        who = f"{self.author_name}: " if (fmt.show_author_name and self.author_name) else ""
         return f"{prefix}{who}{text}"
 
 
@@ -83,8 +85,23 @@ class Snapshot:
         return self.platform == "xhs"
 
 
+# 互动数字的上界。真实世界里没有 10 亿条评论的笔记；出现这种数字一定是
+# 上游 schema 漂移（比如把时间戳塞进了 comment_count），不该拿它去算热度。
+MAX_COUNT = 1_000_000_000
+
+
 def _int_or_none(value: Any) -> Optional[int]:
-    return value if isinstance(value, int) else None
+    """把上游给的计数收成一个能用于判定的整数，否则 None（=这一轮没量到）。
+
+    三件事必须挡：
+    * bool —— 在 Python 里 True 是 int，`comment_count: true` 会被当成「1 条评论」，
+      于是一条爆文被判成「无水花」。
+    * 负数 —— 没有意义，而且会让掉量判定得出荒谬结论。
+    * 超大值 —— schema 漂移的典型形态。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_COUNT else None
 
 
 def _author_name(author: Any) -> str:

@@ -173,17 +173,35 @@ def _classify(code: Any, message: str, http_status: Optional[int]) -> tuple[Fail
     return Failure.UNKNOWN, False
 
 
+# 上游给的等待时间只在这个区间里可信。负数会让 time.sleep 直接抛异常，
+# NaN 同样；一个 3600 秒会把整轮拖死。
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def clamp_retry_after(value: Any) -> Optional[float]:
+    """把上游给的 retry_after 收成一个能安全传给 time.sleep 的数。
+
+    拒绝 bool（在 Python 里 True 是 int，会被当成「等 1 秒」）、
+    拒绝 NaN / ±inf，负数按 0 处理，上界 MAX_RETRY_AFTER_SECONDS。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, min(number, MAX_RETRY_AFTER_SECONDS))
+
+
 def _err(payload: dict[str, Any], http_status: Optional[int], request_id: str) -> Err:
     code = payload.get("code")
     message = str(payload.get("message") or json.dumps(payload, ensure_ascii=False)[:300])
     kind, definitive = _classify(code, message, http_status)
     # 字段名来自官方规范，不是猜的。429 还会同步返回 Retry-After 响应头。
-    retry_after = payload.get("retry_after_seconds")
     return Err(
         kind=kind,
         code=str(code if code is not None else "unknown"),
         message=message,
-        retry_after_seconds=float(retry_after) if isinstance(retry_after, (int, float)) else None,
+        retry_after_seconds=clamp_retry_after(payload.get("retry_after_seconds")),
         http_status=http_status,
         request_id=request_id,
         definitive=definitive,

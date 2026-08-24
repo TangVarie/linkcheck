@@ -8,15 +8,28 @@ on:
     branches:
       - main
 
+# 最小权限（SUP-006）：这个工作流只需要把代码 checkout 出来。
+# 不显式声明的话，用的是仓库/组织的默认权限——那个默认值可能是
+# 「读写所有内容」，而且会随组织设置变化，工作流本身看不出来。
+permissions:
+  contents: read
+
 jobs:
   unittest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Action 钉到 commit SHA 而不是浮动的 major tag（SUP-006）：
+      # v4 这样的标签是**可移动的**，上游被入侵或标签被改指，
+      # 我们的构建环境就跟着变，而且事后完全复现不出来。
+      # 注释里保留人类可读的版本号，升级时改 SHA + 注释。
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955   # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
       # 项目零第三方依赖，不需要 pip install。
       # 全部测试离线运行，不需要任何 API Key。
       - name: 跑单元测试
         run: python3 -m unittest discover -s tests -t . -v
+
+      - name: 编译检查
+        run: python3 -m compileall -q cli.py xhsearch tools tests

@@ -29,50 +29,94 @@ from xhsearch.config import Settings  # noqa: E402
 YUAN_PER_CALL = 0.10  # SocialDataX 单价，用作对照基准
 
 
+def tier_segments(settings: Settings) -> list[tuple[float, float, int]]:
+    """把刷新分层切成 [(起始天, 结束天, 刷新间隔小时)] 的**区间**清单。
+
+    ⚠️ 这里是这个脚本最容易算错的地方，之前就错过：
+
+    1. 归档线不等于最后一档的端点。`archive_after_days` 比 tiers 末端**小**时
+       （比如 tiers 到 30 天、archive 设 14 天），超过 14 天的帖子根本不再刷，
+       但旧算法照样把整个 8–30 天档算进人口，成本凭空多算一倍多。
+       反过来 archive 比末端大时，末档要按「沿用最后一档间隔」延长。
+       两条都要和 RefreshTiers.interval_hours_for_age 的口径完全一致。
+    2. 区间要真的按天切，不能拿档位端点代表整档。
+    """
+    archive = float(settings.refresh.archive_after_days)
+    segments: list[tuple[float, float, int]] = []
+    start = 0.0
+    for max_age_days, interval_hours in settings.refresh.tiers:
+        end = min(float(max_age_days), archive)
+        if end > start:
+            segments.append((start, end, interval_hours))
+        start = float(max_age_days)
+        if start >= archive:
+            return segments
+    # 超出最后一档年龄但还没到归档线：沿用最后一档的间隔。
+    if settings.refresh.tiers and archive > start:
+        segments.append((start, archive, settings.refresh.tiers[-1][1]))
+    return segments
+
+
+def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
 def tier_population(settings: Settings, per_day: float) -> list[tuple[str, float, int, float]]:
     """返回 [(档位说明, 该档笔记数, 刷新间隔小时, 每天刷新次数)]"""
-    out = []
-    previous_max = 0
-    for max_age_days, interval_hours in settings.refresh.tiers:
-        span = max_age_days - previous_max
-        population = per_day * span
-        per_day_refreshes = 24 / interval_hours
-        out.append((f"{previous_max}-{max_age_days} 天", population, interval_hours, per_day_refreshes))
-        previous_max = max_age_days
-    return out
+    return [
+        (f"{start:g}-{end:g} 天", per_day * (end - start), interval, 24 / interval)
+        for start, end, interval in tier_segments(settings)
+    ]
+
+
+def _calls_by_platform(per_day: float, xhs_share: float, settings: Settings):
+    """按区间交集算调用次数，返回（小红书调用/天, 抖音调用/天, 评论调用, detail 调用）。
+
+    小红书的 detail 只在 `detail_within_days` 之内补，而这个窗口可以落在
+    某一档的**中间**（比如 detail 7 天、档位是 3–7/8–30）。按「整档有或没有」
+    近似会整档算错；这里取区间交集，误差为零。
+    """
+    xhs_calls = dy_calls = 0.0
+    comment_calls = detail_calls = 0.0
+    detail_window = float(settings.detail_within_days)
+    for start, end, interval_hours in tier_segments(settings):
+        refreshes = 24 / interval_hours
+        population = per_day * (end - start)
+        xhs_posts = population * xhs_share
+        dy_posts = population * (1 - xhs_share)
+
+        # 评论调用：这一段里每篇每天刷 refreshes 次。
+        xhs_calls += xhs_posts * refreshes
+        dy_calls += dy_posts * refreshes
+        comment_calls += population * refreshes
+
+        # 小红书 detail：只算落在 detail 窗口里的那部分天数。
+        detail_days = _overlap(start, end, 0.0, detail_window)
+        xhs_detail = per_day * detail_days * xhs_share * refreshes
+        xhs_calls += xhs_detail
+        # 抖音 detail：恒定追加（评论接口的 comment_count 可能为 null）。
+        dy_calls += dy_posts * refreshes
+        detail_calls += xhs_detail + dy_posts * refreshes
+    return xhs_calls, dy_calls, comment_calls, detail_calls
 
 
 def estimate(per_day: float, xhs_share: float, settings: Settings) -> dict:
     tiers = tier_population(settings, per_day)
     total_posts = sum(t[1] for t in tiers)
+    xhs_calls, dy_calls, comment_calls, detail_calls = _calls_by_platform(
+        per_day, xhs_share, settings)
 
-    comment_calls = 0.0
-    detail_calls = 0.0
     rows = []
-    for label, population, interval_hours, refreshes in tiers:
-        age_mid = 0.0
-        for max_age, _ in settings.refresh.tiers:
-            if label.endswith(f"{max_age} 天"):
-                age_mid = max_age
-                break
-
-        xhs_posts = population * xhs_share
-        dy_posts = population * (1 - xhs_share)
-
-        tier_comments = population * refreshes
-        # 小红书只在 detail_within_days 内补 detail；抖音恒定补。
-        xhs_detail = xhs_posts * refreshes if age_mid <= settings.detail_within_days else 0.0
-        dy_detail = dy_posts * refreshes
-        tier_detail = xhs_detail + dy_detail
-
-        comment_calls += tier_comments
-        detail_calls += tier_detail
-        rows.append({
-            "label": label,
-            "posts": population,
-            "interval": interval_hours,
-            "calls": tier_comments + tier_detail,
-        })
+    for (start, end, interval_hours), (label, population, _, refreshes) in zip(
+            tier_segments(settings), tiers):
+        detail_days = _overlap(start, end, 0.0, float(settings.detail_within_days))
+        tier_calls = (
+            population * refreshes                                        # 评论
+            + per_day * detail_days * xhs_share * refreshes               # 小红书 detail
+            + population * (1 - xhs_share) * refreshes                    # 抖音 detail
+        )
+        rows.append({"label": label, "posts": population,
+                     "interval": interval_hours, "calls": tier_calls})
 
     total_calls = comment_calls + detail_calls
     return {
@@ -81,6 +125,8 @@ def estimate(per_day: float, xhs_share: float, settings: Settings) -> dict:
         "comment_calls": comment_calls,
         "detail_calls": detail_calls,
         "calls_per_day": total_calls,
+        "xhs_calls_per_day": xhs_calls,
+        "douyin_calls_per_day": dy_calls,
         "yuan_per_day": total_calls * YUAN_PER_CALL,
         "yuan_per_month": total_calls * YUAN_PER_CALL * 30,
     }
@@ -88,18 +134,7 @@ def estimate(per_day: float, xhs_share: float, settings: Settings) -> dict:
 
 def _split_by_platform(per_day: float, xhs_share: float, settings: Settings):
     """把每天的调用次数按平台拆开。双通道之后两家单价差 10 倍，不拆就算不出钱。"""
-    xhs_calls = dy_calls = 0.0
-    previous_max = 0
-    for max_age_days, interval_hours in settings.refresh.tiers:
-        population = per_day * (max_age_days - previous_max)
-        refreshes = 24 / interval_hours
-        xhs_posts = population * xhs_share
-        dy_posts = population * (1 - xhs_share)
-        xhs_calls += xhs_posts * refreshes
-        if max_age_days <= settings.detail_within_days:
-            xhs_calls += xhs_posts * refreshes         # detail
-        dy_calls += dy_posts * refreshes * 2           # 评论 + 恒定 detail
-        previous_max = max_age_days
+    xhs_calls, dy_calls, _, _ = _calls_by_platform(per_day, xhs_share, settings)
     return xhs_calls, dy_calls
 
 

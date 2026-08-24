@@ -30,6 +30,22 @@ class ToolCall:
     arguments: dict[str, Any]
 
 
+def _utc(ms: Optional[int]) -> Optional[datetime]:
+    """毫秒时间戳 → UTC 时间。脏值返回 None，**绝不抛异常**。
+
+    feishu.read_timestamp_ms 已经挡过一次范围，这里是第二道：Row 也可能被
+    直接构造（测试、tools、未来的其它读源）。datetime.fromtimestamp 对
+    超范围的值抛 OverflowError/OSError，而这个调用发生在**选行阶段**——
+    一格脏日期就能让整张表一行都刷不了。
+    """
+    if ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 @dataclass
 class Row:
     record_id: str
@@ -59,10 +75,10 @@ class Row:
         return self._parsed
 
     def age_hours(self, now: Optional[datetime] = None) -> Optional[float]:
-        if self.publish_time_ms is None:
+        published = _utc(self.publish_time_ms)
+        if published is None:
             return None
         now = now or datetime.now(timezone.utc)
-        published = datetime.fromtimestamp(self.publish_time_ms / 1000, tz=timezone.utc)
         return (now - published).total_seconds() / 3600
 
     def age_days(self, now: Optional[datetime] = None) -> Optional[float]:
@@ -75,11 +91,15 @@ class Row:
         这是对「有人连点 200 次按钮」的完整回答：连点 200 次 = 1 次真实调用。
         """
         window = settings.safety.cooldown_seconds
-        if not window or self.last_updated_ms is None:
+        updated = _utc(self.last_updated_ms)
+        if not window or updated is None:
             return False
         now = now or datetime.now(timezone.utc)
-        updated = datetime.fromtimestamp(self.last_updated_ms / 1000, tz=timezone.utc)
-        return (now - updated).total_seconds() < window
+        elapsed = (now - updated).total_seconds()
+        # 负数 = 表里的「最近检查时间」在未来（时钟漂移或人工填错）。
+        # 按「不在冷却里」处理：让它至少能被刷一次并把时间戳纠正回来，
+        # 否则这一行会被一个未来时间锁死到那个时间点为止。
+        return 0 <= elapsed < window
 
     def is_due(self, settings: Settings, now: Optional[datetime] = None) -> bool:
         """按分层策略判断这一行现在该不该刷。
@@ -93,11 +113,14 @@ class Row:
         interval = settings.refresh.interval_hours_for_age(age)
         if interval is None:
             return False  # 已归档
-        if self.last_updated_ms is None:
+        updated = _utc(self.last_updated_ms)
+        if updated is None:
             return True
         now = now or datetime.now(timezone.utc)
-        updated = datetime.fromtimestamp(self.last_updated_ms / 1000, tz=timezone.utc)
-        return (now - updated).total_seconds() / 3600 >= interval
+        elapsed_hours = (now - updated).total_seconds() / 3600
+        # 未来的更新时间同样按「该刷」处理：否则一个填错的日期能让这一行
+        # 长期不到期，而且没有任何人会发现。
+        return elapsed_hours < 0 or elapsed_hours >= interval
 
 
 def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> list[ToolCall]:

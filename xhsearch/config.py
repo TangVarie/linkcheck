@@ -212,13 +212,27 @@ class Thresholds:
 
 @dataclass
 class DigestFormat:
-    """评论区快照的排版。计费按页不按条，所以能存多少存多少。"""
+    """评论区快照的排版。计费按页不按条，所以能存多少存多少。
+
+    ⚠️ 数据最小化：这一列会把**别人写的评论正文、昵称和 IP 属地**长期存进
+    飞书。这些是个人信息，保留期、访问范围和跨境传输都该由你们的法务/信息
+    安全先过一遍（见 docs/待验证清单.md）。两个开关给的是「不必改代码就能
+    收窄」的能力：
+
+        show_author_name=False   不落库昵称，只留评论正文
+        show_ip_location=False   不落库 IP 属地
+
+    环境变量 DIGEST_SHOW_AUTHOR_NAME / DIGEST_SHOW_IP_LOCATION 可以覆盖。
+    默认保持原行为（都写），因为改默认值会让已经在跑的表突然少两列信息；
+    要不要收窄是业务/合规决定，不是代码能替人做的决定。
+    """
 
     max_comments: int = 8
     per_comment_chars: int = 40
     total_chars: int = 700
     show_like_count: bool = True
     show_ip_location: bool = True
+    show_author_name: bool = True
 
 
 @dataclass
@@ -266,9 +280,45 @@ class Safety:
     breaker_gone_ratio: float = 0.2
     breaker_min_sample: int = 10
 
+    # 小样本的第二道熔断：比例闸门在样本 <10 时完全不生效，而 queue 模式
+    # 的一批经常只有三五行。如果这一批里**每一行都失败、且失败原因是同一个
+    # 错误码**，那是上游 schema 漂移的典型形态（比如所有笔记都被译成
+    # empty_shell），不是这三五条内容恰好同时被删。达到这个行数就熔断。
+    breaker_uniform_min_sample: int = 3
+
     # 同一行在这个时间窗内刚成功刷过就跳过，不花积分。
     # 有人连点 200 次按钮 = 1 次真实调用。
     cooldown_seconds: int = 90
+
+
+@dataclass
+class Budget:
+    """单次运行的硬预算。**在发请求之前**预留，不是事后统计。
+
+    没有它的时候，单轮费用是没有上界的：所有行同时被勾上「排队刷新」、
+    首次上线全表到期、「最近检查时间」列被误清空，任意一个都会让一轮
+    把整张表刷一遍。文档里写着「queue 每轮 ≤40 行」，代码里从来没有这条限制。
+
+    三个闸门任一触顶就停止派发新行，**已到手的结果照常写回**，
+    没轮到的行保持 queued / 到期状态，下一轮自然继续。
+
+    0 = 不限（保持老行为）。默认给 records 一个上界、金额留给部署方按
+    自己的规模填——一个拍脑袋的金额上限比没有上限更容易误伤。
+    """
+
+    max_records_per_run: int = 0
+    max_calls_per_run: int = 0
+    max_yuan_per_run: float = 0.0
+
+    def describe(self) -> str:
+        parts = []
+        if self.max_records_per_run:
+            parts.append(f"最多 {self.max_records_per_run} 行")
+        if self.max_calls_per_run:
+            parts.append(f"最多 {self.max_calls_per_run} 次调用")
+        if self.max_yuan_per_run:
+            parts.append(f"最多 ¥{self.max_yuan_per_run:.2f}")
+        return "、".join(parts) or "无上限"
 
 
 @dataclass
@@ -324,6 +374,7 @@ class Settings:
     refresh: RefreshTiers = field(default_factory=RefreshTiers)
     safety: Safety = field(default_factory=Safety)
     channels: Channels = field(default_factory=Channels)
+    budget: Budget = field(default_factory=Budget)
 
     # 小红书笔记发布多少天内额外调一次 detail 拿点赞/收藏。
     # 设为 0 表示完全不调 detail（省一半钱，代价是没有爆文的点赞维度）。
