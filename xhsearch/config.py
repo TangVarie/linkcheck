@@ -57,7 +57,7 @@ class FieldNames:
     refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
     last_updated: str = "最近检查时间"
-    alive_confirmed: str = "已确认存活"       # 复选框：本轮取到数=勾上，确认失效=取消
+    alive_confirmed: str = "已确认存活"       # 复选框：本轮真的量到数字（哪怕是0）=勾上，确认失效=取消
 
     # —— 机器写入 · 系统列（建议在运营视图里隐藏）——
     consecutive_failures: str = "连续失败次数"   # 两击定罪的计数器
