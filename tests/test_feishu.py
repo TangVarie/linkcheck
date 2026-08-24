@@ -131,6 +131,43 @@ class TestTokenRetry(unittest.TestCase):
             self.assertEqual(table.token(), "tok-1")
 
 
+class TestResolveWikiNode(unittest.TestCase):
+    """挂在知识库里的表，链接给的是 wiki 节点 token，要换算成真正的 app_token。"""
+
+    def _token_response(self) -> transport.Response:
+        return transport.Response(200, "application/json",
+                                   json.dumps({"code": 0, "tenant_access_token": "tok-1",
+                                               "expire": 7200}))
+
+    def test_bitable_node_resolves_to_app_token(self):
+        get_resp = ok({"node": {"obj_type": "bitable", "obj_token": "bascnXXXX"}})
+        with mock.patch.object(transport, "post", return_value=self._token_response()), \
+             mock.patch.object(transport, "get", return_value=get_resp), \
+             mock.patch("time.sleep"):
+            app_token = feishu.resolve_wiki_node("app-id", "app-secret", "wikcnZZZZ")
+        self.assertEqual(app_token, "bascnXXXX")
+
+    def test_non_bitable_node_is_rejected(self):
+        """节点是文档/表格以外的类型（比如普通 docx）：这不是能巡查的多维表格。"""
+        get_resp = ok({"node": {"obj_type": "docx", "obj_token": "doccnYYYY"}})
+        with mock.patch.object(transport, "post", return_value=self._token_response()), \
+             mock.patch.object(transport, "get", return_value=get_resp), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError) as ctx:
+                feishu.resolve_wiki_node("app-id", "app-secret", "wikcnZZZZ")
+        self.assertIn("docx", str(ctx.exception))
+
+    def test_permission_error_propagates(self):
+        """没开 wiki:node:read 权限：错误码原样带出去，提示能对上排查线索。"""
+        get_resp = feishu_err(99991672, "无权限")
+        with mock.patch.object(transport, "post", return_value=self._token_response()), \
+             mock.patch.object(transport, "get", return_value=get_resp), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError) as ctx:
+                feishu.resolve_wiki_node("app-id", "app-secret", "wikcnZZZZ")
+        self.assertEqual(ctx.exception.code, 99991672)
+
+
 class TestErrorContext(unittest.TestCase):
     def test_non_json_response_keeps_status_and_request_id(self):
         """网关吐 HTML 时，「响应不是 JSON：None」等于把排查线索全丢了。"""

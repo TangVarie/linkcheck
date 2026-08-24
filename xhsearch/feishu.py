@@ -73,6 +73,63 @@ def _check(resp: transport.Response) -> dict[str, Any]:
     return payload.get("data") or {}
 
 
+def _fetch_tenant_token(app_id: str, app_secret: str, timeout: float = 30.0) -> tuple[str, int]:
+    """真的去换一次 tenant_access_token，返回 (token, expire 秒数)。
+
+    从 Bitable.token() 里抽出来，好让 resolve_wiki_node（换 token 时还没有
+    app_token/table_id，构造不出一个 Bitable 实例）也能复用同一段换取逻辑。
+    """
+    # 带重试：token 是整轮的第一步，一次网络抖动就断送整轮太不值。
+    resp = transport.post_with_retry(
+        f"{BASE}/auth/v3/tenant_access_token/internal",
+        {"Content-Type": "application/json; charset=utf-8"},
+        json.dumps({"app_id": app_id, "app_secret": app_secret}),
+        timeout=timeout,
+        should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+    )
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise FeishuError(-1, f"取 token 失败：HTTP {resp.status} {resp.body[:200]}")
+    code = payload.get("code")
+    if code not in (0, None):
+        raise FeishuError(int(code), str(payload.get("msg", "")), _HINTS.get(int(code), ""))
+
+    value = payload.get("tenant_access_token")
+    if not value:
+        raise FeishuError(-1, f"响应里没有 tenant_access_token：{resp.body[:200]}")
+    return value, int(payload.get("expire", 7200))
+
+
+def resolve_wiki_node(app_id: str, app_secret: str, node_token: str, *, timeout: float = 30.0) -> str:
+    """把知识库分享链接（/wiki/<node_token>）换成多维表格真正的 app_token。
+
+    飞书的多维表格挂进知识库之后，地址栏里的 token 是**知识库节点**的
+    token，跟这张多维表格自己的 app_token 是两个不同的东西——bitable
+    接口只认后者。这里调「获取知识库节点信息」接口做一次换算：
+    https://open.feishu.cn/document/server-docs/docs/wiki-v2/space-node/get_node
+
+    需要额外开一个知识库权限（wiki:node:read / wiki:wiki:readonly 任一个
+    都行），跟 bitable:app 是两个独立的权限，要单独在开放平台加、发布、
+    等审批——没开这个权限会在这里报权限错误，提示很直接，照着开就行。
+    """
+    value, _ = _fetch_tenant_token(app_id, app_secret, timeout)
+    headers = {"Authorization": f"Bearer {value}", "Content-Type": "application/json; charset=utf-8"}
+    url = f"{BASE}/wiki/v2/spaces/get_node?token={urllib.parse.quote(node_token, safe='')}"
+    resp = transport.get(url, headers, timeout=timeout)
+    if resp.status == 0:
+        time.sleep(1.0)
+        resp = transport.get(url, headers, timeout=timeout)
+    data = _check(resp)
+    node = data.get("node") or {}
+    obj_type = node.get("obj_type")
+    obj_token = node.get("obj_token")
+    if obj_type != "bitable":
+        raise FeishuError(-1, f"这个知识库链接指向的不是多维表格（实际类型是 {obj_type!r}）")
+    if not obj_token:
+        raise FeishuError(-1, f"知识库节点信息里没有 obj_token：{resp.body[:200]}")
+    return obj_token
+
+
 @dataclass
 class _Token:
     value: str
@@ -109,26 +166,7 @@ class Bitable:
         now = time.monotonic()
         if self._token and self._token.expires_at > now:
             return self._token.value
-
-        # 带重试：token 是整轮的第一步，一次网络抖动就断送整轮太不值。
-        resp = transport.post_with_retry(
-            f"{BASE}/auth/v3/tenant_access_token/internal",
-            {"Content-Type": "application/json; charset=utf-8"},
-            json.dumps({"app_id": self.app_id, "app_secret": self.app_secret}),
-            timeout=self.timeout,
-            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-        )
-        payload = resp.json()
-        if not isinstance(payload, dict):
-            raise FeishuError(-1, f"取 token 失败：HTTP {resp.status} {resp.body[:200]}")
-        code = payload.get("code")
-        if code not in (0, None):
-            raise FeishuError(int(code), str(payload.get("msg", "")), _HINTS.get(int(code), ""))
-
-        value = payload.get("tenant_access_token")
-        if not value:
-            raise FeishuError(-1, f"响应里没有 tenant_access_token：{resp.body[:200]}")
-        expire = int(payload.get("expire", 7200))
+        value, expire = _fetch_tenant_token(self.app_id, self.app_secret, self.timeout)
         self._token = _Token(value, now + max(expire - 300, 60))
         return value
 
