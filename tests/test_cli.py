@@ -116,6 +116,13 @@ class TestTablesFromEnv(unittest.TestCase):
             cli._tables_from_env(
                 {"FEISHU_TABLES": "甲=bascnA:tbl1; 甲=bascnB:tbl2"})
 
+    def test_wiki_link_is_parsed_like_a_base_link(self):
+        """实测过：/wiki/ 地址栏里的 token 直接当 app_token 用，接口就认，
+        不需要额外换算——跟 /base/ 一视同仁，只是前缀不同。"""
+        entries = cli._tables_from_env(
+            {"FEISHU_TABLES": "企业C=https://xx.feishu.cn/wiki/wikcnA?table=tbl9&view=vewZ"})
+        self.assertEqual(entries, [("企业C", "wikcnA", "tbl9")])
+
 
 class TestMainArgs(unittest.TestCase):
     def test_empty_table_filter_exits(self):

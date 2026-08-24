@@ -70,16 +70,21 @@ def _api_keys() -> dict[str, str]:
 def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
 
-    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项三种写法都认：
+    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项几种写法都认：
 
         OKMAN一期=bascnXXX:tblAAA
         OKMAN二期=https://xx.feishu.cn/base/bascnXXX?table=tblBBB
+        企业C期=https://xx.feishu.cn/wiki/wikcnXXX?table=tblDDD   （挂在知识库里的表也认）
         bascnYYY:tblCCC                     （不带标签时标签取 table_id）
 
     标签用在日志分节和 --table 筛选上，起个人能认的名字。
     单表继续用 FEISHU_APP_TOKEN + FEISHU_TABLE_ID；两种都配了以
     FEISHU_TABLES 为准。所有表共用同一个飞书应用（App ID/Secret），
     应用要逐张表「添加文档应用」授权。
+
+    /wiki/ 链接实测直接把地址栏里那段 token 当 app_token 用，多维表格接口
+    照样认——不需要额外调接口换算、也不需要给应用多开知识库权限，跟
+    /base/ 链接一视同仁，只是换了个前缀。
     """
     spec = environ.get("FEISHU_TABLES", "").strip()
     if spec:
@@ -94,13 +99,13 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
                 label, target = head.strip(), rest.strip()
             else:
                 label, target = "", chunk
-            match = re.search(r"/base/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
+            match = re.search(r"/(?:base|wiki)/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
             if match:
                 app_token, table_id = match.group(1), match.group(2)
             elif "://" in target:
                 sys.exit(f"FEISHU_TABLES 里这个网址提不出表信息：{target!r}。"
-                         "要用 /base/xxx?table=tblxxx 形式的地址（打开目标数据表时"
-                         "浏览器地址栏那串；/wiki/ 地址不行）")
+                         "要用 /base/xxx?table=tblxxx 或 /wiki/xxx?table=tblxxx 形式的地址"
+                         "（打开目标数据表时浏览器地址栏那串）")
             elif ":" in target:
                 app_token, _, table_id = target.partition(":")
                 app_token, table_id = app_token.strip(), table_id.strip()

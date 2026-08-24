@@ -167,6 +167,11 @@ https://xxx.feishu.cn/base/bascnABC123DEF?table=tblXYZ789
                             └── app_token ─┘       └ table_id ┘
 ```
 
+> 表格挂在知识库（Wiki）里的话，地址栏会是 `/wiki/wikcnXXX?table=tblXYZ789`
+> 这种形式——不用另外去找"真正的" `/base/` 链接，`FEISHU_TABLES` 直接认
+> `/wiki/` 链接：地址栏那段 token 直接当 app_token 用，多维表格接口照样认，
+> 不用额外调接口换算，也不用多开权限，跟 `/base/` 链接一视同仁。
+
 ---
 
 ## 四、先在本地跑一次体检（强烈建议，不花钱）
