@@ -5,10 +5,8 @@
 """
 
 import unittest
-from unittest import mock
 
 import cli
-from xhsearch import feishu
 from xhsearch.config import Settings
 
 
@@ -118,34 +116,12 @@ class TestTablesFromEnv(unittest.TestCase):
             cli._tables_from_env(
                 {"FEISHU_TABLES": "甲=bascnA:tbl1; 甲=bascnB:tbl2"})
 
-    def test_wiki_link_is_parsed_with_pending_marker(self):
-        """/wiki/ 链接这一步只抠 node_token，真正换成 app_token 要等
-        _resolve_wiki_entries 拿到凭据之后再调接口，这里先占位。"""
+    def test_wiki_link_is_parsed_like_a_base_link(self):
+        """实测过：/wiki/ 地址栏里的 token 直接当 app_token 用，接口就认，
+        不需要额外换算——跟 /base/ 一视同仁，只是前缀不同。"""
         entries = cli._tables_from_env(
             {"FEISHU_TABLES": "企业C=https://xx.feishu.cn/wiki/wikcnA?table=tbl9&view=vewZ"})
-        self.assertEqual(entries, [("企业C", cli._WIKI_PENDING_PREFIX + "wikcnA", "tbl9")])
-
-
-class TestResolveWikiEntries(unittest.TestCase):
-    """_tables_from_env 占位的 /wiki/ 条目，要在这一步真正换成 app_token。"""
-
-    def test_wiki_entries_are_resolved_via_feishu(self):
-        entries = [("企业C", cli._WIKI_PENDING_PREFIX + "wikcnA", "tbl9"),
-                   ("甲", "bascnA", "tbl1")]
-        with mock.patch.object(cli.feishu, "resolve_wiki_node",
-                               return_value="bascnResolved") as resolver:
-            resolved = cli._resolve_wiki_entries("app-id", "app-secret", entries)
-        resolver.assert_called_once_with("app-id", "app-secret", "wikcnA")
-        self.assertEqual(resolved, [("企业C", "bascnResolved", "tbl9"),
-                                    ("甲", "bascnA", "tbl1")])
-
-    def test_resolve_failure_exits_with_label_in_message(self):
-        entries = [("企业C", cli._WIKI_PENDING_PREFIX + "wikcnA", "tbl9")]
-        with mock.patch.object(cli.feishu, "resolve_wiki_node",
-                               side_effect=feishu.FeishuError(99991672, "无权限")):
-            with self.assertRaises(SystemExit) as ctx:
-                cli._resolve_wiki_entries("app-id", "app-secret", entries)
-        self.assertIn("企业C", str(ctx.exception))
+        self.assertEqual(entries, [("企业C", "wikcnA", "tbl9")])
 
 
 class TestMainArgs(unittest.TestCase):

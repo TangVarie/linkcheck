@@ -67,12 +67,6 @@ def _api_keys() -> dict[str, str]:
     return {k: v for k, v in keys.items() if v}
 
 
-# app_token 位置的哨兵前缀：这一项是 /wiki/ 链接，真正的 app_token 要等
-# 拿到 app_id/app_secret 之后才能换（见 _resolve_wiki_entries）。真实
-# app_token 是纯 [A-Za-z0-9]+，不含冒号，跟这个前缀不会撞。
-_WIKI_PENDING_PREFIX = "wiki:"
-
-
 def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
 
@@ -88,9 +82,9 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     FEISHU_TABLES 为准。所有表共用同一个飞书应用（App ID/Secret），
     应用要逐张表「添加文档应用」授权。
 
-    /wiki/ 链接这里只抠出 node_token，占位成 f"{_WIKI_PENDING_PREFIX}{node_token}"——
-    真正换成 app_token 要调一次接口（需要 app_id/app_secret，这个函数拿不到），
-    留给 _resolve_wiki_entries 在有了凭据之后统一换。
+    /wiki/ 链接实测直接把地址栏里那段 token 当 app_token 用，多维表格接口
+    照样认——不需要额外调接口换算、也不需要给应用多开知识库权限，跟
+    /base/ 链接一视同仁，只是换了个前缀。
     """
     spec = environ.get("FEISHU_TABLES", "").strip()
     if spec:
@@ -105,13 +99,9 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
                 label, target = head.strip(), rest.strip()
             else:
                 label, target = "", chunk
-            base_match = re.search(r"/base/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
-            wiki_match = None if base_match else re.search(
-                r"/wiki/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
-            if base_match:
-                app_token, table_id = base_match.group(1), base_match.group(2)
-            elif wiki_match:
-                app_token, table_id = _WIKI_PENDING_PREFIX + wiki_match.group(1), wiki_match.group(2)
+            match = re.search(r"/(?:base|wiki)/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
+            if match:
+                app_token, table_id = match.group(1), match.group(2)
             elif "://" in target:
                 sys.exit(f"FEISHU_TABLES 里这个网址提不出表信息：{target!r}。"
                          "要用 /base/xxx?table=tblxxx 或 /wiki/xxx?table=tblxxx 形式的地址"
@@ -146,32 +136,10 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     return [(table_id, app_token, table_id)]
 
 
-def _resolve_wiki_entries(
-    app_id: str, app_secret: str, entries: list[tuple[str, str, str]],
-) -> list[tuple[str, str, str]]:
-    """把 _tables_from_env 里占位的 /wiki/ 条目换成真正的 app_token。
-
-    放在 _tables_from_env 之外单独一步，是因为换算要调一次接口，需要
-    app_id/app_secret——那个函数是纯字符串解析，拿不到凭据。
-    """
-    resolved = []
-    for label, app_token, table_id in entries:
-        if app_token.startswith(_WIKI_PENDING_PREFIX):
-            node_token = app_token[len(_WIKI_PENDING_PREFIX):]
-            try:
-                app_token = feishu.resolve_wiki_node(app_id, app_secret, node_token)
-            except feishu.FeishuError as exc:
-                sys.exit(f"FEISHU_TABLES 里「{label}」这条 /wiki/ 链接换不出多维表格：{exc}\n"
-                         "→ 检查这个知识库节点是不是多维表格，以及应用有没有开通 "
-                         "wiki:node:read（或 wiki:wiki:readonly）权限并发布、审批通过")
-        resolved.append((label, app_token, table_id))
-    return resolved
-
-
 def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
-    entries = _resolve_wiki_entries(app_id, app_secret, _tables_from_env(os.environ))
+    entries = _tables_from_env(os.environ)
     if selected:
         by_label = {label: entry for entry in entries for label in [entry[0]]}
         missing = [s for s in selected if s not in by_label]

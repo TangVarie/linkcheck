@@ -169,10 +169,8 @@ https://xxx.feishu.cn/base/bascnABC123DEF?table=tblXYZ789
 
 > 表格挂在知识库（Wiki）里的话，地址栏会是 `/wiki/wikcnXXX?table=tblXYZ789`
 > 这种形式——不用另外去找"真正的" `/base/` 链接，`FEISHU_TABLES` 直接认
-> `/wiki/` 链接，会自动换算成多维表格真正的 app_token。唯一要多做一步：
-> 飞书自建应用要**额外**开一个权限 `wiki:node:read`（或 `wiki:wiki:readonly`，
-> 跟 `bitable:app` 是两个独立权限，不会因为开了一个就自动带出另一个），
-> 一样要发布版本、等审批通过。
+> `/wiki/` 链接：地址栏那段 token 直接当 app_token 用，多维表格接口照样认，
+> 不用额外调接口换算，也不用多开权限，跟 `/base/` 链接一视同仁。
 
 ---
 
