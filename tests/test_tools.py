@@ -11,6 +11,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+import cli
 from tools import estimate_cost, probe_channel
 from xhsearch import providers, transport
 from xhsearch.config import Settings
@@ -186,6 +187,29 @@ class TestPricingIsConfigurable(unittest.TestCase):
         result = estimate_cost.estimate(20, 0.7, Settings())
         self.assertAlmostEqual(result["yuan_per_day"],
                                result["calls_per_day"] * 0.25, places=6)
+
+    def test_estimator_respects_the_detail_window_override(self):
+        """生产设了 DETAIL_WITHIN_DAYS=0（关掉小红书 detail）时，这个脚本
+        如果还按编译进代码的 7 天窗口算，会把每一次合格的小红书刷新都多算
+        一个付费调用——对一个用来做月度成本决策的脚本，这是致命的。"""
+        import os
+
+        saved = os.environ.get("DETAIL_WITHIN_DAYS")
+        try:
+            os.environ["DETAIL_WITHIN_DAYS"] = "0"
+            settings = cli.build_settings()
+            self.assertEqual(settings.detail_within_days, 0)
+            lean = estimate_cost.estimate(20, 0.7, settings)
+
+            os.environ["DETAIL_WITHIN_DAYS"] = "7"
+            full = estimate_cost.estimate(20, 0.7, cli.build_settings())
+            self.assertLess(lean["calls_per_day"], full["calls_per_day"],
+                            "关掉 detail 之后调用数必须真的少下来")
+        finally:
+            if saved is None:
+                os.environ.pop("DETAIL_WITHIN_DAYS", None)
+            else:
+                os.environ["DETAIL_WITHIN_DAYS"] = saved
 
     def test_estimator_entry_point_applies_env_overrides(self):
         import os

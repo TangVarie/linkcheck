@@ -268,6 +268,9 @@ class _Spend:
     yuan: float = 0.0
     provider: str = ""
     tally: dict[str, int] = field(default_factory=dict)
+    # 实际发出去的 HTTP 请求数（含传输层重试和降级到备胎的那几次）。
+    # 预算的调用闸门按它记账，而不是按「计划里有几个调用」。
+    requests: int = 0
 
 
 def _was_billed(provider_name: str, result: protocol.Result) -> bool:
@@ -296,7 +299,12 @@ def _call_once(
     *,
     deadline: Optional[float],
     timeout: float,
-) -> protocol.Result:
+) -> tuple[protocol.Result, int]:
+    """打一次供应商接口。返回（解析结果, **实际发出的 HTTP 请求数**）。
+
+    请求数要如实返回：传输层的一次重试也是一个真实请求，按「计划调用数」记账
+    会让 MAX_CALLS_PER_RUN 名不副实。
+    """
     provider = providers.get_provider(provider_name)
     request = provider.build(api_key, call.platform, call.purpose, call.arguments)
     response = transport.request_with_retry(
@@ -308,13 +316,23 @@ def _call_once(
         deadline=deadline,
         # 传输层只按 HTTP 状态判重试。业务错误可能走 HTTP 200 + body 里的字段，
         # 传输层看不见，必须由下面按解析结果处理。
+        # 429 刻意**不**在这里重试：限流要按 retry_after 等待，那是 _fetch_one
+        # 的职责（它还要照顾软截止）。传输层的退避对它太短。
         should_retry=lambda r: r.status == 0 or r.status >= 500,
     )
-    return provider.parse(
+    result = provider.parse(
         call.platform, call.purpose,
         response.status, response.content_type, response.body,
         response.request_id, api_key,
     )
+    # 把标准的 Retry-After 响应头补进 Err：只有 SocialDataX 会在 body 里给
+    # retry_after_seconds，TikHub 只给响应头。不补的话，一个明确告诉我们
+    # 「等 30 秒」的 429 会被按默认的 5 秒重试，撞回同一堵墙。
+    if (isinstance(result, protocol.Err)
+            and result.retry_after_seconds is None
+            and response.retry_after is not None):
+        result.retry_after_seconds = response.retry_after
+    return result, max(1, response.attempts)
 
 
 def _call(
@@ -360,7 +378,9 @@ def _call(
 
     last: protocol.Result = protocol.Err(protocol.Failure.UNKNOWN, "no_attempt", "没有发起任何请求")
     for index, name in enumerate(order):
-        result = _call_once(name, keys[name], call, deadline=deadline, timeout=timeout)
+        result, attempts = _call_once(name, keys[name], call,
+                                      deadline=deadline, timeout=timeout)
+        spend.requests += attempts
 
         if isinstance(result, protocol.Ok) or _was_billed(name, result):
             spend.provider = name
@@ -395,26 +415,27 @@ def _fetch_one(
     disabled: set[str],
     tally: dict[str, int],
     lock: Optional[threading.Lock] = None,
-) -> tuple[Optional[analyze.Snapshot], Optional[protocol.Err], int, float, int]:
+) -> tuple[Optional[analyze.Snapshot], Optional[protocol.Err], int, float, int, int]:
     """跑完一行需要的全部调用。
 
-    返回（快照, 终局错误, 消耗积分, 花费元, 降级次数）。
+    返回（快照, 终局错误, 消耗积分, 花费元, 降级次数, 实际发出的请求数）。
     终局错误 code == "deadline" 且无快照 = 这一行根本没开始，留给下一轮。
     """
     calls = plan_calls(row, settings, now)
     if not calls:
         return None, protocol.Err(
             protocol.Failure.UNKNOWN, "bad_link", row.parsed.describe_failure()
-        ), 0, 0.0, 0
+        ), 0, 0.0, 0, 0
 
     snapshot: Optional[analyze.Snapshot] = None
     credits = 0
     yuan = 0.0
     failovers = 0
+    requests = 0
     guard = lock or threading.Lock()
 
     def attempt(c: ToolCall) -> protocol.Result:
-        nonlocal credits, yuan, failovers
+        nonlocal credits, yuan, failovers, requests
         spend = _Spend()
         # 「降级」的基准是**此刻真正可用**的第一家，而不是配置里写的主通道：
         # 只配了备胎 key 的部署（完全合法）每一次成功调用都不是降级，
@@ -435,6 +456,7 @@ def _fetch_one(
         with guard:
             credits += spend.credits
             yuan += spend.yuan
+            requests += spend.requests
             for name, count in spend.tally.items():
                 tally[name] = tally.get(name, 0) + count
         if spend.provider and expected and spend.provider != expected:
@@ -447,7 +469,7 @@ def _fetch_one(
                 # 一个请求都还没发：整行留给下一轮，绝不写回。
                 return None, protocol.Err(
                     protocol.Failure.UNKNOWN, "deadline", "已到软截止，本行留给下一轮"
-                ), credits, yuan, failovers
+                ), credits, yuan, failovers, requests
             break  # 评论已到手，detail 放弃：按已有数据完成本行
 
         result = attempt(call)
@@ -469,7 +491,7 @@ def _fetch_one(
                     return None, protocol.Err(
                         protocol.Failure.UNKNOWN, "deadline",
                         "限流等待中到达软截止，本行留给下一轮"
-                    ), credits, yuan, failovers
+                    ), credits, yuan, failovers, requests
                 break  # 评论已到手：detail 放弃，按已有数据完成本行
             result = attempt(call)
 
@@ -482,7 +504,7 @@ def _fetch_one(
                 raise _Abort(str(result), call.platform, credits, yuan)
             if result.kind is protocol.Failure.RATE_LIMIT:
                 # 二连限流：把这一行留给下一轮，别拖垮整批。
-                return snapshot, result, credits, yuan, failovers
+                return snapshot, result, credits, yuan, failovers, requests
             if result.kind is protocol.Failure.GONE and not _looks_alive(snapshot):
                 # 「内容没了」是行级结论，不管它是从评论接口还是 detail 冒出来的。
                 # TikHub 通道上最干净的死亡信号恰恰在 detail 里（小红书 data 为 []、
@@ -492,11 +514,11 @@ def _fetch_one(
                 # 但只在**没有活着的证据**时才认：评论接口刚拿回 200 条评论、
                 # detail 却说笔记不存在，那是上游自相矛盾，这时候信 detail
                 # 就是拿一次上游抖动去杀一条好帖子。
-                return None, result, credits, yuan, failovers
+                return None, result, credits, yuan, failovers, requests
             # 评论接口失败 = 这一行的结论；detail 失败只是少几个数字，
             # 已经拿到的评论数据仍然有效，不该整行判死。
             if call.purpose == "comments":
-                return snapshot, result, credits, yuan, failovers
+                return snapshot, result, credits, yuan, failovers, requests
             continue
 
         assert isinstance(result, protocol.Ok)
@@ -505,7 +527,7 @@ def _fetch_one(
         elif snapshot is not None:
             analyze.merge_detail(snapshot, result.data)
 
-    return snapshot, None, credits, yuan, failovers
+    return snapshot, None, credits, yuan, failovers, requests
 
 
 def _base_fields(settings: Settings, *, status: str, notes: list[str], now: datetime) -> dict[str, Any]:
@@ -712,32 +734,40 @@ def refresh(
                            f"{settings.safety.cooldown_seconds} 秒内刚刷过，跳过（不计费）", 0)
 
         # —— 预算：在发请求**之前**预留（SUP-001）——
-        # 预留价必须按**此刻真正可用**的通道算：主通道已经被判死时，这一行
-        # 实际走的是备胎，而两家单价能差 14 倍。传 disabled 进去，
-        # 否则 MAX_YUAN_PER_RUN 会被超出十几倍。
+        # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
+        # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
+        # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
+        # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
         planned = plan_calls(row, settings, now)
-        reserved_yuan = estimate_yuan([row], settings, now, keys=keys, disabled=disabled)
-        if not budget.reserve(len(planned), reserved_yuan):
+        reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
+                                      disabled=disabled, worst_case=True)
+        # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
+        # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
+        reserved_calls = len(planned) * max(1, len(
+            providers.usable_order(settings.channels, platform, keys, disabled)))
+        if not budget.reserve(reserved_calls, reserved_yuan):
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
 
         try:
-            snapshot, error, credits, cost_yuan, failovers = _fetch_one(
+            snapshot, error, credits, cost_yuan, failovers, made_requests = _fetch_one(
                 row, keys, settings, now=now, deadline=deadline, timeout=timeout,
                 disabled=disabled, tally=tally, lock=lock,
             )
         except _Abort as exc:
             # 中止的行也可能已经花过钱：按实际花销校正账面再走。
-            budget.settle(reserved_yuan, exc.yuan, len(planned), 0)
+            # 请求数按预留值保守留着——中止路径拿不到真实计数，宁可多算。
+            budget.settle(reserved_yuan, exc.yuan, reserved_calls, reserved_calls)
             with lock:
                 dead_platforms.setdefault(exc.platform or platform, exc.reason)
             # 这一行没有完整结论，不写回；但已经花掉的钱要入账。
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            f"{exc.platform or platform} 平台中止：{exc.reason[:150]}",
                            exc.credits, exc.yuan)
-        # 跑到一半降级到更贵的那家（预留时它还健康）会让实际开销超过预留额，
-        # 这里按实际值校正，后面的行才是拿真实余量在放行。
-        budget.settle(reserved_yuan, cost_yuan, len(planned), len(planned))
+        # 按**实际**值校正账面：金额是真花掉的，请求数是真发出去的
+        # （含传输层重试和降级到备胎的那几次）。悲观预留的差额在这里退还，
+        # 后面的行才是拿真实余量在放行。
+        budget.settle(reserved_yuan, cost_yuan, reserved_calls, made_requests)
         with lock:
             report.failovers += failovers
 

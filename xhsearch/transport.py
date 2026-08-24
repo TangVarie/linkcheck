@@ -51,6 +51,10 @@ class Response:
     # 响应体超过上限被截断。这种失败重试没有意义（再来一次还是那么大），
     # request_with_retry 会直接返回它。
     oversized: bool = False
+    # 拿到这个响应**实际发出去了几个 HTTP 请求**（含重试）。
+    # 预算闸门要按真实请求数记账：一个「计划中的调用」在传输层可能变成 3 个请求，
+    # 按计划数记账会让 MAX_CALLS_PER_RUN 名不副实。
+    attempts: int = 1
 
     @property
     def ok(self) -> bool:
@@ -270,11 +274,14 @@ def request_with_retry(
     sleep=None,
 ) -> Response:
     """带指数退避的请求，GET/POST 通用。语义见 post_with_retry。"""
-    last = Response(0, "", "未发起任何请求")
+    last = Response(0, "", "未发起任何请求", attempts=0)
     for attempt in range(attempts):
         if deadline is not None and time.monotonic() >= deadline:
-            return Response(0, "", "已到本次运行的软截止，剩余重试留给下一轮")
+            return Response(0, "", "已到本次运行的软截止，剩余重试留给下一轮",
+                            attempts=attempt)
         last = request(method, url, headers, body, timeout=timeout)
+        # 记的是**真实发出去的请求数**，不是这是第几次尝试——调用方拿它记账。
+        last.attempts = attempt + 1
         if last.ok:
             return last
         if last.oversized:

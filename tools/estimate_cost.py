@@ -155,11 +155,12 @@ def flat_daily(total_posts: float, xhs_share: float, with_detail: bool) -> dict:
 
 
 def main() -> int:
-    # 和 cli.py 共用同一份 .env 加载 + 计价覆盖。少了这两行，运维照文档改完
-    # USD_TO_CNY / TIKHUB_USD_* 之后，生产预算用新价、而这个**做月度成本决策**
-    # 的脚本还在报编译进代码的旧价——两边给出的数字会长期对不上。
+    # 这个脚本是用来**做月度成本决策**的，所以它必须和生产读同一份配置：
+    # 不只是计价覆盖（USD_TO_CNY / TIKHUB_USD_*），还包括 DETAIL_WITHIN_DAYS。
+    # 自己 new 一个裸 Settings() 的话，生产设了 DETAIL_WITHIN_DAYS=0
+    # （关掉小红书 detail）时，这里仍按编译进代码的 7 天窗口算，
+    # 把每一次合格的小红书刷新都多算一个付费调用，成本被系统性高估。
     cli.load_env_or_exit()
-    cli.apply_pricing_overrides()
 
     per_day = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
     xhs_share = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
@@ -170,7 +171,7 @@ def main() -> int:
         print("小红书占比要在 0 和 1 之间（如 0.7）", file=sys.stderr)
         return 2
 
-    settings = Settings()
+    settings = cli.build_settings()
     result = estimate(per_day, xhs_share, settings)
 
     print(f"假设：每天新发 {per_day:.0f} 条，小红书占 {xhs_share:.0%}，"

@@ -435,6 +435,52 @@ class TestFailoverMetricHonesty(FailoverTest):
         self.assertGreaterEqual(report.failovers, 1)
 
 
+class TestRetryAfterHeaderReachesTheRunner(FailoverTest):
+    """429 的等待时间只有一部分供应商放在 body 里（SocialDataX 有
+    retry_after_seconds，TikHub 只给标准响应头）。
+
+    传输层刻意不重试 429（那是 _fetch_one 的活，它还要照顾软截止），
+    所以响应头必须被补进解析出来的 Err——否则一个明确说「等 30 秒」的 429
+    会被按默认的 5 秒重试，撞回同一堵墙。
+    """
+
+    def test_header_only_429_carries_its_wait_into_the_error(self):
+        from xhsearch import runner as runner_mod
+        from xhsearch.protocol import Err
+        from xhsearch.rows import ToolCall
+
+        throttled = transport.Response(
+            429, "application/json",
+            json.dumps({"detail": {"code": 429, "message_zh": "请求过于频繁"}}),
+            "th-429", retry_after=30.0)
+        with mock.patch.object(transport, "get", return_value=throttled), \
+             mock.patch.object(transport, "post", return_value=throttled), \
+             mock.patch("time.sleep"):
+            result, attempts = runner_mod._call_once(
+                "tikhub", "t-key",
+                ToolCall("xhs", "comments", {"note_id": "a" * 24}),
+                deadline=None, timeout=30.0)
+        self.assertIsInstance(result, Err)
+        self.assertEqual(result.retry_after_seconds, 30.0)
+        self.assertEqual(attempts, 1, "429 不该在传输层被重试")
+
+    def test_body_supplied_wait_is_not_overwritten_by_the_header(self):
+        from xhsearch import runner as runner_mod
+        from xhsearch.rows import ToolCall
+
+        both = transport.Response(
+            429, "application/json",
+            json.dumps({"code": 1429, "message": "过于频繁", "retry_after_seconds": 12}),
+            "sdx-429", retry_after=30.0)
+        with mock.patch.object(transport, "post", return_value=both), \
+             mock.patch("time.sleep"):
+            result, _ = runner_mod._call_once(
+                "socialdatax", "s-key",
+                ToolCall("xhs", "comments", {"note_id": "a" * 24}),
+                deadline=None, timeout=30.0)
+        self.assertEqual(result.retry_after_seconds, 12.0)   # body 优先
+
+
 class TestPlatformScopedAbort(FailoverTest):
     """COR-004：一个平台的通道全倒，不该让另一个平台的健康行也停摆。
 

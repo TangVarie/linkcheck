@@ -155,6 +155,30 @@ class TestResponseSizeLimits(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
 
 
+class TestAttemptAccounting(unittest.TestCase):
+    """预算的调用闸门按**真实发出的请求数**记账。一个「计划中的调用」在传输层
+    可能变成 3 个请求，按计划数记账会让 MAX_CALLS_PER_RUN 名不副实。"""
+
+    def test_attempts_reports_the_real_request_count(self):
+        calls = {"n": 0}
+
+        def flaky(method, url, headers, body="", timeout=30.0):
+            calls["n"] += 1
+            return transport.Response(500, "", "boom")
+
+        with mock.patch.object(transport, "request", side_effect=flaky):
+            resp = transport.request_with_retry(
+                "GET", "https://x", {},
+                should_retry=lambda r: r.status >= 500, sleep=lambda _: None)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(resp.attempts, 3)
+
+    def test_first_try_success_counts_as_one(self):
+        with _urlopen_returning(_ChunkedResp(b'{"ok":true}')):
+            resp = transport.get("https://x", {})
+        self.assertEqual(resp.attempts, 1)
+
+
 class TestRetryBehaviour(unittest.TestCase):
     """ROB-011：固定的 2/4 秒退避会让多个实例在同一毫秒一起回来，
     重试本身把限流拖得更久。"""

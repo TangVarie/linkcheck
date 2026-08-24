@@ -33,6 +33,7 @@ VPS 的 crontab 默认允许重叠，文档里的 flock 示例只包了 queue �
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -66,6 +67,11 @@ def default_path() -> str:
 # 租约多久算过期。一次运行正常是几十秒到几分钟；30 分钟还没释放，
 # 要么是进程被 kill -9 且文件锁没生效（无 fcntl 的分支），要么是真的挂死了。
 DEFAULT_TTL_SECONDS = 1800.0
+
+# 只有这两个 errno 代表「锁被别人占着」。别的 OSError（ENOTSUP/ENOLCK/EINVAL
+# 等，某些 NFS 配置和容器挂载会给）说明这个文件系统压根不支持 flock——
+# 把它们也当成 Busy，等于让部署安静地跳过每一次定时运行。
+_CONTENTION_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN})
 
 
 @dataclass
@@ -209,8 +215,15 @@ def acquire(owner: str, *, path: Optional[str] = None,
         fd = os.open(lock_path, flags, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
             os.close(fd)
+            if exc.errno not in _CONTENTION_ERRNOS:
+                # 不是「别人占着」，是这个文件系统根本不支持 flock
+                # （NFS 某些配置、部分容器挂载会给 ENOTSUP/ENOLCK/EINVAL）。
+                # 当成 Busy 的话，CLI 会安静地跳过**每一次**定时运行并返回 0，
+                # 一个部署可以就这样永远不刷表而没有任何人发现。
+                # 抛出去，让调用方走「拿不到锁」那条会吵闹的分支。
+                raise
             raise Busy(previous) from None
         _write_info(fd, info)
         return Lease(lock_path, fd, info)

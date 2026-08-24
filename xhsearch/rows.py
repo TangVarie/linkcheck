@@ -175,8 +175,19 @@ def estimate_yuan(
     now: Optional[datetime] = None,
     keys: Optional[dict[str, str]] = None,
     disabled: Optional[set[str]] = None,
+    worst_case: bool = False,
 ) -> float:
     """预估这一批要花多少钱，按每个平台**实际会走的那家**的单价算。
+
+    worst_case=True 时改按**这次调用可能走到的最贵那家**算。两种口径各有各的
+    用途，别混：
+
+    * 报给人看的「预计花费」要用乐观口径（默认）——报最贵的会让每次估算
+      都虚高，没人会信。
+    * **预算闸门的预留必须用悲观口径**。预留时主通道是健康的，可跑到一半
+      它倒了、这一行就走了贵十几倍的备胎——等 settle() 事后校正时，钱已经
+      花出去了，`MAX_YUAN_PER_RUN` 在这一行上已经被越过。悲观预留 + 事后
+      settle 退还差额，既不让上限被突破，也不会长期压低吞吐。
 
     「实际会走的那家」= 通道顺序里第一家**配了 key、本轮没被判死、且吃这种
     参数形态**的。按配置主通道计价的话，只配了备胎 key 的部署（完全合法）
@@ -184,14 +195,13 @@ def estimate_yuan(
     估算没人会信。keys 不传时退回按「第一家能接的」算。
 
     disabled 一定要传：主通道在本轮早些时候已经被判死之后，后面每一行**实际**
-    走的是备胎。漏传它的后果不只是报表难看——预算闸门就是拿这个数去预留的，
-    抖音一行按 TikHub 预留 ¥0.0144、实际按 SocialDataX 花 ¥0.20，
-    `MAX_YUAN_PER_RUN` 会超出十几倍，「硬上限」就不再是上限。
+    走的是备胎。漏传它的后果不只是报表难看——预算闸门就是拿这个数去预留的。
     """
     dead = disabled or set()
     total = 0.0
     for row in rows:
         for call in plan_calls(row, settings, now):
+            prices: list[float] = []
             for name in settings.channels.for_platform(call.platform):
                 if keys is not None and not keys.get(name):
                     continue
@@ -202,7 +212,10 @@ def estimate_yuan(
                 except ValueError:
                     continue
                 if provider.can_handle(call.platform, call.purpose, call.arguments):
-                    total += provider.yuan_per_call(call.platform, call.purpose)
-                    break
+                    prices.append(provider.yuan_per_call(call.platform, call.purpose))
+                    if not worst_case:
+                        break
             # 一家都接不了：这一行实际会以「不支持的链接形态/没通道」失败，不产生费用
+            if prices:
+                total += max(prices) if worst_case else prices[0]
     return total

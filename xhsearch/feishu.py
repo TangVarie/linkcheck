@@ -51,8 +51,17 @@ _CONFLICT_BASE_DELAY = 1.0
 
 # 分页防循环：上游/代理反复返回同一个 page_token 时，原来的 while True
 # 会把进程永远挂在这里。页数、总行数两道闸都要有。
-MAX_PAGES = 200
+#
+# ⚠️ 两道闸必须对得上。页数闸写死 200 页时，默认 page_size=200 只能翻到
+# 40,000 行——一张 45,000 行的合法大表会被页数闸拦下，而它明明没超过行数闸。
+# 所以页数闸按「行数硬上限 ÷ 实际页大小」推出来，行数闸才是那个说了算的。
+MIN_PAGES = 200
 MAX_RECORDS_HARD_CAP = 50_000
+
+
+def _page_limit(page_size: int) -> int:
+    """翻多少页才算异常。留一点余量，容忍上游返回不满页。"""
+    return max(MIN_PAGES, -(-MAX_RECORDS_HARD_CAP // max(1, page_size)) + 10)
 
 # batch_get 官方单次上限 100 条 record_id。
 BATCH_GET_SIZE = 100
@@ -211,8 +220,9 @@ class Bitable:
         page_token = ""
         fields = list(field_names)
         seen_tokens: set[str] = set()
+        page_limit = _page_limit(min(page_size, 500))
 
-        for page in range(MAX_PAGES):
+        for page in range(page_limit):
             url = self._url(f"records/search?page_size={min(page_size, 500)}")
             if page_token:
                 # page_token 是服务端生成的不透明字符串，可能带 +/= 等字符，必须编码。
@@ -257,7 +267,7 @@ class Bitable:
             seen_tokens.add(page_token)
 
         raise FeishuError(
-            -1, f"分页超过 {MAX_PAGES} 页仍未结束，已中止本次读取（疑似上游分页异常）")
+            -1, f"分页超过 {page_limit} 页仍未结束，已中止本次读取（疑似上游分页异常）")
 
     def batch_get(self, record_ids: Iterable[str]) -> list[dict[str, Any]]:
         """按 record_id 定点读回若干行。官方单次上限 100 条，这里自动分批。
@@ -387,7 +397,7 @@ class Bitable:
         page_token = ""
         meta: dict[str, dict] = {}
         seen_tokens: set[str] = set()
-        for _ in range(MAX_PAGES):
+        for _ in range(_page_limit(100)):
             # 列出字段接口的 page_size 上限是 100（比记录接口低），超了会被拒。
             url = self._url("fields?page_size=100")
             if page_token:

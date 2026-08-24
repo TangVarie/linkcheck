@@ -169,7 +169,7 @@ class TestNumericEnvBounds(unittest.TestCase):
         import os
         for key, value in env.items():
             os.environ[key] = value
-        return cli._settings()
+        return cli.build_settings()
 
     def test_concurrency_out_of_range_is_rejected(self):
         for value in ("0", "4", "1000", "-1"):
@@ -401,6 +401,46 @@ class TestRunLock(unittest.TestCase):
             with self.assertRaises(OSError):
                 runlock.acquire("attacker", path=str(path))
             self.assertEqual(victim.read_text(encoding="utf-8"), "不该被清空的内容")
+
+    def test_unsupported_flock_is_not_reported_as_contention(self):
+        """有些文件系统（部分 NFS 配置、容器挂载）根本不支持 flock，会给
+        ENOTSUP/ENOLCK。把它们当成 Busy 的话，CLI 会安静地跳过**每一次**
+        定时运行并返回 0——一个部署可以就这样永远不刷表而没人发现。"""
+        import errno
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        if runlock.fcntl is None:
+            self.skipTest("这个平台没有 fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "run.lock")
+            with mock.patch.object(runlock.fcntl, "flock",
+                                   side_effect=OSError(errno.ENOTSUP, "not supported")):
+                with self.assertRaises(OSError) as ctx:
+                    runlock.acquire("me", path=path)
+            self.assertNotIsInstance(ctx.exception, runlock.Busy)
+            self.assertEqual(ctx.exception.errno, errno.ENOTSUP)
+
+    def test_real_contention_is_still_reported_as_busy(self):
+        """反面：EAGAIN/EACCES 是真的「别人占着」，必须照旧报 Busy。"""
+        import errno
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        if runlock.fcntl is None:
+            self.skipTest("这个平台没有 fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "run.lock")
+            for code in (errno.EAGAIN, errno.EACCES):
+                with self.subTest(code=code):
+                    with mock.patch.object(runlock.fcntl, "flock",
+                                           side_effect=OSError(code, "locked")):
+                        with self.assertRaises(runlock.Busy):
+                            runlock.acquire("me", path=path)
 
     def test_default_path_is_a_private_per_user_directory(self):
         """默认不能是 /tmp 里一个所有人都能预测、都能抢先建立的固定文件名。"""

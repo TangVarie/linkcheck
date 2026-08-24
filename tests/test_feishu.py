@@ -208,6 +208,15 @@ class TestPaginationGuards(unittest.TestCase):
     """上游/代理反复返回同一个 page_token 时不能无限翻页——
     进程会被挂住，后续的 cron 会因为「上一轮还在跑」被永远跳过（ROB-008）。"""
 
+    def test_page_guard_can_always_reach_the_record_cap(self):
+        """两道闸必须对得上。页数闸写死 200 页时，默认 page_size=200 只能翻到
+        40,000 行——一张 45,000 行的合法大表会被页数闸拦下，
+        而它明明没超过 50,000 行的行数硬上限。"""
+        for page_size in (100, 200, 500):
+            with self.subTest(page_size=page_size):
+                reachable = feishu._page_limit(page_size) * page_size
+                self.assertGreaterEqual(reachable, feishu.MAX_RECORDS_HARD_CAP)
+
     def test_repeated_page_token_aborts(self):
         calls = {"n": 0}
 

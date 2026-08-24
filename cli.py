@@ -239,7 +239,7 @@ def _bool_env(name: str, default: bool) -> bool:
     sys.exit(f"环境变量 {name} 的值 {raw!r} 看不懂，填 1/0（或 true/false）")
 
 
-def _settings() -> Settings:
+def build_settings() -> Settings:
     _apply_endpoint_overrides()
     apply_pricing_overrides()
     settings = Settings()
@@ -499,7 +499,7 @@ def _doctor_table(settings: Settings, table: feishu.Bitable) -> int:
 
 def cmd_doctor(selected: list[str] | None = None) -> int:
     """上线前体检。不花一分钱，但能挡掉九成的「配好了跑不通」。"""
-    settings = _settings()
+    settings = build_settings()
     tables = _tables(selected)
     total = 0
     for index, (label, table) in enumerate(tables):
@@ -707,7 +707,7 @@ def _event_sink():
 
 def _run(mode: str, record_ids: list[str] | None,
          selected: list[str] | None = None) -> int:
-    settings = _settings()
+    settings = build_settings()
     api_keys = _api_keys()
     if not api_keys:
         sys.exit("一个数据通道的 Key 都没配：需要 TIKHUB_API_KEY 或 SOCIALDATAX_API_KEY"

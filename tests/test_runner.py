@@ -1060,6 +1060,49 @@ class TestRunBudget(RunnerTest):
         self.assertLess(cheap, after_tikhub_died)
         self.assertAlmostEqual(after_tikhub_died, 0.20, places=6)
 
+    def test_reservation_is_pessimistic_so_the_cap_cannot_be_crossed(self):
+        """预留时主通道健康、跑到一半它倒了 —— 这一行就走了贵十几倍的备胎。
+
+        乐观预留下 settle() 是**事后**校正：等它反应过来，钱已经花出去，
+        MAX_YUAN_PER_RUN 在这一行上已经被越过。所以预留必须按
+        「可能走到的最贵那家」算。
+        """
+        from xhsearch.rows import estimate_yuan
+
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7412345678901234567",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        keys = {"tikhub": "t", "socialdatax": "s"}
+        optimistic = estimate_yuan([row], self.settings, NOW, keys=keys)
+        pessimistic = estimate_yuan([row], self.settings, NOW, keys=keys, worst_case=True)
+        self.assertAlmostEqual(optimistic, 0.0144, places=4)   # TikHub 两次
+        self.assertAlmostEqual(pessimistic, 0.20, places=4)    # SocialDataX 两次
+
+        # 上限落在两者之间时，悲观预留必须把这一行拦下
+        budget = runner.RunBudget(runner.Budget(max_yuan_per_run=0.10))
+        self.assertFalse(budget.reserve(2, pessimistic))
+        self.assertIn("金额上限", budget.stopped_reason)
+
+    def test_optimistic_estimate_stays_the_default_for_human_facing_numbers(self):
+        """报给人看的「预计花费」仍用乐观口径——按最贵的报会让每次估算虚高。"""
+        from xhsearch.rows import estimate_yuan
+
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7412345678901234567",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        keys = {"tikhub": "t", "socialdatax": "s"}
+        self.assertLess(estimate_yuan([row], self.settings, NOW, keys=keys),
+                        estimate_yuan([row], self.settings, NOW, keys=keys, worst_case=True))
+
+    def test_transport_retries_are_counted_as_real_calls(self):
+        """一个「计划中的调用」在传输层可能变成 3 个真实请求，降级还会再打
+        另一家。按计划数记账会让 MAX_CALLS_PER_RUN 名不副实。"""
+        budget = runner.RunBudget(runner.Budget(max_calls_per_run=100))
+        self.assertTrue(budget.reserve(2, 0.0))
+        self.assertEqual(budget.calls, 2)
+        budget.settle(0.0, 0.0, 2, 6)      # 实际发了 6 个 HTTP 请求
+        self.assertEqual(budget.calls, 6)
+
     def test_actual_spend_is_settled_back_into_the_budget(self):
         """跑到一半降级到更贵的那家（预留时它还健康）会超出预留额。
         不校正的话，后面的行是拿一个假的余量在放行。"""
