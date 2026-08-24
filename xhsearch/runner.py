@@ -116,17 +116,33 @@ class _Abort(Exception):
 
 
 def _looks_alive(snapshot: Optional[analyze.Snapshot]) -> bool:
-    """这一轮有没有拿到「这篇内容还活着」的正面证据。
+    """这一轮有没有拿到「这篇内容还活着」的**强**证据——非零互动数。
 
-    有评论、或者评论数/点赞数/收藏数任何一个大于 0，都算见到活的——
-    detail 接口能返回非零互动数，说明这篇笔记就在那里。之前只认评论数，
-    一条有点赞没评论的帖子明明数据都写进表了，存活勾却一直空着。
-    全为 0 仍然不算证据——刚发的帖子和已经没了的帖子都是 0。
+    只用于内部抗拒矛盾死讯（见下面 GONE 分支）：评论接口刚拿回非零互动数，
+    detail 却说笔记不存在，那是上游自相矛盾，这时候才有资格不信 detail。
+    「已确认存活」复选框走的是更宽松的 _measured_this_round，不用这个。
     """
     if snapshot is None:
         return False
     return (bool(snapshot.comments) or bool(snapshot.comment_count)
             or bool(snapshot.like_count) or bool(snapshot.collect_count))
+
+
+def _measured_this_round(snapshot: Optional[analyze.Snapshot]) -> bool:
+    """这一轮有没有真的量到至少一个数字——哪怕量到的是 0。
+
+    区分「量到了、就是 0」和「压根没量到」：评论数/点赞数/收藏数任一
+    不是 None（哪怕是 0）都算量到了——这本身就证明这篇内容这一轮被
+    成功巡查到，不需要数字非零才算存活。压根没量到的是评论页空壳
+    （items 为空且 comment_count 是 None）又赶上 detail 兜底也失败的
+    轮次：这一轮对存亡什么信息都没拿到，不该拿它去盖章。
+    """
+    if snapshot is None:
+        return False
+    return (bool(snapshot.comments)
+            or snapshot.comment_count is not None
+            or snapshot.like_count is not None
+            or snapshot.collect_count is not None)
 
 
 @dataclass
@@ -624,9 +640,10 @@ def refresh(
         outcome = finish(row, verdict, snapshot, status=STATUS_OK,
                          credits=credits, cost_yuan=cost_yuan)
         outcome.fields[f.consecutive_failures] = 0
-        # 「已确认存活」要有正面证据才勾：拿到评论或评论数才算见到活的。
-        # 评论页空壳 + detail 兜底失败的轮次没有任何存亡证据，复选框不动。
-        if _looks_alive(snapshot):
+        # 「已确认存活」只要这一轮真的量到了数字（哪怕是 0）就打勾——
+        # 巡查状态=正常本身就是这篇内容还在的证明，不需要互动数字非零。
+        # 评论页空壳 + detail 兜底也失败的轮次对存亡零信息，复选框不动。
+        if _measured_this_round(snapshot):
             outcome.fields[f.alive_confirmed] = True
         return outcome
 

@@ -595,18 +595,22 @@ class TestAliveConfirmed(RunnerTest):
         self.assertEqual(outcome.status, runner.STATUS_OK)
         self.assertIs(outcome.fields[self.settings.fields.alive_confirmed], True)
 
-    def test_zero_engagement_round_still_leaves_box_alone(self):
-        """互动全为 0 依然不算证据——刚发的帖子和已经没了的帖子都是 0。"""
+    def test_zero_engagement_round_still_ticks_the_box(self):
+        """互动全为 0 但确实是「量到的」（不是 None）——本轮巡查成功本身
+        就证明这篇内容还在，不需要互动数字非零才算存活。"""
         report = self.run_with(
             [sse({"items": [], "comment_count": 0, "points": {"cost": 10, "balance": 1}}),
              sse({"like_count": 0, "collect_count": 0, "comment_count": 0,
                   "points": {"cost": 10, "balance": 1}})],
             [xhs_row()],
         )
-        self.assertNotIn(self.settings.fields.alive_confirmed, report.outcomes[0].fields)
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_OK)
+        self.assertIs(outcome.fields[self.settings.fields.alive_confirmed], True)
 
     def test_ok_round_without_evidence_leaves_box_alone(self):
-        """评论页空壳 + detail 兜底失败：这一轮「成功」但对存亡零证据。
+        """评论页空壳（comment_count 是 None，不是 0）+ detail 兜底也失败：
+        这一轮「成功」但对存亡零信息（压根没量到任何数字）。
         勾上「已确认存活」等于替上游缺数作保——复选框必须原样不动。"""
         row = Row(record_id="d1",
                   link_cell="https://www.douyin.com/video/7123456789012345678",
