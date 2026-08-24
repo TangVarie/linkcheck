@@ -910,5 +910,215 @@ class TestSharedRunBudget(RunnerTest):
         self.assertIn("socialdatax", shared)
 
 
+class TestBreakerLeavesSchedulingUntouched(RunnerTest):
+    """COR-003：熔断承诺的是「宁可这一轮什么都不写」，那就要真的什么都不写。
+
+    只撤销标签、却仍然带着「最近检查时间=现在」和「排队刷新=False」落表，
+    等于告诉调度器这一行本轮处理完了：运营的手动请求被吞掉，
+    sweep 下一次还要等 8–72 小时才复查。"""
+
+    def _queued_gone_rows(self, n):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"q{i}")
+            row.consecutive_failures = 1
+            row.queued = True
+            rows.append(row)
+        return rows
+
+    def test_tripped_rows_do_not_advance_time_or_clear_the_queue_flag(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._queued_gone_rows(12))
+        self.assertTrue(report.breaker_tripped)
+        f = self.settings.fields
+        for outcome in report.outcomes:
+            self.assertNotIn(f.last_updated, outcome.fields,
+                             "熔断行不该推进最近检查时间")
+            self.assertNotIn(f.queued, outcome.fields,
+                             "熔断行不该清掉排队刷新的勾")
+            # 状态和诊断仍要写：运营得看得见发生了什么
+            self.assertEqual(outcome.fields[f.refresh_status], runner.STATUS_FAILED)
+            self.assertIn("疑似上游故障", outcome.fields[f.failure_reason])
+
+    def test_healthy_rows_in_the_same_batch_still_advance_time(self):
+        """熔断只作废失效判定，同一批里正常完成的行照常落表。"""
+        rows = self._queued_gone_rows(11) + [xhs_row("ok1")]
+        responses = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            responses["n"] += 1
+            if responses["n"] <= 11:
+                return err(200, 1003, "未找到对应内容")
+            return sse(comment_page(count=150))
+
+        report = self.run_with(responder, rows)
+        self.assertTrue(report.breaker_tripped)
+        healthy = [o for o in report.outcomes if o.record_id == "ok1"][0]
+        self.assertEqual(healthy.status, runner.STATUS_OK)
+        self.assertIn(self.settings.fields.last_updated, healthy.fields)
+
+
+class TestRowLevelExceptionIsolation(RunnerTest):
+    """ROB-003：一行抛出未预期的异常，不该让整表已经付过钱的结果一条都不写回。"""
+
+    def test_one_exploding_row_does_not_take_down_the_batch(self):
+        boom = xhs_row("boom")
+
+        real_plan = runner.plan_calls
+
+        def flaky_plan(row, settings, now=None):
+            if row.record_id == "boom":
+                raise RuntimeError("上游形状漂移导致的内部错误")
+            return real_plan(row, settings, now)
+
+        with mock.patch.object(runner, "plan_calls", side_effect=flaky_plan):
+            report = self.run_with(
+                lambda *a, **k: sse(comment_page(count=150)),
+                [xhs_row("a"), boom, xhs_row("c")])
+
+        by_id = {o.record_id: o for o in report.outcomes}
+        self.assertEqual(len(report.outcomes), 3)
+        self.assertEqual(by_id["a"].status, runner.STATUS_OK)
+        self.assertEqual(by_id["c"].status, runner.STATUS_OK)
+        self.assertEqual(by_id["boom"].status, runner.STATUS_FAILED)
+        self.assertIn("RuntimeError", by_id["boom"].reason)
+
+
+class TestPointsBalanceIsNotRaceDependent(RunnerTest):
+    """ROB-012：余额随消费单调下降，最终该显示**最小**的那个，
+    而不是「最后一个线程恰好写进去的那个」——一个会高报余额的资金监控
+    比没有监控更危险。"""
+
+    def test_lowest_balance_wins(self):
+        balances = [1000, 980, 990]
+        state = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            index = state["n"] % len(balances)
+            state["n"] += 1
+            return sse(comment_page(count=30, balance=balances[index]))
+
+        self.settings.detail_within_days = 0     # 每行只发一个请求，balance 一一对应
+        report = self.run_with(responder, [xhs_row(f"r{i}") for i in range(3)])
+        self.assertEqual(report.points_balance, 980)
+
+
+class TestRunBudget(RunnerTest):
+    """SUP-001：预算是**发请求之前**预留的，不是事后统计。"""
+
+    def test_row_limit_stops_dispatch_and_leaves_the_rest_untouched(self):
+        self.settings.budget.max_records_per_run = 2
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return sse(comment_page(count=30))
+
+        self.settings.detail_within_days = 0
+        rows = [xhs_row(f"r{i}") for i in range(5)]
+        report = self.run_with(responder, rows)
+        done = [o for o in report.outcomes if o.status == runner.STATUS_OK]
+        deferred = [o for o in report.outcomes if o.status == runner.STATUS_DEFERRED]
+        self.assertEqual(len(done), 2)
+        self.assertEqual(len(deferred), 3)
+        self.assertEqual(posts["n"], 2, "超预算的行一个请求都不该发")
+        # 顺延的行完全不写回：排队勾和最近检查时间都保持原样
+        for outcome in deferred:
+            self.assertEqual(outcome.fields, {})
+        self.assertIn("行数上限", report.budget_stopped)
+
+    def test_yuan_limit_is_reserved_before_spending(self):
+        self.settings.detail_within_days = 0
+        # SocialDataX 一次调用 ¥0.10，预算 ¥0.25 只够两行
+        self.settings.budget.max_yuan_per_run = 0.25
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return sse(comment_page(count=30))
+
+        report = self.run_with(responder, [xhs_row(f"r{i}") for i in range(5)])
+        self.assertEqual(posts["n"], 2)
+        self.assertIn("金额上限", report.budget_stopped)
+
+    def test_budget_is_shared_across_tables(self):
+        """预算是整次运行的，不是每张表各领一份。"""
+        self.settings.detail_within_days = 0
+        budget = runner.RunBudget(runner.Budget(max_records_per_run=2))
+        first = self.run_with(lambda *a, **k: sse(comment_page(count=30)),
+                              [xhs_row("a1"), xhs_row("a2")], budget=budget)
+        second = self.run_with(lambda *a, **k: sse(comment_page(count=30)),
+                               [xhs_row("b1")], budget=budget)
+        self.assertEqual(first.counts().get(runner.STATUS_OK), 2)
+        self.assertEqual(second.outcomes[0].status, runner.STATUS_DEFERRED)
+
+
+class TestGracefulStop(RunnerTest):
+    """ROB-009：收到 SIGTERM 后停止派发新行，语义和软截止完全一致——
+    没轮到的行一个字段都不写，下一轮自然重捞。"""
+
+    def test_stop_event_defers_remaining_rows(self):
+        import threading
+
+        stop = threading.Event()
+        stop.set()
+        with mock.patch.object(transport, "post") as posted:
+            report = runner.refresh([xhs_row()], "fake-key", self.settings,
+                                    now=NOW, stop=stop)
+        posted.assert_not_called()
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_DEFERRED)
+        self.assertEqual(report.outcomes[0].fields, {})
+
+
+class TestTagWriteBackIsOptimisticallyConcurrent(RunnerTest):
+    """COR-002：读表和写回之间隔着几分钟的付费调用。运营在这几分钟里
+    手工加的人工标签，绝不能被按旧快照算出来的整列值覆盖。"""
+
+    class _FakeTable:
+        def __init__(self, fresh_tags, field_name, fail=False):
+            self.fresh_tags = fresh_tags
+            self.field_name = field_name
+            self.fail = fail
+            self.updates = None
+
+        def batch_get(self, record_ids):
+            if self.fail:
+                raise RuntimeError("重读失败")
+            return [{"record_id": rid, "fields": {self.field_name: list(self.fresh_tags)}}
+                    for rid in record_ids]
+
+        def batch_update(self, updates, errors=None):
+            self.updates = updates
+            return len(updates)
+
+    def _report_with_tags(self):
+        return self.run_with(
+            [sse(comment_page(count=150)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(tags=["已复盘"])])
+
+    def test_tag_added_during_the_run_survives(self):
+        f = self.settings.fields
+        report = self._report_with_tags()
+        self.assertIn("已复盘", report.outcomes[0].fields[f.traffic_status])
+        # 运行期间运营又加了「客户已确认」
+        table = self._FakeTable(["已复盘", "客户已确认"], f.traffic_status)
+        runner.write_back(table, report)
+        written = table.updates[0]["fields"][f.traffic_status]
+        self.assertIn("已复盘", written)
+        self.assertIn("客户已确认", written, "运行期间新增的人工标签被覆盖了")
+        self.assertIn("大爆", written)          # 机器标签照常写
+
+    def test_reread_failure_leaves_the_column_alone(self):
+        """重读失败时宁可这一轮不打机器标签，也不能拿旧快照赌一把。"""
+        f = self.settings.fields
+        report = self._report_with_tags()
+        table = self._FakeTable([], f.traffic_status, fail=True)
+        runner.write_back(table, report)
+        self.assertNotIn(f.traffic_status, table.updates[0]["fields"])
+        # 其余列照常写，不受影响
+        self.assertIn(f.refresh_status, table.updates[0]["fields"])
+
+
 if __name__ == "__main__":
     unittest.main()

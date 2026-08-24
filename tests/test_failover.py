@@ -410,6 +410,120 @@ class TestFailoverMetricHonesty(FailoverTest):
         self.assertEqual(report.failovers, 0)
         self.assertNotIn("降级", report.summary())
 
+    def test_already_disabled_primary_is_not_counted_as_a_failover(self):
+        """COR-008：主通道在本轮早些时候已经被判死之后，后面每一行都直接
+        走备胎——那不是「这一行发生了降级」。
+
+        漏掉这条，降级次数会被持续高估，而降级率恰恰是判断主通道健康度的
+        那个指标：运营会照着一个虚高的数字去查一个已经查过的故障。
+        """
+        report = self.run_with(
+            on_get=lambda i: self.fail("TikHub 已被判死，不该再打它"),
+            on_post=lambda i: [sdx_ok_comments(), sdx_ok_detail()][i],
+            disabled={"tikhub"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.failovers, 0)
+
+    def test_first_failure_of_the_run_still_counts_as_a_failover(self):
+        """反面：主通道是在这一行**当场**倒下的，那就是真的降级，必须记。"""
+        report = self.run_with(
+            on_get=lambda i: tikhub_err(500, "服务暂时不可用"),
+            on_post=lambda i: [sdx_ok_comments(), sdx_ok_detail()][i],
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertGreaterEqual(report.failovers, 1)
+
+
+class TestPlatformScopedAbort(FailoverTest):
+    """COR-004：一个平台的通道全倒，不该让另一个平台的健康行也停摆。
+
+    场景来自审计报告：xhs 只配了一条已失效的 TikHub，douyin 配着健康的
+    SocialDataX。整批级中止会让抖音那些本来能跑完的行全部顺延——
+    一个平台的配置故障拖停另一个平台，丢掉本可完成的监控。
+    """
+
+    def _douyin_row(self, record_id="dy1") -> Row:
+        return Row(record_id=record_id,
+                   link_cell="https://www.douyin.com/video/7412345678901234567",
+                   publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+
+    def test_dead_xhs_channel_does_not_stop_healthy_douyin_rows(self):
+        self.settings.channels = Channels(order={"xhs": ["tikhub"],
+                                                 "douyin": ["socialdatax"]})
+        report = self.run_with(
+            on_get=lambda i: tikhub_err(401, "无效的API令牌"),
+            on_post=lambda i: [sdx_ok_comments(count=12), sdx_ok_detail()][i],
+            rows=[xhs_row("x1"), self._douyin_row("d1")],
+        )
+        by_id = {o.record_id: o for o in report.outcomes}
+        self.assertEqual(by_id["x1"].status, runner.STATUS_DEFERRED)
+        self.assertEqual(by_id["d1"].status, runner.STATUS_OK,
+                         "抖音有健康通道，不该被小红书的配置故障拖停")
+        self.assertIn("xhs", report.dead_platforms)
+        self.assertNotIn("douyin", report.dead_platforms)
+
+    def test_all_platforms_dead_still_reports_fatal(self):
+        self.settings.channels = Channels(order={"xhs": ["tikhub"],
+                                                 "douyin": ["tikhub"]})
+        report = self.run_with(
+            on_get=lambda i: tikhub_err(401, "无效的API令牌"),
+            on_post=lambda i: self.fail("没配 douyin 的备胎"),
+            rows=[xhs_row("x1"), self._douyin_row("d1")],
+            keys={"tikhub": "t-key"},
+        )
+        self.assertTrue(report.fatal)
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_DEFERRED)
+            self.assertEqual(outcome.fields, {})
+
+
+class TestSocialDataXShapeIsFailClosed(FailoverTest):
+    """COR-005：成功响应的形状不符时必须**失败关闭**。
+
+    原来是失败开放：任何 HTTP<400、能解析成 dict、又没有 code 字段的 body
+    都算成功。网关兜底返回 `{"message":"gateway fallback"}` 时，这一行会被
+    记成巡查正常——死亡计数清零、最近检查时间推进、排队勾清掉，
+    表上一切正常，实际这一轮什么都没量到。
+    """
+
+    def test_message_only_body_is_not_success(self):
+        gateway = transport.Response(
+            200, "application/json", json.dumps({"message": "gateway fallback"}), "gw-1")
+        report = self.run_with(
+            on_get=lambda i: self.fail("只配了 SocialDataX"),
+            on_post=lambda i: gateway,
+            keys={"socialdatax": "s-key"},
+        )
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_FAILED)
+        self.assertIn("形状不对", outcome.reason)
+        # 关键：不能推进成功路径的那几个副作用
+        f = self.settings.fields
+        self.assertNotIn(f.consecutive_failures, outcome.fields)
+        self.assertNotIn(f.alive_confirmed, outcome.fields)
+
+    def test_empty_object_is_not_success(self):
+        empty = transport.Response(200, "application/json", "{}", "gw-2")
+        report = self.run_with(
+            on_get=lambda i: self.fail("只配了 SocialDataX"),
+            on_post=lambda i: empty,
+            keys={"socialdatax": "s-key"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
+
+    def test_zero_comment_page_is_still_a_valid_success(self):
+        """空 items 是合法的成功（真的零评论），不能被这道闸误伤。"""
+        page = transport.Response(200, "application/json", json.dumps({
+            "items": [], "comment_count": 0, "top_level_comment_count": 0,
+            "points": {"cost": 10, "balance": 10}}), "sdx-0")
+        report = self.run_with(
+            on_get=lambda i: self.fail("只配了 SocialDataX"),
+            on_post=lambda i: [page, sdx_ok_detail()][i],
+            keys={"socialdatax": "s-key"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+
 
 if __name__ == "__main__":
     unittest.main()
