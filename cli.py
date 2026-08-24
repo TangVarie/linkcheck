@@ -705,6 +705,11 @@ def _run(mode: str, record_ids: list[str] | None,
                   "  如果这是误报（比如上一轮真的挂死了），删掉锁文件即可；"
                   "  锁文件路径可用 RUN_LOCK_PATH 指定。")
             return 0     # 正常跳过，不是失败——返回非零会让云平台反复重启
+        except OSError as exc:
+            # 锁文件所在目录不可写（只读根文件系统、权限不对）：这不该
+            # 让整轮跑不起来，但必须吵闹——此刻是没有互斥保护在跑的。
+            print(f"⚠ 拿不到运行租约的锁文件（{exc}）：本轮**没有**跨进程互斥保护。"
+                  "  设一个可写的 RUN_LOCK_PATH，或确认只有一个调度器在跑。")
     try:
         return _run_locked(mode, record_ids, selected, settings, api_keys)
     finally:
