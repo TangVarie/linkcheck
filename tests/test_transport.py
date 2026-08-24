@@ -180,9 +180,22 @@ class TestRetryBehaviour(unittest.TestCase):
             resp = transport.get("https://x", {})
         self.assertEqual(resp.retry_after, transport.MAX_RETRY_AFTER_SECONDS)
 
-        with _urlopen_returning(_ChunkedResp(b"x", headers={"Retry-After": "不是数字"})):
-            resp = transport.get("https://x", {})
-        self.assertIsNone(resp.retry_after)
+    def test_malformed_retry_after_does_not_destroy_the_response(self):
+        """`parsedate_to_datetime` 对畸形日期是抛 ValueError 而不是返回 None。
+
+        漏掉那个 except，一个坏响应头会顺着 _read 炸到 _perform 的兜底里，
+        把整条响应换成合成的「网络错误」：429 的真实状态码和 body 全丢，
+        上层看到的是一次网络故障而不是限流。
+        """
+        for bad in ("不是数字", "garbage", "Mon, 99 Xxx 2026"):
+            with self.subTest(bad):
+                with _urlopen_returning(_ChunkedResp(
+                        b'{"code":1429,"message":"too fast"}', status=429,
+                        headers={"Retry-After": bad})):
+                    resp = transport.get("https://x", {})
+                self.assertEqual(resp.status, 429, "真实状态码必须保住")
+                self.assertIn("too fast", resp.body, "真实 body 必须保住")
+                self.assertIsNone(resp.retry_after)
 
 
 if __name__ == "__main__":

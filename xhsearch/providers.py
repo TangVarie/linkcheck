@@ -266,9 +266,15 @@ def _sdx_parse(platform: str, purpose: str, http_status: int, content_type: str,
     if problem is None:
         return result
     # 形状不符：记成行级失败并把脱敏后的片段带上，方便对着 request_id 找厂商。
+    #
+    # 分类用 TRANSPORT 而不是 UNKNOWN，因为 Failure 决定的是「这次失败该怎么办」
+    # 而不是「错在哪」：这是**这一家**的契约坏了，正确处置就是换另一家试试。
+    # 归 UNKNOWN 的话它不在 FAILOVER_KINDS 里，配好的备胎一次都不会被尝试——
+    # 主通道 schema 一漂移就是整轮全灭，而旁边有条好通道闲着，
+    # 那正好否定了双通道存在的理由。
     snippet = json.dumps(result.data, ensure_ascii=False)[:300]
     return Err(
-        Failure.UNKNOWN, "unexpected_shape",
+        Failure.TRANSPORT, "unexpected_shape",
         f"{platform}/{purpose} 的成功响应形状不对（{problem}）：{snippet}",
         http_status=http_status, request_id=result.request_id or request_id,
     )
@@ -456,7 +462,9 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
     inner = payload.get("data")
     if not isinstance(inner, dict):
         # 先脱敏再截断：反过来的话，Key 恰好横跨截断边界时会有半截漏出去。
-        return Err(Failure.UNKNOWN, "no_data",
+        # TRANSPORT（而不是 UNKNOWN）：成功信封里连 data 都没有 = 这家的契约坏了，
+        # 该换另一家试试，而不是把行判死然后接着捶同一个坏通道。
+        return Err(Failure.TRANSPORT, "no_data",
                    _redact(json.dumps(payload, ensure_ascii=False), api_key)[:300],
                    http_status=http_status, request_id=request_id)
 
@@ -484,7 +492,8 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
         if note_list and not isinstance(note_list, list):
             # 有内容但形状不认识（比如上游把 list 改成了 dict）：这是协议漂移，
             # 不是「笔记没了」。硬下 [0] 会 KeyError 炸穿；按 GONE 定罪更是误杀。
-            return Err(Failure.UNKNOWN, "unexpected_shape",
+            # 分类同 _sdx_shape_error：这家的契约坏了 → 换另一家试试。
+            return Err(Failure.TRANSPORT, "unexpected_shape",
                        _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
                        http_status=http_status, request_id=request_id)
         if not note_list:

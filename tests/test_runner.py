@@ -1041,6 +1041,34 @@ class TestRunBudget(RunnerTest):
         self.assertEqual(posts["n"], 2)
         self.assertIn("金额上限", report.budget_stopped)
 
+    def test_reservation_uses_the_channel_that_will_actually_run(self):
+        """主通道已被判死时，这一行**实际**走的是备胎，两家单价能差 14 倍。
+
+        按被禁用的便宜通道预留，`MAX_YUAN_PER_RUN` 就不再是上限：
+        抖音一行按 TikHub 预留 ¥0.0144、实际按 SocialDataX 花 ¥0.20，
+        预算 ¥1 能放行十几倍的开销。
+        """
+        from xhsearch.rows import estimate_yuan
+
+        row = Row(record_id="d1",
+                  link_cell="https://www.douyin.com/video/7412345678901234567",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        keys = {"tikhub": "t", "socialdatax": "s"}
+        cheap = estimate_yuan([row], self.settings, NOW, keys=keys)
+        after_tikhub_died = estimate_yuan([row], self.settings, NOW, keys=keys,
+                                          disabled={"tikhub"})
+        self.assertLess(cheap, after_tikhub_died)
+        self.assertAlmostEqual(after_tikhub_died, 0.20, places=6)
+
+    def test_actual_spend_is_settled_back_into_the_budget(self):
+        """跑到一半降级到更贵的那家（预留时它还健康）会超出预留额。
+        不校正的话，后面的行是拿一个假的余量在放行。"""
+        budget = runner.RunBudget(runner.Budget(max_yuan_per_run=1.0))
+        self.assertTrue(budget.reserve(2, 0.02))
+        self.assertAlmostEqual(budget.yuan, 0.02, places=6)
+        budget.settle(0.02, 0.20, 2, 2)      # 实际按备胎的价花掉了
+        self.assertAlmostEqual(budget.yuan, 0.20, places=6)
+
     def test_budget_is_shared_across_tables(self):
         """预算是整次运行的，不是每张表各领一份。"""
         self.settings.detail_within_days = 0
@@ -1068,6 +1096,46 @@ class TestGracefulStop(RunnerTest):
         posted.assert_not_called()
         self.assertEqual(report.outcomes[0].status, runner.STATUS_DEFERRED)
         self.assertEqual(report.outcomes[0].fields, {})
+
+
+class TestStructuredEventsSeeTheFinalStatus(RunnerTest):
+    """事件必须在**所有**熔断定案之后才发。
+
+    在行跑完时就发的话，一旦事后触发熔断，原本记成「已失效」的行会被
+    改写成「刷新失败」再落表——看板和告警消费到的就是一个比表里更吓人的
+    结论，而这恰恰发生在上游故障、最不该误报的时候。
+    """
+
+    def _gone_rows(self, n):
+        rows = []
+        for i in range(n):
+            row = xhs_row(f"g{i}")
+            row.consecutive_failures = 1
+            rows.append(row)
+        return rows
+
+    def test_events_report_the_post_breaker_status(self):
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(12))
+        self.assertTrue(report.breaker_tripped)
+
+        events: list = []
+        runner.emit_run_events(report, events.append, table="表A")
+        self.assertEqual(len(events), 12)
+        for event in events:
+            self.assertEqual(event["status"], runner.STATUS_FAILED)
+            self.assertTrue(event["breaker_tripped"])
+            self.assertEqual(event["table"], "表A")
+
+    def test_a_broken_sink_never_breaks_the_run(self):
+        report = self.run_with([sse(comment_page(count=150)),
+                                sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+                               [xhs_row()])
+
+        def exploding(_event):
+            raise RuntimeError("日志后端挂了")
+
+        runner.emit_run_events(report, exploding)   # 不抛异常即通过
 
 
 class TestTagWriteBackIsOptimisticallyConcurrent(RunnerTest):

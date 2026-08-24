@@ -29,9 +29,9 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from xhsearch.envfile import load_dotenv  # noqa: E402
+import cli  # noqa: E402  —— 复用同一份 .env 加载（看不懂的行当场拒跑）
 
-load_dotenv()   # 本地跑时补上 .env 里的 Key；已存在的环境变量优先
+cli.load_env_or_exit()   # 本地跑时补上 .env 里的 Key；已存在的环境变量优先
 
 from xhsearch import analyze, providers, transport  # noqa: E402
 from xhsearch.config import Settings  # noqa: E402

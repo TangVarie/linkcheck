@@ -208,6 +208,23 @@ class RunBudget:
             self.yuan += yuan
             return True
 
+    def settle(self, reserved_yuan: float, actual_yuan: float,
+               reserved_calls: int, actual_calls: int) -> None:
+        """一行跑完后按**实际**花销校正账面。
+
+        预留是按「此刻看起来会走哪家」算的，但一行跑到一半仍可能降级到更贵的
+        那家（预留时它还是健康的），或者少发一个请求。不校正的话账面会持续
+        偏离真实开销，后面的行就是拿一个假的余量在放行——
+        广告出去的硬上限必须真的是上限。
+        """
+        with self._lock:
+            self.yuan += max(0.0, actual_yuan) - max(0.0, reserved_yuan)
+            self.calls += max(0, actual_calls) - max(0, reserved_calls)
+            if self.yuan < 0:
+                self.yuan = 0.0
+            if self.calls < 0:
+                self.calls = 0
+
 
 def _looks_alive(snapshot: Optional[analyze.Snapshot]) -> bool:
     """这一轮有没有拿到「这篇内容还活着」的**强**证据——非零互动数。
@@ -519,7 +536,6 @@ def refresh(
     disabled: Optional[set[str]] = None,
     budget: Optional[RunBudget] = None,
     stop: Optional[threading.Event] = None,
-    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> RunReport:
     """刷新一批行。不写回，只算结果——写回由调用方决定时机。
 
@@ -540,7 +556,9 @@ def refresh(
     stop 是优雅停机的开关（SIGTERM/SIGINT）：置位后不再派发新行，
     已经在跑的行跑完，结果照常返回给调用方写回。
 
-    on_event 收结构化事件（每行一条 dict），用来出 JSON 日志/指标。
+    结构化事件不在这里发：熔断（尤其是跨表熔断，发生在调用方那一层）会把
+    已失效/疑似受限改写成刷新失败，在这里发等于让告警看到一个比实际落表
+    **更吓人**的结论。用 emit_run_events()，在所有熔断都定案之后再发。
     """
     now = now or datetime.now(timezone.utc)
     if deadline is None:
@@ -694,8 +712,12 @@ def refresh(
                            f"{settings.safety.cooldown_seconds} 秒内刚刷过，跳过（不计费）", 0)
 
         # —— 预算：在发请求**之前**预留（SUP-001）——
+        # 预留价必须按**此刻真正可用**的通道算：主通道已经被判死时，这一行
+        # 实际走的是备胎，而两家单价能差 14 倍。传 disabled 进去，
+        # 否则 MAX_YUAN_PER_RUN 会被超出十几倍。
         planned = plan_calls(row, settings, now)
-        if not budget.reserve(len(planned), estimate_yuan([row], settings, now, keys=keys)):
+        reserved_yuan = estimate_yuan([row], settings, now, keys=keys, disabled=disabled)
+        if not budget.reserve(len(planned), reserved_yuan):
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
 
@@ -705,12 +727,17 @@ def refresh(
                 disabled=disabled, tally=tally, lock=lock,
             )
         except _Abort as exc:
+            # 中止的行也可能已经花过钱：按实际花销校正账面再走。
+            budget.settle(reserved_yuan, exc.yuan, len(planned), 0)
             with lock:
                 dead_platforms.setdefault(exc.platform or platform, exc.reason)
             # 这一行没有完整结论，不写回；但已经花掉的钱要入账。
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            f"{exc.platform or platform} 平台中止：{exc.reason[:150]}",
                            exc.credits, exc.yuan)
+        # 跑到一半降级到更贵的那家（预留时它还健康）会让实际开销超过预留额，
+        # 这里按实际值校正，后面的行才是拿真实余量在放行。
+        budget.settle(reserved_yuan, cost_yuan, len(planned), len(planned))
         with lock:
             report.failovers += failovers
 
@@ -823,27 +850,11 @@ def refresh(
                 reason,
             )
 
-    def emit(outcome: Outcome) -> None:
-        if on_event is None:
-            return
-        try:
-            on_event({
-                "record_id": outcome.record_id,
-                "status": outcome.status,
-                "reason": outcome.reason,
-                "cost_yuan": round(outcome.cost_yuan, 6),
-                "credits": outcome.credits,
-                "failure_code": outcome.failure_code,
-            })
-        except Exception:  # noqa: BLE001 —— 日志出问题绝不能影响业务流程
-            pass
-
     pending = list(rows)
     with ThreadPoolExecutor(max_workers=max(1, settings.max_concurrency)) as pool:
         for outcome in pool.map(guarded, pending):
             report.outcomes.append(outcome)
             say(f"  {outcome.record_id} → {outcome.status} {outcome.reason}".rstrip())
-            emit(outcome)
 
     report.dead_platforms = dict(dead_platforms)
     report.budget_stopped = budget.stopped_reason
@@ -860,6 +871,34 @@ def refresh(
     report.used_providers = dict(tally)
     _apply_circuit_breaker(report, settings)
     return report
+
+
+def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]], None]],
+                    **context: Any) -> None:
+    """把这份 report 的每一行发成一条结构化事件。
+
+    **必须在所有熔断都定案之后调用**（单表熔断在 refresh 末尾、跨表熔断在
+    调用方那一层）。在行跑完时就发的话，一旦事后触发熔断，
+    原本记成「已失效」的行会被改写成「刷新失败」再落表——
+    看板和告警消费到的就是一个比表里更吓人的结论，
+    而这恰恰发生在上游故障、最不该误报的时候。
+    """
+    if sink is None:
+        return
+    for outcome in report.outcomes:
+        try:
+            sink({
+                **context,
+                "record_id": outcome.record_id,
+                "status": outcome.status,
+                "reason": outcome.reason,
+                "cost_yuan": round(outcome.cost_yuan, 6),
+                "credits": outcome.credits,
+                "failure_code": outcome.failure_code,
+                "breaker_tripped": report.breaker_tripped,
+            })
+        except Exception:  # noqa: BLE001 —— 日志出问题绝不能影响业务流程
+            pass
 
 
 def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:

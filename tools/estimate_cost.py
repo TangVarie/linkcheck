@@ -23,10 +23,18 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+import cli  # noqa: E402  —— 复用同一份 .env 加载和计价覆盖，见 main()
 from xhsearch import providers  # noqa: E402
 from xhsearch.config import Settings  # noqa: E402
 
-YUAN_PER_CALL = 0.10  # SocialDataX 单价，用作对照基准
+
+def _yuan_per_call() -> float:
+    """SocialDataX 单价，用作对照基准。
+
+    每次调用时现取，不在导入时固化：计价覆盖是在 main() 里应用的，
+    模块级常量会把覆盖前的旧价钉死。
+    """
+    return providers.SOCIALDATAX_YUAN
 
 
 def tier_segments(settings: Settings) -> list[tuple[float, float, int]]:
@@ -127,8 +135,8 @@ def estimate(per_day: float, xhs_share: float, settings: Settings) -> dict:
         "calls_per_day": total_calls,
         "xhs_calls_per_day": xhs_calls,
         "douyin_calls_per_day": dy_calls,
-        "yuan_per_day": total_calls * YUAN_PER_CALL,
-        "yuan_per_month": total_calls * YUAN_PER_CALL * 30,
+        "yuan_per_day": total_calls * _yuan_per_call(),
+        "yuan_per_month": total_calls * _yuan_per_call() * 30,
     }
 
 
@@ -143,10 +151,16 @@ def flat_daily(total_posts: float, xhs_share: float, with_detail: bool) -> dict:
     xhs = total_posts * xhs_share
     dy = total_posts * (1 - xhs_share)
     calls = xhs * (2 if with_detail else 1) + dy * 2
-    return {"calls_per_day": calls, "yuan_per_month": calls * YUAN_PER_CALL * 30}
+    return {"calls_per_day": calls, "yuan_per_month": calls * _yuan_per_call() * 30}
 
 
 def main() -> int:
+    # 和 cli.py 共用同一份 .env 加载 + 计价覆盖。少了这两行，运维照文档改完
+    # USD_TO_CNY / TIKHUB_USD_* 之后，生产预算用新价、而这个**做月度成本决策**
+    # 的脚本还在报编译进代码的旧价——两边给出的数字会长期对不上。
+    cli.load_env_or_exit()
+    cli.apply_pricing_overrides()
+
     per_day = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
     xhs_share = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
     if per_day <= 0:
@@ -183,7 +197,7 @@ def main() -> int:
           f"= ¥{sdx_month:,.0f}/月")
     print(f"【分层刷新 · 全走 TikHub】     同样次数 = ¥{tik_month:,.0f}/月"
           f"（省 {100 * (1 - tik_month / sdx_month):.0f}%）")
-    print(f"  其中抖音那段：¥{dy_calls * 0.10 * 30:,.0f} → "
+    print(f"  其中抖音那段：¥{dy_calls * _yuan_per_call() * 30:,.0f} → "
           f"¥{dy_calls * tik.yuan_per_call('douyin', 'comments') * 30:,.0f}/月"
           f"（这是省得最狠的一块）")
     print(f"\n  当前配置：小红书主通道 {settings.channels.primary('xhs')}，"
@@ -197,7 +211,7 @@ def main() -> int:
 
     manual = result["posts"] * 0.15 * 1.4
     print(f"【纯手动点】 {manual:.0f} 次/天（按 15% 行被点到估）"
-          f" = ¥{manual * YUAN_PER_CALL * 30:,.0f}/月"
+          f" = ¥{manual * _yuan_per_call() * 30:,.0f}/月"
           f"  ⚠ 没被点到的行永远不更新，最坏陈旧度无穷大")
 
     no_detail = estimate(per_day, xhs_share, _without_xhs_detail(settings))

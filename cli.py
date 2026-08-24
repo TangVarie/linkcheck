@@ -87,8 +87,33 @@ def _apply_endpoint_overrides() -> None:
               "——API Key 会发到这个地址，确认这是你自己的机器")
 
 
-def _apply_pricing_overrides() -> None:
-    """计价参数的环境变量覆盖。供应商改价时不用改代码重新发版。"""
+def load_env_or_exit() -> None:
+    """读 .env，**看不懂的行当场拒跑**。
+
+    本地跑时把仓库根的 .env 补进环境变量（已存在的环境变量优先）。
+    Railway / Actions 由平台注入，这一步是空操作。
+
+    为什么是拒跑而不是提示：严格解析器只有在调用方真的去看 issues 时才有意义。
+    悄悄跳过一行畸形配置，产生的是一个「看起来配好了、实际值不对」的部署——
+    比如 `MAX_YUAN_PER_RUN="10`（引号没配对）会被跳过，于是这一轮按
+    「不限金额」跑，而运维以为自己设了上限。这正是这套严格解析要消灭的东西。
+    """
+    issues: list[str] = []
+    load_dotenv(issues=issues)
+    if issues:
+        print("❌ .env 里有看不懂的行，已拒绝启动（怕你以为配好了、其实没生效）：")
+        for problem in issues:
+            print(f"  · {problem}")
+        sys.exit("修好这些行再跑；语法说明见 .env.example 和 xhsearch/envfile.py")
+
+
+def apply_pricing_overrides() -> None:
+    """计价参数的环境变量覆盖。供应商改价时不用改代码重新发版。
+
+    公开（不带下划线）是给 tools/estimate_cost.py 用的：两个入口必须共用
+    同一份覆盖逻辑，否则运维改完价格之后，生产预算用新价、
+    月度成本规划脚本还在报编译进代码的旧价。
+    """
     overrides = {}
     if os.environ.get("TIKHUB_USD_XHS", "").strip():
         overrides["xhs"] = _numeric_env("TIKHUB_USD_XHS", float, None, minimum=0.0000001)
@@ -216,7 +241,7 @@ def _bool_env(name: str, default: bool) -> bool:
 
 def _settings() -> Settings:
     _apply_endpoint_overrides()
-    _apply_pricing_overrides()
+    apply_pricing_overrides()
     settings = Settings()
     # 独立服务跑批量不需要软截止（那是给有执行时限的运行时准备的）。
     # 负数会让每一行立刻「留待下一轮」——一个看起来在跑、实际一行都不刷的任务。
@@ -513,8 +538,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                    deadline: float | None = None,
                    disabled: set[str] | None = None,
                    budget: runner.RunBudget | None = None,
-                   stop: threading.Event | None = None,
-                   on_event=None):
+                   stop: threading.Event | None = None):
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
@@ -603,7 +627,6 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         disabled=disabled,
         budget=budget,
         stop=stop,
-        on_event=on_event,
     )
     return 0, found, len(row_list), yuan, (report, known_fields)
 
@@ -674,13 +697,11 @@ def _event_sink():
     if not _bool_env("RUN_LOG_JSON", False):
         return None, ""
     run_id = f"{int(time.time())}-{os.getpid()}"
-    context: dict[str, str] = {}
 
     def sink(event: dict) -> None:
-        payload = {"run_id": run_id, "ts": round(time.time(), 3), **context, **event}
+        payload = {"run_id": run_id, "ts": round(time.time(), 3), **event}
         print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
 
-    sink.context = context      # type: ignore[attr-defined]
     return sink, run_id
 
 
@@ -756,13 +777,11 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 print("⚠ 运行已被终止，这张表本轮不再尝试；行都没动过，下一轮自然补上")
                 worst = 1
                 continue
-            if on_event is not None:
-                on_event.context["table"] = label   # type: ignore[attr-defined]
             try:
                 code, found, row_count, yuan, prep = _refresh_table(
                     mode, record_ids, settings, api_keys, table, now,
                     quiet_missing=multi, deadline=deadline, disabled=disabled,
-                    budget=budget, stop=stop, on_event=on_event)
+                    budget=budget, stop=stop)
             except feishu.FeishuError as exc:
                 # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
                 print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
@@ -798,6 +817,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         print("\n🛑 跨表熔断：本轮各表合计的失效比例异常偏高，疑似上游故障，"
               "已作废所有表的失效判定（明细见各表结果）")
 
+    # 结构化事件在**所有**熔断（含上面这次跨表熔断）定案之后才发：
+    # 提前发的话，被熔断改写过的行会让看板和告警看到一个比实际落表更吓人的
+    # 结论，而那正好发生在上游故障、最不该误报的时候。
+    for label, _table, report, _known in pending:
+        runner.emit_run_events(report, on_event, table=label)
+
     for label, table, report, known_fields in pending:
         if multi:
             print(f"\n━━━━ 表：{label}（结果）━━━━")
@@ -830,9 +855,7 @@ def _run_locked(mode: str, record_ids: list[str] | None,
 
 
 def main(argv: list[str]) -> int:
-    # 本地跑时把仓库根的 .env 补进环境变量（已存在的环境变量优先）。
-    # Railway / Actions 由平台注入，这一步是空操作。
-    load_dotenv()
+    load_env_or_exit()
     args = list(argv[1:])
     selected: list[str] | None = None
     if "--table" in args:

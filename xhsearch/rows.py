@@ -174,19 +174,28 @@ def estimate_yuan(
     settings: Settings,
     now: Optional[datetime] = None,
     keys: Optional[dict[str, str]] = None,
+    disabled: Optional[set[str]] = None,
 ) -> float:
     """预估这一批要花多少钱，按每个平台**实际会走的那家**的单价算。
 
-    「实际会走的那家」= 通道顺序里第一家**配了 key 且吃这种参数形态**的。
-    按配置主通道计价的话，只配了备胎 key 的部署（完全合法）会把
-    SocialDataX 的账按 TikHub 的单价报——抖音差 14 倍，一个天天报错账的
+    「实际会走的那家」= 通道顺序里第一家**配了 key、本轮没被判死、且吃这种
+    参数形态**的。按配置主通道计价的话，只配了备胎 key 的部署（完全合法）
+    会把 SocialDataX 的账按 TikHub 的单价报——抖音差 14 倍，一个天天报错账的
     估算没人会信。keys 不传时退回按「第一家能接的」算。
+
+    disabled 一定要传：主通道在本轮早些时候已经被判死之后，后面每一行**实际**
+    走的是备胎。漏传它的后果不只是报表难看——预算闸门就是拿这个数去预留的，
+    抖音一行按 TikHub 预留 ¥0.0144、实际按 SocialDataX 花 ¥0.20，
+    `MAX_YUAN_PER_RUN` 会超出十几倍，「硬上限」就不再是上限。
     """
+    dead = disabled or set()
     total = 0.0
     for row in rows:
         for call in plan_calls(row, settings, now):
             for name in settings.channels.for_platform(call.platform):
                 if keys is not None and not keys.get(name):
+                    continue
+                if name in dead:
                     continue
                 try:
                     provider = get_provider(name)

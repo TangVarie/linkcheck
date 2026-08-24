@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,9 +47,24 @@ try:
 except ImportError:      # Windows：没有 flock，退回 O_EXCL + TTL
     fcntl = None         # type: ignore[assignment]
 
-DEFAULT_PATH = "/tmp/linkcheck.run.lock"
+def default_path() -> str:
+    """默认锁文件路径：**每个用户一个私有目录**，不是 /tmp 里一个可预测的文件名。
+
+    直接用 /tmp/linkcheck.run.lock 是有安全后果的：共享主机上任何本地用户都能
+    在服务第一次运行**之前**，把那个路径先建成一个指向别处的符号链接。
+    我们拿到 flock 之后 _write_info 会 ftruncate + 写——那就成了一个
+    「让别人指哪、我们清空并覆盖哪」的任意文件改写原语，服务权限越高越糟。
+
+    两道防线：目录按 0o700 建在自己名下（别人建不进来），
+    以及打开文件时带 O_NOFOLLOW（不跟符号链接走）。
+    """
+    return str(Path(tempfile.gettempdir()) / f"linkcheck-{os.getuid()}" / "run.lock"
+               if hasattr(os, "getuid")
+               else Path(tempfile.gettempdir()) / "linkcheck" / "run.lock")
+
+
 # 租约多久算过期。一次运行正常是几十秒到几分钟；30 分钟还没释放，
-# 要么是进程被 kill -9 且文件锁没生效（O_EXCL 分支），要么是真的挂死了。
+# 要么是进程被 kill -9 且文件锁没生效（无 fcntl 的分支），要么是真的挂死了。
 DEFAULT_TTL_SECONDS = 1800.0
 
 
@@ -63,6 +79,10 @@ class LeaseInfo:
     # 单调递增的 fencing token。一个"以为自己还持有租约"的僵尸进程
     # 拿着旧 token，凭它可以在日志里被认出来。
     token: int = 0
+    # 上一任是不是**正常释放**的。没有 fcntl 的平台（Windows）全靠它：
+    # 那条路上内核不会替我们解锁，只看 TTL 的话，一次正常跑完的运行会把
+    # 后面 30 分钟内的每一次调用都挡掉。
+    released: bool = False
 
     def describe(self) -> str:
         age = max(0.0, time.time() - self.acquired_at)
@@ -85,6 +105,14 @@ class Lease:
     def release(self) -> None:
         if self._fd < 0:
             return
+        # 先把"我正常收工了"写进去，再解锁：没有 fcntl 的平台完全靠这个标记
+        # 判断上一任是正常释放还是崩掉的。不写的话，一次跑完的运行会把
+        # 后面 TTL 之内的每一次调用都误挡成 Busy。
+        self.info.released = True
+        try:
+            _write_info(self._fd, self.info)
+        except OSError:
+            pass
         try:
             if fcntl is not None:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -129,6 +157,7 @@ def _read_info(path: Path) -> Optional[LeaseInfo]:
             host=str(raw.get("host") or "?"),
             acquired_at=float(raw.get("acquired_at") or 0.0),
             token=int(raw.get("token") or 0),
+            released=bool(raw.get("released")),
         )
     except (TypeError, ValueError):
         return None
@@ -138,6 +167,7 @@ def _write_info(fd: int, info: LeaseInfo) -> None:
     payload = json.dumps({
         "owner": info.owner, "pid": info.pid, "host": info.host,
         "acquired_at": info.acquired_at, "token": info.token,
+        "released": info.released,
     }, ensure_ascii=False)
     os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
@@ -157,8 +187,11 @@ def acquire(owner: str, *, path: Optional[str] = None,
     没有 flock 的平台退回 O_EXCL + TTL：那条路上崩溃会留下陈旧锁文件，
     所以必须有 TTL 才能自愈。
     """
-    lock_path = Path(path or os.environ.get("RUN_LOCK_PATH") or DEFAULT_PATH)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(path or os.environ.get("RUN_LOCK_PATH") or default_path())
+    # 目录按 0o700 建：别人就没法在我们之前把锁文件预置成一个符号链接。
+    # 已存在的目录不改权限（可能是运维刻意配的共享位置），
+    # 打开文件时的 O_NOFOLLOW 是这种情况下的第二道防线。
+    os.makedirs(lock_path.parent, mode=0o700, exist_ok=True)
     previous = _read_info(lock_path)
     info = LeaseInfo(
         owner=owner,
@@ -167,9 +200,13 @@ def acquire(owner: str, *, path: Optional[str] = None,
         acquired_at=time.time(),
         token=(previous.token + 1) if previous else 1,
     )
+    # O_NOFOLLOW：绝不跟着符号链接走。锁文件路径是可预测的，而我们随后会
+    # ftruncate + 写它——跟着链接走就等于把「清空并覆盖任意文件」的能力
+    # 交给任何能在这个目录里建文件的人。
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
 
     if fcntl is not None:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(lock_path, flags, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -178,12 +215,23 @@ def acquire(owner: str, *, path: Optional[str] = None,
         _write_info(fd, info)
         return Lease(lock_path, fd, info)
 
-    # ---- 没有 flock 的退路 ----
-    if previous is not None and (time.time() - previous.acquired_at) < ttl_seconds:
+    # ---- 没有 flock 的退路（Windows）----
+    # 这条路上内核不会替我们解锁，所以判据有两条：上一任**明确释放过**，
+    # 或者它已经超过 TTL（崩溃后自愈）。只看 TTL 的话，一次正常跑完的运行
+    # 会把后面 30 分钟内的每一次调用都误挡成 Busy。
+    if (previous is not None and not previous.released
+            and (time.time() - previous.acquired_at) < ttl_seconds):
         raise Busy(previous)
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError as exc:
-        raise Busy(previous) from exc
+        # 先试原子创建：文件还不存在时，这一步能保证只有一个进程建得出来。
+        fd = os.open(lock_path, flags | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # 文件已存在（上一任正常释放、或已过期）：接管它。
+        # ⚠️ 这一步不是原子的——没有 flock 就做不到，这是这条退路的已知弱点，
+        # 也是为什么 Windows 上更该确保只有一个调度器在跑。
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise Busy(previous) from exc
     _write_info(fd, info)
     return Lease(lock_path, fd, info)

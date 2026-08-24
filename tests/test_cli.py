@@ -5,6 +5,7 @@
 """
 
 import unittest
+from unittest import mock
 
 import cli
 from xhsearch.config import Settings
@@ -305,6 +306,25 @@ class TestDotenvParsing(unittest.TestCase):
             self.assertEqual(len(issues), 1)
             self.assertIn("第 1 行", issues[0])
 
+    def test_real_callers_refuse_to_start_on_a_malformed_line(self):
+        """严格解析器只有在调用方真的去看 issues 时才有意义。
+
+        悄悄跳过一行畸形配置，产生的是一个「看起来配好了、实际值不对」的
+        部署：`MAX_YUAN_PER_RUN="10`（引号没配对）被跳过，这一轮就按
+        「不限金额」跑，而运维以为自己设了上限。
+        """
+        def fake_load(directory=None, *, issues=None):
+            if issues is not None:
+                issues.append('.env 第 3 行：MAX_YUAN_PER_RUN 的值有未配对的引号')
+
+        with mock.patch.object(cli, "load_dotenv", side_effect=fake_load):
+            with self.assertRaises(SystemExit):
+                cli.load_env_or_exit()
+
+    def test_clean_env_file_starts_normally(self):
+        with mock.patch.object(cli, "load_dotenv", side_effect=lambda *a, **k: None):
+            cli.load_env_or_exit()   # 不抛即通过
+
 
 class TestRunLock(unittest.TestCase):
     """ROB-001：两个进程同时刷同一张表 = 重复花钱 + 互相覆盖写入 + 写冲突。"""
@@ -325,6 +345,73 @@ class TestRunLock(unittest.TestCase):
                 self.assertIsNotNone(ctx.exception.holder)
             finally:
                 first.release()
+
+    def test_normal_release_is_recorded_so_the_ttl_path_can_tell(self):
+        """没有 fcntl 的平台（Windows）完全靠 released 标记判断上一任是不是
+        正常收工的。不写这个标记、只看 TTL 的话，一次正常跑完的运行会把
+        后面 30 分钟内的每一次调用都误挡成 Busy。"""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.lock"
+            runlock.acquire("first", path=str(path)).release()
+            self.assertTrue(json.loads(path.read_text())["released"])
+
+            # 模拟没有 fcntl 的平台：正常释放过的租约必须能被立刻接管
+            with mock.patch.object(runlock, "fcntl", None):
+                with runlock.acquire("second", path=str(path)) as second:
+                    self.assertEqual(second.info.owner, "second")
+
+    def test_ttl_path_still_blocks_a_crashed_holder(self):
+        """反面：上一任**没有**正常释放（崩了），TTL 之内仍然要挡住。"""
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.lock"
+            crashed = runlock.acquire("crashed", path=str(path))
+            crashed._fd = -1          # 假装进程没走 release 就没了
+            with mock.patch.object(runlock, "fcntl", None):
+                with self.assertRaises(runlock.Busy):
+                    runlock.acquire("next", path=str(path))
+
+    def test_lock_file_open_refuses_to_follow_symlinks(self):
+        """锁文件路径是可预测的，而我们随后会 ftruncate + 写它。
+        跟着符号链接走 = 把「清空并覆盖任意文件」的能力交给任何能在
+        这个目录里建文件的人。"""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch import runlock
+
+        if not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("这个平台没有 O_NOFOLLOW")
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("不该被清空的内容", encoding="utf-8")
+            path = Path(tmp) / "run.lock"
+            os.symlink(victim, path)
+            with self.assertRaises(OSError):
+                runlock.acquire("attacker", path=str(path))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "不该被清空的内容")
+
+    def test_default_path_is_a_private_per_user_directory(self):
+        """默认不能是 /tmp 里一个所有人都能预测、都能抢先建立的固定文件名。"""
+        import os
+
+        from xhsearch import runlock
+
+        default = runlock.default_path()
+        self.assertTrue(default.endswith("run.lock"))
+        if hasattr(os, "getuid"):
+            self.assertIn(str(os.getuid()), default)
 
     def test_released_lease_can_be_taken_again_with_a_higher_token(self):
         import tempfile

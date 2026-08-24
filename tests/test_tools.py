@@ -176,6 +176,32 @@ class TestPricingIsConfigurable(unittest.TestCase):
             with self.subTest(kwargs), self.assertRaises(ValueError):
                 providers.set_pricing(**kwargs)
 
+    def test_standalone_estimator_honours_the_same_overrides(self):
+        """`tools/estimate_cost.py` 是做**月度成本决策**的脚本。
+
+        它如果不读同一份覆盖，运维改完价格之后就会出现：生产预算用新价、
+        成本规划脚本还在报编译进代码的旧价，两边数字长期对不上。
+        """
+        providers.set_pricing(socialdatax_yuan=0.25)
+        result = estimate_cost.estimate(20, 0.7, Settings())
+        self.assertAlmostEqual(result["yuan_per_day"],
+                               result["calls_per_day"] * 0.25, places=6)
+
+    def test_estimator_entry_point_applies_env_overrides(self):
+        import os
+
+        saved = os.environ.get("SOCIALDATAX_YUAN")
+        os.environ["SOCIALDATAX_YUAN"] = "0.33"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                estimate_cost.main.__globals__["cli"].apply_pricing_overrides()
+            self.assertAlmostEqual(providers.SOCIALDATAX_YUAN, 0.33, places=6)
+        finally:
+            if saved is None:
+                os.environ.pop("SOCIALDATAX_YUAN", None)
+            else:
+                os.environ["SOCIALDATAX_YUAN"] = saved
+
 
 if __name__ == "__main__":
     unittest.main()

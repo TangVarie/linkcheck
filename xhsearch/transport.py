@@ -181,7 +181,14 @@ def _retry_after(headers: Any) -> Optional[float]:
     try:
         seconds = float(raw)
     except ValueError:
-        parsed = email.utils.parsedate_to_datetime(raw)
+        # parsedate_to_datetime 对畸形日期是**抛 ValueError**，不是返回 None。
+        # 漏掉这个 except，一个坏响应头就会顺着 _read 炸到 _perform 的兜底里，
+        # 把整条响应换成合成的「网络错误」——429 的真实状态码和 body 全丢，
+        # 连一条成功响应带了个坏头都会被当成网络故障去重试/降级。
+        try:
+            parsed = email.utils.parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
         if parsed is None:
             return None
         try:

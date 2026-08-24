@@ -512,6 +512,37 @@ class TestSocialDataXShapeIsFailClosed(FailoverTest):
         )
         self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
 
+    def test_shape_drift_fails_over_to_the_backup_channel(self):
+        """主通道 schema 一漂移就整轮全灭、而旁边有条好通道闲着，
+        那正好否定了双通道存在的理由。
+
+        形状错误必须是**可降级**的分类：归 UNKNOWN 的话它不在
+        FAILOVER_KINDS 里，配好的备胎一次都不会被尝试。
+        """
+        self.settings.channels = Channels(order={"xhs": ["socialdatax", "tikhub"],
+                                                 "douyin": ["socialdatax", "tikhub"]})
+        gateway = transport.Response(
+            200, "application/json", json.dumps({"message": "gateway fallback"}), "gw-1")
+        report = self.run_with(
+            on_get=lambda i: [tikhub_ok_comments(150), tikhub_ok_detail()][i],
+            on_post=lambda i: gateway,
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK,
+                         "主通道形状漂移时应当降级到备胎，而不是把行判失败")
+        self.assertGreaterEqual(report.failovers, 1)
+        self.assertIn("tikhub", report.used_providers)
+
+    def test_shape_drift_is_still_a_row_failure_when_there_is_no_backup(self):
+        """只有一条通道时，形状错误照旧是行级失败——不能被降级逻辑吞掉。"""
+        gateway = transport.Response(
+            200, "application/json", json.dumps({"message": "gateway fallback"}), "gw-1")
+        report = self.run_with(
+            on_get=lambda i: self.fail("只配了 SocialDataX"),
+            on_post=lambda i: gateway,
+            keys={"socialdatax": "s-key"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
+
     def test_zero_comment_page_is_still_a_valid_success(self):
         """空 items 是合法的成功（真的零评论），不能被这道闸误伤。"""
         page = transport.Response(200, "application/json", json.dumps({
