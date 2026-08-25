@@ -311,6 +311,49 @@ class TestNegativeKeywords(unittest.TestCase):
         self.assertIsNone(analyze.negative_status_value(verdict, self.settings))
         self.assertTrue(any("保持原样" in n for n in verdict.notes))
 
+    def test_the_brands_own_reply_never_counts_as_negative(self):
+        """负面词问的是「**别人**说了什么」。自家回复里的「不会过敏」
+        按字面照样命中，会把一条干净的帖子写成「有负面」。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "温和配方，不会过敏", "like_count": 9,
+                 "is_author_comment": True, "author": {"name": "官号"}},
+                {"content": "好用，回购了", "like_count": 3,
+                 "author": {"name": "路人"}},
+            ],
+            "comment_count": 2,
+        })
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertEqual(verdict.negative_hits, [])
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.clean)
+
+    def test_a_real_person_saying_it_still_counts(self):
+        """把自家回复排除掉，不能顺手把真正的负面也漏了。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "温和配方，不会过敏", "like_count": 9,
+                 "is_author_comment": True, "author": {"name": "官号"}},
+                {"content": "我用了过敏，退款还难", "like_count": 31,
+                 "author": {"name": "路人"}},
+            ],
+            "comment_count": 2,
+        })
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertEqual(len(verdict.negative_hits), 1)
+        self.assertEqual(verdict.negative_hits[0].comment.content, "我用了过敏，退款还难")
+
+    def test_seed_keywords_still_see_the_authors_own_comment(self):
+        """反方向：自家置顶的引导评论正是「评论关键词」要找的东西。
+        两个方向天生相反，跳过作者的开关不能串到种子词那边。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [{"content": "戳主页领券", "like_count": 10,
+                       "is_author_comment": True, "author": {"name": "官号"}}],
+            "comment_count": 1,
+        })
+        verdict = self.decide(snap, seed_keywords=["领券"])
+        self.assertIsNotNone(verdict.seed_hit)
+
     def test_matching_is_as_loose_as_seed_keywords(self):
         """和种子词共用同一套归一化：大小写、空格、标点都不该影响命中。"""
         snap = _page("这个 Xx 牌 更好用！")
@@ -322,6 +365,34 @@ class TestNegativeKeywords(unittest.TestCase):
         verdict = self.decide(snap, negative_keywords=["过敏", "竞品A"])
         self.assertEqual(len(verdict.negative_hits), 1)
         self.assertEqual(verdict.negative_hits[0].keyword, "过敏")   # 按表里的词序取第一个
+
+    def test_an_empty_page_on_a_busy_post_is_never_a_verdict(self):
+        """评论接口返回空页、detail 兜底回填「评论数 150」——我们对这条
+        帖子的评论区**一眼都没看到**，却曾经据此下了三个结论：
+        「无负面」「评论没有显示」「（暂无评论）」，还把上一轮真实的
+        评论快照覆盖掉。全是拿上游缺数当证据。
+        """
+        snap = analyze.read_comment_page("xhs", {"items": []})
+        analyze.merge_detail(snap, {"comment_count": 150, "like_count": 9})
+        self.assertEqual(snap.comment_count, 150)      # 帖子确实活着
+        self.assertFalse(analyze.saw_comment_page(snap))   # 但没看到评论内容
+
+        verdict = self.decide(snap, seed_keywords=["领券"],
+                              negative_keywords=["过敏"])
+        self.assertFalse(verdict.negative_checked)
+        self.assertIsNone(analyze.negative_status_value(verdict, self.settings))
+        self.assertFalse(verdict.seed_checked)
+        self.assertIsNone(analyze.comment_status_value(verdict, self.settings))
+        self.assertFalse(verdict.pin_checked)
+
+    def test_a_post_with_genuinely_zero_comments_is_a_verdict(self):
+        """「量到了、就是 0」是结论，「压根没量到」才不是。别把两者一起拦掉。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 0})
+        self.assertTrue(analyze.saw_comment_page(snap))
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertTrue(verdict.negative_checked)
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.clean)
 
     def test_negative_and_seed_keywords_are_independent(self):
         """两列查的是相反的东西，互不干扰：我们的评论显示出来了，

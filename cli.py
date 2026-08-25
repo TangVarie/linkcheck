@@ -570,6 +570,22 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
               "先跑 `python3 cli.py doctor` 看具体原因")
         return 1, set(), 0, 0.0, None
     known_fields = set(fields_meta)
+    blockers = _scheduling_blockers(settings, fields_meta)
+    if blockers and mode in ("sweep", "queue"):
+        # 在**花钱之前**拦下来。这两列写不进去会让每一轮重新付费刷同一批行，
+        # 而进程一路返回 0——跳过一轮是有界的损失，循环付费不是。
+        print("❌ 调度地基列的类型不对，本轮不跑（一行都没花钱）：")
+        for problem in blockers:
+            print(f"  {problem}")
+        print("  这两列写不进去，刷过的行下一轮还会被判成到期，"
+              "于是每一轮都重新付费刷同一批行，而且不会报错。"
+              "去飞书把类型改对，或跑 `python3 cli.py doctor` 看完整体检。")
+        return 1, set(), 0, 0.0, None
+    if blockers:
+        # row 模式是人工点名要这几行的数据，拦住不如给：照跑，但把后果说清楚。
+        print("⚠ 调度地基列的类型不对，这几行刷完不会被记成「已检查」：")
+        for problem in blockers:
+            print(f"  {problem}")
     row_list = runner.load_rows(
         table,
         settings,
@@ -638,6 +654,32 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     return 0, found, len(row_list), yuan, (report, fields_meta)
 
 
+def _scheduling_blockers(settings: Settings, fields_meta: dict) -> list[str]:
+    """「调度地基」两列里类型建错的那些，翻译成人话。
+
+    `最近检查时间` 和 `排队刷新` 和别的机器列不是一个量级：别的列写不进去
+    只是这一列没数据，这两列写不进去会**循环烧钱**——刷过的行 last_updated
+    没推进，下一轮 sweep 照样判它到期，于是每一轮都重新付费刷同一批行；
+    勾选清不掉的话 queue 模式同理。而进程一路返回 0，cron 和云平台看到的
+    是一片绿色的成功。
+
+    所以这两列的类型不对时，自动模式在**花钱之前**就拒跑：跳过一轮的代价
+    是有界的，循环付费的代价不是。缺列不归这里管（另有护栏）。
+    """
+    expected = {name: (allowed, label)
+                for name, allowed, label, _o, _n in _expected_schema(settings)}
+    problems = []
+    for name in (settings.fields.last_updated, settings.fields.queued):
+        info = fields_meta.get(name)
+        if info is None:
+            continue
+        allowed, label = expected[name]
+        if info["type"] not in allowed:
+            problems.append(f"「{name}」现在是「{_type_name(info['type'])}」，"
+                            f"需要「{label}」")
+    return problems
+
+
 def _mistyped_warning(mistyped: set[str], fields_meta: dict | None,
                       settings: Settings, label: str = "") -> str:
     """写回时按类型摘掉的列，翻译成运营看得懂的一段话。
@@ -701,7 +743,11 @@ def _write_back_table(table: feishu.Bitable, report,
     # cron / 云平台的重启策略把它当失败反复重启）；真故障（Key/余额）和
     # 「花了钱但有行没写回」都返回非零——花出去的钱没落进表里，
     # 不能让 cron 和 Actions 显示一个绿色的成功。
-    return 1 if (report.fatal or write_errors) else 0
+    #
+    # 类型建错的列同样非零：钱花了，那一列的数据没落表，而且不改配置的话
+    # 每一轮都会这样。缺列（dropped_fields）不算——那是「还没建，建好就补上」
+    # 的正常过渡态，不该每轮都把 cron 染红。
+    return 1 if (report.fatal or write_errors or mistyped_fields) else 0
 
 
 def _install_stop_handlers(stop: threading.Event) -> None:

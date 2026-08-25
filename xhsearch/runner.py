@@ -706,7 +706,7 @@ def refresh(
             # 快照只在看到了评论页（有评论、或至少知道评论数）时更新：
             # 空壳轮写「暂无评论」会把上一轮的真实快照抹掉。
             # 命中关键词的那条评论排最前并带「命中」标记。
-            if snapshot.comments or snapshot.comment_count is not None:
+            if analyze.saw_comment_page(snapshot):
                 fields[f.comment_digest] = analyze.format_digest(
                     snapshot, settings.digest, hit=verdict.seed_hit)
 
