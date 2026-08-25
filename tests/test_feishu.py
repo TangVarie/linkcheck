@@ -322,11 +322,12 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         table = self._StubTable()
         known = {f.link, f.publish_time, f.monitoring, f.queued,
                  f.traffic_status, f.comment_count, f.last_updated,
-                 f.consecutive_failures, f.comment_status}   # 缺 点赞数/收藏数/评论关键词
+                 f.consecutive_failures, f.comment_status}
+        # 表里没建 评论关键词/负面词/置顶状态 —— 请求里就不该出现它们
         runner.load_rows(table, settings, known_fields=known)
-        self.assertNotIn(f.like_count, table.requested_fields)
-        self.assertNotIn(f.collect_count, table.requested_fields)
         self.assertNotIn(f.seed_keywords, table.requested_fields)
+        self.assertNotIn(f.negative_keywords, table.requested_fields)
+        self.assertNotIn(f.pinned_status, table.requested_fields)
         self.assertIn(f.link, table.requested_fields)
 
     def test_pin_status_cell_is_read_as_text(self):

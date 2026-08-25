@@ -58,10 +58,6 @@ class Row:
     negative_keywords: list[str] = field(default_factory=list)
     current_tags: list[str] = field(default_factory=list)
     previous_comment_count: Optional[int] = None
-    # 当前点赞/收藏的现值：写新值前要搬进「上次点赞数/上次收藏数」，
-    # 和评论数的搬移完全对称。
-    previous_like_count: Optional[int] = None
-    previous_collect_count: Optional[int] = None
     last_updated_ms: Optional[int] = None
     consecutive_failures: int = 0
     # 「置顶状态」单选的现值：上一轮是 置顶成功/置顶掉了、这一轮没置顶

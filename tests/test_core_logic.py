@@ -699,20 +699,29 @@ class TestCallPlanning(unittest.TestCase):
         return rows.Row(record_id="rec1", link_cell=cell,
                         publish_time_ms=int(published.timestamp() * 1000))
 
-    def test_fresh_xhs_note_costs_two_calls(self):
-        plan = rows.plan_calls(self._row("https://www.xiaohongshu.com/explore/" + "a" * 24), self.settings, self.now)
-        self.assertEqual([c.purpose for c in plan], ["comments", "detail"])
+    def test_a_fresh_xhs_note_costs_one_call_by_default(self):
+        """出厂默认 detail_within_days=0：小红书任何年龄都只有评论那一次。
+
+        这是省掉 39% 月成本的那个默认值——「点赞数/收藏数」四列去掉之后，
+        detail 买回来的东西没有一样落进表里。
+        """
+        self.assertEqual(self.settings.detail_within_days, 0)
+        plan = rows.plan_calls(self._row("https://www.xiaohongshu.com/explore/" + "a" * 24),
+                               self.settings, self.now)
+        self.assertEqual([c.purpose for c in plan], ["comments"])
         self.assertEqual(plan[0].arguments["sort"], "default")
 
-    def test_old_xhs_note_costs_one_call(self):
-        plan = rows.plan_calls(
-            self._row("https://www.xiaohongshu.com/explore/" + "a" * 24, age_days=30), self.settings, self.now)
-        self.assertEqual([c.purpose for c in plan], ["comments"])
-
-    def test_detail_can_be_switched_off_entirely(self):
-        self.settings.detail_within_days = 0
-        plan = rows.plan_calls(self._row("https://www.xiaohongshu.com/explore/" + "a" * 24), self.settings, self.now)
-        self.assertEqual(len(plan), 1)
+    def test_detail_can_be_switched_back_on(self):
+        """仍然是受支持的配置：填个正数就回来了。"""
+        self.settings.detail_within_days = 7
+        fresh = rows.plan_calls(self._row("https://www.xiaohongshu.com/explore/" + "a" * 24),
+                                self.settings, self.now)
+        self.assertEqual([c.purpose for c in fresh], ["comments", "detail"])
+        # 超出窗口的老帖仍然只有一次
+        old = rows.plan_calls(
+            self._row("https://www.xiaohongshu.com/explore/" + "a" * 24, age_days=30),
+            self.settings, self.now)
+        self.assertEqual([c.purpose for c in old], ["comments"])
 
     def test_douyin_always_costs_two_calls(self):
         for age in (1, 30, 365):
