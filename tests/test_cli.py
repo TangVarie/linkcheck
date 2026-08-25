@@ -28,6 +28,7 @@ class TestDoctorSchema(unittest.TestCase):
                        f.like_count, f.previous_like_count,
                        f.collect_count, f.previous_collect_count,
                        f.pinned_status, f.comment_status, f.comment_digest,
+                       f.negative_status, f.negative_digest,
                        f.traffic_status, f.refresh_status,
                        f.failure_reason, f.last_updated, f.alive_confirmed,
                        f.consecutive_failures):
@@ -51,6 +52,9 @@ class TestDoctorSchema(unittest.TestCase):
         _, _, pin_required, _ = self.schema[f.pinned_status]
         for value in self.settings.pin_status.machine_written():
             self.assertIn(value, pin_required)
+        _, _, negative_required, _ = self.schema[f.negative_status]
+        for value in self.settings.negative_status.machine_written():
+            self.assertIn(value, negative_required)
 
     def test_column_types_match_write_semantics(self):
         """流量状态按多选列表合并写入（必须类型码 4）；评论状态/置顶状态
@@ -58,6 +62,7 @@ class TestDoctorSchema(unittest.TestCase):
         f = self.settings.fields
         self.assertEqual(self.schema[f.traffic_status][0], (4,))
         self.assertEqual(self.schema[f.comment_status][0], (3,))
+        self.assertEqual(self.schema[f.negative_status][0], (3,))
         self.assertEqual(self.schema[f.pinned_status][0], (3,))
 
 

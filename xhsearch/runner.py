@@ -550,6 +550,7 @@ def refresh(
     now: Optional[datetime] = None,
     known_options: Optional[list[str]] = None,
     comment_status_options: Optional[list[str]] = None,
+    negative_status_options: Optional[list[str]] = None,
     pin_status_options: Optional[list[str]] = None,
     forced: bool = False,
     timeout: float = 30.0,
@@ -666,6 +667,9 @@ def refresh(
                 (f.comment_status,
                  analyze.comment_status_value(verdict, settings),
                  comment_status_options),
+                (f.negative_status,
+                 analyze.negative_status_value(verdict, settings),
+                 negative_status_options),
                 (f.pinned_status,
                  analyze.pin_status_value(verdict, row.pin_status, settings),
                  pin_status_options),
@@ -705,6 +709,14 @@ def refresh(
             if snapshot.comments or snapshot.comment_count is not None:
                 fields[f.comment_digest] = analyze.format_digest(
                     snapshot, settings.digest, hit=verdict.seed_hit)
+
+        # 「负面评论快照」跟着「负面状态」一起写：判过就写（命中的几条，
+        # 或者「（未命中）」），没判过一个字都不碰。
+        # 判过却不写的话，上一轮的负面评论会一直留在格子里，
+        # 运营会以为负面还在——那比不写更误导。
+        if touch_tags and verdict.negative_checked:
+            fields[f.negative_digest] = analyze.format_negative_digest(
+                verdict.negative_hits, settings.digest)
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan)
@@ -829,6 +841,7 @@ def refresh(
             previous_comment_count=row.previous_comment_count,
             age_hours=row.age_hours(now),
             seed_keywords=row.seed_keywords,                  # 评论关键词组，任一命中即算命中
+            negative_keywords=row.negative_keywords,          # 负面/竞品词，复用同一份评论页
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
             current_pin_status=row.pin_status,                # 区分「掉了」和「从来没有」
         )
@@ -1123,6 +1136,7 @@ def load_rows(
             link_cell=feishu.read_text(cells.get(f.link)),
             publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
             seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
+            negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
             current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
             previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
             previous_like_count=feishu.read_int(cells.get(f.like_count)),

@@ -767,6 +767,104 @@ def mixed_gone(counter={"n": 0}):
     return responder
 
 
+class TestNegativeColumns(RunnerTest):
+    """负面词/竞品词判定：复用同一份第一页评论，不额外发任何请求。"""
+
+    def _page(self, *contents, count=30):
+        return sse({
+            "items": [{"content": c, "like_count": 5, "is_pinned": False,
+                       "is_author_comment": False, "ip_location": "上海",
+                       "author": {"name": "路人"}} for c in contents],
+            "comment_count": count, "top_level_comment_count": count,
+            "points": {"cost": 10, "balance": 900},
+        })
+
+    def _detail(self):
+        return sse({"like_count": 100, "collect_count": 20,
+                    "points": {"cost": 10, "balance": 890}})
+
+    def test_no_extra_request_is_made_for_the_new_columns(self):
+        """多一列判定不该多花一分钱——调用计划必须和没配负面词时完全一样。"""
+        from xhsearch.rows import plan_calls
+
+        plain = xhs_row()
+        with_negative = xhs_row()
+        with_negative.negative_keywords = ["过敏", "竞品A"]
+        self.assertEqual(len(plan_calls(plain, self.settings, NOW)),
+                         len(plan_calls(with_negative, self.settings, NOW)))
+
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return [self._page("用了过敏"), self._detail()][min(posts["n"] - 1, 1)]
+
+        self.run_with(responder, [with_negative],
+                      negative_status_options=["有负面", "无负面"])
+        self.assertEqual(posts["n"], 2, "评论 1 次 + detail 1 次，没有额外调用")
+
+    def test_hit_writes_both_new_columns(self):
+        row = xhs_row()
+        row.negative_keywords = ["过敏", "竞品A"]
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return [self._page("好用，回购了", "用了过敏，客服还不理人"),
+                    self._detail()][min(posts["n"] - 1, 1)]
+
+        report = self.run_with(responder, [row],
+                               negative_status_options=["有负面", "无负面"])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(fields[f.negative_status], self.settings.negative_status.found)
+        self.assertIn("命中「过敏」", fields[f.negative_digest])
+        self.assertNotIn("回购", fields[f.negative_digest])
+
+    def test_clean_row_says_so_instead_of_leaving_a_stale_digest(self):
+        """上一轮的负面评论留在格子里，运营会以为负面还在——比不写更误导。"""
+        row = xhs_row()
+        row.negative_keywords = ["过敏"]
+        report = self.run_with(
+            [self._page("好用，回购了"), self._detail()], [row],
+            negative_status_options=["有负面", "无负面"])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(fields[f.negative_status], self.settings.negative_status.clean)
+        self.assertEqual(fields[f.negative_digest], "（未命中）")
+
+    def test_row_without_negative_words_touches_neither_column(self):
+        report = self.run_with([self._page("用了过敏"), self._detail()], [xhs_row()])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertNotIn(f.negative_status, fields)
+        self.assertNotIn(f.negative_digest, fields)
+
+    def test_missing_option_is_skipped_not_written(self):
+        """表里还没建选项时安全跳过并提示，别让一个缺选项拖垮整行写回。"""
+        row = xhs_row()
+        row.negative_keywords = ["过敏"]
+        report = self.run_with([self._page("用了过敏"), self._detail()], [row],
+                               negative_status_options=[])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertNotIn(f.negative_status, fields)
+        self.assertIn("还没建选项", fields[f.failure_reason])
+        # 快照列没有选项概念，照常写
+        self.assertIn("命中「过敏」", fields[f.negative_digest])
+
+    def test_failed_round_never_claims_clean(self):
+        """取不到内容的行完全不碰负面列——不能拿失败当「无负面」的证据。"""
+        row = xhs_row()
+        row.negative_keywords = ["过敏"]
+        report = self.run_with(lambda *a, **k: err(500, 1005, "服务暂时不可用"), [row])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
+        self.assertNotIn(f.negative_status, fields)
+        self.assertNotIn(f.negative_digest, fields)
+
+
 class TestBreakerAccounting(RunnerTest):
     def _gone_rows(self, n):
         rows = []

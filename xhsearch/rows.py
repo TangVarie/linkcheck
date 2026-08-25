@@ -53,6 +53,9 @@ class Row:
     publish_time_ms: Optional[int] = None
     # 评论关键词组：任一出现在第一页评论里即算命中（不区分大小写）。
     seed_keywords: list[str] = field(default_factory=list)
+    # 负面词/竞品词组：查的是**别人**写了什么，和上面正好相反。
+    # 两者共用同一份第一页评论，不额外发请求。
+    negative_keywords: list[str] = field(default_factory=list)
     current_tags: list[str] = field(default_factory=list)
     previous_comment_count: Optional[int] = None
     # 当前点赞/收藏的现值：写新值前要搬进「上次点赞数/上次收藏数」，

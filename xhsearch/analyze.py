@@ -239,6 +239,62 @@ def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[See
     return None
 
 
+@dataclass
+class KeywordHit:
+    """一条命中：命中的是哪个词、命中在哪条评论上。
+
+    带的是整个 CommentView 而不只是正文，因为「负面评论快照」要连
+    昵称/赞数/IP 一起排版——和「评论区快照」用同一套 one_line()。
+    """
+
+    keyword: str
+    comment: CommentView
+
+
+def match_all_keywords(snapshot: Snapshot, keywords: list[str]) -> list[KeywordHit]:
+    """把关键词组 × 第一页评论的**全部**命中都找出来，按评论原序返回。
+
+    和 match_seed_keywords 的区别只在「找第一个」还是「找全部」：
+    种子评论只需要知道显示出来没有，找到一条就够了；负面词要让运营
+    看到底下都说了些什么，得把命中的几条都列出来。
+
+    一条评论同时命中多个词时只记第一个命中的词（按关键词在表里的顺序），
+    免得同一条评论在快照里出现好几遍。
+    """
+    hits: list[KeywordHit] = []
+    needles = [(k, _normalize(k)) for k in keywords]
+    for comment in snapshot.comments:
+        haystack = _normalize(comment.content)
+        for keyword, needle in needles:
+            if needle and needle in haystack:
+                hits.append(KeywordHit(keyword, comment))
+                break
+    return hits
+
+
+def format_negative_digest(hits: list[KeywordHit], fmt: DigestFormat) -> str:
+    """把命中负面词的那几条评论排成一格能读的文本。
+
+    只放命中的，不放整页——这一列是给运营「一眼看到底下在说什么」的，
+    掺进没命中的评论就得自己再找一遍。每条前面标出命中的是哪个词，
+    因为「负面词」和「竞品词」混在同一个清单里，处置方式完全不同。
+    """
+    if not hits:
+        # 刻意不留空：空单元格要留给「这一轮压根没查过」。
+        # 「查过、没中」和「没查过」在运营那边是两个完全不同的结论。
+        return "（未命中）"
+    lines: list[str] = []
+    used = 0
+    for index, hit in enumerate(hits[: fmt.max_comments], start=1):
+        line = f"{index}. {hit.comment.one_line(fmt, extra_mark=f'命中「{hit.keyword}」')}"
+        if used + len(line) + 1 > fmt.total_chars:
+            lines.append(f"…（还有 {len(hits) - index + 1} 条未显示）")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
 class Pin(Enum):
     """置顶判定结果。
 
@@ -275,6 +331,22 @@ def comment_status_value(verdict: "Verdict", settings: Settings) -> Optional[str
     return cs.displayed if verdict.seed_hit is not None else cs.not_displayed
 
 
+def negative_status_value(verdict: "Verdict", settings: Settings) -> Optional[str]:
+    """「负面状态」单选列该写的值——由负面词/竞品词命中驱动，直接覆盖。
+
+    和 comment_status_value 完全对称，只是方向相反：那边命中是好事，
+    这边命中是要立刻去看的事。
+
+    返回 None 表示**这一轮不该碰这一列**：没填负面词的行、以及本轮
+    没取到评论页内容的行都保持原样——拿上游缺数当「无负面」的证据，
+    等于给运营一个假的安全感，那比不判还糟。
+    """
+    if not verdict.negative_checked:
+        return None
+    ns = settings.negative_status
+    return ns.found if verdict.negative_hits else ns.clean
+
+
 def pin_status_value(verdict: "Verdict", current: str, settings: Settings) -> Optional[str]:
     """「置顶状态」单选列该写的值——直接覆盖。
 
@@ -305,6 +377,10 @@ class Verdict:
     # seed_checked=False（没填关键词、或本轮没看到评论页）时「评论状态」不碰。
     seed_hit: Optional[SeedHit] = None
     seed_checked: bool = False
+    # 负面词/竞品词命中结果，语义与上面那对完全对称：
+    # negative_checked=False（没填负面词、或本轮没看到评论页）时两个负面列都不碰。
+    negative_hits: list["KeywordHit"] = field(default_factory=list)
+    negative_checked: bool = False
 
 
 def decide(
@@ -314,6 +390,7 @@ def decide(
     previous_comment_count: Optional[int],
     age_hours: Optional[float],
     seed_keywords: Optional[list[str]] = None,
+    negative_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
     current_pin_status: str = "",
 ) -> Verdict:
@@ -422,6 +499,22 @@ def decide(
             )
     elif seed_keywords:
         verdict.notes.append("本轮未取到评论页内容，关键词命中与评论状态保持原样")
+
+    # —— 负面词/竞品词：**复用上面同一份第一页评论**，不额外发任何请求 ——
+    # 判定闸门和种子关键词完全一样：没填词不碰、没看到评论页不碰。
+    # 后者尤其重要——拿上游缺数当「无负面」写进表里，等于给运营一个
+    # 假的安全感，比不判还糟。
+    if negative_keywords and (snapshot.comments or snapshot.comment_count is not None):
+        verdict.negative_checked = True
+        verdict.negative_hits = match_all_keywords(snapshot, negative_keywords)
+        if verdict.negative_hits:
+            words = "、".join(dict.fromkeys(h.keyword for h in verdict.negative_hits))
+            verdict.notes.append(
+                f"⚠ 第一页评论命中 {len(verdict.negative_hits)} 条负面/竞品词（{words}）"
+                f"→ {settings.negative_status.found}，详见「{settings.fields.negative_digest}」"
+            )
+    elif negative_keywords:
+        verdict.notes.append("本轮未取到评论页内容，负面词判定保持原样")
 
     return verdict
 

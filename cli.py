@@ -333,6 +333,8 @@ def _expected_schema(settings: Settings) -> list[tuple]:
          "要手填的普通日期字段；建成「创建时间」类型拿到的是建行时间，不是发布时间"),
         (f.seed_keywords, (4, 1), "多选或文本", None,
          "文本列时用顿号/逗号/分号分隔多个词"),
+        (f.negative_keywords, (4, 1), "多选或文本", None,
+         "负面词 + 竞品词，格式同「评论关键词」；留空的行完全不做负面判定"),
         (f.monitoring, (7,), "复选框", None, None),
         (f.queued, (7,), "复选框", None, None),
         # —— 机器写入 ——
@@ -348,6 +350,9 @@ def _expected_schema(settings: Settings) -> list[tuple]:
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
          "机器直接覆盖写入当前状态（待评论等旧值会被覆盖）"),
         (f.comment_digest, (1,), "文本", None, None),
+        (f.negative_status, (3,), "单选", settings.negative_status.machine_written(),
+         "由「负面词」命中驱动，机器直接覆盖；没填负面词的行不碰这一列"),
+        (f.negative_digest, (1,), "文本", None, None),
         (f.traffic_status, (4,), "多选", settings.tags.machine_written(),
          "机器按多选合并写入——建成单选会让写回整批失败"),
         (f.refresh_status, (3, 1), "单选或文本", statuses, None),
@@ -379,7 +384,8 @@ def _schema_problems(settings: Settings, meta: dict) -> list[str]:
     # 写前核对选项清单）：缺选项会被安全跳过。其余带选项要求的列
     # （平台/巡查状态）是直写字符串，没有写侧守卫，缺选项的后果是
     # 写回可能失败——两种情况的文案必须如实区分。
-    filtered_columns = {f.traffic_status, f.comment_status, f.pinned_status}
+    filtered_columns = {f.traffic_status, f.comment_status, f.negative_status,
+                        f.pinned_status}
     for name, allowed, type_label, required_options, note in _expected_schema(settings):
         info = meta.get(name)
         if info is None:
@@ -620,6 +626,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         now=now,
         known_options=_options_from_meta(fields_meta, settings.fields.traffic_status),
         comment_status_options=_options_from_meta(fields_meta, settings.fields.comment_status),
+        negative_status_options=_options_from_meta(fields_meta, settings.fields.negative_status),
         pin_status_options=_options_from_meta(fields_meta, settings.fields.pinned_status),
         forced=(record_ids is not None),
         progress=print,
