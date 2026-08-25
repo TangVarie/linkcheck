@@ -435,5 +435,66 @@ class TestFieldOptionsPagination(unittest.TestCase):
             self.assertIsNone(make_table().list_field_options("流量状态"))
 
 
+class TestValueFits(unittest.TestCase):
+    """写回前的类型闸。判错的代价不对称：放行一个坏值 = 整表写回全灭
+    （1254063），挡下一个好值 = 这一列这一轮没落表。所以从严。"""
+
+    def test_the_six_writable_types_accept_their_own_shape(self):
+        for code, value in [(1, "文本"), (2, 3000), (2, 1.5), (3, "正常"),
+                            (4, ["大爆"]), (4, []), (5, 1787313600000), (7, True),
+                            (7, False)]:
+            with self.subTest(code=code, value=value):
+                self.assertTrue(feishu.value_fits(code, value))
+
+    def test_shape_mismatches_are_blocked(self):
+        for code, value in [
+            (4, "大爆"),          # 多选列写字符串 —— 事故的另一半
+            (3, ["大爆"]),        # 单选列写列表 —— 事故现场
+            (1, ["大爆"]),
+            (1, 3000),
+            (2, "3000"),
+            (5, "1787313600000"),
+            (7, "true"),
+            (2, True),            # bool 是 int 的子类，但数字列不收 True
+            (5, False),
+        ]:
+            with self.subTest(code=code, value=value):
+                self.assertFalse(feishu.value_fits(code, value))
+
+    def test_types_the_machine_cannot_write_are_blocked(self):
+        # 人员/超链接/附件/公式/创建时间/最后更新时间/自动编号……
+        for code in (11, 13, 15, 17, 18, 19, 20, 21, 22, 23,
+                     1001, 1002, 1003, 1004, 1005):
+            with self.subTest(code=code):
+                self.assertFalse(feishu.value_fits(code, "随便什么值"))
+
+    def test_an_unreadable_type_is_blocked_not_guessed(self):
+        """类型缺失或不是数字：判不了就别赌，摘掉这一列比赔上整表便宜。"""
+        for code in (None, "", "多选", {}, 9999):
+            with self.subTest(code=code):
+                self.assertFalse(feishu.value_fits(code, "值"))
+
+
+class TestMultiSelectConvFailHasAHint(unittest.TestCase):
+    """线上真实报错：[1254063] MultiSelectFieldConvFail，原文一个字的
+    线索都没有。异常里必须直接给出下一步动作。"""
+
+    def test_the_hint_names_the_diagnostic_and_the_usual_suspects(self):
+        with self.assertRaises(feishu.FeishuError) as caught:
+            feishu._raise_business_error(
+                {"code": 1254063, "msg": "MultiSelectFieldConvFail",
+                 "request_id": "b2fae448"}, transport.Response(200, "", "{}"))
+        text = str(caught.exception)
+        self.assertIn("doctor", text)
+        self.assertIn("流量状态", text)
+        self.assertIn("b2fae448", text)          # request_id 不能丢
+        self.assertEqual(caught.exception.code, 1254063)
+
+    def test_it_is_a_table_level_code_not_a_row_level_one(self):
+        """整表的配置问题。放进行级集合会让一次失败被二分放大成 2n-1 次
+        请求，而每一个子分片都会同样失败。"""
+        self.assertNotIn(1254063, feishu._ROW_LEVEL_CODES)
+
+
 if __name__ == "__main__":
     unittest.main()

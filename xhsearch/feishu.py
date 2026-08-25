@@ -83,6 +83,12 @@ _HINTS = {
     1254043: "record_id 不存在（RecordIdNotFound），可能这行在写回前刚被删除",
     1254045: "字段名对不上：config.py 里的列名必须和表头逐字相同（含空格、括号全半角）",
     1254060: "字段值类型不对：数字列不能写字符串，日期列要写毫秒时间戳",
+    1254063: "多选列的值转换失败（MultiSelectFieldConvFail）：某一列的**类型**和"
+             "机器写进去的值形状对不上——最常见的是「流量状态」被建成了单选"
+             "（机器按多选写列表），或者「评论状态」「负面状态」「置顶状态」"
+             "被建成了多选（机器写字符串）。跑 "
+             "`python3 cli.py doctor --table 表名` 会逐列指出是哪一列。"
+             "这是**整表**的配置问题，不是某一行的问题，所以不二分",
     1254291: "写冲突：同一张表正在被并发写入或请求过快。"
              "检查是不是有两个调度器（queue/sweep/手动）同时在跑——"
              "所有付费入口必须共享同一个运行租约（见 xhsearch/runlock.py）",
@@ -469,6 +475,39 @@ class Bitable:
 
 
 # ---------- 单元格取值 / 赋值 ----------
+
+
+# 机器写得进去的字段类型码。本项目写回构造的每一个值都落在这六种类型里
+# （逐列的期望类型见 cli._expected_schema）。一列被建成别的类型
+# ——人员、附件、超链接、公式、创建时间、最后更新时间——说明那一列
+# 压根不是给机器写的，硬写必然失败。
+_WRITABLE_TYPES = frozenset({1, 2, 3, 4, 5, 7})
+
+
+def value_fits(field_type: Any, value: Any) -> bool:
+    """这个值写进这个类型的列，形状对不对。
+
+    存在的理由是一次线上事故：一张表里有一列的类型和机器写的值对不上，
+    飞书回 1254063（MultiSelectFieldConvFail）。batch_update 是全成功或
+    全失败，而这是**整表**的配置问题——4 行付了钱、0 行落表。写回前先按
+    类型筛一遍，坏的那一列被单独摘掉，其余列照写。
+
+    判断只看形状，不看内容（选项名是否已建由另一条路径过滤）：
+    多选要列表、单选/文本要字符串、数字/日期要数（bool 不算数，
+    Python 里 bool 是 int 的子类，但飞书的数字列不收 True）、
+    复选框要布尔。类型不在可写清单里一律返回 False——判不了的时候
+    宁可少写一列，也不要赌上整张表的写回。
+    """
+    code = parse_code(field_type)
+    if code not in _WRITABLE_TYPES:
+        return False
+    if code == 4:
+        return isinstance(value, list)
+    if code == 7:
+        return isinstance(value, bool)
+    if code in (2, 5):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, str)
 
 
 def read_text(value: Any) -> str:

@@ -1329,5 +1329,126 @@ class TestTagWriteBackIsOptimisticallyConcurrent(RunnerTest):
         self.assertIn(f.refresh_status, table.updates[0]["fields"])
 
 
+class TestOneMistypedColumnCannotKillTheTable(RunnerTest):
+    """线上事故：一张表的某列类型建错，飞书回 1254063
+    （MultiSelectFieldConvFail）。batch_update 全成功或全失败，于是
+    4 行付了钱、0 行落表。写回前按类型筛一遍，坏列单独摘掉。"""
+
+    class _FakeTable:
+        def __init__(self):
+            self.updates = None
+
+        def batch_get(self, record_ids):
+            return [{"record_id": rid, "fields": {}} for rid in record_ids]
+
+        def batch_update(self, updates, errors=None):
+            self.updates = updates
+            return len(updates)
+
+    def _report(self):
+        return self.run_with(
+            [sse(comment_page(count=150)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()])
+
+    def _types(self, **overrides):
+        """一张类型全对的表，再按需要把某几列改错。"""
+        f = self.settings.fields
+        types = {
+            f.platform: 3, f.comment_count: 2, f.previous_comment_count: 2,
+            f.like_count: 2, f.previous_like_count: 2,
+            f.collect_count: 2, f.previous_collect_count: 2,
+            f.pinned_status: 3, f.comment_status: 3, f.comment_digest: 1,
+            f.negative_status: 3, f.negative_digest: 1,
+            f.traffic_status: 4, f.refresh_status: 3, f.failure_reason: 1,
+            f.last_updated: 5, f.alive_confirmed: 7, f.consecutive_failures: 2,
+            f.queued: 7,
+        }
+        types.update(overrides)
+        return types
+
+    def test_all_columns_land_when_the_schema_is_right(self):
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, set(), f"类型全对却被摘掉了列：{mistyped}")
+        self.assertIn(f.traffic_status, table.updates[0]["fields"])
+        self.assertIn(f.comment_count, table.updates[0]["fields"])
+
+    def test_multi_select_built_as_single_select_drops_only_that_column(self):
+        """事故现场：「流量状态」建成了单选，机器写的是列表。"""
+        f = self.settings.fields
+        report = self._report()
+        self.assertIsInstance(report.outcomes[0].fields[f.traffic_status], list)
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(**{f.traffic_status: 3}),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, {f.traffic_status})
+        written = table.updates[0]["fields"]
+        self.assertNotIn(f.traffic_status, written)
+        # 付过钱的那些数字和状态照样落表——这才是这个改动的意义
+        self.assertIn(f.comment_count, written)
+        self.assertIn(f.refresh_status, written)
+        self.assertIn(f.last_updated, written)
+
+    def test_single_select_built_as_multi_select_drops_only_that_column(self):
+        """反过来：单选列被建成多选，机器写的是字符串。
+
+        这里拿「置顶状态」当样本；「评论状态」「负面状态」是同一个形状。
+        """
+        f = self.settings.fields
+        report = self._report()
+        self.assertIsInstance(report.outcomes[0].fields[f.pinned_status], str)
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(**{f.pinned_status: 4}),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, {f.pinned_status})
+        self.assertIn(f.traffic_status, table.updates[0]["fields"])
+
+    def test_read_only_column_is_never_written(self):
+        """「最近检查时间」被建成系统的「最后更新时间」（1002）：机器写不进去。"""
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(**{f.last_updated: 1002}),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, {f.last_updated})
+        self.assertNotIn(f.last_updated, table.updates[0]["fields"])
+
+    def test_a_row_with_nothing_writable_left_is_skipped_entirely(self):
+        report = self._report()
+        table = self._FakeTable()
+        # 每一列的类型都判成不可写
+        types = {k: 1002 for k in report.outcomes[0].fields}
+        self.assertEqual(runner.write_back(table, report, field_types=types), 0)
+        self.assertIsNone(table.updates)
+
+    def test_no_field_types_keeps_the_old_behaviour(self):
+        """None = 不过滤。老调用方（和测试）不受影响。"""
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        runner.write_back(table, report)
+        self.assertIn(f.traffic_status, table.updates[0]["fields"])
+
+    def test_columns_absent_from_the_meta_are_left_to_the_name_filter(self):
+        """类型表里没有的列不归类型闸管——那是 known_fields 的活儿，
+        两道闸各管各的，别互相顶替。"""
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types={f.traffic_status: 4},
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, set())
+        self.assertIn(f.comment_count, table.updates[0]["fields"])
+
+
 if __name__ == "__main__":
     unittest.main()

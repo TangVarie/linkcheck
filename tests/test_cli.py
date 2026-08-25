@@ -575,5 +575,29 @@ class TestSchemaProblems(unittest.TestCase):
         self.assertTrue(any("必备列" in p and self.f.last_updated in p for p in problems))
 
 
+class TestMistypedWarning(unittest.TestCase):
+    """写回时按类型摘掉的列，得让运营不看代码就知道该去改什么。
+    只说「跳过了 1 列」等于让人回头再体检一遍——而钱已经花了。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        self.f = self.settings.fields
+
+    def test_it_names_the_column_the_actual_type_and_the_wanted_type(self):
+        meta = {self.f.traffic_status: {"type": 3, "ui_type": "", "options": []}}
+        text = cli._mistyped_warning({self.f.traffic_status}, meta,
+                                     self.settings, "西屋第一期")
+        self.assertIn(self.f.traffic_status, text)
+        self.assertIn("单选", text)      # 现在建成了什么
+        self.assertIn("多选", text)      # 应该是什么
+        self.assertIn("doctor --table 西屋第一期", text)
+
+    def test_it_survives_a_column_missing_from_the_meta(self):
+        text = cli._mistyped_warning({self.f.traffic_status}, None, self.settings)
+        self.assertIn(self.f.traffic_status, text)
+        self.assertIn("doctor", text)
+        self.assertNotIn("--table", text)   # 没表名就别编一个
+
+
 if __name__ == "__main__":
     unittest.main()

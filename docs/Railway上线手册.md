@@ -439,6 +439,7 @@ Railway 按「资源 × 分钟」计费，**内存通常是账单里最大的一
 | 表一直不更新 | Railway → Deployments 日志。有没有在跑？Cron 配了吗？ |
 | 日志说读到 0 行 | **§3.2 忘了把应用加进表**，九成是这个 |
 | `1254045 FieldNameNotFound` | 列名和 `config.py` 对不上，差空格也算 |
+| `1254063 MultiSelectFieldConvFail` | 列名对了但**类型**建错了（多半是「流量状态」建成了单选）。跑 `doctor --table 表名` 看是哪一列 |
 | 报错里有 `auth` | Key 填错或过期。TikHub 和 SocialDataX 分开看是哪个 |
 | 报错里有 `transport` | 网络。TikHub 确认 `TIKHUB_BASE` 设成了 `.io` |
 | 报错里有 `quota` | 余额见底。有备胎的话它会自动顶上，但要去充值 |

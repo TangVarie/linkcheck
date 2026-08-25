@@ -1219,15 +1219,25 @@ def write_back(
     *,
     errors: Optional[list] = None,
     known_fields: Optional[set[str]] = None,
+    field_types: Optional[dict[str, Any]] = None,
     dropped_fields: Optional[set[str]] = None,
+    mistyped_fields: Optional[set[str]] = None,
     say: Callable[[str], None] = lambda _: None,
 ) -> int:
     """写回。errors 传一个列表进来可以收集失败的行（(record_id, FeishuError)），
     不传则在所有行都尝试过之后抛汇总异常——见 feishu.Bitable.batch_update。
 
+    写回前有两道按列的闸，理由是同一个：batch_update 全成功或全失败，
+    一列不对就能让整表已经付过钱的结果全部落空。
+
     known_fields 传入表里实际存在的列名（table.field_names()）时，会把表里
     还没建的机器列挡下来（记进 dropped_fields 供调用方提示）——按名字写
-    不存在的列是表级错误，会让整批写回失败。None = 不过滤，宁可试着写。
+    不存在的列是表级错误（1254045）。None = 不过滤，宁可试着写。
+
+    field_types 传入列名 → 字段类型码（table.fields_meta() 里的 "type"）时，
+    会把类型和值形状对不上的列挡下来（记进 mistyped_fields）——比如
+    「流量状态」被建成单选而机器写列表，飞书回 1254063，整表写回全灭。
+    None = 不过滤（旧行为）。
     """
     _reconcile_tags(table, report, say=say)
     updates = []
@@ -1241,6 +1251,13 @@ def write_back(
                 if dropped_fields is not None:
                     dropped_fields |= missing
                 fields = {k: v for k, v in fields.items() if k in known_fields}
+        if field_types is not None:
+            bad = {k for k, v in fields.items()
+                   if k in field_types and not feishu.value_fits(field_types[k], v)}
+            if bad:
+                if mistyped_fields is not None:
+                    mistyped_fields |= bad
+                fields = {k: v for k, v in fields.items() if k not in bad}
         if fields:
             updates.append({"record_id": o.record_id, "fields": fields})
     return table.batch_update(updates, errors=errors) if updates else 0

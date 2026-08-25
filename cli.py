@@ -548,7 +548,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
-    待写回材料是 (report, known_fields)，None 表示这张表本轮没有要写的
+    待写回材料是 (report, fields_meta)，None 表示这张表本轮没有要写的
     （estimate、没有待刷行、缺列护栏拦下）。写回推迟到所有表都刷完之后
     （见 _run）：跨表熔断要先看全局样本再定罪，作废的判定不能已经落了表。
 
@@ -635,22 +635,53 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         budget=budget,
         stop=stop,
     )
-    return 0, found, len(row_list), yuan, (report, known_fields)
+    return 0, found, len(row_list), yuan, (report, fields_meta)
+
+
+def _mistyped_warning(mistyped: set[str], fields_meta: dict | None,
+                      settings: Settings, label: str = "") -> str:
+    """写回时按类型摘掉的列，翻译成运营看得懂的一段话。
+
+    这段话必须说清三件事：哪一列、现在建成了什么、应该是什么。只报
+    「跳过了 N 列」等于让人回头再体检一遍——而这时候钱已经花了。
+    """
+    expected = {name: (allowed, type_label)
+                for name, allowed, type_label, _opts, _note in _expected_schema(settings)}
+    lines = [
+        "❌ 这些列的**字段类型**和机器要写的值对不上，本轮已跳过这几列"
+        "（其余列照常写回，不会写坏表）："
+    ]
+    for name in sorted(mistyped):
+        actual = _type_name((fields_meta or {}).get(name, {}).get("type"))
+        want = expected.get(name, (None, "见 docs/表结构.md"))[1]
+        lines.append(f"  「{name}」现在是「{actual}」，需要「{want}」")
+    scope = f" --table {label}" if label else ""
+    lines.append(f"  去飞书把类型改过来，或跑 `python3 cli.py doctor{scope}` 看完整体检。"
+                 "不改的话这几列的数据每一轮都落不下来。")
+    return "\n".join(lines)
 
 
 def _write_back_table(table: feishu.Bitable, report,
-                      known_fields: set[str] | None) -> int:
+                      fields_meta: dict | None,
+                      settings: Settings, label: str = "") -> int:
     """写回阶段。summary 也在这里打印——跨表熔断可能刚作废过判定，
     这时各行显示的才是真正落表的最终状态。"""
     print(report.summary())
 
     write_errors: list = []
     dropped_fields: set = set()
+    mistyped_fields: set = set()
     try:
-        written = runner.write_back(table, report, errors=write_errors,
-                                    known_fields=known_fields,
-                                    dropped_fields=dropped_fields,
-                                    say=print)
+        written = runner.write_back(
+            table, report, errors=write_errors,
+            known_fields=None if fields_meta is None else set(fields_meta),
+            # 列名之外还要带上类型：一列被建错类型（比如「流量状态」建成单选）
+            # 会让飞书回 1254063，整表已付费的结果全部落空。
+            field_types=None if fields_meta is None
+            else {name: info.get("type") for name, info in fields_meta.items()},
+            dropped_fields=dropped_fields,
+            mistyped_fields=mistyped_fields,
+            say=print)
     except feishu.FeishuError as exc:
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
@@ -660,6 +691,8 @@ def _write_back_table(table: feishu.Bitable, report,
     if dropped_fields:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
               f"{'、'.join(sorted(dropped_fields))}")
+    if mistyped_fields:
+        print(_mistyped_warning(mistyped_fields, fields_meta, settings, label))
     if write_errors:
         print(f"⚠ {len(write_errors)} 行写回失败（其余行不受影响）：")
         for record_id, exc in write_errors:
@@ -799,8 +832,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             total_rows += row_count
             total_yuan += yuan
             if prep is not None:
-                report, known_fields = prep
-                pending.append((label, table, report, known_fields))
+                report, fields_meta = prep
+                pending.append((label, table, report, fields_meta))
                 if report.fatal and not [k for k in api_keys if k not in disabled]:
                     channels_dead = True
     except BaseException:
@@ -809,9 +842,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         # 下一轮按原样的 last_updated 再付一次。
         if pending:
             print("\n⚠ 运行中断，先把已经完成的表写回（避免已付费的结果丢失）…")
-            for label, table, report, known_fields in pending:
+            for label, table, report, fields_meta in pending:
                 try:
-                    _write_back_table(table, report, known_fields)
+                    _write_back_table(table, report, fields_meta, settings, label)
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
         raise
@@ -827,16 +860,16 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 结构化事件在**所有**熔断（含上面这次跨表熔断）定案之后才发：
     # 提前发的话，被熔断改写过的行会让看板和告警看到一个比实际落表更吓人的
     # 结论，而那正好发生在上游故障、最不该误报的时候。
-    for label, _table, report, _known in pending:
+    for label, _table, report, _meta in pending:
         runner.emit_run_events(report, on_event, table=label)
 
-    for label, table, report, known_fields in pending:
+    for label, table, report, fields_meta in pending:
         if multi:
             print(f"\n━━━━ 表：{label}（结果）━━━━")
         else:
             print()
         try:
-            code = _write_back_table(table, report, known_fields)
+            code = _write_back_table(table, report, fields_meta, settings, label)
         except feishu.FeishuError as exc:
             print(f"❌ 这张表写回失败（表级错误）：{exc}；继续处理其余表")
             worst = 1
