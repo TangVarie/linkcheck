@@ -258,6 +258,179 @@ class TestSeedKeywordMatch(unittest.TestCase):
         self.assertIsNone(analyze.comment_status_value(v, Settings()))
 
 
+def _page(*comments, count=42):
+    return analyze.read_comment_page("xhs", {
+        "items": [{"content": c, "like_count": 5, "ip_location": "上海",
+                   "author": {"name": "路人"}} for c in comments],
+        "comment_count": count,
+    })
+
+
+class TestNegativeKeywords(unittest.TestCase):
+    """负面词/竞品词：和「评论关键词」同一套机制、相反的方向。
+
+    共用**同一份**第一页评论，不额外发请求、不翻页——多一列判定不该多花钱。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def decide(self, snapshot, **kw):
+        return analyze.decide(snapshot, self.settings,
+                              previous_comment_count=None, age_hours=10, **kw)
+
+    def test_hit_marks_the_row_and_lists_the_offending_comments(self):
+        snap = _page("好用，回购了", "用了过敏，客服还不理人", "我一直用竞品A")
+        verdict = self.decide(snap, negative_keywords=["过敏", "竞品A"])
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.found)
+        digest = analyze.format_negative_digest(verdict.negative_hits, self.settings.digest)
+        self.assertIn("命中「过敏」", digest)
+        self.assertIn("命中「竞品A」", digest)
+        self.assertNotIn("回购", digest, "没命中的评论不该进负面快照")
+
+    def test_configured_but_clean_is_an_explicit_verdict(self):
+        """「查过、没中」和「没查过」是两个不同的结论，不能都留空。"""
+        verdict = self.decide(_page("好用，回购了"), negative_keywords=["过敏"])
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.clean)
+        self.assertEqual(
+            analyze.format_negative_digest(verdict.negative_hits, self.settings.digest),
+            "（未命中）")
+
+    def test_no_negative_words_configured_leaves_the_column_alone(self):
+        verdict = self.decide(_page("用了过敏"))
+        self.assertFalse(verdict.negative_checked)
+        self.assertIsNone(analyze.negative_status_value(verdict, self.settings))
+
+    def test_empty_comment_page_never_claims_clean(self):
+        """空壳轮拿上游缺数当「无负面」写进表里，等于给运营一个假的安全感。"""
+        empty = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        verdict = self.decide(empty, negative_keywords=["过敏"])
+        self.assertFalse(verdict.negative_checked)
+        self.assertIsNone(analyze.negative_status_value(verdict, self.settings))
+        self.assertTrue(any("保持原样" in n for n in verdict.notes))
+
+    def test_the_brands_own_reply_never_counts_as_negative(self):
+        """负面词问的是「**别人**说了什么」。自家回复里的「不会过敏」
+        按字面照样命中，会把一条干净的帖子写成「有负面」。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "温和配方，不会过敏", "like_count": 9,
+                 "is_author_comment": True, "author": {"name": "官号"}},
+                {"content": "好用，回购了", "like_count": 3,
+                 "author": {"name": "路人"}},
+            ],
+            "comment_count": 2,
+        })
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertEqual(verdict.negative_hits, [])
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.clean)
+
+    def test_a_real_person_saying_it_still_counts(self):
+        """把自家回复排除掉，不能顺手把真正的负面也漏了。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "温和配方，不会过敏", "like_count": 9,
+                 "is_author_comment": True, "author": {"name": "官号"}},
+                {"content": "我用了过敏，退款还难", "like_count": 31,
+                 "author": {"name": "路人"}},
+            ],
+            "comment_count": 2,
+        })
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertEqual(len(verdict.negative_hits), 1)
+        self.assertEqual(verdict.negative_hits[0].comment.content, "我用了过敏，退款还难")
+
+    def test_seed_keywords_still_see_the_authors_own_comment(self):
+        """反方向：自家置顶的引导评论正是「评论关键词」要找的东西。
+        两个方向天生相反，跳过作者的开关不能串到种子词那边。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [{"content": "戳主页领券", "like_count": 10,
+                       "is_author_comment": True, "author": {"name": "官号"}}],
+            "comment_count": 1,
+        })
+        verdict = self.decide(snap, seed_keywords=["领券"])
+        self.assertIsNotNone(verdict.seed_hit)
+
+    def test_matching_is_as_loose_as_seed_keywords(self):
+        """和种子词共用同一套归一化：大小写、空格、标点都不该影响命中。"""
+        snap = _page("这个 Xx 牌 更好用！")
+        verdict = self.decide(snap, negative_keywords=["xx牌"])
+        self.assertTrue(verdict.negative_hits)
+
+    def test_one_comment_counts_once_even_if_it_hits_several_words(self):
+        snap = _page("过敏了，还是竞品A好")
+        verdict = self.decide(snap, negative_keywords=["过敏", "竞品A"])
+        self.assertEqual(len(verdict.negative_hits), 1)
+        self.assertEqual(verdict.negative_hits[0].keyword, "过敏")   # 按表里的词序取第一个
+
+    def test_an_empty_page_on_a_busy_post_is_never_a_verdict(self):
+        """评论接口返回空页、detail 兜底回填「评论数 150」——我们对这条
+        帖子的评论区**一眼都没看到**，却曾经据此下了三个结论：
+        「无负面」「评论没有显示」「（暂无评论）」，还把上一轮真实的
+        评论快照覆盖掉。全是拿上游缺数当证据。
+        """
+        snap = analyze.read_comment_page("xhs", {"items": []})
+        analyze.merge_detail(snap, {"comment_count": 150, "like_count": 9})
+        self.assertEqual(snap.comment_count, 150)      # 帖子确实活着
+        self.assertFalse(analyze.saw_comment_page(snap))   # 但没看到评论内容
+
+        verdict = self.decide(snap, seed_keywords=["领券"],
+                              negative_keywords=["过敏"])
+        self.assertFalse(verdict.negative_checked)
+        self.assertIsNone(analyze.negative_status_value(verdict, self.settings))
+        self.assertFalse(verdict.seed_checked)
+        self.assertIsNone(analyze.comment_status_value(verdict, self.settings))
+        self.assertFalse(verdict.pin_checked)
+
+    def test_a_post_with_genuinely_zero_comments_is_a_verdict(self):
+        """「量到了、就是 0」是结论，「压根没量到」才不是。别把两者一起拦掉。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 0})
+        self.assertTrue(analyze.saw_comment_page(snap))
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertTrue(verdict.negative_checked)
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.clean)
+
+    def test_negative_and_seed_keywords_are_independent(self):
+        """两列查的是相反的东西，互不干扰：我们的评论显示出来了，
+        底下同时有人骂——这两件事都要如实写出来。"""
+        snap = _page("戳主页领券", "用了过敏")
+        verdict = self.decide(snap, seed_keywords=["领券"], negative_keywords=["过敏"])
+        self.assertEqual(analyze.comment_status_value(verdict, self.settings),
+                         self.settings.comment_status.displayed)
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.found)
+
+    def test_douyin_rows_are_covered_too(self):
+        """匹配的是评论正文，不依赖置顶字段，所以抖音同样能判。"""
+        snap = analyze.read_comment_page("douyin", {
+            "items": [{"content": "用了过敏", "like_count": 1}], "comment_count": 9})
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.found)
+
+    def test_digest_respects_the_privacy_switches(self):
+        snap = _page("用了过敏")
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        fmt = self.settings.digest
+        fmt.show_author_name = False
+        fmt.show_ip_location = False
+        digest = analyze.format_negative_digest(verdict.negative_hits, fmt)
+        self.assertNotIn("路人", digest)
+        self.assertNotIn("上海", digest)
+        self.assertIn("过敏", digest)
+
+    def test_digest_is_capped_like_the_normal_one(self):
+        snap = _page(*[f"过敏第{i}条" for i in range(20)])
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertEqual(len(verdict.negative_hits), 20)
+        digest = analyze.format_negative_digest(verdict.negative_hits, self.settings.digest)
+        self.assertLessEqual(len(digest.splitlines()), self.settings.digest.max_comments)
+
+
 class TestHeatTiers(unittest.TestCase):
     """热度三档：≥20 评估中，≥50 爆贴，≥100 大爆。互斥，取最高，只升不降。"""
 

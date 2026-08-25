@@ -767,6 +767,104 @@ def mixed_gone(counter={"n": 0}):
     return responder
 
 
+class TestNegativeColumns(RunnerTest):
+    """负面词/竞品词判定：复用同一份第一页评论，不额外发任何请求。"""
+
+    def _page(self, *contents, count=30):
+        return sse({
+            "items": [{"content": c, "like_count": 5, "is_pinned": False,
+                       "is_author_comment": False, "ip_location": "上海",
+                       "author": {"name": "路人"}} for c in contents],
+            "comment_count": count, "top_level_comment_count": count,
+            "points": {"cost": 10, "balance": 900},
+        })
+
+    def _detail(self):
+        return sse({"like_count": 100, "collect_count": 20,
+                    "points": {"cost": 10, "balance": 890}})
+
+    def test_no_extra_request_is_made_for_the_new_columns(self):
+        """多一列判定不该多花一分钱——调用计划必须和没配负面词时完全一样。"""
+        from xhsearch.rows import plan_calls
+
+        plain = xhs_row()
+        with_negative = xhs_row()
+        with_negative.negative_keywords = ["过敏", "竞品A"]
+        self.assertEqual(len(plan_calls(plain, self.settings, NOW)),
+                         len(plan_calls(with_negative, self.settings, NOW)))
+
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return [self._page("用了过敏"), self._detail()][min(posts["n"] - 1, 1)]
+
+        self.run_with(responder, [with_negative],
+                      negative_status_options=["有负面", "无负面"])
+        self.assertEqual(posts["n"], 2, "评论 1 次 + detail 1 次，没有额外调用")
+
+    def test_hit_writes_both_new_columns(self):
+        row = xhs_row()
+        row.negative_keywords = ["过敏", "竞品A"]
+        posts = {"n": 0}
+
+        def responder(url, headers, body, timeout=30.0):
+            posts["n"] += 1
+            return [self._page("好用，回购了", "用了过敏，客服还不理人"),
+                    self._detail()][min(posts["n"] - 1, 1)]
+
+        report = self.run_with(responder, [row],
+                               negative_status_options=["有负面", "无负面"])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(fields[f.negative_status], self.settings.negative_status.found)
+        self.assertIn("命中「过敏」", fields[f.negative_digest])
+        self.assertNotIn("回购", fields[f.negative_digest])
+
+    def test_clean_row_says_so_instead_of_leaving_a_stale_digest(self):
+        """上一轮的负面评论留在格子里，运营会以为负面还在——比不写更误导。"""
+        row = xhs_row()
+        row.negative_keywords = ["过敏"]
+        report = self.run_with(
+            [self._page("好用，回购了"), self._detail()], [row],
+            negative_status_options=["有负面", "无负面"])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(fields[f.negative_status], self.settings.negative_status.clean)
+        self.assertEqual(fields[f.negative_digest], "（未命中）")
+
+    def test_row_without_negative_words_touches_neither_column(self):
+        report = self.run_with([self._page("用了过敏"), self._detail()], [xhs_row()])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertNotIn(f.negative_status, fields)
+        self.assertNotIn(f.negative_digest, fields)
+
+    def test_missing_option_is_skipped_not_written(self):
+        """表里还没建选项时安全跳过并提示，别让一个缺选项拖垮整行写回。"""
+        row = xhs_row()
+        row.negative_keywords = ["过敏"]
+        report = self.run_with([self._page("用了过敏"), self._detail()], [row],
+                               negative_status_options=[])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertNotIn(f.negative_status, fields)
+        self.assertIn("还没建选项", fields[f.failure_reason])
+        # 快照列没有选项概念，照常写
+        self.assertIn("命中「过敏」", fields[f.negative_digest])
+
+    def test_failed_round_never_claims_clean(self):
+        """取不到内容的行完全不碰负面列——不能拿失败当「无负面」的证据。"""
+        row = xhs_row()
+        row.negative_keywords = ["过敏"]
+        report = self.run_with(lambda *a, **k: err(500, 1005, "服务暂时不可用"), [row])
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_FAILED)
+        self.assertNotIn(f.negative_status, fields)
+        self.assertNotIn(f.negative_digest, fields)
+
+
 class TestBreakerAccounting(RunnerTest):
     def _gone_rows(self, n):
         rows = []
@@ -1229,6 +1327,156 @@ class TestTagWriteBackIsOptimisticallyConcurrent(RunnerTest):
         self.assertNotIn(f.traffic_status, table.updates[0]["fields"])
         # 其余列照常写，不受影响
         self.assertIn(f.refresh_status, table.updates[0]["fields"])
+
+
+class TestOneMistypedColumnCannotKillTheTable(RunnerTest):
+    """线上事故：一张表的某列类型建错，飞书回 1254063
+    （MultiSelectFieldConvFail）。batch_update 全成功或全失败，于是
+    4 行付了钱、0 行落表。写回前按类型筛一遍，坏列单独摘掉。"""
+
+    class _FakeTable:
+        def __init__(self):
+            self.updates = None
+
+        def batch_get(self, record_ids):
+            return [{"record_id": rid, "fields": {}} for rid in record_ids]
+
+        def batch_update(self, updates, errors=None):
+            self.updates = updates
+            return len(updates)
+
+    def _report(self):
+        return self.run_with(
+            [sse(comment_page(count=150)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row()])
+
+    def _types(self, **overrides):
+        """一张类型全对的表，再按需要把某几列改错。"""
+        f = self.settings.fields
+        types = {
+            f.platform: 3, f.comment_count: 2, f.previous_comment_count: 2,
+            f.like_count: 2, f.previous_like_count: 2,
+            f.collect_count: 2, f.previous_collect_count: 2,
+            f.pinned_status: 3, f.comment_status: 3, f.comment_digest: 1,
+            f.negative_status: 3, f.negative_digest: 1,
+            f.traffic_status: 4, f.refresh_status: 3, f.failure_reason: 1,
+            f.last_updated: 5, f.alive_confirmed: 7, f.consecutive_failures: 2,
+            f.queued: 7,
+        }
+        types.update(overrides)
+        return types
+
+    def test_all_columns_land_when_the_schema_is_right(self):
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, set(), f"类型全对却被摘掉了列：{mistyped}")
+        self.assertIn(f.traffic_status, table.updates[0]["fields"])
+        self.assertIn(f.comment_count, table.updates[0]["fields"])
+
+    def test_multi_select_built_as_single_select_drops_only_that_column(self):
+        """事故现场：「流量状态」建成了单选，机器写的是列表。"""
+        f = self.settings.fields
+        report = self._report()
+        self.assertIsInstance(report.outcomes[0].fields[f.traffic_status], list)
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(**{f.traffic_status: 3}),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, {f.traffic_status})
+        written = table.updates[0]["fields"]
+        self.assertNotIn(f.traffic_status, written)
+        # 付过钱的那些数字和状态照样落表——这才是这个改动的意义
+        self.assertIn(f.comment_count, written)
+        self.assertIn(f.refresh_status, written)
+        self.assertIn(f.last_updated, written)
+
+    def test_single_select_built_as_multi_select_drops_only_that_column(self):
+        """反过来：单选列被建成多选，机器写的是字符串。
+
+        这里拿「置顶状态」当样本；「评论状态」「负面状态」是同一个形状。
+        """
+        f = self.settings.fields
+        report = self._report()
+        self.assertIsInstance(report.outcomes[0].fields[f.pinned_status], str)
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(**{f.pinned_status: 4}),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, {f.pinned_status})
+        self.assertIn(f.traffic_status, table.updates[0]["fields"])
+
+    def test_read_only_column_is_never_written(self):
+        """「最近检查时间」被建成系统的「最后更新时间」（1002）：机器写不进去。"""
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types=self._types(**{f.last_updated: 1002}),
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, {f.last_updated})
+        self.assertNotIn(f.last_updated, table.updates[0]["fields"])
+
+    def test_a_row_with_nothing_writable_left_is_skipped_entirely(self):
+        report = self._report()
+        table = self._FakeTable()
+        # 每一列的类型都判成不可写
+        types = {k: 1002 for k in report.outcomes[0].fields}
+        self.assertEqual(runner.write_back(table, report, field_types=types), 0)
+        self.assertIsNone(table.updates)
+
+    def test_no_field_types_keeps_the_old_behaviour(self):
+        """None = 不过滤。老调用方（和测试）不受影响。"""
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        runner.write_back(table, report)
+        self.assertIn(f.traffic_status, table.updates[0]["fields"])
+
+    def test_doctor_and_the_write_gate_agree_on_every_written_column(self):
+        """这道闸最危险的失败方式不是漏放，是**误伤**：在一张建对了的表上
+        把一列判成类型不对，运营看到一段假警告、那一列还是落不下来。
+
+        所以反过来钉：机器真的写出来的每一列，按 doctor 的期望类型建表时，
+        必须全部过闸。列表取自真实 outcome，加新列不会漏掉。
+        """
+        import cli
+        from xhsearch import feishu
+        expected = {name: (allowed, label)
+                    for name, allowed, label, _o, _n in cli._expected_schema(self.settings)}
+        written: dict = {}
+        for report in (self._report(),
+                       self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                                     [xhs_row()])):
+            for o in report.outcomes:
+                written.update(o.fields)
+        self.assertTrue(written)
+        for name, value in written.items():
+            with self.subTest(column=name):
+                self.assertIn(name, expected,
+                              f"机器在写「{name}」，doctor 的清单里却没有这一列")
+                allowed, label = expected[name]
+                self.assertTrue(
+                    any(feishu.value_fits(code, value) for code in allowed),
+                    f"doctor 说「{name}」该建成「{label}」，但机器写的值 "
+                    f"{value!r} 过不了写回的类型闸——这一列会被永远摘掉，"
+                    f"而 doctor 还说表是健康的")
+
+    def test_columns_absent_from_the_meta_are_left_to_the_name_filter(self):
+        """类型表里没有的列不归类型闸管——那是 known_fields 的活儿，
+        两道闸各管各的，别互相顶替。"""
+        f = self.settings.fields
+        report = self._report()
+        table = self._FakeTable()
+        mistyped: set = set()
+        runner.write_back(table, report, field_types={f.traffic_status: 4},
+                          mistyped_fields=mistyped)
+        self.assertEqual(mistyped, set())
+        self.assertIn(f.comment_count, table.updates[0]["fields"])
 
 
 if __name__ == "__main__":

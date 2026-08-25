@@ -34,6 +34,9 @@ class FieldNames:
     seed_keywords: str = "评论关键词"         # 多选或文本（顿号/逗号分隔）：一组词，
                                               # 任一出现在第一页任一条评论里 = 我们的
                                               # 评论显示出来了。注意不是「蓝词字段」！
+    negative_keywords: str = "负面词"         # 多选或文本，格式同「评论关键词」：
+                                              # 负面词 + 竞品词。命中的是**别人**写的东西，
+                                              # 和「评论关键词」查自己的种子评论正好相反
     monitoring: str = "是否巡查"              # 复选框；取消勾选即停止刷新
     queued: str = "排队刷新"                  # 复选框；勾上=手动请求刷新，机器处理完自动清掉
 
@@ -53,6 +56,11 @@ class FieldNames:
                                               # 没填关键词的行不碰
     comment_digest: str = "评论区快照"        # 命中的那条评论排最前并带「命中」标记，
                                               # 其余按 置顶优先 接在后面
+    negative_status: str = "负面状态"         # 单选，由「负面词」命中驱动直接覆盖：
+                                              # 有负面 / 无负面；没填负面词的行不碰
+    negative_digest: str = "负面评论快照"     # 只放命中负面词的那几条，每条标出命中的是哪个词。
+                                              # 判定过但一条没中时写「（未命中）」——
+                                              # 空单元格要留给「这一轮压根没查过」
     traffic_status: str = "流量状态"          # 多选，人机共用（爆帖预备等人工值不碰）
     refresh_status: str = "巡查状态"
     failure_reason: str = "诊断信息"
@@ -68,6 +76,7 @@ class FieldNames:
             self.link,
             self.publish_time,
             self.seed_keywords,
+            self.negative_keywords,       # 负面/竞品词，和种子词共用同一份评论页
             self.monitoring,
             self.queued,
             self.traffic_status,          # 合并多选必须先读现值
@@ -147,6 +156,31 @@ class CommentStatus:
     def machine_written(self) -> list[str]:
         """机器会写入的值——doctor 检查选项是否建好用这个清单。"""
         return [self.displayed, self.not_displayed]
+
+
+@dataclass
+class NegativeStatus:
+    """「负面状态」单选列的取值：第一页评论里有没有出现负面词或竞品词。
+
+    和「评论状态」是同一套机制、**相反的方向**：
+    评论状态查的是「我们自己种的评论显示出来没有」（希望命中），
+    负面状态查的是「别人有没有在底下说难听的、或者提竞品」（不希望命中）。
+
+    两者共用**同一份**第一页评论快照，不额外发任何请求、不翻页——
+    多一列判定不该多花一分钱。代价要说清楚：只看得到第一页，
+    埋在第二页往后的负面评论这里看不见，这一列是**预警**不是**普查**。
+
+        有负面  —— 任一负面词/竞品词出现在第一页任一条评论里
+        无负面  —— 配了负面词，但第一页一条都没命中
+
+    没填负面词的行、以及本轮没看到评论页内容的行完全不碰这一列。
+    """
+
+    found: str = "有负面"
+    clean: str = "无负面"
+
+    def machine_written(self) -> list[str]:
+        return [self.found, self.clean]
 
 
 @dataclass
@@ -379,6 +413,7 @@ class Settings:
     fields: FieldNames = field(default_factory=FieldNames)
     tags: Tags = field(default_factory=Tags)
     comment_status: CommentStatus = field(default_factory=CommentStatus)
+    negative_status: NegativeStatus = field(default_factory=NegativeStatus)
     pin_status: PinStatus = field(default_factory=PinStatus)
     thresholds: Thresholds = field(default_factory=Thresholds)
     digest: DigestFormat = field(default_factory=DigestFormat)

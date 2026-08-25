@@ -550,6 +550,7 @@ def refresh(
     now: Optional[datetime] = None,
     known_options: Optional[list[str]] = None,
     comment_status_options: Optional[list[str]] = None,
+    negative_status_options: Optional[list[str]] = None,
     pin_status_options: Optional[list[str]] = None,
     forced: bool = False,
     timeout: float = 30.0,
@@ -666,6 +667,9 @@ def refresh(
                 (f.comment_status,
                  analyze.comment_status_value(verdict, settings),
                  comment_status_options),
+                (f.negative_status,
+                 analyze.negative_status_value(verdict, settings),
+                 negative_status_options),
                 (f.pinned_status,
                  analyze.pin_status_value(verdict, row.pin_status, settings),
                  pin_status_options),
@@ -702,9 +706,17 @@ def refresh(
             # 快照只在看到了评论页（有评论、或至少知道评论数）时更新：
             # 空壳轮写「暂无评论」会把上一轮的真实快照抹掉。
             # 命中关键词的那条评论排最前并带「命中」标记。
-            if snapshot.comments or snapshot.comment_count is not None:
+            if analyze.saw_comment_page(snapshot):
                 fields[f.comment_digest] = analyze.format_digest(
                     snapshot, settings.digest, hit=verdict.seed_hit)
+
+        # 「负面评论快照」跟着「负面状态」一起写：判过就写（命中的几条，
+        # 或者「（未命中）」），没判过一个字都不碰。
+        # 判过却不写的话，上一轮的负面评论会一直留在格子里，
+        # 运营会以为负面还在——那比不写更误导。
+        if touch_tags and verdict.negative_checked:
+            fields[f.negative_digest] = analyze.format_negative_digest(
+                verdict.negative_hits, settings.digest)
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan)
@@ -829,6 +841,7 @@ def refresh(
             previous_comment_count=row.previous_comment_count,
             age_hours=row.age_hours(now),
             seed_keywords=row.seed_keywords,                  # 评论关键词组，任一命中即算命中
+            negative_keywords=row.negative_keywords,          # 负面/竞品词，复用同一份评论页
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
             current_pin_status=row.pin_status,                # 区分「掉了」和「从来没有」
         )
@@ -1123,6 +1136,7 @@ def load_rows(
             link_cell=feishu.read_text(cells.get(f.link)),
             publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
             seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
+            negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
             current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
             previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
             previous_like_count=feishu.read_int(cells.get(f.like_count)),
@@ -1205,15 +1219,25 @@ def write_back(
     *,
     errors: Optional[list] = None,
     known_fields: Optional[set[str]] = None,
+    field_types: Optional[dict[str, Any]] = None,
     dropped_fields: Optional[set[str]] = None,
+    mistyped_fields: Optional[set[str]] = None,
     say: Callable[[str], None] = lambda _: None,
 ) -> int:
     """写回。errors 传一个列表进来可以收集失败的行（(record_id, FeishuError)），
     不传则在所有行都尝试过之后抛汇总异常——见 feishu.Bitable.batch_update。
 
+    写回前有两道按列的闸，理由是同一个：batch_update 全成功或全失败，
+    一列不对就能让整表已经付过钱的结果全部落空。
+
     known_fields 传入表里实际存在的列名（table.field_names()）时，会把表里
     还没建的机器列挡下来（记进 dropped_fields 供调用方提示）——按名字写
-    不存在的列是表级错误，会让整批写回失败。None = 不过滤，宁可试着写。
+    不存在的列是表级错误（1254045）。None = 不过滤，宁可试着写。
+
+    field_types 传入列名 → 字段类型码（table.fields_meta() 里的 "type"）时，
+    会把类型和值形状对不上的列挡下来（记进 mistyped_fields）——比如
+    「流量状态」被建成单选而机器写列表，飞书回 1254063，整表写回全灭。
+    None = 不过滤（旧行为）。
     """
     _reconcile_tags(table, report, say=say)
     updates = []
@@ -1227,6 +1251,13 @@ def write_back(
                 if dropped_fields is not None:
                     dropped_fields |= missing
                 fields = {k: v for k, v in fields.items() if k in known_fields}
+        if field_types is not None:
+            bad = {k for k, v in fields.items()
+                   if k in field_types and not feishu.value_fits(field_types[k], v)}
+            if bad:
+                if mistyped_fields is not None:
+                    mistyped_fields |= bad
+                fields = {k: v for k, v in fields.items() if k not in bad}
         if fields:
             updates.append({"record_id": o.record_id, "fields": fields})
     return table.batch_update(updates, errors=errors) if updates else 0

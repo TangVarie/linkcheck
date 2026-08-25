@@ -28,6 +28,7 @@ class TestDoctorSchema(unittest.TestCase):
                        f.like_count, f.previous_like_count,
                        f.collect_count, f.previous_collect_count,
                        f.pinned_status, f.comment_status, f.comment_digest,
+                       f.negative_status, f.negative_digest,
                        f.traffic_status, f.refresh_status,
                        f.failure_reason, f.last_updated, f.alive_confirmed,
                        f.consecutive_failures):
@@ -51,6 +52,9 @@ class TestDoctorSchema(unittest.TestCase):
         _, _, pin_required, _ = self.schema[f.pinned_status]
         for value in self.settings.pin_status.machine_written():
             self.assertIn(value, pin_required)
+        _, _, negative_required, _ = self.schema[f.negative_status]
+        for value in self.settings.negative_status.machine_written():
+            self.assertIn(value, negative_required)
 
     def test_column_types_match_write_semantics(self):
         """流量状态按多选列表合并写入（必须类型码 4）；评论状态/置顶状态
@@ -58,6 +62,7 @@ class TestDoctorSchema(unittest.TestCase):
         f = self.settings.fields
         self.assertEqual(self.schema[f.traffic_status][0], (4,))
         self.assertEqual(self.schema[f.comment_status][0], (3,))
+        self.assertEqual(self.schema[f.negative_status][0], (3,))
         self.assertEqual(self.schema[f.pinned_status][0], (3,))
 
 
@@ -568,6 +573,122 @@ class TestSchemaProblems(unittest.TestCase):
         del meta[self.f.last_updated]
         problems = cli._schema_problems(self.settings, meta)
         self.assertTrue(any("必备列" in p and self.f.last_updated in p for p in problems))
+
+
+class TestSchedulingBlockers(unittest.TestCase):
+    """`最近检查时间` / `排队刷新` 写不进去会**循环烧钱**：刷过的行下一轮
+    还是判到期，每一轮重新付费刷同一批，而进程一路返回 0。别的机器列
+    建错只是少一列数据，这两列建错是无底洞——必须在花钱之前拦。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        self.f = self.settings.fields
+
+    def _meta(self, **overrides) -> dict:
+        meta = {}
+        for name, allowed, _l, options, _n in cli._expected_schema(self.settings):
+            t = overrides.get(name, allowed[0])
+            meta[name] = {"type": t, "ui_type": "",
+                          "options": list(options or []) if t in (3, 4) else None}
+        return meta
+
+    def test_a_healthy_table_blocks_nothing(self):
+        self.assertEqual(cli._scheduling_blockers(self.settings, self._meta()), [])
+
+    def test_last_updated_built_as_text_is_a_blocker(self):
+        blockers = cli._scheduling_blockers(
+            self.settings, self._meta(**{self.f.last_updated: 1}))
+        self.assertEqual(len(blockers), 1)
+        self.assertIn(self.f.last_updated, blockers[0])
+        self.assertIn("文本", blockers[0])       # 现在是什么
+        self.assertIn("日期", blockers[0])       # 应该是什么
+
+    def test_queued_built_as_text_is_a_blocker(self):
+        blockers = cli._scheduling_blockers(
+            self.settings, self._meta(**{self.f.queued: 1}))
+        self.assertEqual(len(blockers), 1)
+        self.assertIn(self.f.queued, blockers[0])
+
+    def test_a_missing_column_is_not_this_guards_business(self):
+        """缺列另有护栏（而且缺 `最近检查时间` 时 sweep 本来就拒跑）。
+        两道闸各管各的，别互相顶替。"""
+        meta = self._meta()
+        del meta[self.f.last_updated]
+        self.assertEqual(cli._scheduling_blockers(self.settings, meta), [])
+
+    def test_other_mistyped_columns_do_not_block_the_run(self):
+        """「流量状态」建错只是这一列落不下来，不该拦下整轮巡查——
+        拦得过宽和拦不住一样糟。"""
+        self.assertEqual(
+            cli._scheduling_blockers(self.settings,
+                                     self._meta(**{self.f.traffic_status: 3})),
+            [])
+
+
+class TestMistypedWarning(unittest.TestCase):
+    """写回时按类型摘掉的列，得让运营不看代码就知道该去改什么。
+    只说「跳过了 1 列」等于让人回头再体检一遍——而钱已经花了。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        self.f = self.settings.fields
+
+    def test_it_names_the_column_the_actual_type_and_the_wanted_type(self):
+        meta = {self.f.traffic_status: {"type": 3, "ui_type": "", "options": []}}
+        text = cli._mistyped_warning({self.f.traffic_status}, meta,
+                                     self.settings, "西屋第一期")
+        self.assertIn(self.f.traffic_status, text)
+        self.assertIn("单选", text)      # 现在建成了什么
+        self.assertIn("多选", text)      # 应该是什么
+        self.assertIn("doctor --table 西屋第一期", text)
+
+    def test_it_survives_a_column_missing_from_the_meta(self):
+        text = cli._mistyped_warning({self.f.traffic_status}, None, self.settings)
+        self.assertIn(self.f.traffic_status, text)
+        self.assertIn("doctor", text)
+        self.assertNotIn("--table", text)   # 没表名就别编一个
+
+    def _run_write_back(self, meta) -> int:
+        """把一份 meta 喂给写回，拿到退出码。"""
+        f = self.f
+
+        class _Outcome:
+            tag_plan = None
+            record_id = "rec1"
+            fields = {f.refresh_status: "正常", f.last_updated: 1787313600000,
+                      f.queued: False, f.traffic_status: ["大爆"]}
+
+        class _Report:
+            fatal = False
+            outcomes = [_Outcome()]
+
+            def summary(self):
+                return ""
+
+        class _Table:
+            def batch_get(self, ids):
+                return [{"record_id": i, "fields": {}} for i in ids]
+
+            def batch_update(self, updates, errors=None):
+                return len(updates)
+
+        with mock.patch("builtins.print"):
+            return cli._write_back_table(_Table(), _Report(), meta, self.settings, "表A")
+
+    def _meta(self, **overrides) -> dict:
+        meta = {}
+        for name, allowed, _l, options, _n in cli._expected_schema(self.settings):
+            t = overrides.get(name, allowed[0])
+            meta[name] = {"type": t, "ui_type": "",
+                          "options": list(options or []) if t in (3, 4) else None}
+        return meta
+
+    def test_a_dropped_column_does_not_exit_green(self):
+        """钱花了、那一列没落表，而且不改配置每一轮都会这样。
+        让 cron 和 Actions 显示绿色的成功等于把它藏起来。"""
+        self.assertEqual(self._run_write_back(self._meta()), 0)
+        self.assertEqual(
+            self._run_write_back(self._meta(**{self.f.traffic_status: 3})), 1)
 
 
 if __name__ == "__main__":

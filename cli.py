@@ -333,6 +333,8 @@ def _expected_schema(settings: Settings) -> list[tuple]:
          "要手填的普通日期字段；建成「创建时间」类型拿到的是建行时间，不是发布时间"),
         (f.seed_keywords, (4, 1), "多选或文本", None,
          "文本列时用顿号/逗号/分号分隔多个词"),
+        (f.negative_keywords, (4, 1), "多选或文本", None,
+         "负面词 + 竞品词，格式同「评论关键词」；留空的行完全不做负面判定"),
         (f.monitoring, (7,), "复选框", None, None),
         (f.queued, (7,), "复选框", None, None),
         # —— 机器写入 ——
@@ -348,6 +350,9 @@ def _expected_schema(settings: Settings) -> list[tuple]:
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
          "机器直接覆盖写入当前状态（待评论等旧值会被覆盖）"),
         (f.comment_digest, (1,), "文本", None, None),
+        (f.negative_status, (3,), "单选", settings.negative_status.machine_written(),
+         "由「负面词」命中驱动，机器直接覆盖；没填负面词的行不碰这一列"),
+        (f.negative_digest, (1,), "文本", None, None),
         (f.traffic_status, (4,), "多选", settings.tags.machine_written(),
          "机器按多选合并写入——建成单选会让写回整批失败"),
         (f.refresh_status, (3, 1), "单选或文本", statuses, None),
@@ -379,7 +384,8 @@ def _schema_problems(settings: Settings, meta: dict) -> list[str]:
     # 写前核对选项清单）：缺选项会被安全跳过。其余带选项要求的列
     # （平台/巡查状态）是直写字符串，没有写侧守卫，缺选项的后果是
     # 写回可能失败——两种情况的文案必须如实区分。
-    filtered_columns = {f.traffic_status, f.comment_status, f.pinned_status}
+    filtered_columns = {f.traffic_status, f.comment_status, f.negative_status,
+                        f.pinned_status}
     for name, allowed, type_label, required_options, note in _expected_schema(settings):
         info = meta.get(name)
         if info is None:
@@ -542,7 +548,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
-    待写回材料是 (report, known_fields)，None 表示这张表本轮没有要写的
+    待写回材料是 (report, fields_meta)，None 表示这张表本轮没有要写的
     （estimate、没有待刷行、缺列护栏拦下）。写回推迟到所有表都刷完之后
     （见 _run）：跨表熔断要先看全局样本再定罪，作废的判定不能已经落了表。
 
@@ -564,6 +570,22 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
               "先跑 `python3 cli.py doctor` 看具体原因")
         return 1, set(), 0, 0.0, None
     known_fields = set(fields_meta)
+    blockers = _scheduling_blockers(settings, fields_meta)
+    if blockers and mode in ("sweep", "queue"):
+        # 在**花钱之前**拦下来。这两列写不进去会让每一轮重新付费刷同一批行，
+        # 而进程一路返回 0——跳过一轮是有界的损失，循环付费不是。
+        print("❌ 调度地基列的类型不对，本轮不跑（一行都没花钱）：")
+        for problem in blockers:
+            print(f"  {problem}")
+        print("  这两列写不进去，刷过的行下一轮还会被判成到期，"
+              "于是每一轮都重新付费刷同一批行，而且不会报错。"
+              "去飞书把类型改对，或跑 `python3 cli.py doctor` 看完整体检。")
+        return 1, set(), 0, 0.0, None
+    if blockers:
+        # row 模式是人工点名要这几行的数据，拦住不如给：照跑，但把后果说清楚。
+        print("⚠ 调度地基列的类型不对，这几行刷完不会被记成「已检查」：")
+        for problem in blockers:
+            print(f"  {problem}")
     row_list = runner.load_rows(
         table,
         settings,
@@ -620,6 +642,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         now=now,
         known_options=_options_from_meta(fields_meta, settings.fields.traffic_status),
         comment_status_options=_options_from_meta(fields_meta, settings.fields.comment_status),
+        negative_status_options=_options_from_meta(fields_meta, settings.fields.negative_status),
         pin_status_options=_options_from_meta(fields_meta, settings.fields.pinned_status),
         forced=(record_ids is not None),
         progress=print,
@@ -628,22 +651,79 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         budget=budget,
         stop=stop,
     )
-    return 0, found, len(row_list), yuan, (report, known_fields)
+    return 0, found, len(row_list), yuan, (report, fields_meta)
+
+
+def _scheduling_blockers(settings: Settings, fields_meta: dict) -> list[str]:
+    """「调度地基」两列里类型建错的那些，翻译成人话。
+
+    `最近检查时间` 和 `排队刷新` 和别的机器列不是一个量级：别的列写不进去
+    只是这一列没数据，这两列写不进去会**循环烧钱**——刷过的行 last_updated
+    没推进，下一轮 sweep 照样判它到期，于是每一轮都重新付费刷同一批行；
+    勾选清不掉的话 queue 模式同理。而进程一路返回 0，cron 和云平台看到的
+    是一片绿色的成功。
+
+    所以这两列的类型不对时，自动模式在**花钱之前**就拒跑：跳过一轮的代价
+    是有界的，循环付费的代价不是。缺列不归这里管（另有护栏）。
+    """
+    expected = {name: (allowed, label)
+                for name, allowed, label, _o, _n in _expected_schema(settings)}
+    problems = []
+    for name in (settings.fields.last_updated, settings.fields.queued):
+        info = fields_meta.get(name)
+        if info is None:
+            continue
+        allowed, label = expected[name]
+        if info["type"] not in allowed:
+            problems.append(f"「{name}」现在是「{_type_name(info['type'])}」，"
+                            f"需要「{label}」")
+    return problems
+
+
+def _mistyped_warning(mistyped: set[str], fields_meta: dict | None,
+                      settings: Settings, label: str = "") -> str:
+    """写回时按类型摘掉的列，翻译成运营看得懂的一段话。
+
+    这段话必须说清三件事：哪一列、现在建成了什么、应该是什么。只报
+    「跳过了 N 列」等于让人回头再体检一遍——而这时候钱已经花了。
+    """
+    expected = {name: (allowed, type_label)
+                for name, allowed, type_label, _opts, _note in _expected_schema(settings)}
+    lines = [
+        "❌ 这些列的**字段类型**和机器要写的值对不上，本轮已跳过这几列"
+        "（其余列照常写回，不会写坏表）："
+    ]
+    for name in sorted(mistyped):
+        actual = _type_name((fields_meta or {}).get(name, {}).get("type"))
+        want = expected.get(name, (None, "见 docs/表结构.md"))[1]
+        lines.append(f"  「{name}」现在是「{actual}」，需要「{want}」")
+    scope = f" --table {label}" if label else ""
+    lines.append(f"  去飞书把类型改过来，或跑 `python3 cli.py doctor{scope}` 看完整体检。"
+                 "不改的话这几列的数据每一轮都落不下来。")
+    return "\n".join(lines)
 
 
 def _write_back_table(table: feishu.Bitable, report,
-                      known_fields: set[str] | None) -> int:
+                      fields_meta: dict | None,
+                      settings: Settings, label: str = "") -> int:
     """写回阶段。summary 也在这里打印——跨表熔断可能刚作废过判定，
     这时各行显示的才是真正落表的最终状态。"""
     print(report.summary())
 
     write_errors: list = []
     dropped_fields: set = set()
+    mistyped_fields: set = set()
     try:
-        written = runner.write_back(table, report, errors=write_errors,
-                                    known_fields=known_fields,
-                                    dropped_fields=dropped_fields,
-                                    say=print)
+        written = runner.write_back(
+            table, report, errors=write_errors,
+            known_fields=None if fields_meta is None else set(fields_meta),
+            # 列名之外还要带上类型：一列被建错类型（比如「流量状态」建成单选）
+            # 会让飞书回 1254063，整表已付费的结果全部落空。
+            field_types=None if fields_meta is None
+            else {name: info.get("type") for name, info in fields_meta.items()},
+            dropped_fields=dropped_fields,
+            mistyped_fields=mistyped_fields,
+            say=print)
     except feishu.FeishuError as exc:
         # 表级错误（权限、列名、token）：逐行重试无意义，说清楚原因退出。
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
@@ -653,6 +733,8 @@ def _write_back_table(table: feishu.Bitable, report,
     if dropped_fields:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
               f"{'、'.join(sorted(dropped_fields))}")
+    if mistyped_fields:
+        print(_mistyped_warning(mistyped_fields, fields_meta, settings, label))
     if write_errors:
         print(f"⚠ {len(write_errors)} 行写回失败（其余行不受影响）：")
         for record_id, exc in write_errors:
@@ -661,7 +743,11 @@ def _write_back_table(table: feishu.Bitable, report,
     # cron / 云平台的重启策略把它当失败反复重启）；真故障（Key/余额）和
     # 「花了钱但有行没写回」都返回非零——花出去的钱没落进表里，
     # 不能让 cron 和 Actions 显示一个绿色的成功。
-    return 1 if (report.fatal or write_errors) else 0
+    #
+    # 类型建错的列同样非零：钱花了，那一列的数据没落表，而且不改配置的话
+    # 每一轮都会这样。缺列（dropped_fields）不算——那是「还没建，建好就补上」
+    # 的正常过渡态，不该每轮都把 cron 染红。
+    return 1 if (report.fatal or write_errors or mistyped_fields) else 0
 
 
 def _install_stop_handlers(stop: threading.Event) -> None:
@@ -792,8 +878,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             total_rows += row_count
             total_yuan += yuan
             if prep is not None:
-                report, known_fields = prep
-                pending.append((label, table, report, known_fields))
+                report, fields_meta = prep
+                pending.append((label, table, report, fields_meta))
                 if report.fatal and not [k for k in api_keys if k not in disabled]:
                     channels_dead = True
     except BaseException:
@@ -802,9 +888,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         # 下一轮按原样的 last_updated 再付一次。
         if pending:
             print("\n⚠ 运行中断，先把已经完成的表写回（避免已付费的结果丢失）…")
-            for label, table, report, known_fields in pending:
+            for label, table, report, fields_meta in pending:
                 try:
-                    _write_back_table(table, report, known_fields)
+                    _write_back_table(table, report, fields_meta, settings, label)
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
         raise
@@ -820,16 +906,16 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 结构化事件在**所有**熔断（含上面这次跨表熔断）定案之后才发：
     # 提前发的话，被熔断改写过的行会让看板和告警看到一个比实际落表更吓人的
     # 结论，而那正好发生在上游故障、最不该误报的时候。
-    for label, _table, report, _known in pending:
+    for label, _table, report, _meta in pending:
         runner.emit_run_events(report, on_event, table=label)
 
-    for label, table, report, known_fields in pending:
+    for label, table, report, fields_meta in pending:
         if multi:
             print(f"\n━━━━ 表：{label}（结果）━━━━")
         else:
             print()
         try:
-            code = _write_back_table(table, report, known_fields)
+            code = _write_back_table(table, report, fields_meta, settings, label)
         except feishu.FeishuError as exc:
             print(f"❌ 这张表写回失败（表级错误）：{exc}；继续处理其余表")
             worst = 1
