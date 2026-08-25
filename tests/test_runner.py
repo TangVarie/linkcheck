@@ -1437,6 +1437,35 @@ class TestOneMistypedColumnCannotKillTheTable(RunnerTest):
         runner.write_back(table, report)
         self.assertIn(f.traffic_status, table.updates[0]["fields"])
 
+    def test_doctor_and_the_write_gate_agree_on_every_written_column(self):
+        """这道闸最危险的失败方式不是漏放，是**误伤**：在一张建对了的表上
+        把一列判成类型不对，运营看到一段假警告、那一列还是落不下来。
+
+        所以反过来钉：机器真的写出来的每一列，按 doctor 的期望类型建表时，
+        必须全部过闸。列表取自真实 outcome，加新列不会漏掉。
+        """
+        import cli
+        from xhsearch import feishu
+        expected = {name: (allowed, label)
+                    for name, allowed, label, _o, _n in cli._expected_schema(self.settings)}
+        written: dict = {}
+        for report in (self._report(),
+                       self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                                     [xhs_row()])):
+            for o in report.outcomes:
+                written.update(o.fields)
+        self.assertTrue(written)
+        for name, value in written.items():
+            with self.subTest(column=name):
+                self.assertIn(name, expected,
+                              f"机器在写「{name}」，doctor 的清单里却没有这一列")
+                allowed, label = expected[name]
+                self.assertTrue(
+                    any(feishu.value_fits(code, value) for code in allowed),
+                    f"doctor 说「{name}」该建成「{label}」，但机器写的值 "
+                    f"{value!r} 过不了写回的类型闸——这一列会被永远摘掉，"
+                    f"而 doctor 还说表是健康的")
+
     def test_columns_absent_from_the_meta_are_left_to_the_name_filter(self):
         """类型表里没有的列不归类型闸管——那是 known_fields 的活儿，
         两道闸各管各的，别互相顶替。"""
