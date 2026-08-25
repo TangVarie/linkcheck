@@ -113,6 +113,17 @@ TIKHUB_PATHS = {
 # https://api.tikhub.dev/api/v1/tikhub/user/get_all_endpoints_info
 # ⚠️ 小红书那两个端点 allow_discount=0，走量折扣对它们不生效。
 #
+# 别再查第二遍了（2026-08-25 已经查过）：小红书 92 个端点里能吃折扣的只有
+# 3 个（web/sign、web/get_note_info_v5、web/get_note_id_and_xsec_token，都是
+# $0.001），看着像是能把 detail 成本砍到十分之一——**但这三个实测全部 404**，
+# api.tikhub.io 和 .dev 两台都试过。它们在计价表里挂着，不在公开 OpenAPI 里，
+# 服务器上也没有。抓评论的 10 个端点（web/web_v2/web_v3/app/app_v2 五代）
+# 则一律 $0.010 且 allow_discount=0，换哪一代都一样贵。
+# 判据是 401 和 404 的区别，用假 key 就能免费验：路由在会先过鉴权返回 401，
+# 路由不在直接 404。工具见 tools/probe_endpoint.py。
+#
+# 抖音那边相反：fetch_video_comments 是 allow_discount=1，评论调用能打折。
+#
 # 价格和汇率**会变**，而「预计花费」一旦不可信就等于没有。所以：
 # 1. 这里的数字带一个核对日期，看到就知道它有多旧；
 # 2. 部署方可以用环境变量覆盖（见 cli._apply_pricing_overrides），
