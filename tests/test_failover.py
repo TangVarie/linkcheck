@@ -90,6 +90,9 @@ class FailoverTest(unittest.TestCase):
         self.settings = Settings()
         self.settings.max_concurrency = 1
         self.settings.soft_deadline_seconds = 0
+        # 降级要在**两种** purpose 上都验，所以显式开着 detail
+        # （出厂默认是 0，见 config.Settings.detail_within_days）。
+        self.settings.detail_within_days = 7
         self.get_calls: list[str] = []
         self.post_calls: list[str] = []
 

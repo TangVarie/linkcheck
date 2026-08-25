@@ -44,10 +44,10 @@ class FieldNames:
     platform: str = "平台"
     comment_count: str = "实时数据.评论数"
     previous_comment_count: str = "上次评论数"
-    like_count: str = "点赞数"
-    previous_like_count: str = "上次点赞数"
-    collect_count: str = "收藏数"
-    previous_collect_count: str = "上次收藏数"
+    # 「点赞数 / 上次点赞数 / 收藏数 / 上次收藏数」四列已经去掉了。
+    # 小红书的赞藏只能从 detail 接口拿（评论接口不带），而 detail 占了
+    # 月成本的 39%——运营确认这两个数字不看，那就没有理由继续为它付费。
+    # 判定链路本来也只用评论数（见 Thresholds），赞藏一直只是参考值。
     pinned_status: str = "置顶状态"           # 单选：置顶成功/置顶掉了/无置顶。
                                               # 自家帖子置顶必为我方，只记状态不记内容；
                                               # 抖音接口没有置顶字段，抖音行不写
@@ -81,8 +81,6 @@ class FieldNames:
             self.queued,
             self.traffic_status,          # 合并多选必须先读现值
             self.comment_count,           # 判定掉量必须知道上一次的数
-            self.like_count,              # 搬「上次点赞数」要先读现值
-            self.collect_count,           # 搬「上次收藏数」同理
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
@@ -422,9 +420,23 @@ class Settings:
     channels: Channels = field(default_factory=Channels)
     budget: Budget = field(default_factory=Budget)
 
-    # 小红书笔记发布多少天内额外调一次 detail 拿点赞/收藏。
-    # 设为 0 表示完全不调 detail（省一半钱，代价是没有爆文的点赞维度）。
-    detail_within_days: int = 7
+    # 小红书笔记发布多少天内额外调一次 detail。**默认 0 = 不调。**
+    #
+    # 这个调用原本只为「点赞数/收藏数」两列而存在，而那四列已经去掉了
+    # （运营确认不看）。它占月成本的 39%——每天 100 条笔记的量级下
+    # 是 ¥2,592/月，买的东西全部落不到表里，所以默认关掉。
+    #
+    # 关掉之后**小红书**失去两样（抖音不受影响，它的 detail 是恒定追加的）：
+    # 1. 上游的 in_censor 审核标记 → 「风控中」少一条证据来源。
+    #    影响有限：这个标记的语义一直没实地验过（只见过 false），
+    #    而链接失效那条硬证据仍然在。见 docs/待验证清单.md。
+    # 2. 「确定性」的死讯。detail 返回空 data 是 definitive=True，一轮定罪；
+    #    只有评论接口时退回 definitive=False 的空壳启发式，走两击定罪，
+    #    在 0-2 天档（每 8 小时一轮）意味着晚约 16 小时确认。
+    #
+    # 判定链路一点没变：打标签、评论状态、负面词、置顶全都只看评论接口。
+    # 想要回来就把这个值调回 7（或 2 —— 风控和删帖最可能发生在头两天）。
+    detail_within_days: int = 0
 
     # SocialDataX 官方 skill 明文要求最多 3 并发，不要突发请求。留一档余量。
     max_concurrency: int = 2

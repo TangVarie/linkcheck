@@ -25,8 +25,6 @@ class TestDoctorSchema(unittest.TestCase):
     def test_covers_every_machine_written_column(self):
         f = self.settings.fields
         for column in (f.platform, f.comment_count, f.previous_comment_count,
-                       f.like_count, f.previous_like_count,
-                       f.collect_count, f.previous_collect_count,
                        f.pinned_status, f.comment_status, f.comment_digest,
                        f.negative_status, f.negative_digest,
                        f.traffic_status, f.refresh_status,
@@ -554,9 +552,9 @@ class TestSchemaProblems(unittest.TestCase):
     def test_exotic_number_subtype_is_flagged(self):
         """评分字段和普通数字共用类型码 2，但封顶 5 星——光看类型码抓不到。"""
         meta = self._healthy_meta()
-        meta[self.f.like_count]["ui_type"] = "Rating"
+        meta[self.f.comment_count]["ui_type"] = "Rating"
         problems = cli._schema_problems(self.settings, meta)
-        self.assertTrue(any(self.f.like_count in p and "评分" in p for p in problems))
+        self.assertTrue(any(self.f.comment_count in p and "评分" in p for p in problems))
 
     def test_missing_required_column_is_called_out_separately(self):
         meta = self._healthy_meta()

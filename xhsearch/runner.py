@@ -693,16 +693,9 @@ def refresh(
                 if row.previous_comment_count is not None:
                     fields[f.previous_comment_count] = row.previous_comment_count
                 fields[f.comment_count] = snapshot.comment_count
-            # 点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
-            # 判定仍然只基于评论数，这两组只作参考。
-            if snapshot.like_count is not None:
-                if row.previous_like_count is not None:
-                    fields[f.previous_like_count] = row.previous_like_count
-                fields[f.like_count] = snapshot.like_count
-            if snapshot.collect_count is not None:
-                if row.previous_collect_count is not None:
-                    fields[f.previous_collect_count] = row.previous_collect_count
-                fields[f.collect_count] = snapshot.collect_count
+            # 赞藏不再写表（四列已去掉）。snapshot.like_count / collect_count
+            # 仍然解析、仍然当「这一轮真的量到了东西」的存活证据用
+            # （见 _observed / _measured_this_round），只是不落表。
             # 快照只在看到了评论页（有评论、或至少知道评论数）时更新：
             # 空壳轮写「暂无评论」会把上一轮的真实快照抹掉。
             # 命中关键词的那条评论排最前并带「命中」标记。
@@ -1139,8 +1132,6 @@ def load_rows(
             negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
             current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
             previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
-            previous_like_count=feishu.read_int(cells.get(f.like_count)),
-            previous_collect_count=feishu.read_int(cells.get(f.collect_count)),
             last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
             consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
             pin_status=feishu.read_text(cells.get(f.pinned_status)),

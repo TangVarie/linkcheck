@@ -60,6 +60,10 @@ class RunnerTest(unittest.TestCase):
         self.settings = Settings()
         self.settings.max_concurrency = 1     # 让断言顺序可预期
         self.settings.soft_deadline_seconds = 0
+        # 出厂默认已经是 0（不调 detail），但这一组测的是「评论 + detail」
+        # 两段响应拼起来的完整链路，所以显式打开——detail 仍是受支持的配置。
+        # 新默认值由 TestDetailIsOffByDefault 单独钉。
+        self.settings.detail_within_days = 7
 
     def run_with(self, responses, rows, **kwargs):
         """responses: 按调用顺序返回的响应列表，或一个 callable(url, headers, body)。"""
@@ -85,8 +89,9 @@ class TestHappyPath(RunnerTest):
         fields = report.outcomes[0].fields
         f = self.settings.fields
         self.assertEqual(fields[f.comment_count], 150)
-        self.assertEqual(fields[f.like_count], 8000)
-        self.assertEqual(fields[f.collect_count], 900)
+        # 赞藏不再落表：上游给了数字也不写（四列已去掉）
+        self.assertNotIn("点赞数", fields)
+        self.assertNotIn("收藏数", fields)
         self.assertEqual(fields[f.pinned_status], self.settings.pin_status.pinned_ok)
         self.assertIn("1. [置顶", fields[f.comment_digest])
         self.assertIn("戳主页领券", fields[f.comment_digest])   # 置顶内容在快照里看
@@ -278,7 +283,6 @@ class TestPartialFailure(RunnerTest):
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_OK)
         self.assertEqual(outcome.fields[self.settings.fields.comment_count], 42)
-        self.assertNotIn(self.settings.fields.like_count, outcome.fields)
 
     def test_comments_failure_fails_the_row(self):
         report = self.run_with([err(500, 1005, "服务暂时不可用，请稍后重试")] * 3, [xhs_row()])
@@ -530,13 +534,13 @@ class TestSeedKeywordColumn(RunnerTest):
 
 
 class TestPreviousMetricsShift(RunnerTest):
-    """点赞/收藏与评论数完全对称：写新值前先把现值搬进「上次」列。
-    判定仍然只基于评论数，这两组只作参考。"""
+    """写新的评论数之前先把现值搬进「上次评论数」，公式列才能算增量。
+
+    赞藏那两组曾经和评论数完全对称，四列去掉之后只剩评论数这一组。
+    """
 
     def test_previous_values_are_shifted(self):
         row = xhs_row(prev_count=40)
-        row.previous_like_count = 500
-        row.previous_collect_count = 60
         report = self.run_with(
             [sse(comment_page(count=50)),
              sse({"like_count": 800, "collect_count": 90,
@@ -547,21 +551,29 @@ class TestPreviousMetricsShift(RunnerTest):
         fields = report.outcomes[0].fields
         self.assertEqual(fields[f.previous_comment_count], 40)
         self.assertEqual(fields[f.comment_count], 50)
-        self.assertEqual(fields[f.previous_like_count], 500)
-        self.assertEqual(fields[f.like_count], 800)
-        self.assertEqual(fields[f.previous_collect_count], 60)
-        self.assertEqual(fields[f.collect_count], 90)
 
     def test_first_round_writes_only_current(self):
         report = self.run_with(
             [sse(comment_page(count=50)),
-             sse({"like_count": 800, "points": {"cost": 10, "balance": 1}})],
+             sse({"points": {"cost": 10, "balance": 1}})],
             [xhs_row()],
         )
         f = self.settings.fields
         fields = report.outcomes[0].fields
-        self.assertNotIn(f.previous_like_count, fields)
-        self.assertEqual(fields[f.like_count], 800)
+        self.assertNotIn(f.previous_comment_count, fields)
+        self.assertEqual(fields[f.comment_count], 50)
+
+    def test_upstream_likes_never_reach_the_table(self):
+        """上游照样返回赞藏（存活判定还用得上），但一个字都不该落表。"""
+        report = self.run_with(
+            [sse(comment_page(count=50)),
+             sse({"like_count": 800, "collect_count": 90,
+                  "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(prev_count=40)],
+        )
+        written = set(report.outcomes[0].fields)
+        for gone in ("点赞数", "上次点赞数", "收藏数", "上次收藏数"):
+            self.assertNotIn(gone, written)
 
 
 class TestAliveConfirmed(RunnerTest):
@@ -1356,8 +1368,6 @@ class TestOneMistypedColumnCannotKillTheTable(RunnerTest):
         f = self.settings.fields
         types = {
             f.platform: 3, f.comment_count: 2, f.previous_comment_count: 2,
-            f.like_count: 2, f.previous_like_count: 2,
-            f.collect_count: 2, f.previous_collect_count: 2,
             f.pinned_status: 3, f.comment_status: 3, f.comment_digest: 1,
             f.negative_status: 3, f.negative_digest: 1,
             f.traffic_status: 4, f.refresh_status: 3, f.failure_reason: 1,
