@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 
 @dataclass
@@ -91,10 +92,18 @@ class FieldNames:
 class Tags:
     """机器管辖的标签。必须穷举——漏一个，那个标签就再也撤不回来。
 
-    热度档位（无水花 / 评估中 / 爆贴 / 大爆）是**互斥**的：一条帖子同时
-    挂着几个没有意义，所以每轮只留最高的那一个。而且只升不降（棘轮）——
+    热度档位（观察中 / 无水花 / 评估中 / 爆贴 / 大爆）是**互斥**的：一条帖子
+    同时挂着几个没有意义，所以每轮只留最高的那一个。而且只升不降（棘轮）——
     爆过就是爆过，评论被删导致数字掉下去不该让它从「大爆」退回「爆贴」，
-    那种异常该由 疑似限流 表达。「无水花」是发出去够久还起不来的最低档。
+    那种异常该由 疑似限流 表达。
+
+    「观察中」是最低档，代表**还没到下结论的时候**：发布不满
+    Thresholds.flop_hours（默认 48 小时）且评论数还够不上「评估中」。
+    这一档存在的唯一理由是**不留空格**——它出现之前，冷启动窗口内的新帖
+    一个标签都不打，`流量状态` 那一格是空的，而空格在运营眼里有三种读法
+    （还没巡查 / 巡查了没结论 / 机器坏了），分不出来就只能一条条手工去填。
+    到点之后它会自动升成「无水花」或更高档，不需要任何人去清。
+    留空值（`TAG_OBSERVING=`）可以关掉这一档，行为退回从前。
 
     风控中只认两种**硬证据**：上游返回了审查/受限标记，或链接已失效
     （两击定罪之后）。评论数的异常都不进风控——腰斩是 疑似限流，
@@ -104,6 +113,7 @@ class Tags:
     否则表会越来越红，最后没人看。
     """
 
+    observing: str = "观察中"
     flop: str = "无水花"
     evaluating: str = "评估中"
     hot: str = "爆贴"
@@ -113,11 +123,17 @@ class Tags:
 
     # 已退役的机器标签：不再产出，但仍算机器管辖——留在 namespace 里，
     # 旧行上残留的「已失效」才会在下一轮被自动摘掉（失效现在并入「风控中」）。
+    # 关掉「观察中」时它的默认名也会被追加进来（见 cli.build_settings），
+    # 否则已经写出去的那些「观察中」会永远撤不回来。
     retired: tuple[str, ...] = ("已失效",)
 
     def heat_tiers(self) -> list[str]:
-        """热度档位，由低到高。互斥，同时只留一个。"""
-        return [self.flop, self.evaluating, self.hot, self.super_hot]
+        """热度档位，由低到高。互斥，同时只留一个。
+
+        空名字 = 这一档被关掉了，不参与排序也不产出（见 observing）。
+        """
+        return [t for t in (self.observing, self.flop, self.evaluating,
+                            self.hot, self.super_hot) if t]
 
     def namespace(self) -> list[str]:
         """机器管辖的全部标签（含退役标签）。merge 的可撤回范围。"""
@@ -212,10 +228,14 @@ class PinStatus:
 class Thresholds:
     """判定口径。
 
-    热度三档互斥，取最高：
+    热度按评论数分三档，互斥，取最高：
         ≥ 20 → 评估中
         ≥ 50 → 爆贴
         ≥ 100 → 大爆
+
+    够不上 20 条的行由**发布时长**决定落在哪一档：
+        发布不满 flop_hours → 观察中（还在冷启动窗口，没到下结论的时候）
+        发布满 flop_hours   → 无水花（给了足够时间还是没起来）
     """
 
     tier_evaluating: int = 20
@@ -407,6 +427,45 @@ class Channels:
 
 
 @dataclass
+class Display:
+    """日志里时间怎么显示。**只影响打印，不影响任何判定或写入的值。**
+
+    这一段存在的理由是「日志和表对不上」这个具体的坑：
+
+    * 表里的「最近检查时间」是飞书按**租户时区**渲染的（国内租户 = 北京时间）
+    * Railway / GitHub Actions 的日志时间戳是**容器的 UTC**
+
+    两边差 8 小时，谁去对都会觉得对不上。所以运行日志里的每一个时间
+    都按这里的偏移打印一遍，让日志里看到的时刻和表里那一格**逐字相同**。
+
+    用固定偏移而不是 IANA 时区名，是因为 `zoneinfo` 依赖系统 tzdata，
+    精简容器里经常没有——一个日志格式化的小功能不该让整轮跑不起来。
+    中国不实行夏令时，固定 +8 就是正确答案；别的时区按需改
+    `DISPLAY_UTC_OFFSET`（支持 5.5 这样的半小时偏移）。
+    """
+
+    utc_offset_hours: float = 8.0
+
+    def tz(self) -> timezone:
+        return timezone(timedelta(hours=self.utc_offset_hours))
+
+    def label(self) -> str:
+        """时区标签，例如 +08 / +05:30 / -03。"""
+        total = round(self.utc_offset_hours * 60)
+        sign = "-" if total < 0 else "+"
+        hours, minutes = divmod(abs(total), 60)
+        return f"{sign}{hours:02d}" + (f":{minutes:02d}" if minutes else "")
+
+    def clock(self, moment: datetime) -> str:
+        """只有时分秒。给逐行进度用——同一轮里日期不会变，占宽度没意义。"""
+        return moment.astimezone(self.tz()).strftime("%H:%M:%S")
+
+    def stamp(self, moment: datetime) -> str:
+        """完整时刻 + 时区标签。给一轮的开跑/收尾这种关键节点用。"""
+        return f"{moment.astimezone(self.tz()):%Y-%m-%d %H:%M:%S} {self.label()}"
+
+
+@dataclass
 class Settings:
     fields: FieldNames = field(default_factory=FieldNames)
     tags: Tags = field(default_factory=Tags)
@@ -419,6 +478,7 @@ class Settings:
     safety: Safety = field(default_factory=Safety)
     channels: Channels = field(default_factory=Channels)
     budget: Budget = field(default_factory=Budget)
+    display: Display = field(default_factory=Display)
 
     # 小红书笔记发布多少天内额外调一次 detail。**默认 0 = 不调。**
     #

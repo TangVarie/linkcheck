@@ -266,6 +266,29 @@ def build_settings() -> Settings:
     settings.digest.show_ip_location = _bool_env(
         "DIGEST_SHOW_IP_LOCATION", settings.digest.show_ip_location)
 
+    # —— 日志里时间按哪个时区打印（只影响打印，见 config.Display）——
+    # 默认 +8：飞书国内租户就是按北京时间渲染「最近检查时间」的，
+    # 而容器日志的时间戳是 UTC——不对齐的话两边差 8 小时，谁看都对不上。
+    settings.display.utc_offset_hours = _numeric_env(
+        "DISPLAY_UTC_OFFSET", float, settings.display.utc_offset_hours,
+        minimum=-12.0, maximum=14.0)
+
+    # —— 最低热度档「观察中」的名字；留空 = 关掉这一档 ——
+    # 关掉之后冷启动窗口内的新帖又会一个标签都不打（`流量状态` 留空），
+    # 所以默认开着。改名要**同时**去飞书把多选选项建好，否则机器写不进去
+    # （会被安全跳过并在「诊断信息」里说明，不会写坏表）。
+    raw_observing = os.environ.get("TAG_OBSERVING")
+    if raw_observing is not None:
+        default_observing = settings.tags.observing
+        settings.tags.observing = raw_observing.strip()
+        if settings.tags.observing != default_observing:
+            # 改名或关掉，都要把**旧名字**留在机器命名空间里，下一轮才摘得掉。
+            # 漏了这一条，已经写出去的「观察中」就掉到命名空间外面，
+            # 被 merge 当成人工标签保护起来——于是一行会同时挂着「观察中」和
+            # 改名后的（或升上去的）档位，两个热度档并排，棘轮形同虚设。
+            settings.tags.retired = tuple(
+                dict.fromkeys((*settings.tags.retired, default_observing)))
+
     # CHANNEL_ORDER="xhs=tikhub,socialdatax; douyin=tikhub"
     # 想把某个平台钉死在一家时用，不改代码。
     # 在**默认配置的基础上合并**：只写 douyin 就只改 douyin，
@@ -725,7 +748,15 @@ def _write_back_table(table: feishu.Bitable, report,
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
         print(f"❌ 写回失败（表级错误）：{exc}")
         return 1
-    print(f"已写回 {written} 行")
+    # 报出去的时间跨度只能覆盖**真的写进去了**的行：逐行失败的那些
+    # （读表之后记录被删等）时间戳压根没落表，「最近检查时间」整列被挡下来时
+    # （列没建、类型建错）更是一行都没盖上。报一个表里不存在的时刻，
+    # 恰恰就是这次要修的「日志和表对不上」。
+    stamp_column = settings.fields.last_updated
+    span = "" if stamp_column in dropped_fields or stamp_column in mistyped_fields \
+        else report.checked_span(settings.display,
+                                 skip=[record_id for record_id, _ in write_errors])
+    print(f"已写回 {written} 行" + (f"，本轮「最近检查时间」= {span}" if span else ""))
     if dropped_fields:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
               f"{'、'.join(sorted(dropped_fields))}")
@@ -826,6 +857,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     tables = _tables(selected)
     now = datetime.now(timezone.utc)
     multi = len(tables) > 1
+
+    # 开跑先把时间打出来，两个时区都打。容器日志的行首时间戳是 UTC，
+    # 表里的「最近检查时间」是飞书按租户时区渲染的——不把换算摆在眼前，
+    # 每一次「日志和表对不上」都要有人重新算一遍 8 小时。
+    print(f"⏱ {mode} 开跑：{settings.display.stamp(now)}"
+          f"（UTC {now:%H:%M:%S}，容器日志用的就是这个）")
 
     # 软截止是整次运行的预算，不是每张表各领一份——在这里算一次绝对
     # 截止点传给每张表共享，五张表就不会把时限放大成五倍。
@@ -936,7 +973,34 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     return worst
 
 
+def _line_buffer_stdout() -> None:
+    """逐行 flush。**这是「日志乱序」的根治办法，不是性能微调。**
+
+    stdout 不接终端时 Python 默认是块缓冲：几十行攒够 8KB 才一起吐出去，
+    云平台（Railway / Actions）按**收到的时刻**给整块打同一个时间戳，
+    块内的顺序还可能被打乱。线上真实出现过的样子是：
+
+        08:45:15  没有需要刷新的行。
+        08:45:15  ━━━━ 表：西屋第一期 ━━━━      ← 表头跑到结论后面
+        15:05:35  已写回 8 行
+        15:05:35    recvs9cC7i7jDl → 正常 …     ← 写回打完了还在出逐行结果
+
+    于是「哪一行属于哪张表」「先后发生了什么」全都读不出来，
+    拿日志去对表自然对不上。逐行 flush 之后每一行都带自己真实的时刻。
+
+    代价是每行一次 write 系统调用——一轮几百行，完全不值得权衡。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            # 被重定向成非 TextIOWrapper（测试里的 StringIO、某些托管运行时）：
+            # 日志格式的优化不该让整个进程起不来。
+            pass
+
+
 def main(argv: list[str]) -> int:
+    _line_buffer_stdout()
     load_env_or_exit()
     args = list(argv[1:])
     selected: list[str] | None = None

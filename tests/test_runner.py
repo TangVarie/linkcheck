@@ -143,9 +143,11 @@ class TestHumanTagsAreNeverClobbered(RunnerTest):
 
     def test_no_tag_change_means_no_write(self):
         """无变化不写：省一次写、避开选项冲突，也不让人看到这行被反复改动。"""
+        # 发布 24 小时、10 条评论 → 本轮算出「观察中」，而这一行已经是
+        # 「观察中」了，所以合并结果和现值一字不差 = 这一列根本不进 payload。
         report = self.run_with(
             [sse(comment_page(count=10)), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [xhs_row(tags=["已复盘"])],
+            [xhs_row(tags=["已复盘", "观察中"])],
         )
         self.assertNotIn(self.settings.fields.traffic_status, report.outcomes[0].fields)
 
@@ -159,6 +161,137 @@ class TestHumanTagsAreNeverClobbered(RunnerTest):
         # 没变化就不写；关键是没被降档
         if self.settings.fields.traffic_status in fields:
             self.assertIn("大爆", fields[self.settings.fields.traffic_status])
+
+
+class TestObservingTagRollout(RunnerTest):
+    """「观察中」要新建一个飞书多选选项。选项建好之前必须**安全降级**——
+    上线一个默认打开、又会让写回整批失败的标签，比不上线还糟。"""
+
+    def _run_young_low_traffic_row(self, **kwargs):
+        return self.run_with(
+            [sse(comment_page(count=4, pinned=False)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(age_days=1.0)],      # 发布 24 小时 < 48，评论数 4 < 20
+            **kwargs,
+        )
+
+    def test_option_built_writes_the_tag(self):
+        f = self.settings.fields
+        report = self._run_young_low_traffic_row(
+            known_options=self.settings.tags.machine_written())
+        self.assertEqual(report.outcomes[0].fields[f.traffic_status], ["观察中"])
+
+    def test_option_not_built_yet_skips_safely_and_says_why(self):
+        f = self.settings.fields
+        built = [t for t in self.settings.tags.machine_written() if t != "观察中"]
+        outcome = self._run_young_low_traffic_row(known_options=built).outcomes[0]
+        self.assertNotIn(f.traffic_status, outcome.fields)
+        self.assertIn("观察中", outcome.fields[f.failure_reason])
+        self.assertIn("还没建选项", outcome.fields[f.failure_reason])
+
+    def test_it_does_not_touch_human_tags(self):
+        """人工标签照旧零权限——新加一档不能成为碰它们的借口。"""
+        f = self.settings.fields
+        report = self.run_with(
+            [sse(comment_page(count=4, pinned=False)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(age_days=1.0, tags=["爆帖预备", "客户确认"])],
+            known_options=self.settings.tags.machine_written() + ["爆帖预备", "客户确认"],
+        )
+        final = report.outcomes[0].fields[f.traffic_status]
+        self.assertIn("爆帖预备", final)
+        self.assertIn("客户确认", final)
+        self.assertIn("观察中", final)
+
+
+class TestCheckedAtIsPerRow(RunnerTest):
+    """「最近检查时间」按行盖章，不是整轮共用开跑时间。
+
+    治的是一个具体的对不上：一轮 sweep 跑几分钟，几百行如果共用开跑时刻，
+    表里那一格就永远比日志里那一行早几分钟；再叠上容器日志是 UTC、
+    飞书渲染是北京时间，运营拿两边对，怎么对都对不上。
+    """
+
+    def _ticking_clock(self, step_seconds=7):
+        """每调一次往前走一步的假时钟。"""
+        state = {"n": 0}
+
+        def tick():
+            state["n"] += 1
+            return NOW + timedelta(seconds=step_seconds * state["n"])
+
+        return tick
+
+    def test_each_row_gets_its_own_timestamp(self):
+        f = self.settings.fields
+        pages = [sse(comment_page(count=150)) for _ in range(3)]
+        report = self.run_with(
+            pages,
+            [xhs_row("rec1"), xhs_row("rec2"), xhs_row("rec3")],
+            clock=self._ticking_clock(),
+        )
+        stamps = [o.fields[f.last_updated] for o in report.outcomes]
+        self.assertEqual(len(set(stamps)), 3, "三行盖出了同一个时间戳")
+        self.assertEqual(stamps, sorted(stamps))
+        # 日志里打印的那个时刻，就是写进表里的那个值——这是两边能对上的全部机制
+        for outcome in report.outcomes:
+            self.assertEqual(int(outcome.checked_at.timestamp() * 1000),
+                             outcome.fields[f.last_updated])
+
+    def test_clock_going_backwards_never_writes_a_stale_stamp(self):
+        """时钟回拨时不写比开跑还早的时刻，否则同一轮里的先后关系会乱。"""
+        f = self.settings.fields
+        report = self.run_with(
+            [sse(comment_page(count=150))],
+            [xhs_row()],
+            clock=lambda: NOW - timedelta(hours=3),
+        )
+        self.assertEqual(report.outcomes[0].fields[f.last_updated],
+                         int(NOW.timestamp() * 1000))
+
+    def test_deferred_rows_carry_no_stamp(self):
+        """顺延的行本来就不推进时间戳，日志也不该显示它盖了章。"""
+        report = self.run_with([], [xhs_row()], deadline=time.monotonic() - 1)
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_DEFERRED)
+        self.assertIsNone(outcome.checked_at)
+
+    def test_checked_span_renders_in_the_display_timezone(self):
+        """收尾那行打印的时刻必须和飞书里那一格逐字相同（默认 +8）。"""
+        report = self.run_with(
+            [sse(comment_page(count=150)) for _ in range(2)],
+            [xhs_row("rec1"), xhs_row("rec2")],
+            clock=self._ticking_clock(step_seconds=60),
+        )
+        span = report.checked_span(self.settings.display)
+        # NOW = 2026-08-21 12:00 UTC → 北京时间 20:01 起
+        self.assertIn("2026-08-21 20:01:00 +08", span)
+        self.assertIn("20:02:00", span)
+
+    def test_rows_that_failed_to_write_drop_out_of_the_span(self):
+        """写回逐行失败的那些（读表之后记录被删等）时间戳压根没落表。
+        把它们算进跨度，就是报一个表里根本不存在的时刻——正是这次要修的毛病。"""
+        report = self.run_with(
+            [sse(comment_page(count=150)) for _ in range(3)],
+            [xhs_row("rec1"), xhs_row("rec2"), xhs_row("rec3")],
+            clock=self._ticking_clock(step_seconds=60),
+        )
+        display = self.settings.display
+        # 首尾两行没写进去 → 跨度只能是中间那一行
+        span = report.checked_span(display, skip=["rec1", "rec3"])
+        self.assertEqual(span, display.stamp(report.outcomes[1].checked_at))
+        # 一行都没写进去 → 什么都不报，别编一个时刻出来
+        self.assertEqual(report.checked_span(display, skip=["rec1", "rec2", "rec3"]), "")
+
+    def test_breaker_voided_rows_drop_out_of_the_span(self):
+        """熔断作废了时间戳，报告里就不能再声称这些行盖过章。"""
+        rows = [xhs_row(f"rec{i}", tags=["已复盘"]) for i in range(3)]
+        report = self.run_with([err(200, 1003, "未找到对应内容")] * 3, rows)
+        self.assertTrue(report.breaker_tripped)
+        self.assertEqual(report.checked_span(self.settings.display), "")
+        for outcome in report.outcomes:
+            self.assertIsNone(outcome.checked_at)
+            self.assertNotIn(self.settings.fields.last_updated, outcome.fields)
 
 
 class TestDeadPostDetection(RunnerTest):

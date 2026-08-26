@@ -446,7 +446,9 @@ class TestHeatTiers(unittest.TestCase):
         return analyze.decide(self._snap(count), self.settings, **kw)
 
     def test_boundaries(self):
-        cases = [(0, None), (19, None), (20, "评估中"), (49, "评估中"),
+        # age_hours=10 还在冷启动窗口内，所以够不上 20 条的落「观察中」
+        # （窗口外是「无水花」，见 TestRiskDetection）。
+        cases = [(0, "观察中"), (19, "观察中"), (20, "评估中"), (49, "评估中"),
                  (50, "爆贴"), (99, "爆贴"), (100, "大爆"), (9999, "大爆")]
         for count, expected in cases:
             heat = {t for t in self.decide(count).tags
@@ -515,9 +517,73 @@ class TestRiskDetection(unittest.TestCase):
             self.assertNotIn("风控中", tags_)
             self.assertNotIn("疑似限流", tags_)
 
-    def test_low_comments_during_cold_start_is_fine(self):
-        """刚发两小时只有几条评论再正常不过，一个标签都不打。"""
+    def test_low_comments_during_cold_start_is_observing_not_flop(self):
+        """刚发三小时只有几条评论再正常不过——不是「无水花」，但也**不能留空**。
+
+        留空是这个项目踩过的坑：一批新帖巡查完 `流量状态` 全是空的，
+        运营分不出「还没轮到它」「轮到了没结论」和「机器坏了」，
+        只能一条条手工去填。「观察中」把这三种情况分开，
+        而且到 48 小时会自己升成「无水花」，不需要人去清。
+        """
+        v = self.decide(0, age_hours=3)
+        self.assertEqual(v.tags, {"观察中"})
+        self.assertNotIn("无水花", v.tags)
+        self.assertTrue(any("冷启动窗口" in n for n in v.notes))
+
+    def test_observing_upgrades_to_flop_once_the_window_closes(self):
+        """观察中是最低档：到点没起来就升成无水花，起来了就升更高，绝不倒退。"""
+        aged = self.decide(3, age_hours=72, current_tags=["观察中"])
+        self.assertEqual(aged.tags, {"无水花"})
+        grew = self.decide(25, age_hours=10, current_tags=["观察中"])
+        self.assertEqual(grew.tags, {"评估中"})
+        # 反过来不成立：已经无水花的行不会因为「窗口内」退回观察中
+        self.assertEqual(self.decide(0, age_hours=3, current_tags=["无水花"]).tags,
+                         {"无水花"})
+
+    def test_observing_can_be_switched_off(self):
+        """TAG_OBSERVING= 关掉这一档，行为完全退回从前（一个标签都不打）。"""
+        self.settings.tags.observing = ""
         self.assertEqual(self.decide(0, age_hours=3).tags, set())
+
+    def test_missing_publish_time_says_so_instead_of_going_quiet(self):
+        """发布时间是空的 → 算不出发布多久，热度判不了。
+
+        这时同样不能默默留空：留空看起来和「机器没跑」一模一样。
+        诊断信息要指出是**表里那一格缺数据**，填上就自动补判。
+        """
+        v = self.decide(3, age_hours=None)
+        self.assertEqual({t for t in v.tags if self.settings.tags.rank(t) >= 0}, set())
+        self.assertTrue(any("发布时间" in n for n in v.notes), v.notes)
+
+    def test_bad_publish_time_is_reported_even_when_a_tier_is_retained(self):
+        """表里已经有档位时也必须报出来——这是最难发现的一种卡死。
+
+        一行卡在「观察中」、发布时间却是空的或未来的：棘轮保住了旧档位，
+        诊断信息只会说「保留高档位」，而真正的问题是那一格坏了——
+        它永远熬不到 48 小时，也就永远升不成「无水花」，表面上一切正常。
+        """
+        for age, keyword in ((None, "是空的"), (-30.0, "未来时间")):
+            with self.subTest(age=age):
+                v = self.decide(3, age_hours=age, current_tags=["观察中"])
+                self.assertIn("观察中", v.tags)       # 棘轮照旧不倒退
+                self.assertTrue(any(keyword in n for n in v.notes), v.notes)
+                self.assertTrue(any("发布时间" in n for n in v.notes), v.notes)
+
+    def test_future_publish_time_never_gets_the_cold_start_tier(self):
+        """发布时间填成未来（年份手滑、时区搞反）：负的时长同样「不足 48 小时」，
+        照打「观察中」的话，一个看着很合理的标签会把日期错误盖住，
+        而且要等到那个错误时间点之后 48 小时才可能露出来。"""
+        v = self.decide(3, age_hours=-30.0)
+        self.assertEqual({t for t in v.tags if self.settings.tags.rank(t) >= 0}, set())
+        self.assertNotIn("观察中", v.tags)
+        self.assertTrue(any("未来时间" in n for n in v.notes), v.notes)
+
+    def test_a_real_tier_from_comment_count_does_not_need_the_publish_time(self):
+        """评论数够得上档位时发布时长根本不参与判定——这时不该报缺数据，
+        否则每一行没填发布时间的爆贴都会带一句与判定无关的告警。"""
+        v = self.decide(60, age_hours=None)
+        self.assertIn("爆贴", v.tags)
+        self.assertFalse(any("发布时间" in n for n in v.notes), v.notes)
 
     def test_flop_ratchets_up_but_never_back(self):
         """无水花是最低热度档：起来了就换高档，绝不从评估中退回无水花。"""
@@ -1145,6 +1211,31 @@ class TestEstimateByActualChannel(unittest.TestCase):
                        publish_time_ms=int((now - timedelta(days=1)).timestamp() * 1000))
         yuan = rows.estimate_yuan([row], Settings(), now, keys={"tikhub": "t"})
         self.assertEqual(yuan, 0.0)
+
+
+class TestDisplayTimezone(unittest.TestCase):
+    """日志里的时间要和飞书那一格逐字相同，否则「日志和表对不上」永远存在。"""
+
+    def test_utc_moment_prints_as_beijing_time(self):
+        display = Settings().display
+        moment = datetime(2026, 8, 26, 0, 7, 14, tzinfo=UTC)
+        self.assertEqual(display.stamp(moment), "2026-08-26 08:07:14 +08")
+        self.assertEqual(display.clock(moment), "08:07:14")
+
+    def test_offset_label_covers_negative_and_half_hours(self):
+        from xhsearch.config import Display
+        self.assertEqual(Display(utc_offset_hours=0).label(), "+00")
+        self.assertEqual(Display(utc_offset_hours=-3).label(), "-03")
+        self.assertEqual(Display(utc_offset_hours=5.5).label(), "+05:30")
+        self.assertEqual(Display(utc_offset_hours=-3.5).label(), "-03:30")
+
+    def test_it_never_touches_the_value_that_gets_written(self):
+        """只影响打印。同一个时刻在不同偏移下显示不同，落表的毫秒数完全一样。"""
+        from xhsearch.config import Display
+        moment = datetime(2026, 8, 26, 0, 7, 14, tzinfo=UTC)
+        rendered = {Display(utc_offset_hours=o).stamp(moment) for o in (0, 8, -5.5)}
+        self.assertEqual(len(rendered), 3, "不同偏移应该渲染出不同的字符串")
+        self.assertEqual(int(moment.timestamp() * 1000), 1787702834000)
 
 
 if __name__ == "__main__":
