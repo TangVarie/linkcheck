@@ -377,12 +377,25 @@ python3 cli.py doctor
 | Networking | `Generate Domain` |
 | Health Check Path | `/healthz` |
 
-项目级变量（飞书凭据、表清单）自动共享，只要再加两个：
+> 第一次部署会按 `railpack.json` 的默认值跑 `python3 cli.py doctor`——
+> **免费的体检，不是 sweep**。它跑完就退出，服务会显示成已停止，那是正常的，
+> 改完 Start Command 就好。
+
+变量要加这三个：
 
 | 名字 | 值 |
 |---|---|
 | `PANEL_PASSWORD` | 面板口令，**至少 12 个字符**。没设它面板会拒绝启动 |
+| `PANEL_SECRET` | 签会话 Cookie，**≥32 字符**。不设就每次重启所有人掉线重登；设了就别短，猜中它能绕过口令且不走登录节流。生成：`python3 -c "import secrets; print(secrets.token_hex(32))"` |
 | `FEISHU_DOMAIN` | `https://xxx.feishu.cn`，就是你打开多维表格时地址栏那一段 |
+
+**另外确认这几个在这个服务里看得到**——Railway 的项目级共享变量不一定自动挂到
+新服务上：`FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_TABLES`（缺了起不来）、
+`TIKHUB_API_KEY` / `SOCIALDATAX_API_KEY`（缺了只是余额那块显示「没配 Key」、
+预估花费按默认单价算）。
+
+启动日志会自己报它看到了什么——几张表、余额接没接上、加表功能就没就绪。
+不用猜，看那几行。
 
 要在面板上加表删表，再跑一次 `python3 cli.py init-registry`（本地跑就行），
 把它打印的 `FEISHU_REGISTRY=...` 加到**项目级**变量里——cron 和面板都要读它。
