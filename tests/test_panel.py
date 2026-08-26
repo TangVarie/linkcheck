@@ -152,15 +152,44 @@ class TestNeverSpends(unittest.TestCase):
         self.assertEqual(spy.call_count, 1)
 
 
-class TestNeverWrites(unittest.TestCase):
-    def test_panel_has_no_write_call(self):
-        """P1 阶段面板对业务表**一列都不写**。写路径要到 P4 才出现，
-        到时候白名单里也只会有「排队刷新」一个元素。"""
-        called = _called_names(panel)
-        for forbidden in ("batch_update", "batch_create", "create_field",
-                          "add_field_options", "update_field"):
-            self.assertNotIn(forbidden, called,
-                             f"panel.py 调了 {forbidden}——现阶段面板是只读的")
+class TestBusinessTableWrites(unittest.TestCase):
+    """面板对**业务表数据**只写一列：`排队刷新`。
+
+    白名单而不是黑名单：黑名单要穷举「不许写什么」，漏一个就是默许；
+    白名单漏一个只是少个功能。
+    """
+
+    def test_the_whitelist_has_exactly_one_column(self):
+        self.assertEqual(panel.BUSINESS_WRITE_WHITELIST, ("排队刷新",))
+
+    def test_the_whitelist_matches_the_configured_column_name(self):
+        """有人改了 config 里的列名却忘了改白名单，那一天要挡住。"""
+        self.assertIn(Settings().fields.queued, panel.BUSINESS_WRITE_WHITELIST)
+
+    def test_conclusion_columns_are_never_writable(self):
+        """写机器的结论列等于伪造监控结果——面板没量过任何东西。"""
+        f = Settings().fields
+        for column in (f.traffic_status, f.refresh_status, f.comment_status,
+                       f.negative_status, f.pinned_status, f.failure_reason,
+                       f.last_updated, f.comment_count, f.consecutive_failures,
+                       f.alive_confirmed, f.comment_digest, f.negative_digest):
+            self.assertNotIn(column, panel.BUSINESS_WRITE_WHITELIST)
+
+    def test_operator_input_columns_are_never_writable(self):
+        """那些是人的判断，面板只显示不代填。"""
+        f = Settings().fields
+        for column in (f.seed_keywords, f.negative_keywords, f.publish_time,
+                       f.link, f.monitoring):
+            self.assertNotIn(column, panel.BUSINESS_WRITE_WHITELIST)
+
+    def test_the_queue_path_refuses_a_column_off_the_whitelist(self):
+        settings = Settings()
+        settings.fields.queued = "我不在白名单里"
+        cfg = config()
+        cfg.app_id, cfg.app_secret = "cli_x", "s"
+        with self.assertRaises(RuntimeError):
+            panel.Queueing(cfg, settings, log=lambda *a: None).queue(
+                "bascnA", "tblB", ["rec1"])
 
 
 class TestConfigRefusesToStartUnsafe(unittest.TestCase):
@@ -1096,6 +1125,187 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
                                   headers=self._login(), method="POST")
         self.assertEqual(status, 400)
         self.assertIn("FEISHU_REGISTRY", body)
+
+
+class TestQueueing(unittest.TestCase):
+    """勾「排队刷新」。面板自己一个付费请求都不发——勾上之后 cron 五分钟内
+    接手，和运营手工勾同一条路，同样受 MAX_RECORDS_PER_RUN 约束。"""
+
+    def _queueing(self):
+        cfg = config()
+        cfg.app_id, cfg.app_secret = "cli_x", "s"
+        return panel.Queueing(cfg, Settings(), log=lambda *a: None)
+
+    def _meta(self, queued_type=7, present=True):
+        f = Settings().fields
+        meta = {f.link: {"type": 1, "ui_type": "", "options": None}}
+        if present:
+            meta[f.queued] = {"type": queued_type, "ui_type": "", "options": None}
+        return meta
+
+    def test_writes_only_the_queued_column(self):
+        captured = {}
+
+        def batch_update(self, updates, **kwargs):
+            captured["updates"] = updates
+            return len(updates)
+
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                               return_value=self._meta()), \
+             mock.patch.object(panel.feishu.Bitable, "batch_update", batch_update):
+            result = self._queueing().queue("bascnA", "tblB", ["r1", "r2"])
+        self.assertEqual(result.queued, 2)
+        for update in captured["updates"]:
+            self.assertEqual(list(update["fields"]), [Settings().fields.queued])
+            self.assertIs(update["fields"][Settings().fields.queued], True)
+
+    def test_refuses_when_the_column_is_missing(self):
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                               return_value=self._meta(present=False)):
+            with self.assertRaises(panel.feishu.FeishuError) as ctx:
+                self._queueing().queue("bascnA", "tblB", ["r1"])
+        self.assertIn("先在面板上把它建出来", str(ctx.exception))
+
+    def test_refuses_when_the_column_is_not_a_checkbox(self):
+        """勾上去会写失败，不如提前说清。"""
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                               return_value=self._meta(queued_type=1)):
+            with self.assertRaises(panel.feishu.FeishuError) as ctx:
+                self._queueing().queue("bascnA", "tblB", ["r1"])
+        self.assertIn("不是复选框", str(ctx.exception))
+
+    def test_refuses_when_not_a_collaborator(self):
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                               return_value=None):
+            with self.assertRaises(panel.feishu.FeishuError) as ctx:
+                self._queueing().queue("bascnA", "tblB", ["r1"])
+        self.assertIn("添加文档应用", str(ctx.exception))
+
+    def test_an_empty_list_touches_nothing(self):
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta") as meta:
+            self.assertEqual(self._queueing().queue("a", "b", []).queued, 0)
+        meta.assert_not_called()
+
+    def test_row_level_failures_are_reported_not_swallowed(self):
+        def batch_update(self, updates, *, errors=None, **kwargs):
+            errors.append(("r2", panel.feishu.FeishuError(1254043, "行没了")))
+            return 1
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                               return_value=self._meta()), \
+             mock.patch.object(panel.feishu.Bitable, "batch_update", batch_update):
+            result = self._queueing().queue("bascnA", "tblB", ["r1", "r2"])
+        self.assertEqual(result.queued, 1)
+        self.assertIn("行没了", result.failures[0])
+
+
+class TestQueueRoute(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        cls.addClassCleanup(quiet.stop)
+        cls.config = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32,
+                                       port=0, cache_seconds=999)
+        cls.config.app_id, cls.config.app_secret = "cli_x", "s"
+        cls.queueing = mock.Mock(spec=panel.Queueing)
+        cls.queueing.queue.return_value = panel.QueueResult(queued=1)
+        cache = panel.Cache(lambda: summary.Overview(projects=[]), ttl=999)
+        cache.refresh()
+        cls.cache = cache
+        cls.server = panel.build_server(cls.config, cache, queueing=cls.queueing,
+                                        host="127.0.0.1")
+        cls.port = cls.server.server_address[1]
+        __import__("threading").Thread(
+            target=cls.server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.cache.stop()
+
+    def setUp(self):
+        self.queueing.reset_mock()
+        self.queueing.queue.return_value = panel.QueueResult(queued=1)
+
+    def _call(self, data, headers=None):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(f"http://localhost:{self.port}/api/queue",
+                                     data=data, headers=headers or {}, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    def _auth(self):
+        import urllib.error
+        import urllib.request
+
+        class _NR(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(_NR)
+        req = urllib.request.Request(f"http://localhost:{self.port}/login",
+                                     data=b"password=" + GOOD_PASSWORD.encode())
+        try:
+            cookie = opener.open(req, timeout=5).headers.get("Set-Cookie")
+        except urllib.error.HTTPError as exc:
+            cookie = exc.headers.get("Set-Cookie")
+        token = cookie.split("=", 1)[1].split(";")[0]
+        return {"Cookie": f"{panel.COOKIE_NAME}={token}",
+                panel.CSRF_HEADER: panel.csrf_token(self.config, token)}
+
+    def test_needs_a_session_and_a_csrf_header(self):
+        self.assertEqual(self._call(b'{"rows":[]}')[0], 401)
+        auth = self._auth()
+        auth.pop(panel.CSRF_HEADER)
+        self.assertEqual(self._call(b'{"rows":[]}', auth)[0], 403)
+
+    def test_groups_rows_by_table(self):
+        """飞书官方建议同一张表同一时刻只做一个写操作。"""
+        body = ('{"rows":[{"app_token":"a","table_id":"t1","record_id":"r1"},'
+                '{"app_token":"a","table_id":"t1","record_id":"r2"},'
+                '{"app_token":"b","table_id":"t2","record_id":"r3"}]}')
+        status, _ = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200)
+        self.assertEqual(self.queueing.queue.call_count, 2)
+        first = self.queueing.queue.call_args_list[0][0]
+        self.assertEqual(first[2], ["r1", "r2"])
+
+    def test_a_huge_selection_is_refused(self):
+        """一次「全选」勾几千行 = 下一轮直接顶穿预算。"""
+        rows = [{"app_token": "a", "table_id": "t", "record_id": f"r{i}"}
+                for i in range(panel.MAX_QUEUE_ROWS + 1)]
+        status, body = self._call(json.dumps({"rows": rows}).encode(), self._auth())
+        self.assertEqual(status, 400)
+        self.assertIn(str(panel.MAX_QUEUE_ROWS), body)
+        self.queueing.queue.assert_not_called()
+
+    def test_one_broken_table_does_not_lose_the_others(self):
+        self.queueing.queue.side_effect = [
+            panel.feishu.FeishuError(-1, "权限没了"),
+            panel.QueueResult(queued=2)]
+        body = ('{"rows":[{"app_token":"a","table_id":"t1","record_id":"r1"},'
+                '{"app_token":"b","table_id":"t2","record_id":"r2"}]}')
+        status, out = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200)
+        self.assertIn("权限没了", out)
+        self.assertIn('"queued": 2', out)
+
+    def test_malformed_rows_are_skipped_not_fatal(self):
+        body = ('{"rows":["junk",{"app_token":"","table_id":"t","record_id":"r"},'
+                '{"app_token":"a","table_id":"t","record_id":"ok"}]}')
+        status, _ = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200)
+        self.assertEqual(self.queueing.queue.call_args[0][2], ["ok"])
+
+    def test_a_bad_body_is_a_400(self):
+        self.assertEqual(self._call(b"not json", self._auth())[0], 400)
+        self.assertEqual(self._call(b'{"nope":1}', self._auth())[0], 400)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,25 @@ COL_STATUS = "入册状态"        # 机器写：体检结论
 COL_CHECKED = "上次体检"       # 机器写：时间戳
 COL_FIRST_RUN = "首轮已完成"   # 机器写：新表的小闸用它判断「还是不是首轮」
 
+# —— 逐表阈值。空着 = 用全局默认（config.py 里那一套）——
+#
+# 只放**纯行级分类**的参数：它们没有跨表语义，一张表改了不影响另一张表的
+# 任何判定。而共用一套本来就是错的——美妆客户和医药客户的评论量级差一个
+# 数量级，config.py 自己就写着那几个默认值「是占位的，上线前必须按你们
+# 自己的历史数据校准一次」。
+#
+# **熔断比例、熔断最小样本、两击定罪次数、冷却秒数、单轮硬预算不在这里，
+# 而且不会加。** 它们有跨表语义——`runner.apply_cross_run_breaker` 要把各表
+# 样本加总重算比例，逐表不同的熔断口径会让「这一轮到底该不该熔」说不清。
+COL_TIER_EVALUATING = "评估中门槛"
+COL_TIER_HOT = "爆贴门槛"
+COL_TIER_SUPER_HOT = "大爆门槛"
+COL_FLOP_HOURS = "无水花小时"
+COL_ARCHIVE_DAYS = "归档天数"
+
+THRESHOLD_COLUMNS = (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT,
+                     COL_FLOP_HOURS, COL_ARCHIVE_DAYS)
+
 # 建注册表时用的列定义（类型码见 schema.FIELD_TYPE_NAMES）。
 REGISTRY_FIELDS = [
     {"field_name": COL_LABEL, "type": 1},
@@ -50,6 +69,8 @@ REGISTRY_FIELDS = [
     {"field_name": COL_CHECKED, "type": 5,
      "property": {"date_formatter": "yyyy/MM/dd HH:mm"}},
     {"field_name": COL_FIRST_RUN, "type": 7},
+    *[{"field_name": name, "type": 2, "property": {"formatter": "0"}}
+      for name in THRESHOLD_COLUMNS],
 ]
 
 # 认出「这确实是一张注册表」要的最小列集。用来挡住 FEISHU_REGISTRY 被误填成
@@ -76,6 +97,8 @@ class Entry:
     app_token: str = ""
     table_id: str = ""
     problem: str = ""
+    # 逐表阈值。None = 这一格空着，用全局默认。
+    thresholds: dict = field(default_factory=dict)
 
     @property
     def usable(self) -> bool:
@@ -116,7 +139,8 @@ def read(table: feishu.Bitable) -> list[Entry]:
             "填成业务表了？机器绝不会往一张认不出来的表里写东西")
 
     wanted = [c for c in (COL_LABEL, COL_TARGET, COL_ENABLED, COL_NOTE,
-                          COL_STATUS, COL_FIRST_RUN) if c in meta]
+                          COL_STATUS, COL_FIRST_RUN, *THRESHOLD_COLUMNS)
+              if c in meta]
     entries: list[Entry] = []
     for record in table.search(wanted):
         cells = record.get("fields") or {}
@@ -130,6 +154,9 @@ def read(table: feishu.Bitable) -> list[Entry]:
             note=feishu.read_text(cells.get(COL_NOTE)),
             status=feishu.read_text(cells.get(COL_STATUS)),
             first_run_done=feishu.read_bool(cells.get(COL_FIRST_RUN)),
+            thresholds={name: feishu.read_int(cells.get(name))
+                        for name in THRESHOLD_COLUMNS
+                        if feishu.read_int(cells.get(name)) is not None},
         )
         if not entry.target:
             entry.problem = f"「{COL_TARGET}」是空的"
@@ -204,3 +231,105 @@ class Health:
     ok: bool = False
     summary: str = ""
     problems: list = field(default_factory=list)
+
+
+# ---------- 逐表阈值 ----------
+
+@dataclass
+class Override:
+    """一张表的阈值覆盖，以及它有没有毛病。"""
+
+    values: dict = field(default_factory=dict)
+    problems: list = field(default_factory=list)
+
+    @property
+    def any(self) -> bool:
+        return bool(self.values)
+
+
+def read_overrides(entry: Entry) -> Override:
+    """把注册表那几格数字读成覆盖值。**纯函数。**
+
+    每一格单独校验，一格填错只丢那一格、不影响别的——和「一行填错只影响
+    那一行」是同一条纪律。校验不过的**不静默忽略**：写进 problems 让面板
+    和日志都能看见。静默忽略一个配置，比不支持它更糟。
+    """
+    out = Override()
+    raw = dict(entry.thresholds or {})
+
+    tiers = {}
+    for column in (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT):
+        value = raw.get(column)
+        if value is None:
+            continue
+        if value < 1:
+            out.problems.append(f"「{column}」= {value}，要是正整数，已忽略")
+            continue
+        tiers[column] = value
+    ordered = [tiers.get(c) for c in
+               (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT)]
+    given = [v for v in ordered if v is not None]
+    if len(given) > 1 and given != sorted(given):
+        # 三档必须递增，否则「爆贴」的门槛比「大爆」还高，热度档永远错。
+        out.problems.append(
+            f"三档门槛不是递增的（{'、'.join(str(v) for v in given)}），"
+            "整组已忽略——评估中 < 爆贴 < 大爆")
+        tiers = {}
+    out.values.update(tiers)
+
+    for column, floor, ceiling in ((COL_FLOP_HOURS, 1, 24 * 365),
+                                   (COL_ARCHIVE_DAYS, 1, 3650)):
+        value = raw.get(column)
+        if value is None:
+            continue
+        if not floor <= value <= ceiling:
+            out.problems.append(
+                f"「{column}」= {value} 超出 [{floor}, {ceiling}]，已忽略")
+            continue
+        out.values[column] = value
+    return out
+
+
+def apply_overrides(base, entry: Entry, *, log=None):
+    """全局 Settings + 这一行的覆盖 → 这张表专用的 Settings。**纯函数。**
+
+    深拷贝而不是就地改：`_run_locked` 的表循环共用一个基准 Settings，
+    就地改会让第一张表的阈值串味到后面所有表——那种 bug 只在多表部署上
+    出现，而且看起来像「判定口径莫名其妙」。
+    """
+    import copy
+
+    override = read_overrides(entry)
+    if log:
+        for problem in override.problems:
+            log(f"⚠ 注册表里「{entry.label}」的阈值有问题：{problem}")
+    if not override.any:
+        return base
+
+    settings = copy.deepcopy(base)
+    values = override.values
+    if COL_TIER_EVALUATING in values:
+        settings.thresholds.tier_evaluating = values[COL_TIER_EVALUATING]
+    if COL_TIER_HOT in values:
+        settings.thresholds.tier_hot = values[COL_TIER_HOT]
+    if COL_TIER_SUPER_HOT in values:
+        settings.thresholds.tier_super_hot = values[COL_TIER_SUPER_HOT]
+    if COL_FLOP_HOURS in values:
+        settings.thresholds.flop_hours = values[COL_FLOP_HOURS]
+    if COL_ARCHIVE_DAYS in values:
+        settings.refresh.archive_after_days = values[COL_ARCHIVE_DAYS]
+    if log:
+        shown = "、".join(f"{k}={v}" for k, v in sorted(values.items()))
+        log(f"⚙ 「{entry.label}」用的是这张表自己的阈值：{shown}")
+    return settings
+
+
+def set_thresholds(table: feishu.Bitable, record_id: str,
+                   values: dict) -> None:
+    """写回逐表阈值。`None` / 空 = 清掉那一格，回到全局默认。"""
+    fields = {}
+    for column in THRESHOLD_COLUMNS:
+        if column in values:
+            fields[column] = values[column]
+    if fields:
+        table.batch_update([{"record_id": record_id, "fields": fields}])

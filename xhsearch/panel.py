@@ -57,6 +57,10 @@ SESSION_TTL_SECONDS = 12 * 3600
 # 口令最短长度。**拒绝启动**而不是警告——一个 4 位口令的公网面板，
 # 和没有口令的区别只是攻击者要多试几千次。
 MIN_PASSWORD_LENGTH = 12
+# 一次最多勾多少行「排队刷新」。「全选」一次勾几千行 = 下一轮直接顶穿预算。
+# 这个上限和 MAX_RECORDS_PER_RUN 是两回事：那个是 cron 那边的，
+# 这个是防手滑的——面板上一个「全选」比误改一列容易得多。
+MAX_QUEUE_ROWS = 200
 # 登录失败的限速：同一来源在窗口内失败这么多次就先歇着。
 LOGIN_MAX_FAILURES = 10
 LOGIN_WINDOW_SECONDS = 300
@@ -426,6 +430,77 @@ class LogFeed:
             return list(self._lines), self._error
 
 
+# 面板对**业务表数据**唯一允许写的列。只有一个元素，而且不会变长。
+#
+# 为什么是白名单而不是黑名单：黑名单要穷举「不许写什么」，漏一个就是默许。
+# 白名单漏一个只是少个功能。这一列是运营本来就会手动勾的东西，
+# 面板勾它和人勾它走的是同一条路（cron 五分钟内接手）。
+#
+# 永不写的两类，都在这个白名单之外：
+# * 机器的**结论列**（流量状态/巡查状态/诊断信息/最近检查时间/评论数……）
+#   —— 写它们等于伪造监控结果，面板没量过任何东西
+# * 运营的**输入列**（评论关键词/负面词/发布时间/反馈链接）
+#   —— 那些是人的判断，面板只显示不代填
+BUSINESS_WRITE_WHITELIST = ("排队刷新",)
+
+
+@dataclass
+class QueueResult:
+    queued: int = 0
+    skipped_archived: int = 0
+    failures: list = field(default_factory=list)
+
+
+class Queueing:
+    """把业务表里的「排队刷新」勾上。**面板对业务表数据唯一的写路径。**
+
+    面板自己一个付费请求都不发——勾上之后由 cron 那个服务在五分钟内接手，
+    和运营手工勾完全是同一条路，同样受 MAX_RECORDS_PER_RUN 这些硬预算约束。
+    """
+
+    def __init__(self, config: PanelConfig, settings: Settings,
+                 log: Callable[[str], None] = print):
+        self.config = config
+        self.settings = settings
+        self.log = log
+
+    def queue(self, app_token: str, table_id: str,
+              record_ids: list[str]) -> QueueResult:
+        column = self.settings.fields.queued
+        if column not in BUSINESS_WRITE_WHITELIST:
+            # 到不了这里——除非有人改了 config 里的列名却忘了改白名单。
+            # 那一天这条断言会挡住一次「面板开始写一列它不该写的东西」。
+            raise RuntimeError(
+                f"「{column}」不在面板的业务表写白名单里，拒绝写入")
+        result = QueueResult()
+        if not record_ids:
+            return result
+        table = feishu.Bitable(app_id=self.config.app_id,
+                               app_secret=self.config.app_secret,
+                               app_token=app_token, table_id=table_id)
+        meta = table.fields_meta()
+        if not meta:
+            raise feishu.FeishuError(-1, provision.NOT_A_COLLABORATOR)
+        info = meta.get(column)
+        if info is None:
+            raise feishu.FeishuError(
+                -1, f"表里没有「{column}」列，勾不了——先在面板上把它建出来")
+        if not feishu.value_fits(info.get("type"), True):
+            raise feishu.FeishuError(
+                -1, f"「{column}」不是复选框（现在是类型 {info.get('type')}），"
+                    "勾上去会写失败")
+
+        errors: list = []
+        written = table.batch_update(
+            [{"record_id": rid, "fields": {column: True}} for rid in record_ids],
+            errors=errors)
+        result.queued = written
+        result.failures = [f"{rid}：{exc.msg}" for rid, exc in errors]
+        self.log(f"☑ 勾「{column}」{written} 行 @ {app_token[-6:]}/{table_id}"
+                 f"（cron 五分钟内接手）")
+        return result
+
+
 class Projects:
     """注册表的读写。面板对**注册表**的全部写路径都在这里。
 
@@ -500,6 +575,46 @@ class Projects:
         made = provision.create_monitored_table(workspace, self.settings, name)
         self.log(f"🧱 新建监控表 {name} → {made['app_token'][-6:]}/{made['table_id']}")
         return made
+
+    def preview_thresholds(self, record_id: str, values: dict) -> dict:
+        """改阈值之前先算给人看。**不花钱**——用表里已有的评论数就能算。
+
+        这是改阈值唯一的真实副作用：热度档是**棘轮（只升不降）**的，
+        改完不回溯。调低门槛的行下一轮会升上去；调高门槛的行**不会降回来**，
+        于是表里会短暂并存两套口径打出来的标签。
+        """
+        entries = {e.record_id: e for e in self.list()}
+        entry = entries.get(record_id)
+        if entry is None:
+            raise registry.RegistryError("注册表里没有这一行")
+        old = registry.apply_overrides(self.settings, entry)
+        after = registry.Entry(label=entry.label,
+                               thresholds={**entry.thresholds, **values})
+        override = registry.read_overrides(after)
+        new = registry.apply_overrides(self.settings, after)
+
+        table = self._bitable(entry.app_token, entry.table_id)
+        meta = table.fields_meta()
+        if not meta:
+            raise feishu.FeishuError(-1, provision.NOT_A_COLLABORATOR)
+        f = self.settings.fields
+        wanted = [c for c in (f.link, f.publish_time, f.comment_count,
+                              f.traffic_status, f.monitoring) if c in meta]
+        filter_spec = None
+        if f.monitoring in meta:
+            filter_spec = {"conjunction": "and", "conditions": [
+                {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
+        records = table.search(wanted, filter_spec=filter_spec)
+        shift = summary.preview_tier_shift(records, old, new)
+        return {"describe": shift.describe(), "changed": shift.changed,
+                "up": shift.up, "down_blocked": shift.down_blocked,
+                "examples": shift.examples, "problems": override.problems,
+                "effective": override.values}
+
+    def set_thresholds(self, record_id: str, values: dict) -> None:
+        shown = "、".join(f"{k}={v}" for k, v in sorted(values.items()))
+        self.log(f"⚙ 改阈值 {record_id}：{shown or '（清空，回到全局默认）'}")
+        registry.set_thresholds(self._registry(), record_id, values)
 
     def set_enabled(self, record_id: str, enabled: bool) -> None:
         self.log(f"📋 {'启用' if enabled else '停用'} 注册表行 {record_id}")
@@ -627,6 +742,7 @@ class _Deps:
     cache: Cache
     logs: Optional["LogFeed"] = None
     projects: Optional["Projects"] = None
+    queueing: Optional["Queueing"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -698,6 +814,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             return None
         if path.startswith("/api/projects/"):
             return self._project_action(path.rsplit("/", 1)[-1])
+        if path == "/api/queue":
+            return self._queue_action()
         if path == "/api/refresh":
             # 只是让缓存立刻重取一遍飞书数据和 Railway 日志。
             # **不发任何付费请求。**
@@ -858,6 +976,60 @@ class PanelHandler(BaseHTTPRequestHandler):
             "runs": [_run_json(r) for r in railway.build_runs(lines)],
         }
 
+    def _queue_action(self):
+        """把选中的行勾上「排队刷新」。**面板对业务表数据唯一的写路径。**
+
+        面板自己一个付费请求都不发——勾上之后 cron 五分钟内接手，
+        和运营手工勾同一条路，同样受 MAX_RECORDS_PER_RUN 这些硬预算约束。
+        """
+        if not self._authed():
+            return self._send_json(401, {"error": "未登录"})
+        if not self._csrf_ok():
+            return self._send_json(403, {"error": "缺少 " + CSRF_HEADER})
+        if self.deps.queueing is None:
+            return self._send_json(400, {"error": "面板没配 FEISHU_APP_ID"})
+        body = self._read_body()
+        if body is None:
+            return None
+        try:
+            payload = json.loads(body or b"{}")
+            rows = payload["rows"]
+            if not isinstance(rows, list):
+                raise ValueError("rows 要是数组")
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return self._send_json(400, {"error": f"请求体不对：{exc}"})
+        if len(rows) > MAX_QUEUE_ROWS:
+            # 「全选」一次勾几千行 = 下一轮直接顶穿预算。硬上限。
+            return self._send_json(400, {
+                "error": f"一次最多勾 {MAX_QUEUE_ROWS} 行（这次 {len(rows)} 行）。"
+                         "分几次来，或者先想想是不是该调分层刷新的节奏"})
+
+        # 按表分组：一张表一次 batch_update，飞书官方建议同一张表
+        # 同一时刻只做一个写操作。
+        grouped: dict[tuple, list] = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            key = (str(item.get("app_token") or ""), str(item.get("table_id") or ""))
+            record_id = str(item.get("record_id") or "")
+            if all(key) and record_id:
+                grouped.setdefault(key, []).append(record_id)
+
+        queued, failures = 0, []
+        for (app_token, table_id), record_ids in grouped.items():
+            try:
+                result = self.deps.queueing.queue(app_token, table_id, record_ids)
+            except feishu.FeishuError as exc:
+                failures.append(f"{table_id}：{exc.msg}")
+                continue
+            except Exception as exc:                            # noqa: BLE001
+                failures.append(f"{table_id}：{type(exc).__name__}: {exc}")
+                continue
+            queued += result.queued
+            failures.extend(result.failures)
+        self.deps.cache.refresh()
+        return self._send_json(200, {"queued": queued, "failures": failures})
+
     def _projects_payload(self) -> dict:
         projects = self.deps.projects
         if projects is None or not projects.enabled:
@@ -931,6 +1103,17 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "options_added": result.options_added,
                     "skipped_options": result.skipped_options,
                     "failures": result.failures, "ok": result.ok}
+        if action == "thresholds":
+            values = payload.get("values")
+            if not isinstance(values, dict):
+                raise ValueError("values 要是对象")
+            clean = {k: (None if v in ("", None) else int(v))
+                     for k, v in values.items()
+                     if k in registry.THRESHOLD_COLUMNS}
+            if payload.get("preview"):
+                return projects.preview_thresholds(text("record_id"), clean)
+            projects.set_thresholds(text("record_id"), clean)
+            return {"ok": True}
         if action == "enable":
             projects.set_enabled(text("record_id"), bool(payload.get("enabled")))
             self.deps.cache.refresh()
@@ -956,7 +1139,9 @@ def _entry_json(entry) -> dict:
             "target": entry.target, "enabled": entry.enabled,
             "note": entry.note, "status": entry.status,
             "problem": entry.problem, "usable": entry.usable,
-            "app_token": entry.app_token, "table_id": entry.table_id}
+            "app_token": entry.app_token, "table_id": entry.table_id,
+            "thresholds": dict(entry.thresholds or {}),
+            "threshold_columns": list(registry.THRESHOLD_COLUMNS)}
 
 
 def _checkup_json(c) -> dict:
@@ -1009,6 +1194,7 @@ def _project_json(p: summary.ProjectSnapshot) -> dict:
 def _todo_json(t: summary.TodoRow) -> dict:
     return {
         "record_id": t.record_id, "project": t.project, "record_url": t.record_url,
+        "app_token": t.app_token, "table_id": t.table_id, "key": t.key,
         "link_cell": t.link_cell, "reasons": t.reasons,
         "refresh_status": t.refresh_status, "diagnosis": t.diagnosis,
         "comment_count": t.comment_count, "traffic_tags": t.traffic_tags,
@@ -1030,11 +1216,13 @@ class PanelServer(ThreadingHTTPServer):
 
 def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] = None,
                  projects: Optional[Projects] = None,
+                 queueing: Optional[Queueing] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
         config=config, cache=cache, logs=logs, projects=projects,
+        queueing=queueing,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -1046,8 +1234,11 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     """起面板。阻塞到进程被杀。"""
     cache = Cache(produce, config.cache_seconds)
     logs = LogFeed(config, config.cache_seconds)
-    projects = Projects(config, settings or Settings())
-    server = build_server(config, cache, logs=logs, projects=projects)
+    resolved = settings or Settings()
+    projects = Projects(config, resolved)
+    queueing = Queueing(config, resolved) if config.app_id else None
+    server = build_server(config, cache, logs=logs, projects=projects,
+                          queueing=queueing)
     cache.start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"

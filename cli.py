@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from xhsearch import (feishu, providers, rows as rows_mod, runlock, runner,
                       schema, tablespec)
@@ -231,11 +232,17 @@ def _entries(app_id: str, app_secret: str) -> list[tuple[str, str, str]]:
         if entry.problem:
             print(f"⚠ 注册表里「{entry.label or entry.record_id}」这一行有问题，"
                   f"本轮跳过：{entry.problem}")
+    _REGISTRY_ROWS.clear()
+    _REGISTRY_ROWS.update({e.table_id: e for e in entries if e.usable})
     usable = registry_mod.to_tuples(entries)
     if not usable:
         sys.exit(f"注册表里没有一张可用的表（共 {len(entries)} 行，"
                  "要么没勾「启用」，要么配置有误）。本轮拒跑")
     return usable
+
+
+# 注册表里那一行，按 table_id 索引。逐表阈值从这儿来；没用注册表时是空的。
+_REGISTRY_ROWS: dict[str, Any] = {}
 
 
 def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
@@ -825,8 +832,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         """
         runner.emit(on_event, runner.EVENT_RUN_END, mode=mode,
                     tables=len(tables), exit_code=code, error=error,
-                    rows=sum(len(r.outcomes) for _l, _t, r, _m in pending),
-                    cost_yuan=round(sum(r.cost_yuan for _l, _t, r, _m in pending), 6),
+                    rows=sum(len(r.outcomes) for _l, _t, r, _m, _c in pending),
+                    cost_yuan=round(
+                        sum(r.cost_yuan for _l, _t, r, _m, _c in pending), 6),
                     channels_dead=channels_dead, stopped=stop.is_set(),
                     budget_stopped=budget.stopped_reason)
         return code
@@ -838,7 +846,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 把它们当成 ¥0 加进去，报出来的数字就是个假的下界。
     unknown_cost = 0
     # 先把所有表都刷完、攒起来，写回放到跨表熔断之后（见下）。
-    pending: list[tuple[str, feishu.Bitable, runner.RunReport, set[str] | None]] = []
+    pending: list[tuple[str, feishu.Bitable, runner.RunReport,
+                       set[str] | None, Settings]] = []
     channels_dead = False
     try:
         for index, (label, table) in enumerate(tables):
@@ -853,9 +862,17 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 print("⚠ 运行已被终止，这张表本轮不再尝试；行都没动过，下一轮自然补上")
                 worst = 1
                 continue
+            # 逐表阈值：深拷贝 + 浅覆盖，绝不就地改基准 Settings——
+            # 就地改会让第一张表的阈值串味到后面所有表，而那种 bug 只在
+            # 多表部署上出现，看起来像「判定口径莫名其妙」。
+            per_table = settings
+            row = _REGISTRY_ROWS.get(table.table_id)
+            if row is not None:
+                from xhsearch import registry as registry_mod
+                per_table = registry_mod.apply_overrides(settings, row, log=print)
             try:
                 code, found, row_count, yuan, prep = _refresh_table(
-                    mode, record_ids, settings, api_keys, table, now,
+                    mode, record_ids, per_table, api_keys, table, now,
                     quiet_missing=multi, deadline=deadline, disabled=disabled,
                     budget=budget, stop=stop)
             except feishu.FeishuError as exc:
@@ -872,7 +889,7 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 total_yuan += yuan
             if prep is not None:
                 report, fields_meta = prep
-                pending.append((label, table, report, fields_meta))
+                pending.append((label, table, report, fields_meta, per_table))
                 if report.fatal and not [k for k in api_keys if k not in disabled]:
                     channels_dead = True
     except BaseException:
@@ -881,9 +898,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         # 下一轮按原样的 last_updated 再付一次。
         if pending:
             print("\n⚠ 运行中断，先把已经完成的表写回（避免已付费的结果丢失）…")
-            for label, table, report, fields_meta in pending:
+            for label, table, report, fields_meta, per_table in pending:
                 try:
-                    _write_back_table(table, report, fields_meta, settings, label)
+                    _write_back_table(table, report, fields_meta, per_table, label)
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
         _finish(1, error=type(sys.exc_info()[1]).__name__)
@@ -892,24 +909,26 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 跨表熔断：单表可能只有三五行，永远凑不满熔断的最小样本，但上游
     # 故障是通道级的——把这一轮所有表的观测合起来再判一次，该作废的
     # 失效判定在写回**之前**作废掉。
+    # 跨表熔断用**全局** settings：熔断参数刻意不允许逐表（见 registry.py），
+    # 逐表不同的熔断口径会让「这一轮到底该不该熔」说不清。
     if len(pending) > 1 and runner.apply_cross_run_breaker(
-            [report for _, _, report, _ in pending], settings):
+            [report for _, _, report, _, _ in pending], settings):
         print("\n🛑 跨表熔断：本轮各表合计的失效比例异常偏高，疑似上游故障，"
               "已作废所有表的失效判定（明细见各表结果）")
 
     # 结构化事件在**所有**熔断（含上面这次跨表熔断）定案之后才发：
     # 提前发的话，被熔断改写过的行会让看板和告警看到一个比实际落表更吓人的
     # 结论，而那正好发生在上游故障、最不该误报的时候。
-    for label, _table, report, _meta in pending:
+    for label, _table, report, _meta, _cfg in pending:
         runner.emit_run_events(report, on_event, table=label, mode=mode)
 
-    for label, table, report, fields_meta in pending:
+    for label, table, report, fields_meta, per_table in pending:
         if multi:
             print(f"\n━━━━ 表：{label}（结果）━━━━")
         else:
             print()
         try:
-            code = _write_back_table(table, report, fields_meta, settings, label)
+            code = _write_back_table(table, report, fields_meta, per_table, label)
         except feishu.FeishuError as exc:
             print(f"❌ 这张表写回失败（表级错误）：{exc}；继续处理其余表")
             worst = 1

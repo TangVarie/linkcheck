@@ -38,6 +38,13 @@ class TodoRow:
     project: str
     record_url: str
     link_cell: str
+    # 勾「排队刷新」要拿这两个去定位那张表。
+    app_token: str = ""
+    table_id: str = ""
+    # 已归档 = 超过 archive_after_days，本来就不再自动刷。
+    # 面板默认**不把它们混进主待办列表**：批量勾选会绕过归档线，
+    # 而面板恰好把跨表的老旧失效行摆在一屏、天然鼓励全选。
+    archived: bool = False
     reasons: list[str] = field(default_factory=list)
     refresh_status: str = ""
     diagnosis: str = ""
@@ -50,6 +57,14 @@ class TodoRow:
     # 是别人的个人信息，不该因为「顺手」就上一个公网页面。
     digest: str = ""
     negative_digest: str = ""
+
+    @property
+    def key(self) -> str:
+        """这一条待办的身份。**同一行因为不同原因上榜算不同的待办**——
+        「这行开始有负面了」和「这行早就风控中」是两件事，
+        后者已经看过不代表前者也看过。
+        """
+        return f"{self.table_id}:{self.record_id}:{','.join(sorted(self.reasons))}"
 
 
 @dataclass
@@ -244,9 +259,12 @@ def build_snapshot(
             negative_status=negative_status, stale=stale)
         if reasons and len(snap.todos) < max_todos:
             snap.todos.append(TodoRow(
+                archived=archived,
                 record_id=row.record_id,
                 project=label,
                 record_url=record_url(feishu_base, app_token, table_id, row.record_id),
+                app_token=app_token,
+                table_id=table_id,
                 link_cell=row.link_cell,
                 reasons=reasons,
                 refresh_status=refresh_status,
@@ -348,12 +366,98 @@ class Overview:
     def unhealthy_projects(self) -> list[ProjectSnapshot]:
         return [p for p in self.projects if not p.healthy]
 
-    def todos(self, limit: int = 500) -> list[TodoRow]:
+    def todos(self, limit: int = 500, *, include_archived: bool = False
+              ) -> list[TodoRow]:
         """跨表拉平的待办。**这是整个面板的价值所在**——
         运营看到的是「这 7 行要处理」，而不是「去 5 张表里找」。
+
+        默认**不含已归档的行**。它们超过了 archive_after_days、本来就不再
+        自动刷，而「排队刷新」会绕过归档线——把一堆老帖混进这一屏，
+        再配上一个「全选」，就是一次把钱花在几个月前的内容上。
+        要看它们走 `archived_todos()`，那边是折叠的、要单独确认。
         """
         merged: list[TodoRow] = []
         for project in self.projects:
-            merged.extend(project.todos)
+            merged.extend(t for t in project.todos
+                          if include_archived or not t.archived)
         merged.sort(key=_todo_sort_key)
         return merged[:limit]
+
+    def archived_todos(self, limit: int = 200) -> list[TodoRow]:
+        """已归档但仍有异常的行。单独一区，重刷要另外确认。"""
+        merged = [t for p in self.projects for t in p.todos if t.archived]
+        merged.sort(key=_todo_sort_key)
+        return merged[:limit]
+
+
+# ---------- 改阈值之前先算给人看 ----------
+
+@dataclass
+class TierShift:
+    """按新口径，这个项目有多少行的热度档会变。"""
+
+    changed: int = 0
+    up: int = 0
+    down_blocked: int = 0
+    examples: list = field(default_factory=list)
+
+    def describe(self) -> str:
+        if not self.changed and not self.down_blocked:
+            return "按新口径，这个项目没有行的档位会变。"
+        parts = []
+        if self.up:
+            parts.append(f"{self.up} 行会**升档**（下一轮生效）")
+        if self.down_blocked:
+            parts.append(
+                f"{self.down_blocked} 行按新口径本该**降档，但不会降**"
+                "——热度档是棘轮（只升不降），改阈值不回溯")
+        return "；".join(parts) + "。"
+
+
+def preview_tier_shift(records: list[dict], old: Settings, new: Settings,
+                       *, now: Optional[datetime] = None,
+                       max_examples: int = 5) -> TierShift:
+    """改阈值会影响哪些行。**纯函数，不发请求、不花钱**——
+    用表里已经有的评论数就能算。
+
+    这是改阈值唯一的真实副作用，所以保存前必须摆出来：热度档是**棘轮
+    （只升不降）**的，改完不回溯。调低门槛的行下一轮会升上去；
+    调高门槛的行**不会降回来**，于是表里会短暂并存两套口径打出来的标签。
+    """
+    now = now or datetime.now(timezone.utc)
+    shift = TierShift()
+    for record in records:
+        row = runner.row_from_record(record, old)
+        count = row.previous_comment_count
+        if count is None:
+            continue
+        before = _tier_for(row, count, old, now)
+        after = _tier_for(row, count, new, now)
+        if before == after:
+            continue
+        rank_before = old.tags.rank(before or "")
+        rank_after = new.tags.rank(after or "")
+        if rank_after > rank_before:
+            shift.changed += 1
+            shift.up += 1
+            if len(shift.examples) < max_examples:
+                shift.examples.append(
+                    f"{row.record_id}：{count} 条评论 {before or '—'} → {after}")
+        else:
+            # 棘轮：算出来更低也不会真降。摆出来，别让人以为改完就回退了。
+            shift.down_blocked += 1
+    return shift
+
+
+def _tier_for(row: rows_mod.Row, count: int, settings: Settings,
+              now: datetime) -> Optional[str]:
+    """这一行按这套口径落在哪一档。和 analyze 那边同一套判据。"""
+    tier = settings.thresholds.heat_tier(count, settings.tags)
+    if tier:
+        return tier
+    age = row.age_hours(now)
+    if age is None:
+        return None
+    if age < settings.thresholds.flop_hours:
+        return settings.tags.observing or None
+    return settings.tags.flop or None

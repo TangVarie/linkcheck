@@ -69,7 +69,7 @@ cd linkcheck
 python3 -m unittest discover -s tests -t .
 ```
 
-**做完应该看到**：`Ran 753 tests ... OK`，一秒内跑完。
+**做完应该看到**：`Ran 792 tests ... OK`，一秒内跑完。
 这一步不需要任何密钥、不联网、不花钱。跑不通就是 Python 版本太老。
 
 ---
@@ -476,7 +476,7 @@ Railway 按「资源 × 分钟」计费，**内存通常是账单里最大的一
 分层刷新间隔、快照里显示几条评论。改完 `git push` 就生效。
 
 改判定逻辑记得跑一遍 `python3 -m unittest discover -s tests -t .`——
-753 个测试全离线，一秒跑完，能挡掉绝大部分改坏的情况。
+792 个测试全离线，一秒跑完，能挡掉绝大部分改坏的情况。
 
 ---
 

@@ -79,6 +79,10 @@ padding:22px;text-align:center;color:var(--dim)}
 padding:9px 11px;font-size:12.5px;margin:10px 0}
 .tools{display:flex;gap:10px;align-items:center;margin-left:auto}
 .tools input{width:200px}
+.queuebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+tr.fresh td:nth-child(2){box-shadow:inset 3px 0 0 var(--blue)}
+tr.fresh td:nth-child(2)::after{content:"新";font-size:11px;color:var(--blue);
+margin-left:5px;vertical-align:super}
 .proj{display:flex;gap:10px;align-items:flex-start;padding:9px 0;
 border-bottom:1px solid var(--line);flex-wrap:wrap}
 .proj:last-child{border-bottom:none}
@@ -116,6 +120,75 @@ _SCRIPT = """
     }
   });
 
+  // ---- 待办：批量勾「排队刷新」 + 标出自上次以来新出现的 ----
+  var picks = document.querySelectorAll("#todos .todoPick");
+  var btnQ = document.getElementById("btnQueue");
+  var pickN = document.getElementById("pickN");
+  var qOut = document.getElementById("queueOut");
+  function rowsOf(el){ return el.closest("tr"); }
+  function selected(){
+    var out = [];
+    for (var i = 0; i < picks.length; i++) {
+      if (!picks[i].checked) continue;
+      var tr = rowsOf(picks[i]);
+      out.push({app_token: tr.dataset.app, table_id: tr.dataset.tbl,
+                record_id: tr.dataset.rec});
+    }
+    return out;
+  }
+  function sync(){
+    var n = selected().length;
+    if (pickN) pickN.textContent = n;
+    if (btnQ) btnQ.disabled = n === 0;
+  }
+  for (var i = 0; i < picks.length; i++) picks[i].addEventListener("change", sync);
+  var all = document.getElementById("todoAll");
+  if (all) all.addEventListener("change", function(){
+    for (var i = 0; i < picks.length; i++) {
+      var tr = rowsOf(picks[i]);
+      if (tr.style.display !== "none") picks[i].checked = all.checked;
+    }
+    sync();
+  });
+  if (btnQ) btnQ.addEventListener("click", function(){
+    var rows = selected();
+    if (!rows.length) return;
+    if (!confirm("给这 " + rows.length + " 行勾上「排队刷新」？\n\n" +
+                 "面板不发付费请求——由后台 cron 在五分钟内接手，" +
+                 "花费和你在飞书里手工勾完全一样。")) return;
+    btnQ.disabled = true;
+    if (qOut) qOut.textContent = "勾选中…";
+    fetch("/api/queue", {method: "POST",
+      headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
+      body: JSON.stringify({rows: rows})})
+      .then(function(r){ return r.json().then(function(j){
+        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        return j; }); })
+      .then(function(j){
+        if (qOut) qOut.textContent = "已勾 " + j.queued + " 行，等 cron 接手" +
+          (j.failures.length ? "；" + j.failures.length + " 行失败：" + j.failures.join("；") : "");
+        sync();
+      })
+      .catch(function(err){ if (qOut) qOut.textContent = String(err); btnQ.disabled = false; });
+  });
+
+  // 「问题发现」的关键是新增，不是总量。上次看到的存在浏览器本地，
+  // 不上服务端——它是每个人自己的阅读进度，不是共享状态。
+  try {
+    var SEEN = "linkcheck.seen";
+    var seen = JSON.parse(localStorage.getItem(SEEN) || "[]");
+    var now = [], fresh = 0;
+    var trs = document.querySelectorAll("#todos tbody tr");
+    for (var i = 0; i < trs.length; i++) {
+      var k = trs[i].dataset.key;
+      if (!k) continue;
+      now.push(k);
+      if (seen.indexOf(k) < 0) { trs[i].className = "fresh"; fresh++; }
+    }
+    if (fresh && qOut) qOut.textContent = fresh + " 条是上次看过之后新出现的（标了「新」）";
+    localStorage.setItem(SEEN, JSON.stringify(now.slice(0, 2000)));
+  } catch (e) { /* 隐私模式/禁用存储：高亮没了而已，不影响别的 */ }
+
   // ---- 项目管理 ----
   var list = document.getElementById("projects");
   var out = document.getElementById("addOut");
@@ -130,6 +203,31 @@ _SCRIPT = """
       if (!r.ok) { throw new Error((j && (j.error || j.hint)) || ("HTTP " + r.status)); }
       return j; }); });
   }
+  function thresholdForm(e){
+    var cols = e.threshold_columns || [];
+    var inputs = cols.map(function(c){
+      var v = e.thresholds && e.thresholds[c] != null ? e.thresholds[c] : "";
+      return "<label class=muted style='display:inline-block;margin:0 10px 6px 0'>" +
+        esc(c) + " <input type=number min=1 style='width:90px' data-col='" + esc(c) +
+        "' value='" + esc(String(v)) + "' placeholder='默认'></label>";
+    }).join("");
+    return "<div class=thr data-rec='" + esc(e.record_id) + "' hidden style='flex-basis:100%;margin-top:8px'>" +
+      "<div class=muted style='margin-bottom:6px'>空着 = 用全局默认。" +
+      "熔断比例、两击定罪、冷却、单轮预算<b>不能逐表</b>——它们有跨表语义，" +
+      "逐表不同会让「这一轮该不该熔」说不清。</div>" +
+      inputs +
+      "<div><button type=button data-thr=preview>先算给我看</button> " +
+      "<button type=button data-thr=save disabled>保存</button></div>" +
+      "<div class='out thrOut'></div></div>";
+  }
+  function thrValues(box){
+    var out = {};
+    box.querySelectorAll("input[data-col]").forEach(function(i){
+      out[i.dataset.col] = i.value.trim() === "" ? null : Number(i.value);
+    });
+    return out;
+  }
+
   function load(){
     if (!list) return;
     fetch("/api/projects").then(function(r){ return r.json(); }).then(function(j){
@@ -148,17 +246,47 @@ _SCRIPT = """
           "<div class=acts>" +
           "<button type=button data-act=build data-app='" + esc(e.app_token) + "' data-tbl='" + esc(e.table_id) + "'>补齐缺的列</button>" +
           "<button type=button data-act=enable data-rec='" + esc(e.record_id) + "' data-on='" + (e.enabled ? "0" : "1") + "'>" + (e.enabled ? "停用" : "启用") + "</button>" +
+          "<button type=button data-act=thresholds data-rec='" + esc(e.record_id) + "'>阈值</button>" +
           "<button type=button data-act=remove data-rec='" + esc(e.record_id) + "' data-label='" + esc(e.label) + "'>移除</button>" +
-          "</div></div>";
+          "</div>" + thresholdForm(e) + "</div>";
       }).join("");
     }).catch(function(err){ list.className = "problem"; list.textContent = String(err); });
   }
   if (list) {
     load();
     list.addEventListener("click", function(ev){
-      var b = ev.target.closest ? ev.target.closest("button[data-act]") : null;
+      var b = ev.target.closest ? ev.target.closest("button[data-act],button[data-thr]") : null;
       if (!b) return;
       var act = b.dataset.act;
+      if (act === "thresholds") {
+        var box = list.querySelector(".thr[data-rec='" + b.dataset.rec + "']");
+        if (box) box.hidden = !box.hidden;
+        return;
+      }
+      if (b.dataset.thr) {
+        var panelBox = b.closest(".thr");
+        var rec = panelBox.dataset.rec;
+        var out2 = panelBox.querySelector(".thrOut");
+        var saveBtn = panelBox.querySelector("[data-thr=save]");
+        b.disabled = true;
+        if (b.dataset.thr === "preview") {
+          out2.textContent = "算一下…（不花钱）";
+          post("thresholds", {record_id: rec, values: thrValues(panelBox), preview: true})
+            .then(function(j){
+              var lines = [j.describe];
+              if (j.examples && j.examples.length) lines.push("比如：\n· " + j.examples.map(esc).join("\n· "));
+              if (j.problems && j.problems.length) lines.push("这几处填得不对，已忽略：\n· " + j.problems.map(esc).join("\n· "));
+              out2.innerHTML = lines.join("\n\n");
+              saveBtn.disabled = false; b.disabled = false;
+            })
+            .catch(function(err){ out2.textContent = String(err); b.disabled = false; });
+        } else {
+          post("thresholds", {record_id: rec, values: thrValues(panelBox)})
+            .then(function(){ out2.innerHTML = "<span class=ok>保存了。下一轮 cron（≤5 分钟）生效，不用重新部署。</span>"; })
+            .catch(function(err){ out2.textContent = String(err); b.disabled = false; });
+        }
+        return;
+      }
       if (act === "remove" && !confirm("不再监控「" + b.dataset.label + "」？\n\n只是从清单里去掉，飞书表和里面的数据一个字都不动。")) return;
       b.disabled = true;
       var body = act === "build" ? {app_token: b.dataset.app, table_id: b.dataset.tbl}
@@ -288,7 +416,8 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
         return ("<div class=empty>没有需要处理的行。"
                 "<br><span class=muted>风控中 / 有负面 / 置顶掉了 / 已失效 / "
                 "刷新失败 / 卡住了 —— 一条都没有。</span></div>")
-    head = ("<tr><th>项目</th><th>为什么</th><th>诊断信息</th>"
+    head = ("<tr><th><input type=checkbox id=todoAll title='全选'></th>"
+            "<th>项目</th><th>为什么</th><th>诊断信息</th>"
             "<th>评论数</th><th>最近检查</th><th></th></tr>")
     body = []
     for todo in todos:
@@ -297,7 +426,9 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
             extra = (f"<div class=muted style='margin-top:4px'>"
                      f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
         body.append(
-            "<tr>"
+            f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
+            f"data-tbl='{_e(todo.table_id)}' data-key='{_e(todo.key)}'>"
+            "<td class=nowrap><input type=checkbox class=todoPick></td>"
             f"<td class=nowrap>{_e(todo.project)}</td>"
             f"<td>{_chips(todo.reasons, _REASON_CLASS)}</td>"
             f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
@@ -306,8 +437,42 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
             f"<td class=nowrap><a href='{_e(todo.record_url)}' "
             "target=_blank rel='noopener noreferrer'>去这一行 →</a></td>"
             "</tr>")
-    return (f"<table id=todos><thead>{head}</thead>"
+    return (f"""<div class=queuebar>
+  <button type=button id=btnQueue disabled>勾「排队刷新」（<span id=pickN>0</span>）</button>
+  <span class=muted>面板不发付费请求——勾上之后由 cron 在五分钟内接手，
+  和你在飞书里手工勾是同一条路。</span>
+  <span id=queueOut class=muted></span>
+</div>
+<table id=todos><thead>{head}</thead>"""
             f"<tbody>{''.join(body)}</tbody></table>")
+
+
+def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
+    """已归档但仍有异常的行。**折叠着，而且不在批量勾选的范围里。**
+
+    「排队刷新」会绕过归档线——把这些老帖混进主列表，再配一个「全选」，
+    就是一次把钱花在几个月前的内容上。它们大多数时候的正确处置是
+    「取消巡查」，不是「重新刷新」。
+    """
+    if not todos:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f"<td class=nowrap>{_e(t.project)}</td>"
+        f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
+        f"<td>{_e(t.diagnosis) or '<span class=muted>—</span>'}</td>"
+        f"<td class=nowrap><a href='{_e(t.record_url)}' target=_blank "
+        "rel='noopener noreferrer'>去这一行 →</a></td></tr>"
+        for t in todos)
+    return f"""<details style='margin-top:12px'>
+  <summary class=muted style='cursor:pointer'>还有 {len(todos)} 行已归档的老帖也有异常
+    （不在上面的列表和批量勾选里）</summary>
+  <div class=note>这些帖子已经超过归档天数、不再自动刷了。
+    「排队刷新」会**绕过归档线**，所以它们刻意不混进上面那一屏——
+    多数时候正确的处置是去飞书**取消巡查**，而不是再花钱刷一次。</div>
+  <table><thead><tr><th>项目</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
+  <tbody>{rows}</tbody></table>
+</details>"""
 
 
 def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
@@ -491,6 +656,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 <div class=muted style='margin-bottom:8px'>跨所有项目拉平。点「去这一行」直接落到
 飞书表里那一行——面板负责发现，具体处理在飞书里做。</div>
 {_todo_table(todos, offset_hours, config.show_digest)}
+{_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
 
 <h2>各项目</h2>
 <div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
