@@ -165,6 +165,43 @@ class TestDashboardComponents(unittest.TestCase):
         self.assertNotIn("nth-child(even)", css)
         self.assertNotIn("nth-child(odd)", css)
 
+    def test_the_chevron_is_a_link_tail_not_a_heading_bullet(self):
+        """BRAND.md §4 允许双箭做「区块标题前标」和「链接尾标」两种，
+        但这一轨的定式（templates/dashboard.html）里前标 0 处、尾标 2 处。
+
+        五个区块各挂一个前标，双箭就从品牌重音降成了项目符号——
+        而且「一屏最多 3 处」那条上限也悬。
+        """
+        css = css_without_comments()
+        self.assertNotIn("h2::before", css, "h2 不该带双箭前标")
+        html = render()
+        self.assertIn("»", html, "双箭该以链接尾标的形态出现")
+        for tail in re.findall(r"([^>]{0,12})»", html):
+            self.assertNotIn("<h2", tail)
+
+    def test_row_actions_are_small_and_blue(self):
+        """scenarios/03：「行操作用 13px 蓝字链接」。
+
+        模板里通用的 `a` 是 accent 红，和这条冲突——仲裁顺序里
+        **场景文件规则高于可执行模板**，所以行操作听场景的。
+        """
+        css = css_without_comments()
+        rule = re.search(r"td a\.act\{([^}]+)\}", css)
+        self.assertIsNotNone(rule, "行操作链接没有单独的样式")
+        self.assertIn("13px", rule.group(1))
+        self.assertIn("var(--primary)", rule.group(1))
+        self.assertIn("class=act", render())
+
+    def test_a_space_between_a_number_and_a_chinese_unit(self):
+        """模板里一律 `3 天` / `20 条` / `6 个`。
+
+        **先把标签剥掉再查**：`9<small>天</small>` 在源码里数字和量词之间
+        隔着一个标签，但渲染出来是紧挨着的——按源码查会漏掉这一类。
+        """
+        text = re.sub(r"<[^>]+>", "", render())
+        bad = re.findall(r"\d(天|行|个|条|次|张|轮)", text)
+        self.assertEqual(bad, [], f"数字和中文量词之间少了空格：{bad}")
+
     def test_money_numbers_carry_the_num_class(self):
         """负面清单 #12：不带 num 类的金额数字。"""
         html = render()

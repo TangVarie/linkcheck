@@ -142,8 +142,10 @@ h1{font-size:24px;font-weight:700;margin:0 0 6px;color:var(--text-dark)}
 .lede b{color:var(--text-dark);font-weight:600}
 h2{font-size:16px;font-weight:600;margin:32px 0 4px;color:var(--text-dark);
   display:flex;align-items:baseline;gap:8px}
+/* 区块 / 卡片的入口链接。双箭挂这儿——BRAND.md §4 的「链接尾标」，
+ * 也是 templates/dashboard.html 里双箭唯一出现的形态。 */
+.enter{font-size:13px}
 /* 品牌双箭：单个蓝色 »，字号同标题、字重 800（BRAND.md §4） */
-h2::before{content:"»";color:var(--primary);font-weight:800}
 h2 .n{font-weight:400;color:var(--text-faint)}
 .sub{font-size:13px;color:var(--text-light);margin:0 0 12px;max-width:78ch}
 
@@ -174,6 +176,10 @@ td{padding:12px;border-top:1px solid var(--border);font-size:14px;
 tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
 td.right{text-align:right}
+/* 行操作：13px 品牌蓝。scenarios/03 明写「行操作用 13px 蓝字链接」，
+ * 而模板里通用的 a 是 accent 红——仲裁顺序中**场景文件规则高于模板**，
+ * 这一处听场景的。 */
+td a.act{font-size:13px;color:var(--primary)}
 tr.fresh td:nth-child(2){border-left:3px solid var(--primary)}
 tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary);
   margin-left:6px;font-weight:600}
@@ -709,7 +715,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
             f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
             f"<td class=nowrap>{_e(_stamp(todo.checked_at_ms, offset_hours))}</td>"
             f"<td class=nowrap><a href='{_e(todo.record_url)}' "
-            "target=_blank rel='noopener noreferrer'>去这一行 →</a></td>"
+            "target=_blank rel='noopener noreferrer' class=act>去这一行</a></td>"
             "</tr>")
     return (f"""<div class=queuebar>
   <button type=button id=btnQueue disabled>勾「排队刷新」（<span id=pickN>0</span>）</button>
@@ -736,7 +742,7 @@ def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
         f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
         f"<td>{_e(t.diagnosis) or '<span class=muted>—</span>'}</td>"
         f"<td class=nowrap><a href='{_e(t.record_url)}' target=_blank "
-        "rel='noopener noreferrer'>去这一行 →</a></td></tr>"
+        "rel='noopener noreferrer' class=act>去这一行</a></td></tr>"
         for t in todos)
     return f"""<details style='margin-top:12px'>
   <summary class=muted style='cursor:pointer'>还有 {len(todos)} 行已归档的老帖也有异常
@@ -755,7 +761,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
                 f"<div class=problem>{_icon('alert-circle')}"
                 f"<span>{_e(p.error)}</span></div>"
                 f"<div class=rows><div><a href='{_e(p.table_url)}' target=_blank "
-                "rel='noopener noreferrer'>打开这张表 →</a></div></div></div>")
+                "rel='noopener noreferrer' class=enter>打开这张表 »</a></div></div></div>")
 
     health = ""
     problems = list(p.health)
@@ -785,7 +791,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     return f"""<div class='{card_class}'>
   <h3>{_e(p.label)}</h3>
   <div class=muted><a href='{_e(p.table_url)}' target=_blank
-     rel='noopener noreferrer'>打开这张表 →</a></div>
+     rel='noopener noreferrer' class=enter>打开这张表 »</a></div>
   {health}
   <div class=rows>
     <div><span class=lbl>在管</span><span>{p.total_rows} 行
@@ -1135,7 +1141,8 @@ def _kpi_box(value, key: str, sub: str = "", *, warn: bool = False,
     `unit` 单独一个参数而不是让调用方把 `<small>` 拼进 value —— value 要
     转义，混进去的标签会被转义成字面量。
     """
-    tail = f"<small>{_e(unit)}</small>" if unit else ""
+    # 数字和中文量词之间**留一个空格**：模板里一律 `3 天` / `20 条` / `6 个`。
+    tail = f"<small> {_e(unit)}</small>" if unit else ""
     return (f"<div class='box{' warn' if warn else ''}'>"
             f"<div class=k>{_e(key)}</div>"
             f"<div class='n num'>{_e(value)}{tail}</div>"
