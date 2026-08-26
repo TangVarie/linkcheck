@@ -363,6 +363,71 @@ class TestTruncationAndFailureStates(unittest.TestCase):
         self.assertNotIn("data-sec='s-balance'", html)
 
 
+def _raw_newline_in_js_string(js: str):
+    """扫一遍 JS，找出**字符串字面量里的裸换行**。返回出错的行号。
+
+    这个仓库的 JS 全是内联单文件、不用模板字符串，所以「字符串里出现换行」
+    一定是 bug。写成扫描器而不是「每行数引号」：注释和中文标点里都可能出现
+    引号，数引号会误报。
+    """
+    bad, i, n = [], 0, len(js)
+    quote, line, opened_at = None, 1, 0
+    while i < n:
+        c = js[i]
+        if c == "\n":
+            line += 1
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            elif c == "\n":
+                bad.append(opened_at)
+        elif c in "\"'":
+            quote, opened_at = c, line
+        elif c == "/" and i + 1 < n and js[i + 1] == "/":
+            while i < n and js[i] != "\n":
+                i += 1
+            continue
+        i += 1
+    return bad
+
+
+class TestScriptParses(unittest.TestCase):
+    """内联 JS 的语法闸。
+
+    ⚠️ 这一条是补的，因为**上一版真的坏过**：`_SCRIPT` 是普通三引号字符串，
+    里面写的 `\n`（想给 JS 的换行转义）被 Python 直接吃成了真换行，
+    于是 11 处 `confirm("…？\n\n…")` 变成跨行字符串，整段脚本
+    `Uncaught SyntaxError` —— 面板上**所有**交互（勾选计数、项目列表、
+    重新取数、筛选、加表）全部失效，而当时的测试一条都没红：
+    它们全是拿正则解析 HTML，看不见 JS 语法错误。
+
+    修法是把 `_SCRIPT` 改成 raw string。这条测试钉住它别再退回去。
+    """
+
+    def test_no_raw_newline_inside_a_js_string_literal(self):
+        bad = _raw_newline_in_js_string(panel_view._SCRIPT)
+        self.assertEqual(
+            bad, [],
+            "JS 字符串字面量里有裸换行（第 %s 行附近），整段脚本会解析失败。"
+            "多半是 `_SCRIPT` 不是 raw string，Python 把 `\\n` 吃成了真换行。"
+            % bad)
+
+    def test_the_script_is_a_raw_string(self):
+        """直接钉住写法本身——比只查结果更早暴露问题。"""
+        import inspect
+        source = inspect.getsource(panel_view)
+        self.assertIn('_SCRIPT = r"""', source,
+                      "_SCRIPT 必须是 raw string，否则 JS 里的 \\n 会被 Python 吃掉")
+
+    def test_escapes_survive_into_the_javascript(self):
+        """`\n` 要以**两个字符**（反斜杠 + n）的形式到达浏览器。"""
+        self.assertIn("\\n", panel_view._SCRIPT,
+                      "JS 里一个 \\n 转义都没有了？那多半是又被吃掉了")
+
+
 class TestDarkMode(unittest.TestCase):
     def test_dark_is_a_token_flip_only(self):
         """负面清单 #17：深色模式下写第二套组件颜色。
