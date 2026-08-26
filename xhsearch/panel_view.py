@@ -132,7 +132,8 @@ svg{display:block;flex:none}
 .top{height:56px;background:var(--surface);border-bottom:1px solid var(--border);
   display:flex;align-items:center;gap:12px;padding:0 24px;position:sticky;
   top:0;z-index:5}
-.top .when{font-size:12px;color:var(--text-light);margin-left:auto}
+.top .when{font-size:12px;color:var(--text-light);margin-left:auto;
+  white-space:nowrap}
 .content{padding:24px;max-width:1440px;margin:0 auto}
 
 /* ---------- 标题与编辑式导语 ---------- */
@@ -142,6 +143,10 @@ h1{font-size:24px;font-weight:700;margin:0 0 6px;color:var(--text-dark)}
 .lede b{color:var(--text-dark);font-weight:600}
 h2{font-size:16px;font-weight:600;margin:32px 0 4px;color:var(--text-dark);
   display:flex;align-items:baseline;gap:8px}
+/* 侧栏走的是原生 hash 跳转，目标会被顶到视口最上沿——而 .top 是 56px 的
+ * sticky，正好盖在那儿。点「余额」跳过去看到的会是余额区的第二行。
+ * 56 顶栏 + 16 呼吸。 */
+h2[id]{scroll-margin-top:72px}
 /* 区块 / 卡片的入口链接。双箭挂这儿——BRAND.md §4 的「链接尾标」，
  * 也是 templates/dashboard.html 里双箭唯一出现的形态。 */
 .enter{font-size:13px}
@@ -167,8 +172,12 @@ h2 .n{font-weight:400;color:var(--text-faint)}
   margin-left:4px}
 
 /* ---------- 表格：表头 44 / 行 48 / 发丝线 / 无斑马纹 ---------- */
+/* 表格自己横向滚动，不把整页撑宽。七列在手机上放不下是必然的，
+ * 让页面横滚会把侧栏和顶栏一起推走。 */
+.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;background:var(--surface);
   border:1px solid var(--border)}
+.tablewrap table{min-width:720px}
 th{height:44px;background:var(--bg);font-size:13px;font-weight:500;
   color:var(--text-light);text-align:left;padding:0 12px;white-space:nowrap}
 td{padding:12px;border-top:1px solid var(--border);font-size:14px;
@@ -297,7 +306,7 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
   padding:8px 0}
 #projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
 @media (max-width:900px){
-  .app{grid-template-columns:1fr}
+  .app{grid-template-columns:minmax(0,1fr)}
   .side{position:static;height:auto;border-right:0;
     border-bottom:1px solid var(--border)}
   .side nav{display:flex;flex-wrap:wrap;padding:8px}
@@ -305,33 +314,53 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
   .side .grp,.side .foot{display:none}
   .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
   .content{padding:16px}
+  /* 顶栏在窄屏会溢出：固定 220px 的搜索框 + 按钮 + 时间戳 + 退出，
+   * 加左右各 24px padding，375px 宽根本排不下，时间戳和退出会被挤出屏幕。
+   * 搜索框改成可伸缩、时间戳藏起来（那个宽度下它不是决策信息）。 */
+  .top{padding:0 16px;gap:8px}
+  .tools{flex:1;min-width:0}
+  .tools input{width:auto;flex:1;min-width:0}
+  .top .when{display:none}
 }
 """
 
+# ⚠️ 这段脚本会**原样进到页面里**，所以连注释都不放 emoji——
+# `tests/test_design.py` 的「不许拿 emoji 当图标」是按页面字节查的，
+# 它不区分注释和正文，这样最严也最省事。Python 侧的注释不受影响。
 _SCRIPT = """
 (function(){
   var token = document.body.dataset.csrf || "";
 
-  // 侧栏跟随滚动高亮。用 IntersectionObserver 不用 scroll 事件——
+  // 侧栏跟随滚动高亮。用 IntersectionObserver 触发，不挂 scroll 事件——
   // 后者每帧跑一次，长页面上白烧电池。动效有信息含义：它告诉你现在看的是哪一段。
+  //
+  // 注意：判据**不能**只看 isIntersecting。区块标题就 24px 高，一旦滚过顶部
+  // 那条带子它就不再相交，于是「待办表格」那种长区块的绝大部分时间侧栏
+  // 是没有高亮的。所以回调里按几何位置重算：取最后一个已经越过顶线的标题。
+  // 区块只有五个，走一遍是 O(5)，比每帧跑一次便宜得多。
   var links = Array.prototype.slice.call(
     document.querySelectorAll(".side nav a[data-sec]"));
   if (links.length && window.IntersectionObserver) {
-    var seen = {};
-    var spy = new IntersectionObserver(function(entries){
-      entries.forEach(function(e){ seen[e.target.id] = e.isIntersecting; });
+    var TOP = 72;                       // 顶栏 56 + 呼吸 16，和 scroll-margin 对齐
+    function paint(){
       var active = "";
       links.forEach(function(a){
-        if (!active && seen[a.dataset.sec]) active = a.dataset.sec;
+        var el = document.getElementById(a.dataset.sec);
+        if (el && el.getBoundingClientRect().top <= TOP) active = a.dataset.sec;
       });
+      // 一个都没越过顶线 = 还在页面最上面，highlight 第一个，别留空。
+      if (!active) active = links[0].dataset.sec;
       links.forEach(function(a){
         a.classList.toggle("on", a.dataset.sec === active);
       });
-    }, {rootMargin: "-56px 0px -70% 0px"});
+    }
+    var spy = new IntersectionObserver(paint, {
+      rootMargin: "-" + TOP + "px 0px 0px 0px", threshold: [0, 1]});
     links.forEach(function(a){
       var el = document.getElementById(a.dataset.sec);
       if (el) spy.observe(el);
     });
+    paint();
   }
   var btn = document.getElementById("refresh");
   if (btn) btn.addEventListener("click", function(){
@@ -723,8 +752,8 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
   和你在飞书里手工勾是同一条路。</span>
   <span id=queueOut class=muted></span>
 </div>
-<table id=todos><thead>{head}</thead>"""
-            f"<tbody>{''.join(body)}</tbody></table>")
+<div class=tablewrap><table id=todos><thead>{head}</thead>"""
+            f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
 def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
@@ -750,8 +779,9 @@ def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
   <div class=note>{_icon('alert-triangle')}<span>这些帖子已经超过归档天数、
     不再自动刷了。「排队刷新」会<b>绕过归档线</b>，所以它们刻意不混进上面那一屏——
     多数时候正确的处置是去飞书<b>取消巡查</b>，而不是再花钱刷一次。</span></div>
-  <table><thead><tr><th>项目</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
-  <tbody>{rows}</tbody></table>
+  <div class=tablewrap><table>
+  <thead><tr><th>项目</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
+  <tbody>{rows}</tbody></table></div>
 </details>"""
 
 
@@ -773,7 +803,8 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
                   f"<b>体检发现 {len(problems)} 个问题</b>"
                   f"<ul>{items}</ul></span></div>")
 
-    due_text = (f"{p.due_rows} 行 ≈ ¥{p.due_yuan:.2f}" if not p.estimate_blocked
+    due_text = (f"<span class=num>{p.due_rows} 行 ≈ ¥{p.due_yuan:.2f}</span>"
+                if not p.estimate_blocked
                 else "<b style='color:var(--danger-deep)'>无法估算</b>")
     seed_gap = p.total_rows - p.seed_keyword_rows
     neg_gap = p.total_rows - p.negative_keyword_rows
@@ -833,7 +864,7 @@ def _run_row(run, offset_hours: float) -> str:
     # 「跑完还剩多少」——不是额外查的，每次付费响应本来就带 points.balance。
     # None = 这一轮没走 SocialDataX（全走 TikHub 了），显示「—」不是 ¥0。
     left = ("—" if run.points_balance is None
-            else f"¥{run.points_yuan:.2f}")
+            else f"<span class=num>¥{run.points_yuan:.2f}</span>")
     started = _stamp(int(run.started_at * 1000) if run.started_at else None,
                      offset_hours)
     return ("<tr>"
@@ -841,8 +872,8 @@ def _run_row(run, offset_hours: float) -> str:
             f"<td class=nowrap>{_e(run.mode or '—')}</td>"
             f"<td>{tables}</td>"
             f"<td class=nowrap>{run.rows}</td>"
-            f"<td class=nowrap>¥{run.cost_yuan:.2f}</td>"
-            f"<td class=nowrap>{left}</td>"
+            f"<td class='nowrap right num'>¥{run.cost_yuan:.2f}</td>"
+            f"<td class='nowrap right'>{left}</td>"
             f"<td>{badge}{''.join(extra)}</td>"
             "</tr>")
 
@@ -869,7 +900,8 @@ def _runs_section(runs, log_error: str, offset_hours: float) -> str:
                 "那是被容器杀掉的形态（redeploy、回收、OOM），"
                 "那几轮已经付过钱的结果多半丢了。</span></div>")
     return (f"<h2 id=s-runs>运行历史 <span class=n>{len(runs)}</span></h2>{note}{warn}"
-            f"<table><thead>{head}</thead><tbody>{rows}</tbody></table>")
+            f"<div class=tablewrap><table><thead>{head}</thead>"
+            f"<tbody>{rows}</tbody></table></div>")
 
 
 def _projects_section(config) -> str:
@@ -925,15 +957,17 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
             main = f"${b.amount:.2f}"
             sub = (f"≈ ¥{b.yuan:.2f}（按 {b.rate:g} 折算）"
                    if b.yuan is not None else "")
+            sub_cls = "muted num"
         else:
             main = f"{b.amount:.0f} 积分"
             sub = f"≈ ¥{b.yuan:.2f}" if b.yuan is not None else ""
+            sub_cls = "muted num"
         credit = (f"<div class=muted>另有赠送额度 {b.free_credit:g}</div>"
                   if b.free_credit else "")
         cards.append(
             f"<div class=card><h3>{_e(b.label)}</h3>"
             f"<div class='big num'>{_e(main)}</div>"
-            f"<div class=muted>{_e(sub)}</div>{credit}</div>")
+            f"<div class='{sub_cls}'>{_e(sub)}</div>{credit}</div>")
 
     note = ""
     if runway is not None and runway.known:
@@ -943,8 +977,8 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
                    if runway.partial else "")
         note = (f"<div class={cls}>按最近 {runway.runs_used} 轮"
                 f"（{runway.hours_covered:.1f} 小时）的实际花速 "
-                f"¥{runway.yuan_per_day:.2f}/天，余额还够跑 "
-                f"<b>{runway.days:.0f} 天</b>{partial}</div>")
+                f"<span class=num>¥{runway.yuan_per_day:.2f}/天</span>，余额还够跑 "
+                f"<b class=num>{runway.days:.0f} 天</b>{partial}</div>")
     elif runway is not None and runway.reason:
         note = f"<div class=muted>还算不出「够跑多久」：{_e(runway.reason)}</div>"
     err = (f"<div class=note>{_icon('alert-triangle')}<span>"
@@ -1047,13 +1081,25 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     # 编辑式导语：一行，15px 基色 50%，重点词 90% + semibold。
     # 后台轨把它收敛成一行放在页面标题下方（scenarios/03「文字」）。
     # 它替代了上一版顶栏那一排读不出主次的数字。
+    # 截断的时候导语也不能按精确值说。它和侧栏计数是页面上最显眼的两处，
+    # 大面积事故时在这两处少报，正是最不该少报的时候。
+    # 导语是句子，有地方把话讲清楚——不像 KPI 只能挂一个 `+`。
+    todo_text = (f"<b>{len(todos)}</b> 行现在需要人看一眼"
+                 f"（另有 <b>{todos_hidden}</b> 行因条数上限没列出来）"
+                 if todos_hidden else
+                 f"<b>{len(todos)}</b> 行现在需要人看一眼")
     lede = (f"在管 <b>{overview.total_rows}</b> 行，分在 "
-            f"<b>{len(projects)}</b> 个项目里；"
-            f"其中 <b>{len(todos)}</b> 行现在需要人看一眼，"
+            f"<b>{len(projects)}</b> 个项目里；其中 {todo_text}，"
             f"<b>{overview.queued_rows}</b> 行已排队等下一轮刷新。")
 
-    nav = _sidebar_nav(todos=len(todos), projects=len(projects),
-                       runs=len(runs or []), balances=bool(balances))
+    nav = _sidebar_nav(
+        # 侧栏那个数字和 KPI 走同一个口径：截断了就带 `+`，不装成精确值。
+        todos=f"{len(todos)}" + ("+" if todos_hidden else ""),
+        projects=len(projects), runs=len(runs or []),
+        # 余额整块读失败时 `_balance_section` 仍然渲染一个 id=s-balance 的
+        # 错误区块——侧栏这边也得有入口，否则「余额出事了」这个信息恰好在
+        # 它最该出现的时候从导航里消失。
+        balances=bool(balances) or bool(balance_error))
     when = _stamp(int(fetched_at * 1000) if fetched_at else None, offset_hours)
 
     inner = f"""<div class=app>
@@ -1099,7 +1145,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     return _shell("监控面板", inner, csrf=csrf)
 
 
-def _sidebar_nav(*, todos: int, projects: int, runs: int,
+def _sidebar_nav(*, todos, projects: int, runs: int,
                  balances: bool) -> str:
     """侧栏导航。导航项高 40、图标 20 + 文字 14/500，激活 = 雾蓝底 + 蓝字。
 
@@ -1107,7 +1153,7 @@ def _sidebar_nav(*, todos: int, projects: int, runs: int,
     「哪儿有事」的地方——收着的时候也能一眼看出待办有多少。
     """
     items = [
-        ("s-todo", "alert-circle", "要人管的行", str(todos)),
+        ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
         ("s-proj", "layout-grid", "各项目", str(projects)),
         ("s-manage", "folder", "加表 / 改配置", ""),
     ]
@@ -1135,7 +1181,7 @@ def _kpi_lead(value, key: str, sub: str = "") -> str:
 
 
 def _kpi_box(value, key: str, sub: str = "", *, warn: bool = False,
-             unit: str = "") -> str:
+             unit: str = "", sub_money: bool = False) -> str:
     """白 surface KPI 卡。**最多三张**，且必须配一个主块。
 
     `unit` 单独一个参数而不是让调用方把 `<small>` 拼进 value —— value 要
@@ -1143,10 +1189,14 @@ def _kpi_box(value, key: str, sub: str = "", *, warn: bool = False,
     """
     # 数字和中文量词之间**留一个空格**：模板里一律 `3 天` / `20 条` / `6 个`。
     tail = f"<small> {_e(unit)}</small>" if unit else ""
+    # `sub` 里带金额时那一行也要 num（负面清单 #12 管的是**金额数字**，
+    # 不分它在主位还是说明位）。sub 是要转义的纯文本，所以靠这个开关
+    # 给容器加类，而不是让调用方往里拼标签。
+    sub_cls = "s num" if sub_money else "s"
     return (f"<div class='box{' warn' if warn else ''}'>"
             f"<div class=k>{_e(key)}</div>"
             f"<div class='n num'>{_e(value)}{tail}</div>"
-            f"<div class=s>{_e(sub)}</div></div>")
+            f"<div class='{sub_cls}'>{_e(sub)}</div></div>")
 
 
 def _runway_box(runway, config) -> list:
@@ -1161,4 +1211,5 @@ def _runway_box(runway, config) -> list:
     if runway.partial:
         sub += "，有一家读不到，这是下界"
     return [_kpi_box(f"{runway.days:.0f}", "余额还够跑", sub, unit="天",
+                     sub_money=True,
                      warn=runway.days <= max(alert_days, warn_days))]
