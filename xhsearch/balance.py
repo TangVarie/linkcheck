@@ -121,10 +121,13 @@ def read_tikhub(api_key: str, *, base: str, usd_to_cny: float,
                 get=None) -> Balance:
     """TikHub 余额。端点零费用（见模块开头那张表）。
 
-    ⚠️ `balance` 的**单位是推断的**：计价表里的 `endpoint_cost` 是美元，
-    所以余额几乎一定也是美元。但这一点没在真机上对过 TikHub 后台，
-    所以页面上把原值和折算值一起显示，别只给一个 ¥ 数字让人当准数用。
-    见 docs/待验证清单.md。
+    `balance` 的单位是**美元**——和计价表里的 `endpoint_cost` 同一单位，
+    2026-08-26 由使用者对着 TikHub 后台确认过。页面上原值和折算值并排显示：
+    汇率是我们自己配的（`USD_TO_CNY`，默认 7.2），折算值随它漂，
+    原值不会。
+
+    `free_credit`（赠送额度）**不算进余额**，也不算进「还够跑多久」——
+    宁可低报。
     """
     out = Balance(channel=TIKHUB, label="TikHub", unit="USD", rate=usd_to_cny)
     if not api_key:

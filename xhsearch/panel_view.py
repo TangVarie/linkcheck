@@ -20,89 +20,313 @@ from typing import Any, Optional
 from . import summary
 
 _STYLE = """
-:root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--ink:#1c1f23;--dim:#6b7280;
---red:#c0392b;--amber:#b7791f;--green:#1e7d44;--blue:#1d4ed8;--chip:#eef1f5}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",
-"Helvetica Neue",Arial,sans-serif}
-a{color:var(--blue)}
-.wrap{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
-header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:14px}
-h1{font-size:19px;margin:0}
-.muted{color:var(--dim);font-size:12px}
-.bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-gap:10px;margin:14px 0 22px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;
-padding:12px 14px}
-.stat .n{font-size:24px;font-weight:600;letter-spacing:-.02em}
-.stat .k{font-size:12px;color:var(--dim);margin-top:2px}
-.stat.alert .n{color:var(--red)}
-h2{font-size:15px;margin:26px 0 10px;display:flex;align-items:center;gap:8px}
-table{width:100%;border-collapse:collapse;background:var(--card);
-border:1px solid var(--line);border-radius:8px;overflow:hidden}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);
-vertical-align:top;font-size:13px}
-th{background:#fafbfc;font-weight:600;font-size:12px;color:var(--dim);
-white-space:nowrap}
-tr:last-child td{border-bottom:none}
+/* BYWOOD 设计系统 v3 · 界面轨「管理后台」（scenarios/03-dashboard.md）
+ *
+ * 色值全部来自 tokens/palette.json 的 screen 节——它是全轨色板的唯一事实源，
+ * 任何一处不一致按设计系统的规矩算**构建错误**，不是审美分歧。
+ * 这里不引 tokens/globals.css：那是 Tailwind v4 的 @theme，而这个面板是
+ * 零依赖的标准库 http.server 手拼 HTML，引不进来。所以从 palette.json
+ * 取值、手写同名 CSS 变量，角色和取值都对齐。
+ *
+ * 硬性遵守的几条（DESIGN.md §5 §8 负面清单）：
+ *   · 直角制度 border-radius: 0，例外只有本体即圆形的状态点
+ *   · 零阴影、零渐变（骨架屏微光是明文例外）、零毛玻璃
+ *   · 文字永不用纯黑纯白，只走四阶透明度；深色块内恒白是另一条规则
+ *   · 语义色只表状态；浅底上的文字用加深档
+ *   · 深色模式只翻 token，组件不写第二套颜色
+ */
+:root{
+  --primary:#235E8E; --primary-dark:#1B4A72;
+  --accent:#D9232B; --money:#D9232B;
+  --block-blue:#235E8E; --block-red:#D9232B;
+  --tint-sky:#E3EDF5; --tint-blush:#FBE3E3;
+  --success:#00B578; --warning:#FF8F1F; --danger:#D92B3C;
+  --success-deep:#006B4A; --warning-deep:#995400; --danger-deep:#B02330;
+  --bg:#F3F4F6; --bg-secondary:#EAECEF; --surface:#FFFFFF;
+  --fill:rgba(0,0,0,.045);
+  --text-dark:rgba(0,0,0,.90); --text:rgba(0,0,0,.65);
+  --text-light:rgba(0,0,0,.55); --text-faint:rgba(0,0,0,.30);
+  --border:rgba(0,0,0,.08); --border-strong:#E5E6EB;
+  --tint-danger:rgba(217,43,60,.10);
+  --tint-warning:rgba(255,143,31,.10);
+  --tint-success:rgba(0,181,120,.10);
+  --font-sans:'PingFang SC','Hiragino Sans GB','Microsoft YaHei',-apple-system,
+    BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --font-num:'DIN Alternate','Bahnschrift','Roboto Condensed','Helvetica Neue',
+    var(--font-sans);
+  color-scheme:light;
+}
+/* 深色模式：只翻 token。画布仍比表面深一档，深色块蓝红照旧白字。 */
+[data-theme=dark]{
+  --primary:#3F7FB2; --primary-dark:#346892;
+  --accent:#E8575C; --money:#E8575C;
+  --block-red:#C22329;
+  --tint-sky:#1E3B54; --tint-blush:#442228;
+  --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
+  --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
+  --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
+  --fill:rgba(255,255,255,.06);
+  --text-dark:rgba(255,255,255,.92); --text:rgba(255,255,255,.70);
+  --text-light:rgba(255,255,255,.55); --text-faint:rgba(255,255,255,.34);
+  --border:rgba(255,255,255,.10); --border-strong:#2B3440;
+  --tint-danger:rgba(232,87,92,.16);
+  --tint-warning:rgba(255,162,77,.16);
+  --tint-success:rgba(33,177,131,.16);
+  color-scheme:dark;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme=light]){
+    --primary:#3F7FB2; --primary-dark:#346892;
+    --accent:#E8575C; --money:#E8575C;
+    --block-red:#C22329;
+    --tint-sky:#1E3B54; --tint-blush:#442228;
+    --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
+    --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
+    --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
+    --fill:rgba(255,255,255,.06);
+    --text-dark:rgba(255,255,255,.92); --text:rgba(255,255,255,.70);
+    --text-light:rgba(255,255,255,.55); --text-faint:rgba(255,255,255,.34);
+    --border:rgba(255,255,255,.10); --border-strong:#2B3440;
+    --tint-danger:rgba(232,87,92,.16);
+    --tint-warning:rgba(255,162,77,.16);
+    --tint-success:rgba(33,177,131,.16);
+    color-scheme:dark;
+  }
+}
+
+*{box-sizing:border-box;border-radius:0}
+body{margin:0;background:var(--bg);color:var(--text-dark);
+  font:14px/1.6 var(--font-sans);-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+svg{display:block;flex:none}
+.num{font-family:var(--font-num);font-variant-numeric:tabular-nums;
+  letter-spacing:-.01em}
+.muted{color:var(--text-light);font-size:12px}
+.icon{width:16px;height:16px;stroke:currentColor;stroke-width:1.75;fill:none;
+  stroke-linecap:round;stroke-linejoin:round;display:inline-block;
+  vertical-align:-3px}
+
+/* ---------- 骨架：侧栏 240 + 顶栏 56 + 内容区 24 / max 1440 ---------- */
+.app{display:grid;grid-template-columns:240px minmax(0,1fr);min-height:100vh}
+.side{background:var(--surface);border-right:1px solid var(--border);
+  position:sticky;top:0;height:100vh;overflow:auto;display:flex;
+  flex-direction:column}
+.side .brand{height:64px;display:flex;align-items:center;gap:10px;
+  padding:0 16px;border-bottom:1px solid var(--border);flex:none}
+.side .brand b{font-size:15px;font-weight:700;color:var(--text-dark);
+  letter-spacing:.02em}
+.side .brand span{font-size:12px;color:var(--text-faint)}
+.side nav{padding:8px 0 24px}
+.side .grp{font-size:12px;color:var(--text-faint);padding:0 16px;
+  margin:24px 0 6px}
+.side nav a{display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;
+  font-size:14px;font-weight:500;color:var(--text);text-decoration:none}
+.side nav a:hover{background:var(--fill);text-decoration:none}
+/* 激活态是雾蓝底 + 品牌蓝字，不是深蓝底白字（03 场景点名的高发 bug） */
+.side nav a.on{background:var(--tint-sky);color:var(--primary)}
+.side nav a .cnt{margin-left:auto;font-size:12px;color:var(--text-faint)}
+.side nav a.on .cnt{color:var(--primary)}
+.side .foot{margin-top:auto;padding:16px;font-size:12px;color:var(--text-faint);
+  border-top:1px solid var(--border)}
+.top{height:56px;background:var(--surface);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;padding:0 24px;position:sticky;
+  top:0;z-index:5}
+.top .when{font-size:12px;color:var(--text-light);margin-left:auto}
+.content{padding:24px;max-width:1440px;margin:0 auto}
+
+/* ---------- 标题与编辑式导语 ---------- */
+h1{font-size:24px;font-weight:700;margin:0 0 6px;color:var(--text-dark)}
+/* 导语：15px 基色 50%，重点词 90% + semibold（DESIGN.md §3） */
+.lede{font-size:15px;color:var(--text-light);margin:0 0 24px;max-width:78ch}
+.lede b{color:var(--text-dark);font-weight:600}
+h2{font-size:16px;font-weight:600;margin:32px 0 4px;color:var(--text-dark);
+  display:flex;align-items:baseline;gap:8px}
+/* 品牌双箭：单个蓝色 »，字号同标题、字重 800（BRAND.md §4） */
+h2::before{content:"»";color:var(--primary);font-weight:800}
+h2 .n{font-weight:400;color:var(--text-faint)}
+.sub{font-size:13px;color:var(--text-light);margin:0 0 12px;max-width:78ch}
+
+/* ---------- KPI：1 个深蓝主块 + 最多 3 张白卡 ---------- */
+.kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;
+  margin:0 0 8px}
+.kpi>*{padding:16px 18px;min-height:112px;display:flex;flex-direction:column;
+  justify-content:space-between}
+.kpi .lead{background:var(--block-blue);color:#fff}
+.kpi .lead .k{font-size:13px;color:rgba(255,255,255,.85)}
+.kpi .lead .n{font-size:40px;font-weight:600;line-height:1.05}
+.kpi .lead .s{font-size:12px;color:rgba(255,255,255,.85)}
+.kpi .box{background:var(--surface);border:1px solid var(--border)}
+.kpi .box .k{font-size:13px;color:var(--text-light)}
+.kpi .box .n{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
+.kpi .box .s{font-size:12px;color:var(--text-light)}
+.kpi .box.warn .n{color:var(--danger-deep)}
+.kpi .box .n small{font-size:15px;font-weight:500;color:var(--text-light);
+  margin-left:4px}
+
+/* ---------- 表格：表头 44 / 行 48 / 发丝线 / 无斑马纹 ---------- */
+table{width:100%;border-collapse:collapse;background:var(--surface);
+  border:1px solid var(--border)}
+th{height:44px;background:var(--bg);font-size:13px;font-weight:500;
+  color:var(--text-light);text-align:left;padding:0 12px;white-space:nowrap}
+td{padding:12px;border-top:1px solid var(--border);font-size:14px;
+  vertical-align:top;color:var(--text)}
+tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
-.chip{display:inline-block;padding:1px 7px;border-radius:99px;background:var(--chip);
-font-size:12px;margin:0 4px 3px 0;white-space:nowrap}
-.chip.r{background:#fdecea;color:var(--red)}
-.chip.a{background:#fdf3e2;color:var(--amber)}
-.chip.g{background:#e8f5ec;color:var(--green)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px}
-.card.bad{border-color:#f0b4ac}
-.card h3{margin:0 0 2px;font-size:15px}
-.card .rows{margin:10px 0 0;font-size:13px}
-.card .rows div{display:flex;justify-content:space-between;gap:10px;padding:2px 0}
-.card .rows .lbl{color:var(--dim)}
-.problem{background:#fdecea;border:1px solid #f0b4ac;border-radius:6px;
-padding:8px 10px;margin:8px 0 0;font-size:12.5px;color:#8c2f22}
-.problem li{margin:3px 0}
+td.right{text-align:right}
+tr.fresh td:nth-child(2){border-left:3px solid var(--primary)}
+tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary);
+  margin-left:6px;font-weight:600}
+
+/* ---------- 徽标：高 20、直角、语义浅底 + 加深档字 ---------- */
+.chip{display:inline-block;height:20px;line-height:20px;padding:0 8px;
+  font-size:12px;background:var(--fill);color:var(--text);
+  margin:0 4px 4px 0;white-space:nowrap}
+.chip.r{background:var(--tint-danger);color:var(--danger-deep)}
+.chip.a{background:var(--tint-warning);color:var(--warning-deep)}
+.chip.g{background:var(--tint-success);color:var(--success-deep)}
+
+/* ---------- 卡片与色块 ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+  gap:16px;align-items:start}
+.card{background:var(--surface);border:1px solid var(--border);padding:18px}
+.card.bad{border-color:var(--danger);border-left-width:3px}
+.card h3{margin:0 0 2px;font-size:16px;font-weight:600;color:var(--text-dark)}
+.card .rows{margin:12px 0 0;font-size:14px}
+.card .rows div{display:flex;justify-content:space-between;gap:12px;
+  padding:4px 0;border-top:1px solid var(--border)}
+.card .rows div:first-child{border-top:0}
+.card .rows .lbl{color:var(--text-light)}
+.card .big{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
+
+/* ---------- 横幅：浅调底 + 文字色阶（禁彩字配浅底） ---------- */
+.problem,.note{padding:10px 12px;margin:12px 0;font-size:13px;
+  display:flex;gap:8px;align-items:flex-start;line-height:1.55}
+.problem{background:var(--tint-danger);color:var(--danger-deep);
+  border-left:3px solid var(--danger)}
+.note{background:var(--tint-warning);color:var(--warning-deep);
+  border-left:3px solid var(--warning)}
 .problem ul{margin:4px 0 0;padding-left:18px}
-button{font:inherit;padding:6px 13px;border:1px solid var(--line);background:var(--card);
-border-radius:6px;cursor:pointer}
-button:hover{background:#f0f2f5}
-input[type=password],input[type=search]{font:inherit;padding:7px 10px;
-border:1px solid var(--line);border-radius:6px;background:var(--card);width:100%}
-.login{max-width:340px;margin:14vh auto;background:var(--card);
-border:1px solid var(--line);border-radius:10px;padding:22px}
-.login h1{font-size:17px;margin:0 0 4px}
-.login p{margin:0 0 16px}
-.err{color:var(--red);font-size:13px;margin:0 0 12px}
-.empty{background:var(--card);border:1px solid var(--line);border-radius:8px;
-padding:22px;text-align:center;color:var(--dim)}
-.note{background:#fffbea;border:1px solid #f0dfa8;border-radius:6px;
-padding:9px 11px;font-size:12.5px;margin:10px 0}
-.tools{display:flex;gap:10px;align-items:center;margin-left:auto}
-.tools input{width:200px}
-.queuebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
-tr.fresh td:nth-child(2){box-shadow:inset 3px 0 0 var(--blue)}
-tr.fresh td:nth-child(2)::after{content:"新";font-size:11px;color:var(--blue);
-margin-left:5px;vertical-align:super}
-.proj{display:flex;gap:10px;align-items:flex-start;padding:9px 0;
-border-bottom:1px solid var(--line);flex-wrap:wrap}
-.proj:last-child{border-bottom:none}
-.proj .who{flex:1;min-width:180px}
-.proj .who b{font-weight:600}
-.proj .acts{display:flex;gap:6px}
+.problem li{margin:3px 0}
+.problem .icon,.note .icon{margin-top:3px}
+
+/* ---------- 控件：高 40 / 直角 / 聚焦 2px 品牌蓝环 ---------- */
+button{font:600 14px/1 var(--font-sans);height:40px;padding:0 16px;border:0;
+  background:var(--fill);color:var(--text-dark);cursor:pointer}
+button:hover:not(:disabled){background:var(--bg-secondary)}
+button:active:not(:disabled){transform:scale(.98)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--primary);color:#fff}
+button.primary:hover:not(:disabled){background:var(--primary-dark)}
+button.sm{height:32px;font-size:13px;font-weight:500;padding:0 12px}
+button.danger{background:var(--danger);color:#fff}
+input[type=password],input[type=search],input[type=text],input[type=number]{
+  font:14px/1 var(--font-sans);height:40px;padding:0 12px;
+  border:1px solid var(--border-strong);background:var(--surface);
+  color:var(--text-dark);width:100%}
+input:focus-visible,button:focus-visible,a:focus-visible,
+summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+:where(button,input,a){transition:background-color .12s ease-out,
+  transform .12s ease-out}
+
+/* ---------- 登录 ---------- */
+.login{max-width:360px;margin:14vh auto;background:var(--surface);
+  border:1px solid var(--border);padding:28px}
+.login .brand{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+.login h1{font-size:20px;margin:0 0 4px}
+.login p{margin:0 0 20px}
+.login button{width:100%}
+.err{color:var(--danger-deep);background:var(--tint-danger);padding:8px 10px;
+  font-size:13px;margin:0 0 14px}
+
+/* ---------- 四态：空 / 骨架 ---------- */
+.empty{background:var(--surface);border:1px solid var(--border);padding:32px;
+  text-align:center;color:var(--text-light);font-size:14px}
+.empty .icon{width:24px;height:24px;stroke-width:1.5;margin:0 auto 10px;
+  color:var(--text-faint)}
+.empty .two{font-size:13px;color:var(--text-faint);margin-top:6px}
+/* 骨架屏微光是负面清单 #2 明文豁免的唯一渐变 */
+.sk{background:var(--bg-secondary);background-image:linear-gradient(90deg,
+  rgba(0,0,0,0) 0%,var(--fill) 50%,rgba(0,0,0,0) 100%);
+  background-size:200% 100%;animation:shimmer 1.6s linear infinite;height:14px}
+.sk.tall{height:112px}
+@keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+
+/* ---------- 级联入场：动效必须有信息含义 ---------- */
+.stagger-in>*{animation:fade-up .28s cubic-bezier(.22,1,.36,1) both}
+.stagger-in>*:nth-child(2){animation-delay:.055s}
+.stagger-in>*:nth-child(3){animation-delay:.11s}
+.stagger-in>*:nth-child(4){animation-delay:.165s}
+.stagger-in>*:nth-child(n+5){animation-delay:.22s}
+@keyframes fade-up{from{opacity:0;transform:translateY(8px)}
+  to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;
+    animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
+
+/* ---------- 其余定式 ---------- */
+.tools{display:flex;gap:10px;align-items:center}
+.tools input{width:220px;height:36px}
+.tools button{height:36px}
+.queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+  margin-bottom:12px;background:var(--surface);border:1px solid var(--border);
+  padding:12px}
+.proj{display:flex;gap:12px;align-items:flex-start;padding:12px 0;
+  border-top:1px solid var(--border);flex-wrap:wrap}
+.proj:first-child{border-top:0}
+.proj .who{flex:1;min-width:200px}
+.proj .who b{font-weight:600;color:var(--text-dark)}
+.proj .acts{display:flex;gap:8px}
 .proj.off{opacity:.55}
-.addbox{background:var(--card);border:1px solid var(--line);border-radius:8px;
-padding:14px;margin-top:12px}
-.addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
-.addbox input[type=text]{flex:1;min-width:190px;font:inherit;padding:7px 10px;
-border:1px solid var(--line);border-radius:6px}
-.out{margin-top:10px;font-size:13px;white-space:pre-wrap}
-.ok{color:var(--green)}
-code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12px}
+.addbox{background:var(--surface);border:1px solid var(--border);padding:18px;
+  margin-top:16px}
+.addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.addbox input[type=text]{flex:1;min-width:200px}
+.out{margin-top:12px;font-size:13px;white-space:pre-wrap;color:var(--text)}
+.ok{color:var(--success-deep)}
+code{background:var(--fill);padding:2px 6px;font-size:13px;
+  font-family:var(--font-num)}
+details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
+  padding:8px 0}
+#projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
+@media (max-width:900px){
+  .app{grid-template-columns:1fr}
+  .side{position:static;height:auto;border-right:0;
+    border-bottom:1px solid var(--border)}
+  .side nav{display:flex;flex-wrap:wrap;padding:8px}
+  .side nav a{height:36px;padding:0 12px}
+  .side .grp,.side .foot{display:none}
+  .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .content{padding:16px}
+}
 """
 
 _SCRIPT = """
 (function(){
   var token = document.body.dataset.csrf || "";
+
+  // 侧栏跟随滚动高亮。用 IntersectionObserver 不用 scroll 事件——
+  // 后者每帧跑一次，长页面上白烧电池。动效有信息含义：它告诉你现在看的是哪一段。
+  var links = Array.prototype.slice.call(
+    document.querySelectorAll(".side nav a[data-sec]"));
+  if (links.length && window.IntersectionObserver) {
+    var seen = {};
+    var spy = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){ seen[e.target.id] = e.isIntersecting; });
+      var active = "";
+      links.forEach(function(a){
+        if (!active && seen[a.dataset.sec]) active = a.dataset.sec;
+      });
+      links.forEach(function(a){
+        a.classList.toggle("on", a.dataset.sec === active);
+      });
+    }, {rootMargin: "-56px 0px -70% 0px"});
+    links.forEach(function(a){
+      var el = document.getElementById(a.dataset.sec);
+      if (el) spy.observe(el);
+    });
+  }
   var btn = document.getElementById("refresh");
   if (btn) btn.addEventListener("click", function(){
     btn.disabled = true; btn.textContent = "取数中…";
@@ -352,6 +576,54 @@ def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+# lucide 线性图标，内联成 SVG。**不用 emoji 当图标**（负面清单 #1），
+# 也不引外部图标库——这个面板是零依赖的，而且 CSP 是 default-src 'none'。
+# 只放实际用到的几个，路径逐字取自 lucide 的 24×24 网格。
+_ICON_PATHS = {
+    "alert-triangle": ('<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 '
+                       '4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/>'
+                       '<path d="M12 17h.01"/>'),
+    "alert-circle": ('<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/>'
+                     '<path d="M12 16h.01"/>'),
+    "check-circle": ('<path d="M21.8 10A10 10 0 1 1 17 3.3"/>'
+                     '<path d="m9 11 3 3L22 4"/>'),
+    "inbox": ('<path d="M22 12h-6l-2 3h-4l-2-3H2"/>'
+              '<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6'
+              'l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>'),
+    "layout-grid": ('<rect width="7" height="7" x="3" y="3"/>'
+                    '<rect width="7" height="7" x="14" y="3"/>'
+                    '<rect width="7" height="7" x="14" y="14"/>'
+                    '<rect width="7" height="7" x="3" y="14"/>'),
+    "wallet": ('<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1'
+               'v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/>'
+               '<path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>'),
+    "folder": ('<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69'
+               '-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
+    "history": ('<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>'
+                '<path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>'),
+}
+
+
+def _icon(name: str, cls: str = "icon") -> str:
+    body = _ICON_PATHS.get(name, "")
+    return (f'<svg class="{cls}" viewBox="0 0 24 24" aria-hidden="true">'
+            f'{body}</svg>')
+
+
+# 品牌双箭。几何逐字沿用 logo/bywood-mark.svg：stroke 圆头圆角、
+# 粗细 = 高度的 1/4（7/28）、固定朝右、固定蓝前红后（BRAND.md §4）。
+# 这两个色值是标志本身的，不走界面 token —— 标志正红 #E5262B 只出现在
+# 标志图形里，任何文字线条色块都不用这一档。
+_MARK = (
+    '<svg width="26" height="19" viewBox="0 0 38 28" role="img"'
+    ' aria-label="BYWOOD"><path d="M5 4 L15 14 L5 24" fill="none"'
+    ' stroke="#235E8E" stroke-width="7" stroke-linecap="round"'
+    ' stroke-linejoin="round"/><path d="M21 4 L31 14 L21 24" fill="none"'
+    ' stroke="#E5262B" stroke-width="7" stroke-linecap="round"'
+    ' stroke-linejoin="round"/></svg>'
+)
+
+
 def _shell(title: str, body: str, *, csrf: str = "") -> str:
     return (
         "<!doctype html><html lang=zh-CN><head><meta charset=utf-8>"
@@ -366,14 +638,15 @@ def login_page(message: str = "") -> str:
     error = f"<p class=err>{_e(message)}</p>" if message else ""
     return _shell("监控面板", f"""
 <div class=login>
-  <h1>监控面板</h1>
-  <p class=muted>小红书/抖音笔记巡检</p>
+  <div class=brand>{_MARK}<b style='font-size:15px;letter-spacing:.02em'>BYWOOD</b></div>
+  <h1>内容监控面板</h1>
+  <p class=muted>小红书 / 抖音笔记巡检</p>
   {error}
   <form method=post action=/login>
     <input type=password name=password placeholder=口令 autofocus
            autocomplete=current-password>
     <p></p>
-    <button type=submit>进去</button>
+    <button type=submit class=primary>进去</button>
   </form>
 </div>""")
 
@@ -413,9 +686,10 @@ def _counts_chips(counts: dict) -> str:
 
 def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
     if not todos:
-        return ("<div class=empty>没有需要处理的行。"
-                "<br><span class=muted>风控中 / 有负面 / 置顶掉了 / 已失效 / "
-                "刷新失败 / 卡住了 —— 一条都没有。</span></div>")
+        return ("<div class=empty>" + _icon("check-circle") +
+                "没有需要处理的行。"
+                "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
+                "刷新失败 / 卡住了 —— 一条都没有。</div></div>")
     head = ("<tr><th><input type=checkbox id=todoAll title='全选'></th>"
             "<th>项目</th><th>为什么</th><th>诊断信息</th>"
             "<th>评论数</th><th>最近检查</th><th></th></tr>")
@@ -467,9 +741,9 @@ def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
     return f"""<details style='margin-top:12px'>
   <summary class=muted style='cursor:pointer'>还有 {len(todos)} 行已归档的老帖也有异常
     （不在上面的列表和批量勾选里）</summary>
-  <div class=note>这些帖子已经超过归档天数、不再自动刷了。
-    「排队刷新」会**绕过归档线**，所以它们刻意不混进上面那一屏——
-    多数时候正确的处置是去飞书**取消巡查**，而不是再花钱刷一次。</div>
+  <div class=note>{_icon('alert-triangle')}<span>这些帖子已经超过归档天数、
+    不再自动刷了。「排队刷新」会<b>绕过归档线</b>，所以它们刻意不混进上面那一屏——
+    多数时候正确的处置是去飞书<b>取消巡查</b>，而不是再花钱刷一次。</span></div>
   <table><thead><tr><th>项目</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
   <tbody>{rows}</tbody></table>
 </details>"""
@@ -478,7 +752,8 @@ def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
 def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     if p.error:
         return (f"<div class='card bad'><h3>{_e(p.label)}</h3>"
-                f"<div class=problem>{_e(p.error)}</div>"
+                f"<div class=problem>{_icon('alert-circle')}"
+                f"<span>{_e(p.error)}</span></div>"
                 f"<div class=rows><div><a href='{_e(p.table_url)}' target=_blank "
                 "rel='noopener noreferrer'>打开这张表 →</a></div></div></div>")
 
@@ -488,11 +763,12 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
         problems.insert(0, p.estimate_blocked)
     if problems:
         items = "".join(f"<li>{_e(problem)}</li>" for problem in problems)
-        health = (f"<div class=problem><b>体检发现 {len(problems)} 个问题</b>"
-                  f"<ul>{items}</ul></div>")
+        health = (f"<div class=problem>{_icon('alert-circle')}<span>"
+                  f"<b>体检发现 {len(problems)} 个问题</b>"
+                  f"<ul>{items}</ul></span></div>")
 
     due_text = (f"{p.due_rows} 行 ≈ ¥{p.due_yuan:.2f}" if not p.estimate_blocked
-                else "<b style='color:var(--red)'>无法估算</b>")
+                else "<b style='color:var(--danger-deep)'>无法估算</b>")
     seed_gap = p.total_rows - p.seed_keyword_rows
     neg_gap = p.total_rows - p.negative_keyword_rows
     coverage = (
@@ -566,24 +842,27 @@ def _run_row(run, offset_hours: float) -> str:
 
 
 def _runs_section(runs, log_error: str, offset_hours: float) -> str:
-    note = (f"<div class=note>⚠ 取 Railway 日志失败：{_e(log_error)}</div>"
+    note = (f"<div class=note>{_icon('alert-triangle')}"
+            f"<span>取 Railway 日志失败：{_e(log_error)}</span></div>"
             if log_error else "")
     if not runs:
-        body = ("<div class=empty>暂时没有可解析的运行记录。"
-                "<br><span class=muted>需要 cron 那个服务设上 "
+        body = ("<div class=empty>" + _icon("inbox") +
+                "暂时没有可解析的运行记录。"
+                "<div class=two>需要 cron 那个服务设上 "
                 "<code>RUN_LOG_JSON=1</code>，日志才带结构化事件；"
-                "Railway 免费/Hobby 套餐日志只留 7 天。</span></div>")
-        return f"<h2>运行历史</h2>{note}{body}"
+                "Railway 免费 / Hobby 套餐日志只留 7 天。</div></div>")
+        return f"<h2 id=s-runs>运行历史</h2>{note}{body}"
     head = ("<tr><th>开跑</th><th>模式</th><th>表</th><th>行数</th>"
             "<th>花费</th><th>跑完剩</th><th>结果</th></tr>")
     rows = "".join(_run_row(r, offset_hours) for r in runs)
     unfinished = sum(1 for r in runs if not r.finished)
     warn = ""
     if unfinished:
-        warn = (f"<div class=note>有 {unfinished} 轮只有开跑没有收尾——"
+        warn = (f"<div class=note>{_icon('alert-triangle')}<span>"
+                f"有 {unfinished} 轮只有开跑没有收尾——"
                 "那是被容器杀掉的形态（redeploy、回收、OOM），"
-                "那几轮已经付过钱的结果多半丢了。</div>")
-    return (f"<h2>运行历史（{len(runs)}）</h2>{note}{warn}"
+                "那几轮已经付过钱的结果多半丢了。</span></div>")
+    return (f"<h2 id=s-runs>运行历史 <span class=n>{len(runs)}</span></h2>{note}{warn}"
             f"<table><thead>{head}</thead><tbody>{rows}</tbody></table>")
 
 
@@ -594,10 +873,10 @@ def _projects_section(config) -> str:
     patch = ("自动补选项：<b>已开</b>" if getattr(config, "allow_option_patch", False)
              else "自动补选项：<b>关</b>（缺选项只给清单，"
                   "在废表上验过再开 <code>PANEL_ALLOW_OPTION_PATCH=1</code>）")
-    return f"""<h2>项目</h2>
+    return f"""<h2 id=s-manage>项目</h2>
 <div class=muted style='margin-bottom:8px'>加表、停用、移除都在这儿。
 「移除」只是不再监控，<b>不动你飞书表里的任何数据</b>。{patch}</div>
-<div id=projects class=empty>读取中…</div>
+<div id=projects><div class=sk style='margin:14px 0;width:70%'></div><div class=sk style='margin:14px 0;width:55%'></div><div class=sk style='margin:14px 0;width:62%'></div></div>
 <div class=addbox>
   <div style='font-weight:600;margin-bottom:8px'>加一张表</div>
   <div class=row>
@@ -621,7 +900,8 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
     if not balances and not balance_error:
         return ""
     if not balances:
-        return (f"<h2>余额</h2><div class=empty>{_e(balance_error)}</div>")
+        return (f"<h2 id=s-balance>余额</h2><div class=empty>"
+                + _icon("wallet") + f"{_e(balance_error)}</div>")
 
     warn_days = getattr(config, "runway_warn_days", 14.0)
     alert_days = getattr(config, "runway_alert_days", 5.0)
@@ -630,7 +910,8 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
         if b.error:
             cards.append(
                 f"<div class='card bad'><h3>{_e(b.label)}</h3>"
-                f"<div class=problem>读不到：{_e(b.error)}</div>"
+                f"<div class=problem>{_icon('alert-circle')}"
+                f"<span>读不到：{_e(b.error)}</span></div>"
                 "<div class=muted>这不等于余额为 0——去对应后台看一眼，"
                 "或检查 Key 是不是过期了</div></div>")
             continue
@@ -645,7 +926,7 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
                   if b.free_credit else "")
         cards.append(
             f"<div class=card><h3>{_e(b.label)}</h3>"
-            f"<div style='font-size:24px;font-weight:600'>{_e(main)}</div>"
+            f"<div class='big num'>{_e(main)}</div>"
             f"<div class=muted>{_e(sub)}</div>{credit}</div>")
 
     note = ""
@@ -660,9 +941,10 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
                 f"<b>{runway.days:.0f} 天</b>{partial}</div>")
     elif runway is not None and runway.reason:
         note = f"<div class=muted>还算不出「够跑多久」：{_e(runway.reason)}</div>"
-    err = (f"<div class=note>⚠ 取余额失败：{_e(balance_error)}，"
-           "下面是上一次还能用的读数。</div>" if balance_error else "")
-    return (f"<h2>余额</h2>{err}{note}"
+    err = (f"<div class=note>{_icon('alert-triangle')}<span>"
+           f"取余额失败：{_e(balance_error)}，"
+           "下面是上一次还能用的读数。</span></div>" if balance_error else "")
+    return (f"<h2 id=s-balance>余额</h2>{err}{note}"
             f"<div class=grid>{''.join(cards)}</div>"
             "<div class=muted style='margin-top:8px'>这两个查询端点是两家"
             "<b>官方标明零费用</b>的（TikHub 计价表 <code>endpoint_cost: 0.0</code>；"
@@ -676,101 +958,200 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                   balances=None, balance_error: str = "", runway=None,
                   offset_hours: float = 8.0) -> str:
     if overview is None:
-        inner = ("<div class=wrap><header><h1>监控面板</h1></header>"
-                 "<div class=empty>正在第一次取数，稍等几秒刷新页面。"
-                 + (f"<div class=problem style='margin-top:12px'>{_e(error)}</div>"
-                    if error else "") + "</div></div>")
+        # 四态里的「骨架加载」。给骨架而不是一句「正在取数」，是因为这一屏
+        # 要读完整张表，第一次可能要好几秒——一个空盒子看着像坏了。
+        boxes = "".join("<div class='sk tall'></div>" for _ in range(4))
+        lines = "".join(
+            f"<div class=sk style='margin:10px 0;width:{w}%'></div>"
+            for w in (92, 78, 85, 60))
+        problem = (f"<div class=problem>{_icon('alert-circle')}"
+                   f"<span>{_e(error)}</span></div>" if error else "")
+        inner = f"""<div class=app>
+<aside class=side>
+  <div class=brand>{_MARK}<b>BYWOOD</b><span>监控</span></div>
+</aside>
+<div class=main>
+  <div class=top><span class=when>正在第一次取数…</span></div>
+  <div class=content>
+    <h1>内容监控面板</h1>
+    <p class=lede>正在把每张表读一遍，第一次要几秒钟。这一步<b>不花钱</b>——
+      飞书读表不计费。</p>
+    {problem}
+    <div class=kpi>{boxes}</div>
+    <div style='margin-top:24px'>{lines}</div>
+  </div>
+</div>
+</div>"""
         return _shell("监控面板", inner, csrf=csrf)
 
     todos = overview.todos()
     # 每张表内部按 max_todos 截掉的 + 跨表拉平之后再截掉的。两个都要算，
     # 否则「要人管 200 行」在一次大面积事故里会被当成精确值。
     todos_hidden = overview.todos_dropped + overview.todos_dropped_by()
-    hidden_note = (f" ⚠ 另有 {todos_hidden} 行同样需要处理，"
+    hidden_note = (f" 另有 {todos_hidden} 行同样需要处理，"
                    "因为条数上限没显示——先处理完这一屏再回来看。"
                    if todos_hidden else "")
     # 零个项目要说清楚是「还没加」而不是「都健康」。全零的一屏和
     # 「一切正常」长得一模一样，这是这套东西最难发现的那类故障。
     empty_note = ("" if overview.projects else
-                  "<div class=note>注册表里还没有一张可用的表——"
+                  f"<div class=note>{_icon('alert-triangle')}<span>"
+                  "注册表里还没有一张可用的表——"
                   "在下面「项目」那一栏加第一张。加完等一轮缓存（或点"
-                  "「重新取数」）就会出现在这里。</div>")
+                  "「重新取数」）就会出现在这里。</span></div>")
     projects = overview.projects
     stale_note = ""
     if error:
-        stale_note = (f"<div class=note>⚠ 上一次取数失败（{_e(error)}），"
-                      "下面是上一份还能用的快照。</div>")
+        stale_note = (f"<div class=note>{_icon('alert-triangle')}<span>"
+                      f"上一次取数失败（{_e(error)}），"
+                      "下面是上一份还能用的快照。</span></div>")
     domain_note = ""
     if config.feishu_base.rstrip("/") == "https://feishu.cn":
-        domain_note = ("<div class=note>没设 <code>FEISHU_DOMAIN</code>，"
+        domain_note = (f"<div class=note>{_icon('alert-triangle')}<span>"
+                       "没设 <code>FEISHU_DOMAIN</code>，"
                        "「去这一行」的链接用的是通用域名，不一定跳得准。"
                        "把你们租户的域名（形如 <code>https://xxx.feishu.cn</code>）"
-                       "设进去就好了。</div>")
+                       "设进去就好了。</span></div>")
 
-    bar = "".join([
-        _stat(overview.total_rows, "在管行数"),
-        _stat(f"{len(todos)}" + ("+" if todos_hidden else ""),
-              "要人管" + (f"（另有 {todos_hidden} 行未显示）" if todos_hidden else ""),
-              alert=bool(todos)),
-        _stat(overview.due_rows, "到期待刷"),
-        _stat(f"¥{overview.due_yuan:.2f}"
-              + (" +?" if overview.unestimatable else ""),
-              "预计花费" + (f"（{len(overview.unestimatable)} 张表算不出）"
-                          if overview.unestimatable else "")),
-        _stat(overview.queued_rows, "排队中"),
-        _stat(overview.stale_rows, "卡住了", alert=bool(overview.stale_rows)),
-        *_runway_stat(runway, config),
-    ])
+    # KPI 行的组成是**设计系统定死的**：1 个深蓝主块 + 最多 3 张白卡
+    # （DESIGN.md 负面清单 #9、scenarios/03）。上一版是 6–7 个同规格方块
+    # 排排坐，正好是那条禁令点名的形态——数字一样多，但没有主次，
+    # 眼睛落不到「今天该干什么」上。
+    #
+    # 主块给「要人管」：那是这个面板存在的理由。其余按「要不要现在做决定」
+    # 挑三个：待刷多少钱（下一轮的支出）、还够跑多久（要不要充值）、
+    # 卡住了多少（机器是不是没在干活）。在管行数、排队中、项目数这些
+    # 属于背景信息，降到主块下面那行 meta 里。
+    lead_sub = (f"另有 {todos_hidden} 行未显示" if todos_hidden
+                else ("按严重度排序" if todos else "这一屏是干净的"))
+    cost = f"¥{overview.due_yuan:.2f}"
+    cost_sub = (f"{len(overview.unestimatable)} 张表算不出，这是下界"
+                if overview.unestimatable else f"{overview.due_rows} 行到期待刷")
+    kpi = [
+        _kpi_lead(f"{len(todos)}" + ("+" if todos_hidden else ""),
+                  "要人管", lead_sub),
+        _kpi_box(cost + ("+" if overview.unestimatable else ""),
+                 "下一轮预计花费", cost_sub),
+        *_runway_box(runway, config),
+        _kpi_box(overview.stale_rows, "卡住了",
+                 "早该刷到却一直没轮到" if overview.stale_rows
+                 else "没有积压", warn=bool(overview.stale_rows)),
+    ]
+    bar = "".join(kpi[:4])
 
-    inner = f"""<div class=wrap>
-<header>
-  <h1>监控面板</h1>
-  <span class=muted>{len(projects)} 个项目 · 数据于
-    {_e(_stamp(int(fetched_at * 1000) if fetched_at else None, offset_hours))} 取得</span>
-  <span class=tools>
-    <input id=filter type=search placeholder='筛待办…'>
-    <button id=refresh type=button>重新取数</button>
-    <form method=post action=/logout style='margin:0'><button type=submit>退出</button></form>
-  </span>
-</header>
-{stale_note}{domain_note}
-<div class=bar>{bar}</div>
+    # 编辑式导语：一行，15px 基色 50%，重点词 90% + semibold。
+    # 后台轨把它收敛成一行放在页面标题下方（scenarios/03「文字」）。
+    # 它替代了上一版顶栏那一排读不出主次的数字。
+    lede = (f"在管 <b>{overview.total_rows}</b> 行，分在 "
+            f"<b>{len(projects)}</b> 个项目里；"
+            f"其中 <b>{len(todos)}</b> 行现在需要人看一眼，"
+            f"<b>{overview.queued_rows}</b> 行已排队等下一轮刷新。")
 
-<h2>要人管的行（{len(todos)}{'+' if todos_hidden else ''}）</h2>
-<div class=muted style='margin-bottom:8px'>跨所有项目拉平，按严重度排序。点「去这一行」
-直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做。{hidden_note}</div>
-{_todo_table(todos, offset_hours, config.show_digest)}
-{_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
+    nav = _sidebar_nav(todos=len(todos), projects=len(projects),
+                       runs=len(runs or []), balances=bool(balances))
+    when = _stamp(int(fetched_at * 1000) if fetched_at else None, offset_hours)
 
-<h2>各项目</h2>
-{empty_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
+    inner = f"""<div class=app>
+<aside class=side>
+  <div class=brand>{_MARK}<b>BYWOOD</b><span>监控</span></div>
+  {nav}
+  <div class=foot>面板只读飞书表，<b>不发任何付费请求</b>。<br>
+    要刷新某一行，勾「排队刷新」，cron 五分钟内接手。</div>
+</aside>
+<div class=main>
+  <div class=top>
+    <span class=tools>
+      <input id=filter type=search placeholder='筛待办…' aria-label='筛待办'>
+      <button id=refresh type=button class=sm>重新取数</button>
+    </span>
+    <span class=when>数据于 {_e(when)} 取得</span>
+    <form method=post action=/logout style='margin:0 0 0 12px'>
+      <button type=submit class=sm>退出</button></form>
+  </div>
+  <div class=content>
+    <h1>内容监控面板</h1>
+    <p class=lede>{lede}</p>
+    {stale_note}{domain_note}
+    <div class='kpi stagger-in'>{bar}</div>
 
-{_projects_section(config)}
+    <h2 id=s-todo>要人管的行 <span class=n>{len(todos)}{'+' if todos_hidden else ''}</span></h2>
+    <p class=sub>跨所有项目拉平，按严重度排序。点「去这一行」直接落到飞书表里那一行——
+      面板负责发现，具体处理在飞书里做。{hidden_note}</p>
+    {_todo_table(todos, offset_hours, config.show_digest)}
+    {_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
 
-{_balance_section(balances or [], balance_error, runway, config)}
+    <h2 id=s-proj>各项目 <span class=n>{len(projects)}</span></h2>
+    {empty_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
 
-{_runs_section(runs or [], log_error, offset_hours)}
+    {_projects_section(config)}
 
-<p class=muted style='margin-top:26px'>这个面板只读飞书表，
-<b>不发任何付费请求</b>。要刷新某一行，去表里勾「排队刷新」，
-后台 cron 会在 5 分钟内接手。</p>
+    {_balance_section(balances or [], balance_error, runway, config)}
+
+    {_runs_section(runs or [], log_error, offset_hours)}
+  </div>
+</div>
 </div>"""
     return _shell("监控面板", inner, csrf=csrf)
 
 
-def _runway_stat(runway, config) -> list:
-    """顶栏那一格「还够跑」。算不出就整格不显示——
-    顶栏放一个「—」只会占位置，还让人以为是 0。"""
+def _sidebar_nav(*, todos: int, projects: int, runs: int,
+                 balances: bool) -> str:
+    """侧栏导航。导航项高 40、图标 20 + 文字 14/500，激活 = 雾蓝底 + 蓝字。
+
+    带上每一项的条数：侧栏在这个面板里不只是跳转，它是**第二处**告诉你
+    「哪儿有事」的地方——收着的时候也能一眼看出待办有多少。
+    """
+    items = [
+        ("s-todo", "alert-circle", "要人管的行", str(todos)),
+        ("s-proj", "layout-grid", "各项目", str(projects)),
+        ("s-manage", "folder", "加表 / 改配置", ""),
+    ]
+    if balances:
+        items.append(("s-balance", "wallet", "余额", ""))
+    items.append(("s-runs", "history", "运行历史", str(runs) if runs else ""))
+    links = "".join(
+        f"<a href='#{anchor}' data-sec='{anchor}'>"
+        f"{_icon(icon, 'icon')}<span>{_e(label)}</span>"
+        + (f"<span class=cnt>{_e(count)}</span>" if count else "")
+        + "</a>"
+        for anchor, icon, label, count in items)
+    return f"<nav>{links}</nav>"
+
+
+def _kpi_lead(value, key: str, sub: str = "") -> str:
+    """KPI 行的深蓝主块。**一屏只有一个**，给最该被看见的那个数。
+
+    块内文字恒白（DESIGN.md §2「深色块（蓝/红）恒白」），不用文字色阶
+    token —— 那套是给画布上的文字的，放进深底会看不清。
+    """
+    return (f"<div class=lead><div class=k>{_e(key)}</div>"
+            f"<div class='n num'>{_e(value)}</div>"
+            f"<div class=s>{_e(sub)}</div></div>")
+
+
+def _kpi_box(value, key: str, sub: str = "", *, warn: bool = False,
+             unit: str = "") -> str:
+    """白 surface KPI 卡。**最多三张**，且必须配一个主块。
+
+    `unit` 单独一个参数而不是让调用方把 `<small>` 拼进 value —— value 要
+    转义，混进去的标签会被转义成字面量。
+    """
+    tail = f"<small>{_e(unit)}</small>" if unit else ""
+    return (f"<div class='box{' warn' if warn else ''}'>"
+            f"<div class=k>{_e(key)}</div>"
+            f"<div class='n num'>{_e(value)}{tail}</div>"
+            f"<div class=s>{_e(sub)}</div></div>")
+
+
+def _runway_box(runway, config) -> list:
+    """「还够跑几天」那一格。算不出就**整格不显示**——
+    放一个「—」只会占掉主块旁边三个位置里的一个，还让人以为是 0。
+    """
     if runway is None or not runway.known:
         return []
     alert_days = getattr(config, "runway_alert_days", 5.0)
     warn_days = getattr(config, "runway_warn_days", 14.0)
-    label = "还够跑" + ("（下界）" if runway.partial else "")
-    return [_stat(f"{runway.days:.0f} 天", label,
-                  alert=runway.days <= max(alert_days, warn_days))]
-
-
-def _stat(value, key: str, *, alert: bool = False) -> str:
-    cls = "stat alert" if alert else "stat"
-    return (f"<div class='{cls}'>"
-            f"<div class=n>{_e(value)}</div><div class=k>{_e(key)}</div></div>")
+    sub = f"按 ¥{runway.yuan_per_day:.2f}/天 的实际花速"
+    if runway.partial:
+        sub += "，有一家读不到，这是下界"
+    return [_kpi_box(f"{runway.days:.0f}", "余额还够跑", sub, unit="天",
+                     warn=runway.days <= max(alert_days, warn_days))]
