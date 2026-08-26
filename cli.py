@@ -1086,8 +1086,16 @@ def cmd_serve(selected: list[str] | None = None) -> int:
 
     settings = build_settings()
     api_keys = _api_keys()
-    # Key 只用来给「预计花费」选对单价（不同通道差十几倍），一个请求都不发。
-    # 没配也能起：那时按默认通道计价，数字会偏，页面上会说明。
+    # Key 有两个用途，**都不花钱**：
+    # ① 给「预计花费」选对单价（不同通道差十几倍）——纯本地计算；
+    # ② 查两家的余额——两个端点都是官方标明零费用的（见 xhsearch/balance.py
+    #    开头那张表，以及那里为什么是单独一个模块）。
+    # 没配也能起：那时按默认通道计价、余额那一块显示「没配 Key」。
+    from xhsearch import protocol
+    config.api_keys = dict(api_keys)
+    config.tikhub_base = providers.TIKHUB_BASE
+    config.socialdatax_base = protocol.BASE
+    config.usd_to_cny = providers.usd_to_cny()
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
 
