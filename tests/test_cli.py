@@ -157,7 +157,8 @@ class TestNumericEnvBounds(unittest.TestCase):
         import os
         self._saved = {}
         for name in ("MAX_CONCURRENCY", "SOFT_DEADLINE_SECONDS", "DETAIL_WITHIN_DAYS",
-                     "MAX_RECORDS_PER_RUN", "TIKHUB_BASE", "CHANNEL_ORDER"):
+                     "MAX_RECORDS_PER_RUN", "TIKHUB_BASE", "CHANNEL_ORDER",
+                     "DISPLAY_UTC_OFFSET", "TAG_OBSERVING"):
             self._saved[name] = os.environ.pop(name, None)
 
     def tearDown(self):
@@ -210,6 +211,45 @@ class TestNumericEnvBounds(unittest.TestCase):
     def test_unlisted_tikhub_host_is_rejected(self):
         with self.assertRaises(SystemExit):
             self._settings_with(TIKHUB_BASE="https://evil.example")
+
+    def test_line_buffering_never_breaks_a_redirected_stdout(self):
+        """日志格式的优化不该让进程起不来：stdout 被换成 StringIO
+        （测试、某些托管运行时）时静默跳过即可。"""
+        import io
+        import sys
+        saved = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            cli._line_buffer_stdout()      # 不抛异常就是通过
+        finally:
+            sys.stdout = saved
+
+    def test_display_timezone_defaults_to_beijing(self):
+        """默认必须是 +8：飞书国内租户就是按北京时间渲染「最近检查时间」的，
+        默认不对齐的话每个人第一次看日志都会以为对不上。"""
+        self.assertEqual(cli.build_settings().display.utc_offset_hours, 8.0)
+
+    def test_display_offset_out_of_range_is_rejected(self):
+        for value in ("-13", "15", "99"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self._settings_with(DISPLAY_UTC_OFFSET=value)
+
+    def test_half_hour_offsets_work(self):
+        settings = self._settings_with(DISPLAY_UTC_OFFSET="5.5")
+        self.assertEqual(settings.display.label(), "+05:30")
+
+    def test_observing_tag_can_be_renamed(self):
+        settings = self._settings_with(TAG_OBSERVING="冷启动")
+        self.assertEqual(settings.tags.heat_tiers()[0], "冷启动")
+        self.assertIn("冷启动", settings.tags.machine_written())
+
+    def test_switching_observing_off_keeps_it_revocable(self):
+        """关掉这一档 ≠ 放着不管：已经写出去的「观察中」要还在机器命名空间里，
+        下一轮才摘得掉。漏了这一条，那些格子会永远卡在一个没人再更新的标签上。"""
+        settings = self._settings_with(TAG_OBSERVING="")
+        self.assertNotIn("观察中", settings.tags.heat_tiers())
+        self.assertNotIn("观察中", settings.tags.machine_written())
+        self.assertIn("观察中", settings.tags.namespace())
 
 
 class TestLoadDotenv(unittest.TestCase):
@@ -653,6 +693,7 @@ class TestMistypedWarning(unittest.TestCase):
         class _Outcome:
             tag_plan = None
             record_id = "rec1"
+            checked_at = None
             fields = {f.refresh_status: "正常", f.last_updated: 1787313600000,
                       f.queued: False, f.traffic_status: ["大爆"]}
 
@@ -661,6 +702,9 @@ class TestMistypedWarning(unittest.TestCase):
             outcomes = [_Outcome()]
 
             def summary(self):
+                return ""
+
+            def checked_span(self, display):
                 return ""
 
         class _Table:

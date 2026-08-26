@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from . import analyze, feishu, protocol, providers, tags, transport
-from .config import Budget, Settings
+from .config import Budget, Display, Settings
 from .rows import Row, ToolCall, plan_calls, estimate_yuan
 
 STATUS_OK = "正常"
@@ -80,6 +80,10 @@ class Outcome:
     # 权威信号不参与小样本熔断：那是有契约的死讯，不是启发式误判，
     # 否则一张只有三行、三条都真被删了的表会永远等不到「已失效」。
     failure_definitive: bool = False
+    # 真正写进「最近检查时间」的那个时刻（UTC）。None = 这一行本轮不推进时间戳
+    # （顺延、冷却、熔断作废）。日志逐行打印的就是它——日志和表对得上，
+    # 全靠这里和 fields[last_updated] 是同一个值。
+    checked_at: Optional[datetime] = None
 
 
 @dataclass
@@ -123,6 +127,21 @@ class RunReport:
         for outcome in self.outcomes:
             tally[outcome.status] = tally.get(outcome.status, 0) + 1
         return tally
+
+    def checked_span(self, display: Display) -> str:
+        """本轮真正盖上「最近检查时间」的时间跨度，按显示时区渲染。
+
+        写在「已写回 N 行」那一行后面，是为了让日志和表能**直接对上**：
+        表里那一格显示的是什么，这里就打印什么。跨度而不是单个时刻，
+        是因为几百行的一轮会跨好几分钟，而每一行盖的是自己的那个时刻。
+        """
+        stamps = sorted(o.checked_at for o in self.outcomes if o.checked_at)
+        if not stamps:
+            return ""
+        if stamps[0] == stamps[-1]:
+            return display.stamp(stamps[0])
+        return (f"{display.stamp(stamps[0])} ~ "
+                f"{display.clock(stamps[-1])}")
 
     def summary(self) -> str:
         parts = [f"{k} {v}" for k, v in sorted(self.counts().items())]
@@ -530,12 +549,19 @@ def _fetch_one(
     return snapshot, None, credits, yuan, failovers, requests
 
 
-def _base_fields(settings: Settings, *, status: str, notes: list[str], now: datetime) -> dict[str, Any]:
+def _base_fields(settings: Settings, *, status: str, notes: list[str],
+                 checked_at: datetime) -> dict[str, Any]:
+    """每条路径都要写的四列。
+
+    checked_at 是**这一行处理完的那一刻**，不是整轮开跑的那一刻。
+    一轮 sweep 要跑几分钟，几百行共用开跑时间的话，表里的「最近检查时间」
+    会比日志里那一行早好几分钟——运营拿两边对，怎么对都对不上。
+    """
     f = settings.fields
     return {
         f.refresh_status: status,
         f.failure_reason: "；".join(n for n in notes if n)[:500],
-        f.last_updated: int(now.timestamp() * 1000),
+        f.last_updated: int(checked_at.timestamp() * 1000),
         # 处理完就把「排队刷新」的勾去掉 —— 勾自动消失就是「已完成」的视觉信号，
         # 不需要向运营解释任何东西。
         f.queued: False,
@@ -559,6 +585,7 @@ def refresh(
     disabled: Optional[set[str]] = None,
     budget: Optional[RunBudget] = None,
     stop: Optional[threading.Event] = None,
+    clock: Optional[Callable[[], datetime]] = None,
 ) -> RunReport:
     """刷新一批行。不写回，只算结果——写回由调用方决定时机。
 
@@ -579,11 +606,27 @@ def refresh(
     stop 是优雅停机的开关（SIGTERM/SIGINT）：置位后不再派发新行，
     已经在跑的行跑完，结果照常返回给调用方写回。
 
+    now 是**开跑那一刻**，用于筛行（到期、冷却）和算发布时长——整轮一个值，
+    行与行之间的判定口径才一致。clock 是**当下**，只用来给每一行盖
+    「最近检查时间」的戳；默认就是真实时钟，测试可以注入一个假的。
+    两者分开是刻意的：判定要可复现，时间戳要说实话。
+
     结构化事件不在这里发：熔断（尤其是跨表熔断，发生在调用方那一层）会把
     已失效/疑似受限改写成刷新失败，在这里发等于让告警看到一个比实际落表
     **更吓人**的结论。用 emit_run_events()，在所有熔断都定案之后再发。
     """
     now = now or datetime.now(timezone.utc)
+    tick = clock or (lambda: datetime.now(timezone.utc))
+
+    def stamp() -> datetime:
+        """这一行的「最近检查时间」。
+
+        兜住时钟回拨：绝不写一个比开跑还早的时刻，否则这一行会显得比
+        同一轮里先跑完的行更旧，分层刷新的先后关系就乱了。
+        """
+        moment = tick()
+        return moment if moment >= now else now
+
     if deadline is None:
         deadline = (
             time.monotonic() + settings.soft_deadline_seconds
@@ -626,7 +669,9 @@ def refresh(
         否则易变标签会被当成「本轮判定为不需要」而摘掉，等于用一次失败
         抹掉上一次的真实结论。
         """
-        fields = _base_fields(settings, status=status, notes=verdict.notes, now=now)
+        checked_at = stamp()
+        fields = _base_fields(settings, status=status, notes=verdict.notes,
+                              checked_at=checked_at)
         tag_plan: Optional[TagPlan] = None
 
         if touch_tags:
@@ -712,7 +757,7 @@ def refresh(
                 verdict.negative_hits, settings.digest)
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
-                       credits, cost_yuan, tag_plan=tag_plan)
+                       credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at)
 
     def work(row: Row) -> Outcome:
         platform = row.parsed.platform or ""
@@ -813,13 +858,16 @@ def refresh(
         # —— 取不到内容且不是「确认不存在」：只记，绝不打标签 ——
         if snapshot is None:
             reason = error.operator_text() if error else "没有拿到任何数据"
+            checked_at = stamp()
             outcome = Outcome(
                 row.record_id,
                 STATUS_FAILED,
-                _base_fields(settings, status=STATUS_FAILED, notes=[reason], now=now),
+                _base_fields(settings, status=STATUS_FAILED, notes=[reason],
+                             checked_at=checked_at),
                 reason,
                 credits,
                 cost_yuan,
+                checked_at=checked_at,
             )
             # ⚠️ 刻意不动「连续失败次数」：超时、5xx、限流这类失败对
             # 「内容还在不在」没有任何证据力。把它们也计进去，等于让一次
@@ -879,18 +927,29 @@ def refresh(
             say(f"  ⚠ {row.record_id} 处理时抛异常：{detail}")
             say("    " + traceback.format_exc().strip().replace("\n", "\n    "))
             reason = f"内部错误，本行已跳过：{detail}"[:300]
+            checked_at = stamp()
             return Outcome(
                 row.record_id,
                 STATUS_FAILED,
-                _base_fields(settings, status=STATUS_FAILED, notes=[reason], now=now),
+                _base_fields(settings, status=STATUS_FAILED, notes=[reason],
+                             checked_at=checked_at),
                 reason,
+                checked_at=checked_at,
             )
 
     pending = list(rows)
     with ThreadPoolExecutor(max_workers=max(1, settings.max_concurrency)) as pool:
         for outcome in pool.map(guarded, pending):
             report.outcomes.append(outcome)
-            say(f"  {outcome.record_id} → {outcome.status} {outcome.reason}".rstrip())
+            # 行首的时间是**这一行的**「最近检查时间」，和写进表里的是同一个值。
+            # pool.map 按提交顺序产出，日志行的打印时刻可能比实际处理晚好几秒
+            # （前一行卡住时后几行会一起冲出来），所以不能拿日志自己的时间戳去
+            # 对表——必须把落表的那个值直接打出来。顺延/冷却的行没有时间戳，
+            # 留空占位，一眼就能看出「这一行本轮没动过时间」。
+            when = (settings.display.clock(outcome.checked_at)
+                    if outcome.checked_at else "  --  ")
+            say(f"  [{when}] {outcome.record_id} → {outcome.status} "
+                f"{outcome.reason}".rstrip())
 
     report.dead_platforms = dict(dead_platforms)
     report.budget_stopped = budget.stopped_reason
@@ -1049,6 +1108,9 @@ def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: i
             # 不推进最近检查时间、不清排队勾：这一行**没有**得到有效结论。
             outcome.fields.pop(f.last_updated, None)
             outcome.fields.pop(f.queued, None)
+            # 时间戳撤了，报告里也不能再声称盖过章——收尾那行打印的
+            # 「巡查时间 x ~ y」区间必须只包含真正落表的那些行。
+            outcome.checked_at = None
             # 标签重算材料也要撤销：这一行本轮不碰标签列了。
             outcome.tag_plan = None
             # 追加而不是覆盖：原始错误文案里带着 request_id，是找厂商排查的唯一凭据。

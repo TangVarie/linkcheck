@@ -450,8 +450,16 @@ def decide(
         # 和「疑似限流」（有量之后异常下跌）必须分开，证据完全不同。
         flopped = (tier is None and age_hours is not None
                    and age_hours >= th.flop_hours)
+        # 还在冷启动窗口里 → 观察中。刚发两小时只有几条评论再正常不过，
+        # 这时候判「无水花」是误标；但**什么都不写**同样是错的：
+        # 空格分不出「还没巡查」「巡查了没结论」「机器坏了」，
+        # 于是这一批新帖只能靠人手工去填。这一档就是为了不留空格。
+        observing = (tier is None and not flopped and bool(t.observing)
+                     and age_hours is not None and age_hours < th.flop_hours)
         if flopped:
             tier = t.flop
+        elif observing:
+            tier = t.observing
         # 棘轮：算上表里已有的档位取最高。评论被删导致数字掉下去，不该让
         # 一条帖子从「大爆」退回「爆贴」——那种异常由「疑似限流」表达。
         best = max(
@@ -467,8 +475,19 @@ def decide(
                 verdict.notes.append(
                     f"发布 {age_hours:.0f} 小时评论数仍只有 {count}"
                     f"（不足 {th.tier_evaluating} 条）→ {t.flop}")
+            elif observing:
+                verdict.notes.append(
+                    f"发布 {age_hours:.0f} 小时评论数 {count}，还在 {th.flop_hours} 小时"
+                    f"冷启动窗口内，暂不下结论 → {t.observing}")
             else:
                 verdict.notes.append(f"评论数 {count} → {best}")
+        elif age_hours is None:
+            # 「发布时间」为空：算不出发布多久，也就分不清「刚发出去」和
+            # 「发了两周还是没起来」，热度档位这一轮判不了。这是**表里缺数据**，
+            # 不是机器出错——如实说出来，运营把那一格填上下一轮就自动补判。
+            verdict.notes.append(
+                f"「{settings.fields.publish_time}」是空的，算不出发布多久，"
+                "本轮判不了热度档位（把发布时间填上，下一轮自动补判）")
     else:
         # 评论数未知（抖音评论接口的 total 是 integer|null，detail 兜底又恰好
         # 失败）——这一轮对热度和风控**没有获得任何新证据**。此时必须把已有的
