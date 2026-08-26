@@ -11,7 +11,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import panel, panel_view, summary
+from xhsearch import panel, panel_view, railway, summary
 from xhsearch.config import Settings
 
 UTC = timezone.utc
@@ -687,6 +687,158 @@ class TestOverHttp(unittest.TestCase):
     def test_forged_cookie_does_not_get_in(self):
         headers = {"Cookie": f"{panel.COOKIE_NAME}=99999999999.deadbeef"}
         self.assertEqual(self._call("/api/overview", headers=headers)[0], 401)
+
+
+# ---------------------------------------------------------------- 日志
+
+class FakeRailwayConfig:
+    def __init__(self, enabled=True, missing=()):
+        self._enabled = enabled
+        self._missing = list(missing)
+        self.token = "tok-1234567890" if enabled else ""
+        self.environment_id = "env-1" if enabled else ""
+        self.service_id = ""
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    def missing(self):
+        return list(self._missing)
+
+
+class TestLogFeed(unittest.TestCase):
+    def _feed(self, fetch, *, enabled=True, missing=(), ttl=999):
+        cfg = config()
+        cfg.railway = FakeRailwayConfig(enabled=enabled, missing=missing)
+        cfg.secrets = ("sk-live-abcdefghijklmnop",)
+        return panel.LogFeed(cfg, ttl, fetch=fetch)
+
+    def test_disabled_says_exactly_which_variable_is_missing(self):
+        """「日志不可用」这种话没用。"""
+        feed = self._feed(lambda *a, **k: [], enabled=False,
+                          missing=["RAILWAY_API_TOKEN"])
+        lines, message = feed.get()
+        self.assertEqual(lines, [])
+        self.assertIn("RAILWAY_API_TOKEN", message)
+
+    def test_secrets_are_handed_to_the_fetcher(self):
+        seen = {}
+
+        def fetch(cfg, *, secrets=()):
+            seen["secrets"] = secrets
+            return []
+        self._feed(fetch).get()
+        self.assertIn("sk-live-abcdefghijklmnop", seen["secrets"])
+
+    def test_result_is_cached_within_the_ttl(self):
+        calls = []
+
+        def fetch(cfg, *, secrets=()):
+            calls.append(1)
+            return [railway.LogLine(message="x")]
+        feed = self._feed(fetch)
+        feed.get()
+        feed.get()
+        self.assertEqual(len(calls), 1)
+
+    def test_force_bypasses_the_cache(self):
+        calls = []
+
+        def fetch(cfg, *, secrets=()):
+            calls.append(1)
+            return []
+        feed = self._feed(fetch)
+        feed.get()
+        feed.get(force=True)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_railway_failure_keeps_the_last_batch(self):
+        """日志少一次刷新不该让页面上那一块变空白。"""
+        state = {"fail": False}
+
+        def fetch(cfg, *, secrets=()):
+            if state["fail"]:
+                raise railway.RailwayError("429 限流")
+            return [railway.LogLine(message="上一批")]
+        feed = self._feed(fetch, ttl=0)
+        feed.get()
+        state["fail"] = True
+        lines, error = feed.get()
+        self.assertEqual([l.message for l in lines], ["上一批"])
+        self.assertIn("429", error)
+
+    def test_an_unexpected_exception_is_contained(self):
+        def fetch(cfg, *, secrets=()):
+            raise ValueError("没想到的错")
+        lines, error = self._feed(fetch).get()
+        self.assertEqual(lines, [])
+        self.assertIn("没想到的错", error)
+
+
+class TestSecretsList(unittest.TestCase):
+    def test_collects_every_secret_that_could_show_up_in_a_log(self):
+        env = {"TIKHUB_API_KEY": "tk", "SOCIALDATAX_API_KEY": "sd",
+               "FEISHU_APP_SECRET": "fs", "RAILWAY_API_TOKEN": "rw",
+               "PANEL_PASSWORD": "pw"}
+        found = panel._secrets(env)
+        for value in env.values():
+            self.assertIn(value, found)
+
+    def test_empty_values_are_dropped(self):
+        self.assertEqual(panel._secrets({"TIKHUB_API_KEY": "  "}), ())
+
+
+class TestRunHistoryRendering(unittest.TestCase):
+    def _page(self, runs, log_error=""):
+        overview = summary.Overview(
+            projects=[summary.ProjectSnapshot(label="A", app_token="t",
+                                              table_id="tb")],
+            generated_at=NOW)
+        return panel_view.overview_page(
+            overview=overview, error="", fetched_at=NOW.timestamp(),
+            config=config(), csrf="tok", runs=runs, log_error=log_error)
+
+    def _run(self, **kwargs):
+        base = dict(run_id="r1", mode="sweep", started_at=NOW.timestamp(),
+                    ended_at=NOW.timestamp() + 30, exit_code=0, rows=7,
+                    cost_yuan=0.5)
+        base.update(kwargs)
+        return railway.Run(**base)
+
+    def test_no_runs_explains_what_is_needed(self):
+        page = self._page([])
+        self.assertIn("RUN_LOG_JSON", page)
+
+    def test_a_normal_run_reads_as_normal(self):
+        page = self._page([self._run()])
+        self.assertIn("正常", page)
+        self.assertIn("¥0.50", page)
+
+    def test_an_unfinished_run_is_called_out(self):
+        """有 run_start 没 run_end = 被容器杀掉了，那几轮的钱多半白花了。"""
+        page = self._page([self._run(ended_at=None, exit_code=None)])
+        self.assertIn("没跑完", page)
+        self.assertIn("被容器杀掉", page)
+
+    def test_a_tripped_breaker_is_shown(self):
+        run = self._run()
+        run.tables = [railway.TableRun(label="A", breaker_tripped=True)]
+        self.assertIn("已熔断", self._page([run]))
+
+    def test_failovers_are_surfaced(self):
+        run = self._run()
+        run.tables = [railway.TableRun(label="A", failovers=4)]
+        self.assertIn("降级 4 次", self._page([run]))
+
+    def test_log_error_is_shown_without_hiding_the_runs(self):
+        page = self._page([self._run()], log_error="429 限流")
+        self.assertIn("429 限流", page)
+        self.assertIn("¥0.50", page)
+
+    def test_run_fields_are_escaped(self):
+        page = self._page([self._run(error="<script>alert(1)</script>")])
+        self.assertNotIn("<script>alert(1)</script>", page)
 
 
 if __name__ == "__main__":

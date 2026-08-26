@@ -740,6 +740,28 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     stop = threading.Event()
     _install_stop_handlers(stop)
     on_event, run_id = _event_sink()
+    # 一轮的开头也发一条：面板靠「有 run_start 没有 run_end」认出
+    # 跑到一半被杀掉的那些轮（Railway redeploy、容器回收、OOM）。
+    # 只看结束事件的话，那种轮在看板上根本不存在。
+    runner.emit(on_event, runner.EVENT_RUN_START, mode=mode,
+                tables=[label for label, _ in tables],
+                started_at=now.isoformat(),
+                budget=settings.budget.describe())
+
+    def _finish(code: int, error: str = "") -> int:
+        """收尾事件。**每一条退出路径都要经过它。**
+
+        面板靠「有 run_start 没有 run_end」认出被杀掉的轮子。要是某条正常
+        退出路径漏发了，那一轮在看板上就长得和「跑到一半被容器回收」一模一样
+        ——一个假的故障信号比没有信号更糟。
+        """
+        runner.emit(on_event, runner.EVENT_RUN_END, mode=mode,
+                    tables=len(tables), exit_code=code, error=error,
+                    rows=sum(len(r.outcomes) for _l, _t, r, _m in pending),
+                    cost_yuan=round(sum(r.cost_yuan for _l, _t, r, _m in pending), 6),
+                    channels_dead=channels_dead, stopped=stop.is_set(),
+                    budget_stopped=budget.stopped_reason)
+        return code
 
     worst = 0
     found_all: set[str] = set()
@@ -790,6 +812,7 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                     _write_back_table(table, report, fields_meta, settings, label)
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
+        _finish(1, error=type(sys.exc_info()[1]).__name__)
         raise
 
     # 跨表熔断：单表可能只有三五行，永远凑不满熔断的最小样本，但上游
@@ -804,7 +827,7 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 提前发的话，被熔断改写过的行会让看板和告警看到一个比实际落表更吓人的
     # 结论，而那正好发生在上游故障、最不该误报的时候。
     for label, _table, report, _meta in pending:
-        runner.emit_run_events(report, on_event, table=label)
+        runner.emit_run_events(report, on_event, table=label, mode=mode)
 
     for label, table, report, fields_meta in pending:
         if multi:
@@ -831,10 +854,10 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             print(f"\n⚠ 这些 record_id 在所有已配置的表里都没找到："
                   f"{'、'.join(missing)}")
             if not found_all:
-                return 1
+                return _finish(1)
     if mode == "estimate" and multi:
         print(f"\n合计：待刷 {total_rows} 行，预计花费 ≈ ¥{total_yuan:.2f}")
-    return worst
+    return _finish(worst)
 
 
 def _line_buffer_stdout() -> None:

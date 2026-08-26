@@ -750,6 +750,68 @@ class TestMistypedWarning(unittest.TestCase):
             self._run_write_back(self._meta(**{self.f.traffic_status: 3})), 1)
 
 
+class TestEveryExitPathReportsTheRunEnd(unittest.TestCase):
+    """面板靠「有 run_start 没有 run_end」认出被容器杀掉的那些轮。
+
+    所以每一条**正常**退出路径都必须发 run_end。漏一条，那一轮在看板上
+    就长得和「跑到一半被回收」一模一样——一个假的故障信号比没有信号更糟。
+    这里按 AST 检查，因为这类遗漏都是「新加了一个 return 忘了改」，
+    靠人看 diff 挡不住。
+    """
+
+    def _run_locked_ast(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(cli))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_locked":
+                return node
+        self.fail("找不到 cli._run_locked")
+
+    def _returns_in(self, node):
+        """_run_locked 自己的 return，不含嵌套函数（_finish 自己那条不算）。"""
+        import ast
+        found = []
+        stack = list(node.body)
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(item, ast.Return):
+                found.append(item)
+            for child in ast.iter_child_nodes(item):
+                stack.append(child)
+        return found
+
+    def test_every_return_goes_through_finish(self):
+        import ast
+        for node in self._returns_in(self._run_locked_ast()):
+            self.assertIsInstance(
+                node.value, ast.Call,
+                f"cli.py 第 {node.lineno} 行的 return 不是 _finish(...)")
+            self.assertEqual(
+                getattr(node.value.func, "id", None), "_finish",
+                f"cli.py 第 {node.lineno} 行的 return 绕开了 _finish，"
+                "这一轮不会发 run_end，看板会把它当成被杀掉的轮子")
+
+    def test_the_raise_path_also_reports(self):
+        """刷新阶段炸了也要发一条（带错误类型），否则一次 Python 异常
+        和一次 SIGKILL 在看板上分不出来。"""
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        head, _, tail = source.partition("except BaseException:")
+        self.assertTrue(tail, "_run_locked 里的 BaseException 兜底不见了")
+        self.assertIn("_finish(1, error=", tail)
+
+    def test_run_start_is_emitted_before_any_table_runs(self):
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        self.assertIn("EVENT_RUN_START", source)
+        self.assertLess(source.index("EVENT_RUN_START"),
+                        source.index("for index, (label, table) in enumerate(tables)"),
+                        "run_start 要在开跑之前发")
+
+
 class TestReportedSpanOnlyCoversRowsThatLanded(unittest.TestCase):
     """「已写回 N 行，本轮『最近检查时间』= …」那一行只能报**真的落表**的时刻。
 

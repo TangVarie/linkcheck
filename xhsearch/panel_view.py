@@ -244,8 +244,64 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
 </div>"""
 
 
+def _run_row(run, offset_hours: float) -> str:
+    if not run.finished:
+        badge = "<span class='chip r'>没跑完</span>"
+    elif run.error:
+        badge = f"<span class='chip r'>{_e(run.error)}</span>"
+    elif run.breaker_tripped:
+        badge = "<span class='chip r'>已熔断</span>"
+    elif run.channels_dead:
+        badge = "<span class='chip r'>通道全倒</span>"
+    elif run.exit_code:
+        badge = f"<span class='chip a'>退出码 {run.exit_code}</span>"
+    elif run.stopped:
+        badge = "<span class='chip a'>被终止</span>"
+    else:
+        badge = "<span class='chip g'>正常</span>"
+    extra = []
+    if run.failovers:
+        extra.append(f"<span class='chip a'>降级 {run.failovers} 次</span>")
+    if run.budget_stopped:
+        extra.append("<span class='chip a'>预算触顶</span>")
+    tables = "、".join(_e(t.label) for t in run.tables) or "—"
+    started = _stamp(int(run.started_at * 1000) if run.started_at else None,
+                     offset_hours)
+    return ("<tr>"
+            f"<td class=nowrap>{_e(started)}</td>"
+            f"<td class=nowrap>{_e(run.mode or '—')}</td>"
+            f"<td>{tables}</td>"
+            f"<td class=nowrap>{run.rows}</td>"
+            f"<td class=nowrap>¥{run.cost_yuan:.2f}</td>"
+            f"<td>{badge}{''.join(extra)}</td>"
+            "</tr>")
+
+
+def _runs_section(runs, log_error: str, offset_hours: float) -> str:
+    note = (f"<div class=note>⚠ 取 Railway 日志失败：{_e(log_error)}</div>"
+            if log_error else "")
+    if not runs:
+        body = ("<div class=empty>暂时没有可解析的运行记录。"
+                "<br><span class=muted>需要 cron 那个服务设上 "
+                "<code>RUN_LOG_JSON=1</code>，日志才带结构化事件；"
+                "Railway 免费/Hobby 套餐日志只留 7 天。</span></div>")
+        return f"<h2>运行历史</h2>{note}{body}"
+    head = ("<tr><th>开跑</th><th>模式</th><th>表</th><th>行数</th>"
+            "<th>花费</th><th>结果</th></tr>")
+    rows = "".join(_run_row(r, offset_hours) for r in runs)
+    unfinished = sum(1 for r in runs if not r.finished)
+    warn = ""
+    if unfinished:
+        warn = (f"<div class=note>有 {unfinished} 轮只有开跑没有收尾——"
+                "那是被容器杀掉的形态（redeploy、回收、OOM），"
+                "那几轮已经付过钱的结果多半丢了。</div>")
+    return (f"<h2>运行历史（{len(runs)}）</h2>{note}{warn}"
+            f"<table><thead>{head}</thead><tbody>{rows}</tbody></table>")
+
+
 def overview_page(*, overview: Optional[summary.Overview], error: str,
                   fetched_at: float, config, csrf: str = "",
+                  runs=None, log_error: str = "",
                   offset_hours: float = 8.0) -> str:
     if overview is None:
         inner = ("<div class=wrap><header><h1>监控面板</h1></header>"
@@ -297,6 +353,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
 <h2>各项目</h2>
 <div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
+
+{_runs_section(runs or [], log_error, offset_hours)}
 
 <p class=muted style='margin-top:26px'>这个面板只读飞书表，
 <b>不发任何付费请求</b>。要刷新某一行，去表里勾「排队刷新」，

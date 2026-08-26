@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
-from . import feishu, schema, summary
+from . import feishu, railway, schema, summary
 from .config import Settings
 
 # 请求体上限。面板的 POST 只有登录表单，几十字节；64 KiB 是三个数量级的余量。
@@ -74,6 +74,11 @@ class PanelConfig:
     # 飞书租户域名。直达链接靠它拼出来，而面板的价值有一半在那个链接上。
     feishu_base: str = "https://feishu.cn"
     read_only: bool = True
+    railway: railway.RailwayConfig = field(
+        default_factory=lambda: railway.RailwayConfig(token="", environment_id=""))
+    # 送到浏览器的日志文本要按这一组逐个脱敏。**别只放上游 Key**：
+    # 飞书 Secret、Railway token、面板口令同样可能出现在某条报错话术里。
+    secrets: tuple = ()
 
     @staticmethod
     def from_env(environ: Optional[dict] = None) -> "PanelConfig":
@@ -98,6 +103,8 @@ class PanelConfig:
             cache_seconds=_float_env(env, "PANEL_CACHE_SECONDS", 60.0, 5.0, 3600.0),
             show_digest=_bool_env(env, "PANEL_SHOW_DIGEST", False),
             feishu_base=_feishu_base(env),
+            railway=railway.RailwayConfig.from_env(env),
+            secrets=_secrets(env),
         )
 
 
@@ -136,6 +143,18 @@ def _bool_env(env, name, default: bool) -> bool:
     if raw in ("0", "false", "no", "off"):
         return False
     raise ConfigError(f"环境变量 {name} 的值 {raw!r} 看不懂，填 1/0")
+
+
+def _secrets(env) -> tuple:
+    """所有可能出现在日志里、绝不能送到浏览器的值。
+
+    宁可多列几个：漏一个的代价是把生产密钥贴在一个公网页面上，
+    多列一个的代价只是某条日志里多几个星号。
+    """
+    names = ("TIKHUB_API_KEY", "SOCIALDATAX_API_KEY", "FEISHU_APP_SECRET",
+             "FEISHU_APP_ID", "RAILWAY_API_TOKEN", "PANEL_PASSWORD",
+             "PANEL_SECRET")
+    return tuple(v for v in ((env.get(n) or "").strip() for n in names) if v)
 
 
 def _feishu_base(env) -> str:
@@ -289,6 +308,59 @@ class Cache:
         self._stop.set()
 
 
+class LogFeed:
+    """Railway 日志的缓存。
+
+    和聚合缓存分开是有意的：飞书那趟慢、Railway 这趟快，失败模式也不一样
+    （飞书挂了整个面板没数据，Railway 挂了只是日志那一块看不了）。
+    合成一个的话，Railway 一个 401 就能让整个面板变空白。
+    """
+
+    def __init__(self, config: PanelConfig, ttl: float,
+                 fetch: Optional[Callable[..., list]] = None):
+        self._config = config
+        self._ttl = ttl
+        self._fetch = fetch or railway.fetch_logs
+        self._lock = threading.Lock()
+        self._lines: list = []
+        self._error = ""
+        self._fetched_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self._config.railway.enabled
+
+    def _missing_hint(self) -> str:
+        gaps = self._config.railway.missing()
+        return ("没接 Railway 日志：还差 " + "、".join(gaps) +
+                "。设上就能在这里看到每一轮的真实输出（见 docs/面板.md）")
+
+    def get(self, *, force: bool = False) -> tuple[list, str]:
+        if not self.enabled:
+            return [], self._missing_hint()
+        with self._lock:
+            fresh = (time.time() - self._fetched_at) < self._ttl
+            if fresh and not force and (self._lines or self._error):
+                return list(self._lines), self._error
+        try:
+            lines = self._fetch(self._config.railway,
+                                secrets=self._config.secrets)
+            with self._lock:
+                self._lines, self._error = lines, ""
+                self._fetched_at = time.time()
+        except railway.RailwayError as exc:
+            # 保留上一批：日志少一次刷新不该让页面上那一块变空白。
+            with self._lock:
+                self._error = str(exc)
+                self._fetched_at = time.time()
+        except Exception as exc:                                # noqa: BLE001
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"
+                self._fetched_at = time.time()
+        with self._lock:
+            return list(self._lines), self._error
+
+
 # ---------- 鉴权 ----------
 
 def issue_session(config: PanelConfig, *, now: Optional[float] = None) -> str:
@@ -403,6 +475,7 @@ class _Deps:
 
     config: PanelConfig
     cache: Cache
+    logs: Optional["LogFeed"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -443,6 +516,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._send_json(200, self._overview_payload())
+        if path == "/api/logs":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._send_json(200, self._logs_payload())
         return self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):                                          # noqa: N802
@@ -465,8 +542,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return None
         if path == "/api/refresh":
-            # 只是让缓存立刻重取一遍飞书数据。**不发任何付费请求。**
+            # 只是让缓存立刻重取一遍飞书数据和 Railway 日志。
+            # **不发任何付费请求。**
             self.deps.cache.refresh()
+            if self.deps.logs is not None:
+                self.deps.logs.get(force=True)
             return self._send_json(200, self._overview_payload())
         return self._send_json(404, {"error": "not found"})
 
@@ -595,10 +675,31 @@ class PanelHandler(BaseHTTPRequestHandler):
     # —— 页面数据 ——
     def _page(self) -> str:
         overview, error, fetched_at = self.deps.cache.snapshot()
+        runs, log_error = self._runs()
         return self.deps.render_page(
             overview=overview, error=error, fetched_at=fetched_at,
-            config=self.deps.config,
+            config=self.deps.config, runs=runs, log_error=log_error,
             csrf=csrf_token(self.deps.config, self._session_token()))
+
+    def _runs(self):
+        if self.deps.logs is None:
+            return [], ""
+        lines, error = self.deps.logs.get()
+        return railway.build_runs(lines), error
+
+    def _logs_payload(self) -> dict:
+        if self.deps.logs is None:
+            return {"enabled": False, "error": "", "lines": [], "runs": []}
+        lines, error = self.deps.logs.get()
+        return {
+            "enabled": self.deps.logs.enabled,
+            "error": error,
+            # 原始日志只回最近这些行：整批几千行塞进一个 JSON 响应，
+            # 浏览器渲染比取数还慢。
+            "lines": [{"timestamp": l.timestamp, "severity": l.severity,
+                       "message": l.message} for l in lines[:300]],
+            "runs": [_run_json(r) for r in railway.build_runs(lines)],
+        }
 
     def _overview_payload(self) -> dict:
         overview, error, fetched_at = self.deps.cache.snapshot()
@@ -608,6 +709,23 @@ class PanelHandler(BaseHTTPRequestHandler):
             "projects": [_project_json(p) for p in (overview.projects if overview else [])],
             "todos": [_todo_json(t) for t in (overview.todos() if overview else [])],
         }
+
+
+def _run_json(run) -> dict:
+    return {
+        "run_id": run.run_id, "mode": run.mode,
+        "started_at": run.started_at, "ended_at": run.ended_at,
+        "exit_code": run.exit_code, "error": run.error,
+        "rows": run.rows, "cost_yuan": round(run.cost_yuan, 4),
+        "finished": run.finished, "ok": run.ok,
+        "breaker_tripped": run.breaker_tripped, "failovers": run.failovers,
+        "channels_dead": run.channels_dead, "stopped": run.stopped,
+        "budget_stopped": run.budget_stopped,
+        "tables": [{"label": t.label, "rows": t.rows,
+                    "cost_yuan": round(t.cost_yuan, 4), "counts": t.counts,
+                    "breaker_tripped": t.breaker_tripped,
+                    "failovers": t.failovers} for t in run.tables],
+    }
 
 
 def _project_json(p: summary.ProjectSnapshot) -> dict:
@@ -649,12 +767,12 @@ class PanelServer(ThreadingHTTPServer):
         super().__init__(address, PanelHandler)
 
 
-def build_server(config: PanelConfig, cache: Cache, *,
+def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
-        config=config, cache=cache,
+        config=config, cache=cache, logs=logs,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -664,11 +782,17 @@ def build_server(config: PanelConfig, cache: Cache, *,
 def serve(config: PanelConfig, produce: Callable[[], summary.Overview]) -> int:
     """起面板。阻塞到进程被杀。"""
     cache = Cache(produce, config.cache_seconds)
-    server = build_server(config, cache)
+    logs = LogFeed(config, config.cache_seconds)
+    server = build_server(config, cache, logs=logs)
     cache.start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"
           f"评论正文{'展示' if config.show_digest else '不展示'}）", flush=True)
+    if logs.enabled:
+        print("Railway 日志：已接入", flush=True)
+    else:
+        print(f"Railway 日志：未接入（差 "
+              f"{'、'.join(config.railway.missing())}）", flush=True)
     print("⚠ 这个进程不发任何付费请求：要刷新就在飞书表里勾「排队刷新」，"
           "由 cron 那个服务处理", flush=True)
     try:
