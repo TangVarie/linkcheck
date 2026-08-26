@@ -1,0 +1,693 @@
+"""监控面板的单测。全部离线，不起真服务、不发任何请求。
+
+这个文件里最重要的不是「功能对不对」，是**几条不变量**：
+面板不发付费请求、不写业务表、不把密钥或个人信息漏到前端、
+口令没配就拒绝启动。那几条一旦破了，破法都是安静的。
+"""
+
+import json
+import re
+import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+
+from xhsearch import panel, panel_view, summary
+from xhsearch.config import Settings
+
+UTC = timezone.utc
+NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+GOOD_PASSWORD = "a-very-long-passphrase"
+
+
+def config(**kwargs):
+    base = dict(password=GOOD_PASSWORD, secret=b"secret-bytes", port=8080)
+    base.update(kwargs)
+    return panel.PanelConfig(**base)
+
+
+class FakeTable:
+    """只实现面板真正会调的两个方法。多一个都不给——
+    面板要是哪天开始调别的东西，这里会直接 AttributeError。"""
+
+    def __init__(self, meta, records, *, app_token="bascnAAA", table_id="tblBBB",
+                 meta_error=None, search_error=None):
+        self.app_token = app_token
+        self.table_id = table_id
+        self._meta = meta
+        self._records = records
+        self._meta_error = meta_error
+        self._search_error = search_error
+        self.searched_fields = None
+        self.searched_filter = None
+
+    def fields_meta(self):
+        if self._meta_error:
+            raise self._meta_error
+        return self._meta
+
+    def search(self, field_names, *, filter_spec=None, **_kwargs):
+        if self._search_error:
+            raise self._search_error
+        self.searched_fields = list(field_names)
+        self.searched_filter = filter_spec
+        return self._records
+
+
+def healthy_meta(settings=None):
+    from xhsearch import schema
+    settings = settings or Settings()
+    meta = {}
+    for name, allowed, _label, options, _note in schema.expected_schema(settings):
+        meta[name] = {"type": allowed[0], "ui_type": "",
+                      "options": list(options) if options else None}
+    return meta
+
+
+# ---------------------------------------------------------------- 不变量
+
+def _called_names(module) -> set:
+    """模块里所有被调用的名字（含 a.b.c 这种点号形式）。
+
+    按 AST 走，不是字符串搜——注释和文档字符串里提到某个函数名是正常的
+    （这个仓库的文档就写在代码里），把它们算成「调用了它」会逼着人
+    为了过测试而把话说得含糊。
+    """
+    import ast
+    import inspect
+
+    called = set()
+
+    def dotted(node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return None
+
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = dotted(node.func)
+            if name:
+                called.add(name)
+                called.add(name.rsplit(".", 1)[-1])
+    return called
+
+
+def _imported_modules(module) -> set:
+    import ast
+    import inspect
+
+    names = set()
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(a.name for a in node.names)
+            if node.module:
+                names.add(node.module.split(".")[0])
+    return names
+
+
+class TestNeverSpends(unittest.TestCase):
+    def test_panel_calls_nothing_that_spends_money(self):
+        """面板永远不发付费请求。按 AST 逐个调用节点查，不是字符串搜。
+
+        只认**带点号的全名**和几个不会撞车的裸名字：光看裸名字的话，
+        `Cache.refresh`（重新读一遍飞书）会被当成 `runner.refresh`（真花钱）。
+        「面板压根不 import 那两层」由下面两条测试保证，两条合起来才严密。
+        """
+        called = _called_names(panel)
+        for name in called:
+            self.assertFalse(
+                name.startswith(("providers.", "runner.", "protocol.", "transport.")),
+                f"panel.py 调了 {name}——面板不许碰会发请求的那几层")
+        for forbidden in ("plan_calls", "estimate_yuan", "_fetch_one",
+                          "_call_once", "post_with_retry", "get_with_retry",
+                          "get_provider", "write_back"):
+            self.assertNotIn(forbidden, called,
+                             f"panel.py 调了 {forbidden}——面板不许成为付费执行者")
+
+    def test_panel_does_not_import_the_provider_layer(self):
+        self.assertNotIn("providers", _imported_modules(panel))
+        self.assertFalse(hasattr(panel, "providers"),
+                         "panel 模块不该持有 providers 的引用")
+
+    def test_panel_does_not_import_runner_either(self):
+        """连 runner 都不引：面板要的 row_from_record 是 summary 那一层的事，
+        面板自己碰不到编排层，也就没有「不小心调了 refresh」的可能。"""
+        self.assertNotIn("runner", _imported_modules(panel))
+
+    def test_collect_only_reads(self):
+        """跑一趟完整的 collect，确认它只调了 fields_meta 和 search。"""
+        table = FakeTable(healthy_meta(), [])
+        with mock.patch.object(FakeTable, "search",
+                               side_effect=FakeTable.search,
+                               autospec=True) as spy:
+            panel.collect([("A", table)], Settings(), {"tikhub": "k"}, now=NOW)
+        self.assertEqual(spy.call_count, 1)
+
+
+class TestNeverWrites(unittest.TestCase):
+    def test_panel_has_no_write_call(self):
+        """P1 阶段面板对业务表**一列都不写**。写路径要到 P4 才出现，
+        到时候白名单里也只会有「排队刷新」一个元素。"""
+        called = _called_names(panel)
+        for forbidden in ("batch_update", "batch_create", "create_field",
+                          "add_field_options", "update_field"):
+            self.assertNotIn(forbidden, called,
+                             f"panel.py 调了 {forbidden}——现阶段面板是只读的")
+
+
+class TestConfigRefusesToStartUnsafe(unittest.TestCase):
+    def test_missing_password_refuses(self):
+        with self.assertRaises(panel.ConfigError) as ctx:
+            panel.PanelConfig.from_env({})
+        self.assertIn("PANEL_PASSWORD", str(ctx.exception))
+
+    def test_short_password_refuses(self):
+        with self.assertRaises(panel.ConfigError) as ctx:
+            panel.PanelConfig.from_env({"PANEL_PASSWORD": "short"})
+        self.assertIn("至少", str(ctx.exception))
+
+    def test_secret_is_random_when_unset(self):
+        a = panel.PanelConfig.from_env({"PANEL_PASSWORD": GOOD_PASSWORD})
+        b = panel.PanelConfig.from_env({"PANEL_PASSWORD": GOOD_PASSWORD})
+        self.assertNotEqual(a.secret, b.secret)
+        self.assertGreaterEqual(len(a.secret), 32)
+
+    def test_bad_numbers_refuse_rather_than_clamp(self):
+        for env in ({"PANEL_CACHE_SECONDS": "0"}, {"PANEL_CACHE_SECONDS": "abc"},
+                    {"PORT": "0"}, {"PORT": "99999"}, {"PANEL_SHOW_DIGEST": "maybe"}):
+            env = {"PANEL_PASSWORD": GOOD_PASSWORD, **env}
+            with self.assertRaises(panel.ConfigError):
+                panel.PanelConfig.from_env(env)
+
+
+class TestSessions(unittest.TestCase):
+    def test_roundtrip(self):
+        cfg = config()
+        self.assertTrue(panel.valid_session(cfg, panel.issue_session(cfg)))
+
+    def test_expired_token_rejected(self):
+        # now=0 是 epoch，是个合法时刻。曾经这里写的是 `now or time.time()`，
+        # 0 被当成「没传」，于是这个「1970 年签发的 token」反而是有效的。
+        cfg = config()
+        token = panel.issue_session(cfg, now=0)
+        self.assertFalse(panel.valid_session(cfg, token))
+
+    def test_zero_is_a_real_timestamp_not_a_missing_one(self):
+        cfg = config()
+        token = panel.issue_session(cfg, now=0)
+        self.assertTrue(token.startswith(str(panel.SESSION_TTL_SECONDS) + "."))
+        self.assertTrue(panel.valid_session(cfg, token, now=0))
+
+    def test_forged_signature_rejected(self):
+        cfg = config()
+        expiry = int(NOW.timestamp()) + 9999
+        self.assertFalse(panel.valid_session(cfg, f"{expiry}.deadbeef"))
+
+    def test_token_from_another_secret_rejected(self):
+        token = panel.issue_session(config(secret=b"other"))
+        self.assertFalse(panel.valid_session(config(), token))
+
+    def test_garbage_rejected_without_raising(self):
+        cfg = config()
+        for junk in ("", "x", "....", "abc.def", "9999999999999999999999.x"):
+            self.assertFalse(panel.valid_session(cfg, junk))
+
+    def test_csrf_token_is_derived_not_the_session(self):
+        cfg = config()
+        session = panel.issue_session(cfg)
+        derived = panel.csrf_token(cfg, session)
+        self.assertNotEqual(derived, session)
+        self.assertNotIn(session, derived)
+        self.assertEqual(derived, panel.csrf_token(cfg, session))
+        self.assertNotEqual(derived, panel.csrf_token(config(secret=b"other"), session))
+        self.assertEqual(panel.csrf_token(cfg, ""), "")
+
+    def test_password_check_is_exact(self):
+        cfg = config()
+        self.assertTrue(panel.check_password(cfg, GOOD_PASSWORD))
+        self.assertFalse(panel.check_password(cfg, GOOD_PASSWORD + " "))
+        self.assertFalse(panel.check_password(cfg, ""))
+
+
+class TestLoginThrottle(unittest.TestCase):
+    def test_blocks_after_the_limit(self):
+        throttle = panel.LoginThrottle(max_failures=3, window=60)
+        for _ in range(3):
+            self.assertFalse(throttle.blocked("1.2.3.4"))
+            throttle.record_failure("1.2.3.4")
+        self.assertTrue(throttle.blocked("1.2.3.4"))
+
+    def test_one_source_does_not_lock_out_everyone(self):
+        """全局锁定意味着任何人都能让整个团队登不进来。"""
+        throttle = panel.LoginThrottle(max_failures=2, window=60)
+        for _ in range(5):
+            throttle.record_failure("attacker")
+        self.assertTrue(throttle.blocked("attacker"))
+        self.assertFalse(throttle.blocked("colleague"))
+
+    def test_window_expires(self):
+        throttle = panel.LoginThrottle(max_failures=2, window=60)
+        throttle.record_failure("ip", now=1000)
+        throttle.record_failure("ip", now=1000)
+        self.assertTrue(throttle.blocked("ip", now=1010))
+        self.assertFalse(throttle.blocked("ip", now=1100))
+
+    def test_bucket_count_is_bounded(self):
+        """X-Forwarded-For 可以伪造。伪造只能绕过限速，
+        不能把限速本身变成内存耗尽。"""
+        throttle = panel.LoginThrottle()
+        for i in range(5000):
+            throttle.record_failure(f"ip-{i}")
+        self.assertLessEqual(len(throttle._buckets), 4096)
+
+    def test_success_clears_the_bucket(self):
+        throttle = panel.LoginThrottle(max_failures=2, window=60)
+        throttle.record_failure("ip")
+        throttle.clear("ip")
+        self.assertFalse(throttle.blocked("ip"))
+
+
+# ---------------------------------------------------------------- 取数
+
+class TestCollect(unittest.TestCase):
+    def test_only_asks_for_columns_that_exist(self):
+        """按名字请求不存在的列会让整个 search 报 1254045，一行都读不回来。"""
+        settings = Settings()
+        meta = healthy_meta(settings)
+        del meta[settings.fields.negative_status]
+        table = FakeTable(meta, [])
+        panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertNotIn(settings.fields.negative_status, table.searched_fields)
+        self.assertIn(settings.fields.link, table.searched_fields)
+
+    def test_filters_to_monitored_rows(self):
+        settings = Settings()
+        table = FakeTable(healthy_meta(settings), [])
+        panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertEqual(table.searched_filter["conditions"][0]["field_name"],
+                         settings.fields.monitoring)
+
+    def test_missing_monitoring_column_is_flagged_not_silently_ignored(self):
+        """没法过滤在管的行，下面每个数字都包含了本该排除的行——
+        必须说出来，而不是给一堆看起来正常的数字。"""
+        settings = Settings()
+        meta = healthy_meta(settings)
+        del meta[settings.fields.monitoring]
+        overview = panel.collect([("A", FakeTable(meta, []))], settings, {}, now=NOW)
+        self.assertTrue(any("无法只统计在管的行" in p
+                            for p in overview.projects[0].health))
+
+    def test_unreadable_metadata_explains_the_usual_cause(self):
+        overview = panel.collect([("A", FakeTable(None, []))], Settings(), {}, now=NOW)
+        self.assertIn("添加文档应用", overview.projects[0].error)
+
+    def test_empty_metadata_is_treated_the_same_as_unreadable(self):
+        """多维表格的主字段不可删，健康的表不可能一列都没有。"""
+        overview = panel.collect([("A", FakeTable({}, []))], Settings(), {}, now=NOW)
+        self.assertIn("添加文档应用", overview.projects[0].error)
+
+    def test_one_broken_table_does_not_break_the_others(self):
+        settings = Settings()
+        broken = FakeTable(healthy_meta(settings), [],
+                           search_error=RuntimeError("权限被收回"))
+        good = FakeTable(healthy_meta(settings), [], app_token="t2", table_id="tb2")
+        overview = panel.collect([("坏", broken), ("好", good)], settings, {}, now=NOW)
+        self.assertIn("权限被收回", overview.projects[0].error)
+        self.assertEqual(overview.projects[1].error, "")
+
+    def test_digest_columns_not_requested_by_default(self):
+        settings = Settings()
+        table = FakeTable(healthy_meta(settings), [])
+        panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertNotIn(settings.fields.comment_digest, table.searched_fields)
+
+
+class TestCache(unittest.TestCase):
+    def test_keeps_the_last_good_snapshot_when_a_refresh_fails(self):
+        """一次网络抖动不该让整个面板变成白纸。"""
+        results = [summary.Overview(projects=[]), RuntimeError("网络抖了一下")]
+
+        def produce():
+            item = results.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        cache = panel.Cache(produce, ttl=999)
+        cache.refresh()
+        first, error, _ = cache.snapshot()
+        self.assertIsNotNone(first)
+        self.assertEqual(error, "")
+        cache.refresh()
+        second, error, _ = cache.snapshot()
+        self.assertIs(second, first)
+        self.assertIn("网络抖了一下", error)
+
+    def test_first_failure_leaves_no_snapshot_but_records_why(self):
+        cache = panel.Cache(lambda: (_ for _ in ()).throw(RuntimeError("挂了")), ttl=999)
+        cache.refresh()
+        value, error, _ = cache.snapshot()
+        self.assertIsNone(value)
+        self.assertIn("挂了", error)
+
+
+class TestFeishuBase(unittest.TestCase):
+    def test_explicit_domain_wins(self):
+        self.assertEqual(panel._feishu_base({"FEISHU_DOMAIN": "https://acme.feishu.cn"}),
+                         "https://acme.feishu.cn")
+
+    def test_bare_domain_gets_https(self):
+        self.assertEqual(panel._feishu_base({"FEISHU_DOMAIN": "acme.feishu.cn"}),
+                         "https://acme.feishu.cn")
+
+    def test_scraped_from_tables_spec(self):
+        spec = "A=bascnX:tblY; B=https://acme.feishu.cn/base/bascnZ?table=tblW"
+        self.assertEqual(panel._feishu_base({"FEISHU_TABLES": spec}),
+                         "https://acme.feishu.cn")
+
+    def test_falls_back_to_the_generic_domain(self):
+        self.assertEqual(panel._feishu_base({}), "https://feishu.cn")
+
+
+# ---------------------------------------------------------------- 渲染
+
+class TestRendering(unittest.TestCase):
+    def _page(self, snap, **kwargs):
+        overview = summary.Overview(projects=[snap], generated_at=NOW)
+        return panel_view.overview_page(
+            overview=overview, error="", fetched_at=NOW.timestamp(),
+            config=config(**kwargs), csrf="tok")
+
+    def _snap(self, **kwargs):
+        base = dict(label="项目A", app_token="t", table_id="tb")
+        base.update(kwargs)
+        return summary.ProjectSnapshot(**base)
+
+    def test_escapes_text_that_came_from_feishu(self):
+        """诊断信息、项目名、评论正文都是人写的字。直接拼进 HTML 就是存储型 XSS。"""
+        todo = summary.TodoRow(record_id="r1", project="<img src=x onerror=alert(1)>",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               link_cell="", reasons=["风控中"],
+                               diagnosis="</td><script>alert(1)</script>")
+        page = self._page(self._snap(todos=[todo]))
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertNotIn("<img src=x onerror", page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_no_external_resources(self):
+        page = self._page(self._snap())
+        for pattern in (r'src=["\']https?://', r'href=["\']https?://(?!\w+\.feishu)',
+                        r'@import', r'//cdn\.'):
+            self.assertIsNone(re.search(pattern, page),
+                              f"页面里出现了外部资源：{pattern}")
+
+    def test_empty_todo_list_says_so_plainly(self):
+        page = self._page(self._snap())
+        self.assertIn("没有需要处理的行", page)
+
+    def test_deep_link_is_present_for_each_todo(self):
+        todo = summary.TodoRow(record_id="rec1", project="A",
+                               record_url="https://acme.feishu.cn/base/t?table=tb&record=rec1",
+                               link_cell="", reasons=["有负面"])
+        page = self._page(self._snap(todos=[todo]))
+        self.assertIn("record=rec1", page)
+        self.assertIn("去这一行", page)
+
+    def test_generic_domain_warning_shown_when_unset(self):
+        page = self._page(self._snap())
+        self.assertIn("FEISHU_DOMAIN", page)
+
+    def test_no_warning_when_domain_is_configured(self):
+        page = self._page(self._snap(), feishu_base="https://acme.feishu.cn")
+        self.assertNotIn("FEISHU_DOMAIN", page)
+
+    def test_health_problems_are_shown_verbatim(self):
+        page = self._page(self._snap(health=["「流量状态」缺这些选项：观察中。"]))
+        self.assertIn("缺这些选项", page)
+
+    def test_stale_snapshot_is_labelled(self):
+        overview = summary.Overview(projects=[self._snap()], generated_at=NOW)
+        page = panel_view.overview_page(
+            overview=overview, error="FeishuError: 权限被收回",
+            fetched_at=NOW.timestamp(), config=config(), csrf="tok")
+        self.assertIn("上一次取数失败", page)
+        self.assertIn("权限被收回", page)
+
+    def test_cold_start_page_does_not_crash(self):
+        page = panel_view.overview_page(
+            overview=None, error="", fetched_at=0.0, config=config(), csrf="")
+        self.assertIn("正在第一次取数", page)
+
+    def test_login_page_escapes_its_message(self):
+        page = panel_view.login_page("<script>alert(1)</script>")
+        self.assertNotIn("<script>alert(1)</script>", page)
+
+    def test_page_never_contains_the_password_or_secret(self):
+        """密钥绝不下发前端。"""
+        page = self._page(self._snap())
+        self.assertNotIn(GOOD_PASSWORD, page)
+        self.assertNotIn("secret-bytes", page)
+
+
+class TestJsonPayload(unittest.TestCase):
+    def test_todo_json_is_serialisable_and_carries_no_secrets(self):
+        todo = summary.TodoRow(record_id="r1", project="A", record_url="u",
+                               link_cell="https://xhs/x", reasons=["风控中"])
+        blob = json.dumps(panel._todo_json(todo), ensure_ascii=False)
+        self.assertIn("风控中", blob)
+
+    def test_project_json_round_trips(self):
+        snap = summary.ProjectSnapshot(label="A", app_token="t", table_id="tb",
+                                       total_rows=3, due_yuan=1.23456)
+        payload = panel._project_json(snap)
+        self.assertEqual(payload["due_yuan"], 1.23)
+        json.dumps(payload, ensure_ascii=False)
+
+
+class TestLogSanitising(unittest.TestCase):
+    def test_control_characters_are_scrubbed(self):
+        """Python 3.12 才在 BaseHTTPRequestHandler 里做这件事，
+        而这个项目钉在 3.11——不自己做，远端能往终端里塞转义序列。"""
+        dirty = "GET /\x1b[31mred\x00\x07 HTTP/1.1"
+        clean = panel._sanitize_for_log(dirty)
+        self.assertNotIn("\x1b", clean)
+        self.assertNotIn("\x00", clean)
+        self.assertNotIn("\x07", clean)
+
+    def test_长度有上界(self):
+        self.assertLessEqual(len(panel._sanitize_for_log("x" * 5000)), 200)
+
+
+# ---------------------------------------------------------------- 真起服务
+
+class TestOverHttp(unittest.TestCase):
+    """真起一个服务、真发 HTTP 请求。
+
+    鉴权、CSRF、Cookie 属性这几件事，单看函数是测不出来的——
+    它们的 bug 全都长在「handler 到底往响应里写了什么」上。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from xhsearch import schema as _schema
+
+        # 访问日志会把测试输出淹掉。这里静音，但**不改生产行为**——
+        # 日志的清洗逻辑另有单测（TestLogSanitising）盯着。
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        cls.addClassCleanup(quiet.stop)
+
+        settings = Settings()
+
+        class Table:
+            app_token, table_id = "bascnAAA", "tblBBB"
+
+            def fields_meta(self):
+                return {n: {"type": a[0], "ui_type": "",
+                            "options": list(o) if o else None}
+                        for n, a, _l, o, _x in _schema.expected_schema(settings)}
+
+            def search(self, fields, *, filter_spec=None, **kwargs):
+                return [{"record_id": "r1", "fields": {
+                    settings.fields.link: "https://www.xiaohongshu.com/explore/aa",
+                    settings.fields.traffic_status: ["风控中"],
+                    settings.fields.failure_reason: "1006 内容被限制",
+                }}]
+
+        cls.config = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32,
+                                       port=0, cache_seconds=999)
+        cache = panel.Cache(
+            lambda: panel.collect([("A", Table())], settings, {}, now=NOW), ttl=999)
+        cache.refresh()
+        cls.cache = cache
+        cls.server = panel.build_server(cls.config, cache, host="127.0.0.1")
+        cls.port = cls.server.server_address[1]
+        cls.thread = __import__("threading").Thread(
+            target=cls.server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.cache.stop()
+
+    def _call(self, path, *, data=None, headers=None, method=None,
+              follow=True, host="localhost"):
+        import urllib.error
+        import urllib.request
+
+        url = f"http://{host}:{self.port}{path}"
+        request = urllib.request.Request(url, data=data, headers=headers or {},
+                                         method=method)
+        if follow:
+            opener = urllib.request.build_opener()
+        else:
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **k):
+                    return None
+            opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            resp = opener.open(request, timeout=5)
+            return resp.status, resp.read().decode("utf-8", "replace"), resp.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace"), exc.headers
+
+    def _login(self, host="localhost", headers=None):
+        status, _body, resp_headers = self._call(
+            "/login", data=b"password=" + GOOD_PASSWORD.encode(),
+            headers=headers, follow=False, host=host)
+        cookie = resp_headers.get("Set-Cookie") or ""
+        token = cookie.split("=", 1)[1].split(";")[0] if "=" in cookie else ""
+        return status, cookie, token
+
+    def _authed(self, token):
+        return {"Cookie": f"{panel.COOKIE_NAME}={token}"}
+
+    # —— 无需登录 ——
+    def test_healthz_needs_no_password(self):
+        status, body, _ = self._call("/healthz")
+        self.assertEqual((status, body), (200, "ok"))
+
+    def test_root_without_session_is_the_login_page(self):
+        status, body, _ = self._call("/")
+        self.assertEqual(status, 200)
+        self.assertIn("口令", body)
+        self.assertNotIn("要人管的行", body)
+
+    def test_api_without_session_is_401(self):
+        self.assertEqual(self._call("/api/overview")[0], 401)
+
+    def test_unknown_route_is_404(self):
+        self.assertEqual(self._call("/nope")[0], 404)
+
+    def test_security_headers_are_present(self):
+        _s, _b, headers = self._call("/healthz")
+        self.assertIn("Content-Security-Policy", headers)
+        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(headers.get("X-Frame-Options"), "DENY")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+
+    # —— 登录 ——
+    def test_wrong_password_is_401_and_grants_nothing(self):
+        status, body, headers = self._call("/login", data=b"password=nope")
+        self.assertEqual(status, 401)
+        self.assertIn("口令不对", body)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_oversized_body_is_rejected_before_reading(self):
+        status, _b, _h = self._call("/login", data=b"password=" + b"x" * 70000)
+        self.assertEqual(status, 413)
+
+    def test_missing_content_length_is_411(self):
+        # urllib 总会带 Content-Length，所以直接走裸 socket。
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(b"POST /login HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            self.assertIn(b"411", sock.recv(64))
+
+    def test_login_then_see_the_panel(self):
+        status, _cookie, token = self._login()
+        self.assertEqual(status, 303)
+        body = self._call("/", headers=self._authed(token))[1]
+        self.assertIn("要人管的行", body)
+        self.assertIn("1006 内容被限制", body)
+        self.assertIn("record=r1", body)
+
+    def test_password_never_appears_in_any_response(self):
+        _s, _c, token = self._login()
+        for path in ("/", "/api/overview"):
+            self.assertNotIn(GOOD_PASSWORD, self._call(path, headers=self._authed(token))[1])
+
+    # —— Cookie 属性 ——
+    def test_plain_localhost_omits_secure_so_local_dev_works(self):
+        _s, cookie, _t = self._login()
+        self.assertNotIn("Secure", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+
+    def test_https_forwarded_gets_secure(self):
+        _s, cookie, _t = self._login(headers={"X-Forwarded-Proto": "https"})
+        self.assertIn("Secure", cookie)
+
+    def test_unknown_host_gets_secure(self):
+        """判断不出来是不是明文时，从严——失败方向必须是「更严」。"""
+        _s, cookie, _t = self._login(host="127.0.0.1",
+                                     headers={"Host": "panel.up.railway.app"})
+        self.assertIn("Secure", cookie)
+
+    # —— CSRF ——
+    def test_post_without_the_header_is_refused(self):
+        _s, _c, token = self._login()
+        status, _b, _h = self._call("/api/refresh", data=b"", method="POST",
+                                    headers=self._authed(token))
+        self.assertEqual(status, 403)
+
+    def test_post_with_a_wrong_header_is_refused(self):
+        _s, _c, token = self._login()
+        headers = {**self._authed(token), panel.CSRF_HEADER: "not-the-token"}
+        status, _b, _h = self._call("/api/refresh", data=b"", method="POST",
+                                    headers=headers)
+        self.assertEqual(status, 403)
+
+    def test_post_with_the_matching_header_works(self):
+        _s, _c, token = self._login()
+        csrf = panel.csrf_token(self.config, token)
+        headers = {**self._authed(token), panel.CSRF_HEADER: csrf}
+        status, body, _h = self._call("/api/refresh", data=b"", method="POST",
+                                      headers=headers)
+        self.assertEqual(status, 200)
+        self.assertIn("风控中", body)
+
+    def test_session_value_is_not_accepted_as_the_csrf_token(self):
+        """CSRF token 是派生值，不是会话本身——会话原值不该能当它用。
+        （否则页面里那个 data-csrf 就等于把 HttpOnly 的 Cookie 抄进了 DOM。）"""
+        _s, _c, token = self._login()
+        headers = {**self._authed(token), panel.CSRF_HEADER: token}
+        status, _b, _h = self._call("/api/refresh", data=b"", method="POST",
+                                    headers=headers)
+        self.assertEqual(status, 403)
+
+    def test_page_does_not_leak_the_session_value(self):
+        _s, _c, token = self._login()
+        body = self._call("/", headers=self._authed(token))[1]
+        self.assertNotIn(token, body)
+        self.assertIn(panel.csrf_token(self.config, token), body)
+
+    def test_forged_cookie_does_not_get_in(self):
+        headers = {"Cookie": f"{panel.COOKIE_NAME}=99999999999.deadbeef"}
+        self.assertEqual(self._call("/api/overview", headers=headers)[0], 401)
+
+
+if __name__ == "__main__":
+    unittest.main()

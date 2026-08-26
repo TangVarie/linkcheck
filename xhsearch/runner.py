@@ -1135,6 +1135,32 @@ def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: i
 # ---------- 与飞书表的对接 ----------
 
 
+def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
+    """一条飞书 record → 一个 Row。**纯函数，不发请求。**
+
+    抽出来是为了给第二个读侧用：监控面板要按更宽的列做一次 search
+    （它还要 巡查状态/负面状态/诊断信息 这些判定链路用不到的列），
+    但「这一格怎么读成 Row 的哪个字段」必须和 load_rows 逐字相同——
+    两处各写一遍的话，面板算出来的「到期几行、预计多少钱」迟早和
+    真正开跑时不是一个数，而那正是最难发现的一类不一致。
+    """
+    f = settings.fields
+    cells = record.get("fields") or {}
+    return Row(
+        record_id=record.get("record_id") or "",
+        link_cell=feishu.read_text(cells.get(f.link)),
+        publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
+        seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
+        negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
+        current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
+        previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
+        last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
+        consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
+        pin_status=feishu.read_text(cells.get(f.pinned_status)),
+        queued=feishu.read_bool(cells.get(f.queued)),
+    )
+
+
 def load_rows(
     table: feishu.Bitable,
     settings: Settings,
@@ -1192,20 +1218,7 @@ def load_rows(
         record_id = record.get("record_id") or ""
         if wanted and record_id not in wanted:
             continue
-        cells = record.get("fields") or {}
-        row = Row(
-            record_id=record_id,
-            link_cell=feishu.read_text(cells.get(f.link)),
-            publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
-            seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
-            negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
-            current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
-            previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
-            last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
-            consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
-            pin_status=feishu.read_text(cells.get(f.pinned_status)),
-            queued=feishu.read_bool(cells.get(f.queued)),
-        )
+        row = row_from_record(record, settings)
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。
         if wanted or row.queued or not only_due or row.is_due(settings, now):
             result.append(row)
