@@ -43,6 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
+from . import balance as balance_mod
 from . import feishu, provision, railway, registry, schema, summary, tablespec
 
 tablespec_BadTarget = tablespec.BadTarget
@@ -92,6 +93,18 @@ class PanelConfig:
     registry_target: str = ""
     app_id: str = ""
     app_secret: str = ""
+    # 余额那一块。两家的余额端点都是官方标明零费用的（见 xhsearch/balance.py
+    # 开头那张表），所以「面板不发付费请求」这条不变量没被动过——
+    # 而且面板本来就一直在发免费请求（飞书、Railway）。
+    show_balance: bool = True
+    tikhub_base: str = ""
+    socialdatax_base: str = ""
+    usd_to_cny: float = 7.2
+    # 余额还够跑几天，低于这个就报红/报黄。做成两级是因为它们要人做的事
+    # 不一样：黄 = 该安排充值了，红 = 再不管就要断供。
+    runway_warn_days: float = 14.0
+    runway_alert_days: float = 5.0
+    api_keys: dict = field(default_factory=dict)
     railway: railway.RailwayConfig = field(
         default_factory=lambda: railway.RailwayConfig(token="", environment_id=""))
     # 送到浏览器的日志文本要按这一组逐个脱敏。**别只放上游 Key**：
@@ -132,6 +145,11 @@ class PanelConfig:
             registry_target=(env.get("FEISHU_REGISTRY") or "").strip(),
             app_id=(env.get("FEISHU_APP_ID") or "").strip(),
             app_secret=(env.get("FEISHU_APP_SECRET") or "").strip(),
+            show_balance=_bool_env(env, "PANEL_SHOW_BALANCE", True),
+            runway_warn_days=_float_env(env, "PANEL_RUNWAY_WARN_DAYS",
+                                        14.0, 0.5, 3650.0),
+            runway_alert_days=_float_env(env, "PANEL_RUNWAY_ALERT_DAYS",
+                                         5.0, 0.5, 3650.0),
             railway=railway.RailwayConfig.from_env(env),
             secrets=_secrets(env),
         )
@@ -463,6 +481,140 @@ class LogFeed:
             return list(self._lines), self._error
 
 
+class BalanceFeed:
+    """两家通道余额的缓存。**只打官方标明零费用的端点**（见 balance.py）。
+
+    单独一个缓存，和聚合缓存、日志缓存都分开。三者的失败模式互不相干：
+    余额接口 401 不该让整个面板空白，也不该让日志那一块跟着消失。
+
+    TTL 跟着面板的聚合缓存走。TikHub 那个端点限速 1/second，60 秒一次
+    余量三个数量级；后台单线程刷，不是「谁开页面就打一次」——
+    否则五个人同时刷新页面就是五倍上游请求。
+    """
+
+    def __init__(self, config: PanelConfig, ttl: float, read=None):
+        self._config = config
+        self._ttl = ttl
+        self._read = read or balance_mod.read_all
+        self._lock = threading.Lock()
+        self._items: list = []
+        self._error = ""
+        self._fetched_at = 0.0
+        self._loaded = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._config.show_balance and self._config.api_keys)
+
+    def why_disabled(self) -> str:
+        if not self._config.show_balance:
+            return "已关掉（PANEL_SHOW_BALANCE=0）"
+        return ("没配 TIKHUB_API_KEY / SOCIALDATAX_API_KEY，读不到余额。"
+                "这两个端点是免费的，配上不会花钱")
+
+    def get(self, *, force: bool = False) -> tuple[list, str]:
+        if not self.enabled:
+            return [], self.why_disabled()
+        with self._lock:
+            fresh = (time.time() - self._fetched_at) < self._ttl
+            if fresh and not force and self._loaded:
+                return list(self._items), self._error
+        try:
+            items = self._read(
+                self._config.api_keys,
+                tikhub_base=self._config.tikhub_base,
+                socialdatax_base=self._config.socialdatax_base,
+                usd_to_cny=self._config.usd_to_cny)
+            with self._lock:
+                self._items, self._error = list(items), ""
+                self._fetched_at = time.time()
+                self._loaded = True
+        except Exception as exc:                                # noqa: BLE001
+            # 保留上一批。整块取数炸了和「某一家读不到」是两回事——
+            # 后者由 Balance.error 逐家表达，不会走到这里。
+            #
+            # 过一遍脱敏：这句话会渲染到页面上，而异常文本的内容不由我们决定
+            # （第三方库可能把请求头、URL 原样塞进去）。这里的 Key 本来就在
+            # 配置里，多脱一次的代价只是几次字符串替换。
+            with self._lock:
+                self._error = railway.redact(f"{type(exc).__name__}: {exc}",
+                                             self._config.secrets)
+                self._fetched_at = time.time()
+                self._loaded = True
+        with self._lock:
+            return list(self._items), self._error
+
+
+@dataclass
+class Runway:
+    """按最近的实际花速，余额还够跑多久。**不发任何请求**——
+    花速来自 Railway 日志里已有的 run 历史，余额来自 BalanceFeed。
+
+    这是运营真正想知道的那个数：「还能跑多久」比「还剩多少钱」有用，
+    因为后者要人自己心算，而心算的前提是知道每天花多少——那正是没人知道的。
+    """
+
+    days: Optional[float] = None
+    yuan_per_day: float = 0.0
+    yuan_left: float = 0.0
+    # 算这个花速用了几轮、覆盖多长时间。样本太少的时候这个数会很飘，
+    # 页面上要把依据一起显示出来，别让人把它当成一个准数。
+    runs_used: int = 0
+    hours_covered: float = 0.0
+    # 有通道读不到余额时，`yuan_left` 是**下界**，days 也就是下界。
+    partial: bool = False
+    reason: str = ""
+
+    @property
+    def known(self) -> bool:
+        return self.days is not None
+
+
+# 花速至少要这么多轮、这么长时间才算得准。低于它就只报「样本不够」——
+# 一轮恰好赶上批量勾排队刷新，算出来的日花速能比真实高一个数量级，
+# 据此说「只够跑 2 天」会让人白白去充一笔钱。
+MIN_RUNWAY_RUNS = 3
+MIN_RUNWAY_HOURS = 2.0
+
+
+def runway_from_runs(balances: list, runs: list) -> Runway:
+    """余额 + run 历史 → 还够跑几天。"""
+    usable = [b for b in (balances or []) if getattr(b, "ok", False)]
+    if not usable:
+        return Runway(reason="两家余额都读不到")
+    yuan_left = sum(b.yuan or 0.0 for b in usable)
+    partial = len(usable) < len(balances or [])
+
+    # `is not None`，**不是真值判断**：一个 started_at == 0 的轮子会被真值
+    # 判断悄悄丢掉，于是花速按少一轮算、还够跑多久跟着偏。同一类坑在这个
+    # 仓库里已经踩过一次（`now or time.time()` 把 epoch 0 当成没传）。
+    finished = [r for r in (runs or [])
+                if r.started_at is not None and r.ended_at is not None
+                and r.cost_yuan is not None and r.cost_yuan >= 0]
+    if len(finished) < MIN_RUNWAY_RUNS:
+        return Runway(yuan_left=yuan_left, partial=partial,
+                      runs_used=len(finished),
+                      reason=f"只有 {len(finished)} 轮记录，"
+                             f"至少要 {MIN_RUNWAY_RUNS} 轮才算得准")
+    first = min(r.started_at for r in finished)
+    last = max(r.ended_at for r in finished)
+    hours = (last - first) / 3600.0
+    if hours < MIN_RUNWAY_HOURS:
+        return Runway(yuan_left=yuan_left, partial=partial,
+                      runs_used=len(finished), hours_covered=hours,
+                      reason=f"这些轮只覆盖了 {hours:.1f} 小时，"
+                             f"不足 {MIN_RUNWAY_HOURS:.0f} 小时，花速还看不准")
+    spent = sum(r.cost_yuan for r in finished)
+    per_day = spent / hours * 24.0
+    if per_day <= 0:
+        return Runway(yuan_left=yuan_left, partial=partial,
+                      runs_used=len(finished), hours_covered=hours,
+                      reason="最近这些轮一分钱没花，算不出花速（也就不用担心）")
+    return Runway(days=yuan_left / per_day, yuan_per_day=per_day,
+                  yuan_left=yuan_left, runs_used=len(finished),
+                  hours_covered=hours, partial=partial)
+
+
 # 面板对**业务表数据**唯一允许写的列。只有一个元素，而且不会变长。
 #
 # 为什么是白名单而不是黑名单：黑名单要穷举「不许写什么」，漏一个就是默许。
@@ -774,6 +926,7 @@ class _Deps:
     config: PanelConfig
     cache: Cache
     logs: Optional["LogFeed"] = None
+    balances: Optional["BalanceFeed"] = None
     projects: Optional["Projects"] = None
     queueing: Optional["Queueing"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
@@ -855,6 +1008,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.deps.cache.refresh()
             if self.deps.logs is not None:
                 self.deps.logs.get(force=True)
+            if self.deps.balances is not None:
+                self.deps.balances.get(force=True)
             return self._send_json(200, self._overview_payload())
         return self._send_json(404, {"error": "not found"})
 
@@ -984,10 +1139,18 @@ class PanelHandler(BaseHTTPRequestHandler):
     def _page(self) -> str:
         overview, error, fetched_at = self.deps.cache.snapshot()
         runs, log_error = self._runs()
+        balances, balance_error = self._balances()
         return self.deps.render_page(
             overview=overview, error=error, fetched_at=fetched_at,
             config=self.deps.config, runs=runs, log_error=log_error,
+            balances=balances, balance_error=balance_error,
+            runway=runway_from_runs(balances, runs),
             csrf=csrf_token(self.deps.config, self._session_token()))
+
+    def _balances(self):
+        if self.deps.balances is None:
+            return [], ""
+        return self.deps.balances.get()
 
     def _runs(self):
         if self.deps.logs is None:
@@ -1248,14 +1411,15 @@ class PanelServer(ThreadingHTTPServer):
 
 
 def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] = None,
+                 balances: Optional["BalanceFeed"] = None,
                  projects: Optional[Projects] = None,
                  queueing: Optional[Queueing] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
-        config=config, cache=cache, logs=logs, projects=projects,
-        queueing=queueing,
+        config=config, cache=cache, logs=logs, balances=balances,
+        projects=projects, queueing=queueing,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -1267,11 +1431,12 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     """起面板。阻塞到进程被杀。"""
     cache = Cache(produce, config.cache_seconds)
     logs = LogFeed(config, config.cache_seconds)
+    balances = BalanceFeed(config, config.cache_seconds)
     resolved = settings or Settings()
     projects = Projects(config, resolved)
     queueing = Queueing(config, resolved) if config.app_id else None
-    server = build_server(config, cache, logs=logs, projects=projects,
-                          queueing=queueing)
+    server = build_server(config, cache, logs=logs, balances=balances,
+                          projects=projects, queueing=queueing)
     cache.start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"

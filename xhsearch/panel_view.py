@@ -548,6 +548,10 @@ def _run_row(run, offset_hours: float) -> str:
     if run.budget_stopped:
         extra.append("<span class='chip a'>预算触顶</span>")
     tables = "、".join(_e(t.label) for t in run.tables) or "—"
+    # 「跑完还剩多少」——不是额外查的，每次付费响应本来就带 points.balance。
+    # None = 这一轮没走 SocialDataX（全走 TikHub 了），显示「—」不是 ¥0。
+    left = ("—" if run.points_balance is None
+            else f"¥{run.points_yuan:.2f}")
     started = _stamp(int(run.started_at * 1000) if run.started_at else None,
                      offset_hours)
     return ("<tr>"
@@ -556,6 +560,7 @@ def _run_row(run, offset_hours: float) -> str:
             f"<td>{tables}</td>"
             f"<td class=nowrap>{run.rows}</td>"
             f"<td class=nowrap>¥{run.cost_yuan:.2f}</td>"
+            f"<td class=nowrap>{left}</td>"
             f"<td>{badge}{''.join(extra)}</td>"
             "</tr>")
 
@@ -570,7 +575,7 @@ def _runs_section(runs, log_error: str, offset_hours: float) -> str:
                 "Railway 免费/Hobby 套餐日志只留 7 天。</span></div>")
         return f"<h2>运行历史</h2>{note}{body}"
     head = ("<tr><th>开跑</th><th>模式</th><th>表</th><th>行数</th>"
-            "<th>花费</th><th>结果</th></tr>")
+            "<th>花费</th><th>跑完剩</th><th>结果</th></tr>")
     rows = "".join(_run_row(r, offset_hours) for r in runs)
     unfinished = sum(1 for r in runs if not r.finished)
     warn = ""
@@ -606,9 +611,69 @@ def _projects_section(config) -> str:
 </div>"""
 
 
+def _balance_section(balances, balance_error: str, runway, config) -> str:
+    """余额那一块。
+
+    ⚠️ **读不到就说读不到，绝不显示 ¥0。** 真的余额为 0 和读不到余额，
+    要人做的事完全相反（一个去充值，一个去查 Key），而 ¥0 长得像前者。
+    这和「缺列时 estimate 报 ¥0.00」是同一类错误。
+    """
+    if not balances and not balance_error:
+        return ""
+    if not balances:
+        return (f"<h2>余额</h2><div class=empty>{_e(balance_error)}</div>")
+
+    warn_days = getattr(config, "runway_warn_days", 14.0)
+    alert_days = getattr(config, "runway_alert_days", 5.0)
+    cards = []
+    for b in balances:
+        if b.error:
+            cards.append(
+                f"<div class='card bad'><h3>{_e(b.label)}</h3>"
+                f"<div class=problem>读不到：{_e(b.error)}</div>"
+                "<div class=muted>这不等于余额为 0——去对应后台看一眼，"
+                "或检查 Key 是不是过期了</div></div>")
+            continue
+        if b.unit == "USD":
+            main = f"${b.amount:.2f}"
+            sub = (f"≈ ¥{b.yuan:.2f}（按 {b.rate:g} 折算）"
+                   if b.yuan is not None else "")
+        else:
+            main = f"{b.amount:.0f} 积分"
+            sub = f"≈ ¥{b.yuan:.2f}" if b.yuan is not None else ""
+        credit = (f"<div class=muted>另有赠送额度 {b.free_credit:g}</div>"
+                  if b.free_credit else "")
+        cards.append(
+            f"<div class=card><h3>{_e(b.label)}</h3>"
+            f"<div style='font-size:24px;font-weight:600'>{_e(main)}</div>"
+            f"<div class=muted>{_e(sub)}</div>{credit}</div>")
+
+    note = ""
+    if runway is not None and runway.known:
+        cls = "problem" if runway.days <= alert_days else (
+            "note" if runway.days <= warn_days else "muted")
+        partial = ("；<b>只算了读得到的那家</b>，实际比这个多"
+                   if runway.partial else "")
+        note = (f"<div class={cls}>按最近 {runway.runs_used} 轮"
+                f"（{runway.hours_covered:.1f} 小时）的实际花速 "
+                f"¥{runway.yuan_per_day:.2f}/天，余额还够跑 "
+                f"<b>{runway.days:.0f} 天</b>{partial}</div>")
+    elif runway is not None and runway.reason:
+        note = f"<div class=muted>还算不出「够跑多久」：{_e(runway.reason)}</div>"
+    err = (f"<div class=note>⚠ 取余额失败：{_e(balance_error)}，"
+           "下面是上一次还能用的读数。</div>" if balance_error else "")
+    return (f"<h2>余额</h2>{err}{note}"
+            f"<div class=grid>{''.join(cards)}</div>"
+            "<div class=muted style='margin-top:8px'>这两个查询端点是两家"
+            "<b>官方标明零费用</b>的（TikHub 计价表 <code>endpoint_cost: 0.0</code>；"
+            "SocialDataX <code>x-socialdatax-cost-points: 0</code>）—— "
+            "看余额本身不花钱。</div>")
+
+
 def overview_page(*, overview: Optional[summary.Overview], error: str,
                   fetched_at: float, config, csrf: str = "",
                   runs=None, log_error: str = "",
+                  balances=None, balance_error: str = "", runway=None,
                   offset_hours: float = 8.0) -> str:
     if overview is None:
         inner = ("<div class=wrap><header><h1>监控面板</h1></header>"
@@ -654,6 +719,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                           if overview.unestimatable else "")),
         _stat(overview.queued_rows, "排队中"),
         _stat(overview.stale_rows, "卡住了", alert=bool(overview.stale_rows)),
+        *_runway_stat(runway, config),
     ])
 
     inner = f"""<div class=wrap>
@@ -681,6 +747,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
 {_projects_section(config)}
 
+{_balance_section(balances or [], balance_error, runway, config)}
+
 {_runs_section(runs or [], log_error, offset_hours)}
 
 <p class=muted style='margin-top:26px'>这个面板只读飞书表，
@@ -688,6 +756,18 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 后台 cron 会在 5 分钟内接手。</p>
 </div>"""
     return _shell("监控面板", inner, csrf=csrf)
+
+
+def _runway_stat(runway, config) -> list:
+    """顶栏那一格「还够跑」。算不出就整格不显示——
+    顶栏放一个「—」只会占位置，还让人以为是 0。"""
+    if runway is None or not runway.known:
+        return []
+    alert_days = getattr(config, "runway_alert_days", 5.0)
+    warn_days = getattr(config, "runway_warn_days", 14.0)
+    label = "还够跑" + ("（下界）" if runway.partial else "")
+    return [_stat(f"{runway.days:.0f} 天", label,
+                  alert=runway.days <= max(alert_days, warn_days))]
 
 
 def _stat(value, key: str, *, alert: bool = False) -> str:

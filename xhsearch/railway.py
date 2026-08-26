@@ -324,6 +324,19 @@ class Run:
     channels_dead: bool = False
     stopped: bool = False
     budget_stopped: str = ""
+    # 这一轮跑完时 SocialDataX 还剩多少积分。**不是额外查来的**——
+    # 每一次付费响应本来就带 `points.balance`，runner 已经写进 run_end 事件，
+    # 这里只是捞出来。零请求、零 Key，而且它是「花完这一轮之后」的真实读数，
+    # 比任何时点查询都更贴近「这轮花掉了多少」。
+    # None = 这一轮没走 SocialDataX（全走 TikHub 了），不是 0。
+    points_balance: Optional[int] = None
+
+    @property
+    def points_yuan(self) -> Optional[float]:
+        """积分折成人民币。1 积分 = ¥0.01。"""
+        if self.points_balance is None:
+            return None
+        return self.points_balance * 0.01
 
     @property
     def finished(self) -> bool:
@@ -392,6 +405,8 @@ def build_runs(lines: Iterable[LogLine], *, limit: int = 50) -> list[Run]:
             run.channels_dead = bool(event.get("channels_dead"))
             run.stopped = bool(event.get("stopped"))
             run.budget_stopped = str(event.get("budget_stopped") or "")
+            balance = event.get("points_balance")
+            run.points_balance = None if balance is None else _as_int(balance)
         # EVENT_ROW 有意忽略，见 docstring。
         if run.started_at is None and stamp is not None:
             run.started_at = _as_float(stamp, None)

@@ -134,6 +134,11 @@ TIKHUB_USD = {"xhs": 0.010, "douyin": 0.001}
 SOCIALDATAX_YUAN = 0.10   # 10 积分 × ¥0.01，全平台统一价
 
 
+def usd_to_cny() -> float:
+    """当前汇率。给面板折算 TikHub 余额用——那边不该去读私有变量。"""
+    return _USD_TO_CNY
+
+
 def set_pricing(*, usd_to_cny: Optional[float] = None,
                 tikhub_usd: Optional[dict[str, float]] = None,
                 socialdatax_yuan: Optional[float] = None) -> None:
