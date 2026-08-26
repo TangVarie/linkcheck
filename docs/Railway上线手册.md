@@ -69,7 +69,7 @@ cd linkcheck
 python3 -m unittest discover -s tests -t .
 ```
 
-**做完应该看到**：`Ran 561 tests ... OK`，一秒内跑完。
+**做完应该看到**：`Ran 753 tests ... OK`，一秒内跑完。
 这一步不需要任何密钥、不联网、不花钱。跑不通就是 Python 版本太老。
 
 ---
@@ -384,6 +384,10 @@ python3 cli.py doctor
 | `PANEL_PASSWORD` | 面板口令，**至少 12 个字符**。没设它面板会拒绝启动 |
 | `FEISHU_DOMAIN` | `https://xxx.feishu.cn`，就是你打开多维表格时地址栏那一段 |
 
+要在面板上加表删表，再跑一次 `python3 cli.py init-registry`（本地跑就行），
+把它打印的 `FEISHU_REGISTRY=...` 加到**项目级**变量里——cron 和面板都要读它。
+**这辈子只做一次**，之后加表全在面板上。
+
 常驻进程约 $0.3–1/月。相对数据接口的 ¥950/月，这是噪声。
 
 > ⚠️ **两条不能踩的线**
@@ -472,7 +476,7 @@ Railway 按「资源 × 分钟」计费，**内存通常是账单里最大的一
 分层刷新间隔、快照里显示几条评论。改完 `git push` 就生效。
 
 改判定逻辑记得跑一遍 `python3 -m unittest discover -s tests -t .`——
-561 个测试全离线，一秒跑完，能挡掉绝大部分改坏的情况。
+753 个测试全离线，一秒跑完，能挡掉绝大部分改坏的情况。
 
 ---
 

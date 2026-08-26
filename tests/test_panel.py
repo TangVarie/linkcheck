@@ -900,5 +900,203 @@ class TestUnknownEstimateIsNotZero(unittest.TestCase):
         self.assertIn("算不出", page)
 
 
+class TestProjectRoutes(unittest.TestCase):
+    """项目页的写路径。它们改的是**注册表**（这套东西自己的配置存储），
+    以及业务表的**结构**（只追加）——业务表的数据一个字都不碰。
+    """
+
+    def _projects(self, **overrides):
+        cfg = config()
+        cfg.registry_target = "bascnREG:tblREG"
+        cfg.app_id = "cli_x"
+        cfg.app_secret = "s"
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return panel.Projects(cfg, Settings(), log=lambda *a: None), cfg
+
+    def test_disabled_until_the_registry_is_configured(self):
+        cfg = config()
+        cfg.app_id = "cli_x"
+        projects = panel.Projects(cfg, Settings())
+        self.assertFalse(projects.enabled)
+        self.assertIn("init-registry", projects.why_disabled())
+
+    def test_missing_app_id_is_reported_distinctly(self):
+        projects = panel.Projects(config(), Settings())
+        self.assertIn("FEISHU_APP_ID", projects.why_disabled())
+
+    def test_enabled_when_both_are_set(self):
+        projects, _ = self._projects()
+        self.assertTrue(projects.enabled)
+
+    def test_build_refuses_when_not_a_collaborator(self):
+        """读不到字段列表就不该乱建列——先把提示给对。"""
+        projects, _ = self._projects()
+        with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                               return_value=None):
+            with self.assertRaises(panel.feishu.FeishuError) as ctx:
+                projects.build("bascnA", "tblB")
+        self.assertIn("添加文档应用", str(ctx.exception))
+
+    def test_build_passes_the_option_switch_through(self):
+        from xhsearch import provision as provision_mod
+        for allowed in (False, True):
+            projects, _ = self._projects(allow_option_patch=allowed)
+            with mock.patch.object(panel.feishu.Bitable, "fields_meta",
+                                   return_value={"x": {"type": 1, "ui_type": "",
+                                                       "options": None}}), \
+                 mock.patch.object(provision_mod, "build_missing") as built:
+                projects.build("bascnA", "tblB")
+            self.assertEqual(built.call_args.kwargs["allow_option_patch"], allowed)
+
+    def test_remove_only_touches_the_registry_row(self):
+        from xhsearch import registry as registry_mod
+        projects, _ = self._projects()
+        with mock.patch.object(registry_mod, "remove") as removed:
+            projects.remove("rec1")
+        self.assertEqual(removed.call_args[0][1], "rec1")
+
+
+class TestProjectRoutesOverHttp(unittest.TestCase):
+    """路由层：鉴权、CSRF、错误翻译。"""
+
+    @classmethod
+    def setUpClass(cls):
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        cls.addClassCleanup(quiet.stop)
+
+        cls.config = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32,
+                                       port=0, cache_seconds=999)
+        cls.config.registry_target = "bascnREG:tblREG"
+        cls.config.app_id = "cli_x"
+        cls.config.app_secret = "s"
+        cls.actions = mock.Mock(spec=panel.Projects)
+        cls.actions.enabled = True
+        cls.actions.why_disabled.return_value = ""
+        cls.actions.list.return_value = []
+        cache = panel.Cache(lambda: summary.Overview(projects=[]), ttl=999)
+        cache.refresh()
+        cls.cache = cache
+        cls.server = panel.build_server(cls.config, cache, projects=cls.actions,
+                                        host="127.0.0.1")
+        cls.port = cls.server.server_address[1]
+        cls.thread = __import__("threading").Thread(
+            target=cls.server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.cache.stop()
+
+    def setUp(self):
+        self.actions.reset_mock()
+        self.actions.enabled = True
+        self.actions.list.return_value = []
+
+    def _call(self, path, *, data=None, headers=None, method=None):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(f"http://localhost:{self.port}{path}",
+                                     data=data, headers=headers or {}, method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
+    def _login(self):
+        import urllib.error
+        import urllib.request
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(f"http://localhost:{self.port}/login",
+                                     data=b"password=" + GOOD_PASSWORD.encode())
+        try:
+            resp = opener.open(req, timeout=5)
+            cookie = resp.headers.get("Set-Cookie") or ""
+        except urllib.error.HTTPError as exc:
+            cookie = exc.headers.get("Set-Cookie") or ""
+        token = cookie.split("=", 1)[1].split(";")[0]
+        return {"Cookie": f"{panel.COOKIE_NAME}={token}",
+                panel.CSRF_HEADER: panel.csrf_token(self.config, token),
+                "Content-Type": "application/json"}
+
+    def test_listing_needs_a_session(self):
+        self.assertEqual(self._call("/api/projects")[0], 401)
+
+    def test_writes_need_a_session(self):
+        status, _ = self._call("/api/projects/remove", data=b"{}", method="POST")
+        self.assertEqual(status, 401)
+
+    def test_writes_need_the_csrf_header(self):
+        headers = self._login()
+        headers.pop(panel.CSRF_HEADER)
+        status, _ = self._call("/api/projects/remove", data=b'{"record_id":"r"}',
+                               headers=headers, method="POST")
+        self.assertEqual(status, 403)
+
+    def test_a_valid_remove_reaches_the_action_layer(self):
+        status, _ = self._call("/api/projects/remove", data=b'{"record_id":"rec9"}',
+                               headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        self.actions.remove.assert_called_once_with("rec9")
+
+    def test_a_bad_link_becomes_a_400_with_the_reason(self):
+        from xhsearch import tablespec
+        self.actions.check.side_effect = tablespec.BadTarget("这一项看不懂")
+        status, body = self._call("/api/projects/check",
+                                  data=b'{"label":"x","target":"junk"}',
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("看不懂", body)
+
+    def test_a_feishu_error_carries_its_remedy(self):
+        """面板要把「怎么修」摆在错误旁边，而不是让人从报错文本里自己找。"""
+        self.actions.build.side_effect = panel.feishu.FeishuError(
+            1254302, "no permission", "这张表开了「高级权限」")
+        status, body = self._call("/api/projects/build",
+                                  data=b'{"app_token":"a","table_id":"t"}',
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("高级权限", body)
+
+    def test_a_non_json_body_is_rejected_cleanly(self):
+        status, body = self._call("/api/projects/add", data=b"not json",
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("JSON", body)
+
+    def test_an_unknown_action_is_404(self):
+        status, _ = self._call("/api/projects/frobnicate", data=b"{}",
+                               headers=self._login(), method="POST")
+        self.assertEqual(status, 404)
+
+    def test_oversized_body_is_still_capped(self):
+        status, _ = self._call("/api/projects/add", data=b"{" + b"x" * 70000,
+                               headers=self._login(), method="POST")
+        self.assertEqual(status, 413)
+
+    def test_add_generates_an_idempotency_key_when_absent(self):
+        self._call("/api/projects/add", data=b'{"label":"x","target":"a:b"}',
+                   headers=self._login(), method="POST")
+        self.assertTrue(self.actions.add.call_args.kwargs["client_token"])
+
+    def test_disabled_projects_explain_why(self):
+        self.actions.enabled = False
+        self.actions.why_disabled.return_value = "还没配 FEISHU_REGISTRY"
+        status, body = self._call("/api/projects/add", data=b"{}",
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("FEISHU_REGISTRY", body)
+
+
 if __name__ == "__main__":
     unittest.main()

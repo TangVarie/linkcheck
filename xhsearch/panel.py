@@ -43,7 +43,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
-from . import feishu, railway, schema, summary
+from . import feishu, provision, railway, registry, schema, summary, tablespec
+
+tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
 
 # 请求体上限。面板的 POST 只有登录表单，几十字节；64 KiB 是三个数量级的余量。
@@ -74,6 +76,13 @@ class PanelConfig:
     # 飞书租户域名。直达链接靠它拼出来，而面板的价值有一半在那个链接上。
     feishu_base: str = "https://feishu.cn"
     read_only: bool = True
+    # 补选项默认不做：PUT fields 对 property 是整体覆盖、飞书按 id 认选项，
+    # 写错一次就是清空全表那一列的值且不可逆。在一张废表上验过再开
+    # （步骤见 docs/待验证清单.md）。
+    allow_option_patch: bool = False
+    registry_target: str = ""
+    app_id: str = ""
+    app_secret: str = ""
     railway: railway.RailwayConfig = field(
         default_factory=lambda: railway.RailwayConfig(token="", environment_id=""))
     # 送到浏览器的日志文本要按这一组逐个脱敏。**别只放上游 Key**：
@@ -103,6 +112,10 @@ class PanelConfig:
             cache_seconds=_float_env(env, "PANEL_CACHE_SECONDS", 60.0, 5.0, 3600.0),
             show_digest=_bool_env(env, "PANEL_SHOW_DIGEST", False),
             feishu_base=_feishu_base(env),
+            allow_option_patch=_bool_env(env, "PANEL_ALLOW_OPTION_PATCH", False),
+            registry_target=(env.get("FEISHU_REGISTRY") or "").strip(),
+            app_id=(env.get("FEISHU_APP_ID") or "").strip(),
+            app_secret=(env.get("FEISHU_APP_SECRET") or "").strip(),
             railway=railway.RailwayConfig.from_env(env),
             secrets=_secrets(env),
         )
@@ -413,6 +426,91 @@ class LogFeed:
             return list(self._lines), self._error
 
 
+class Projects:
+    """注册表的读写。面板对**注册表**的全部写路径都在这里。
+
+    和业务表的写路径（P4 的「排队刷新」）刻意分开：注册表是这套东西自己的
+    配置存储，改它不会碰运营的任何数据；业务表是运营的资产，那边的白名单
+    只有一列。两者混在一起会让「面板到底能写什么」说不清。
+    """
+
+    def __init__(self, config: PanelConfig, settings: Settings,
+                 log: Callable[[str], None] = print):
+        self.config = config
+        self.settings = settings
+        self.log = log
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.registry_target and self.config.app_id)
+
+    def why_disabled(self) -> str:
+        if not self.config.app_id:
+            return "面板没配 FEISHU_APP_ID"
+        return ("还没配 FEISHU_REGISTRY——在面板上加表删表需要一个存清单的地方。"
+                "跑一次 `python3 cli.py init-registry`，它会自动建好并打印"
+                "这一行环境变量，粘进 Railway 就行（这辈子只用做一次）。")
+
+    def _bitable(self, app_token: str, table_id: str) -> feishu.Bitable:
+        return feishu.Bitable(app_id=self.config.app_id,
+                              app_secret=self.config.app_secret,
+                              app_token=app_token, table_id=table_id)
+
+    def _registry(self) -> feishu.Bitable:
+        from . import tablespec
+        target = tablespec.parse_target(self.config.registry_target,
+                                        default_label="registry")
+        return self._bitable(target.app_token, target.table_id)
+
+    def list(self) -> list:
+        return registry.read(self._registry())
+
+    def check(self, label: str, target: str):
+        """体检一个候选表。**不花钱，也不写任何东西。**"""
+        from . import tablespec
+        parsed = tablespec.parse_target(target, default_label=label)
+        known = [(e.label, e.app_token, e.table_id)
+                 for e in self.list() if e.usable]
+        return provision.check(
+            self._bitable(parsed.app_token, parsed.table_id), self.settings,
+            label=label or parsed.label, target=target, known_tables=known)
+
+    def build(self, app_token: str, table_id: str):
+        """把缺的列建出来。只追加，绝不改已有列。"""
+        table = self._bitable(app_token, table_id)
+        meta = table.fields_meta()
+        if not meta:
+            raise feishu.FeishuError(-1, provision.NOT_A_COLLABORATOR)
+        return provision.build_missing(
+            table, schema.diff(self.settings, meta),
+            allow_option_patch=self.config.allow_option_patch, log=self.log)
+
+    def add(self, label: str, target: str, note: str, client_token: str) -> str:
+        from . import tablespec
+        parsed = tablespec.parse_target(target, default_label=label)
+        self.log(f"📋 入册：{label or parsed.label} → "
+                 f"{parsed.app_token[-6:]}/{parsed.table_id}")
+        return registry.add(self._registry(), label=label or parsed.label,
+                            target=target, note=note, client_token=client_token)
+
+    def create(self, name: str) -> dict:
+        """从零建一张监控表。一次飞书都不用点。"""
+        workspace = feishu.Workspace(app_id=self.config.app_id,
+                                     app_secret=self.config.app_secret)
+        made = provision.create_monitored_table(workspace, self.settings, name)
+        self.log(f"🧱 新建监控表 {name} → {made['app_token'][-6:]}/{made['table_id']}")
+        return made
+
+    def set_enabled(self, record_id: str, enabled: bool) -> None:
+        self.log(f"📋 {'启用' if enabled else '停用'} 注册表行 {record_id}")
+        registry.set_enabled(self._registry(), record_id, enabled)
+
+    def remove(self, record_id: str) -> None:
+        """从注册表删一行 = 不再监控。**业务表和它的数据一个字都不动。**"""
+        self.log(f"📋 移除注册表行 {record_id}（业务表数据不动）")
+        registry.remove(self._registry(), record_id)
+
+
 # ---------- 鉴权 ----------
 
 def issue_session(config: PanelConfig, *, now: Optional[float] = None) -> str:
@@ -528,6 +626,7 @@ class _Deps:
     config: PanelConfig
     cache: Cache
     logs: Optional["LogFeed"] = None
+    projects: Optional["Projects"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -572,6 +671,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._send_json(200, self._logs_payload())
+        if path == "/api/projects":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._send_json(200, self._projects_payload())
         return self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):                                          # noqa: N802
@@ -593,6 +696,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return None
+        if path.startswith("/api/projects/"):
+            return self._project_action(path.rsplit("/", 1)[-1])
         if path == "/api/refresh":
             # 只是让缓存立刻重取一遍飞书数据和 Railway 日志。
             # **不发任何付费请求。**
@@ -753,6 +858,89 @@ class PanelHandler(BaseHTTPRequestHandler):
             "runs": [_run_json(r) for r in railway.build_runs(lines)],
         }
 
+    def _projects_payload(self) -> dict:
+        projects = self.deps.projects
+        if projects is None or not projects.enabled:
+            return {"enabled": False,
+                    "hint": projects.why_disabled() if projects else "",
+                    "entries": []}
+        try:
+            entries = projects.list()
+        except Exception as exc:                                # noqa: BLE001
+            return {"enabled": True, "error": str(exc), "entries": []}
+        return {"enabled": True, "error": "",
+                "allow_option_patch": self.deps.config.allow_option_patch,
+                "entries": [_entry_json(e) for e in entries]}
+
+    def _project_action(self, action: str):
+        """项目页的写路径。全部要 CSRF 头，且都不碰业务表的**数据**。"""
+        projects = self.deps.projects
+        if not self._authed():
+            return self._send_json(401, {"error": "未登录"})
+        if not self._csrf_ok():
+            return self._send_json(403, {"error": "缺少 " + CSRF_HEADER})
+        if projects is None or not projects.enabled:
+            return self._send_json(
+                400, {"error": projects.why_disabled() if projects else "没配"})
+        body = self._read_body()
+        if body is None:
+            return None
+        try:
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("要一个 JSON 对象")
+        except (ValueError, json.JSONDecodeError) as exc:
+            return self._send_json(400, {"error": f"请求体不是 JSON：{exc}"})
+
+        try:
+            return self._send_json(200, self._run_action(action, payload))
+        except tablespec_BadTarget as exc:
+            return self._send_json(400, {"error": str(exc)})
+        except feishu.FeishuError as exc:
+            return self._send_json(
+                400, {"error": exc.msg, "hint": exc.hint, "code": exc.code})
+        except registry.RegistryError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        except NotImplementedError:
+            return self._send_json(404, {"error": f"没有这个动作：{action}"})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _run_action(self, action: str, payload: dict) -> dict:
+        projects = self.deps.projects
+        text = lambda key: str(payload.get(key) or "").strip()   # noqa: E731
+
+        if action == "check":
+            result = projects.check(text("label"), text("target"))
+            return {"checkup": _checkup_json(result)}
+        if action == "add":
+            record_id = projects.add(
+                text("label"), text("target"), text("note"),
+                # 幂等键由前端生成：连点两次「加」不该多出两行。
+                client_token=text("client_token") or secrets.token_hex(16))
+            self.deps.cache.refresh()
+            return {"record_id": record_id}
+        if action == "create":
+            name = text("name")
+            if not name:
+                raise ValueError("要填个项目名")
+            return {"created": projects.create(name)}
+        if action == "build":
+            result = projects.build(text("app_token"), text("table_id"))
+            return {"summary": result.summary(), "created": result.created,
+                    "options_added": result.options_added,
+                    "skipped_options": result.skipped_options,
+                    "failures": result.failures, "ok": result.ok}
+        if action == "enable":
+            projects.set_enabled(text("record_id"), bool(payload.get("enabled")))
+            self.deps.cache.refresh()
+            return {"ok": True}
+        if action == "remove":
+            projects.remove(text("record_id"))
+            self.deps.cache.refresh()
+            return {"ok": True}
+        raise NotImplementedError(action)
+
     def _overview_payload(self) -> dict:
         overview, error, fetched_at = self.deps.cache.snapshot()
         return {
@@ -761,6 +949,26 @@ class PanelHandler(BaseHTTPRequestHandler):
             "projects": [_project_json(p) for p in (overview.projects if overview else [])],
             "todos": [_todo_json(t) for t in (overview.todos() if overview else [])],
         }
+
+
+def _entry_json(entry) -> dict:
+    return {"record_id": entry.record_id, "label": entry.label,
+            "target": entry.target, "enabled": entry.enabled,
+            "note": entry.note, "status": entry.status,
+            "problem": entry.problem, "usable": entry.usable,
+            "app_token": entry.app_token, "table_id": entry.table_id}
+
+
+def _checkup_json(c) -> dict:
+    return {
+        "label": c.label, "target": c.target,
+        "app_token": c.app_token, "table_id": c.table_id,
+        "reachable": c.reachable, "error": c.error,
+        "duplicate": c.duplicate, "ready": c.ready,
+        "sample_rows": c.sample_rows,
+        "buildable": [col.describe() for col in c.buildable],
+        "manual": c.manual,
+    }
 
 
 def _run_json(run) -> dict:
@@ -821,22 +1029,25 @@ class PanelServer(ThreadingHTTPServer):
 
 
 def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] = None,
+                 projects: Optional[Projects] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
-        config=config, cache=cache, logs=logs,
+        config=config, cache=cache, logs=logs, projects=projects,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
     return PanelServer((host, config.port), deps)
 
 
-def serve(config: PanelConfig, produce: Callable[[], summary.Overview]) -> int:
+def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
+          settings: Optional[Settings] = None) -> int:
     """起面板。阻塞到进程被杀。"""
     cache = Cache(produce, config.cache_seconds)
     logs = LogFeed(config, config.cache_seconds)
-    server = build_server(config, cache, logs=logs)
+    projects = Projects(config, settings or Settings())
+    server = build_server(config, cache, logs=logs, projects=projects)
     cache.start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"
@@ -846,6 +1057,10 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview]) -> int:
     else:
         print(f"Railway 日志：未接入（差 "
               f"{'、'.join(config.railway.missing())}）", flush=True)
+    if projects.enabled:
+        print("在面板上加表删表：已就绪", flush=True)
+    else:
+        print(f"在面板上加表删表：未就绪（{projects.why_disabled()}）", flush=True)
     print("⚠ 这个进程不发任何付费请求：要刷新就在飞书表里勾「排队刷新」，"
           "由 cron 那个服务处理", flush=True)
     try:

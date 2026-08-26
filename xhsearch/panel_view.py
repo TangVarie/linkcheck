@@ -79,6 +79,21 @@ padding:22px;text-align:center;color:var(--dim)}
 padding:9px 11px;font-size:12.5px;margin:10px 0}
 .tools{display:flex;gap:10px;align-items:center;margin-left:auto}
 .tools input{width:200px}
+.proj{display:flex;gap:10px;align-items:flex-start;padding:9px 0;
+border-bottom:1px solid var(--line);flex-wrap:wrap}
+.proj:last-child{border-bottom:none}
+.proj .who{flex:1;min-width:180px}
+.proj .who b{font-weight:600}
+.proj .acts{display:flex;gap:6px}
+.proj.off{opacity:.55}
+.addbox{background:var(--card);border:1px solid var(--line);border-radius:8px;
+padding:14px;margin-top:12px}
+.addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.addbox input[type=text]{flex:1;min-width:190px;font:inherit;padding:7px 10px;
+border:1px solid var(--line);border-radius:6px}
+.out{margin-top:10px;font-size:13px;white-space:pre-wrap}
+.ok{color:var(--green)}
+code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12px}
 """
 
 _SCRIPT = """
@@ -99,6 +114,100 @@ _SCRIPT = """
       var hit = !q || rows[i].textContent.toLowerCase().indexOf(q) >= 0;
       rows[i].style.display = hit ? "" : "none";
     }
+  });
+
+  // ---- 项目管理 ----
+  var list = document.getElementById("projects");
+  var out = document.getElementById("addOut");
+  function esc(t){ var d = document.createElement("div"); d.textContent = t == null ? "" : t; return d.innerHTML; }
+  function say(html, cls){ if (out) out.innerHTML = "<div class='" + (cls||"") + "'>" + html + "</div>"; }
+  function post(action, body){
+    return fetch("/api/projects/" + action, {
+      method: "POST",
+      headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
+      body: JSON.stringify(body || {})
+    }).then(function(r){ return r.json().then(function(j){
+      if (!r.ok) { throw new Error((j && (j.error || j.hint)) || ("HTTP " + r.status)); }
+      return j; }); });
+  }
+  function load(){
+    if (!list) return;
+    fetch("/api/projects").then(function(r){ return r.json(); }).then(function(j){
+      if (!j.enabled) { list.className = "note"; list.innerHTML = esc(j.hint); return; }
+      if (j.error) { list.className = "problem"; list.innerHTML = esc(j.error); return; }
+      if (!j.entries.length) { list.className = "empty"; list.textContent = "注册表还是空的，从下面加第一张。"; return; }
+      list.className = "";
+      list.innerHTML = j.entries.map(function(e){
+        var bits = [];
+        if (e.problem) bits.push("<span class='chip r'>" + esc(e.problem) + "</span>");
+        else if (!e.enabled) bits.push("<span class=chip>已停用</span>");
+        else bits.push("<span class='chip g'>巡查中</span>");
+        return "<div class='proj" + (e.enabled ? "" : " off") + "'>" +
+          "<div class=who><b>" + esc(e.label) + "</b> " + bits.join("") +
+          "<div class=muted>" + esc(e.target) + "</div></div>" +
+          "<div class=acts>" +
+          "<button type=button data-act=build data-app='" + esc(e.app_token) + "' data-tbl='" + esc(e.table_id) + "'>补齐缺的列</button>" +
+          "<button type=button data-act=enable data-rec='" + esc(e.record_id) + "' data-on='" + (e.enabled ? "0" : "1") + "'>" + (e.enabled ? "停用" : "启用") + "</button>" +
+          "<button type=button data-act=remove data-rec='" + esc(e.record_id) + "' data-label='" + esc(e.label) + "'>移除</button>" +
+          "</div></div>";
+      }).join("");
+    }).catch(function(err){ list.className = "problem"; list.textContent = String(err); });
+  }
+  if (list) {
+    load();
+    list.addEventListener("click", function(ev){
+      var b = ev.target.closest ? ev.target.closest("button[data-act]") : null;
+      if (!b) return;
+      var act = b.dataset.act;
+      if (act === "remove" && !confirm("不再监控「" + b.dataset.label + "」？\n\n只是从清单里去掉，飞书表和里面的数据一个字都不动。")) return;
+      b.disabled = true;
+      var body = act === "build" ? {app_token: b.dataset.app, table_id: b.dataset.tbl}
+               : act === "enable" ? {record_id: b.dataset.rec, enabled: b.dataset.on === "1"}
+               : {record_id: b.dataset.rec};
+      post(act, body).then(function(j){
+        if (act === "build") { say(esc(j.summary) + (j.skipped_options && j.skipped_options.length ? "\n\n这几处要去飞书手工补（补选项会整体覆盖，默认不代劳）：\n· " + j.skipped_options.map(esc).join("\n· ") : ""), j.ok ? "ok" : ""); }
+        load();
+      }).catch(function(err){ say(esc(String(err)), ""); b.disabled = false; });
+    });
+  }
+  var btnCheck = document.getElementById("btnCheck");
+  if (btnCheck) btnCheck.addEventListener("click", function(){
+    var label = document.getElementById("addLabel").value.trim();
+    var target = document.getElementById("addTarget").value.trim();
+    if (!target) { say("先把表格链接粘进来", ""); return; }
+    say("体检中…（不花钱）", "muted");
+    post("check", {label: label, target: target}).then(function(j){
+      var c = j.checkup, lines = [];
+      if (c.duplicate) { say(esc(c.duplicate), ""); return; }
+      if (!c.reachable) { say(esc(c.error), ""); return; }
+      lines.push("读到了这张表" + (c.sample_rows === 0 ? "，但一行记录都没读到——多半也是没加协作者" : ""));
+      if (c.buildable.length) lines.push("缺 " + c.buildable.length + " 列，面板能建：\n· " + c.buildable.map(esc).join("\n· "));
+      if (c.manual.length) lines.push("这几条要人去飞书改（改类型会丢数据、补选项会整体覆盖，都不代劳）：\n· " + c.manual.map(esc).join("\n· "));
+      if (c.ready) lines.push("配置齐了，可以直接入册。");
+      lines.push("<button type=button id=btnAdd>加进清单</button> <span class=muted>加进来默认<b>不启用</b>，体检绿了再点启用</span>");
+      say(lines.join("\n\n"), "");
+      var add = document.getElementById("btnAdd");
+      if (add) add.addEventListener("click", function(){
+        add.disabled = true;
+        post("add", {label: label, target: target, client_token: "add-" + target + "-" + label}).then(function(){
+          say("加好了。<b>还没启用</b>——确认配置齐了再点上面那一行的「启用」。", "ok"); load();
+        }).catch(function(err){ say(esc(String(err)), ""); add.disabled = false; });
+      });
+    }).catch(function(err){ say(esc(String(err)), ""); });
+  });
+  var btnCreate = document.getElementById("btnCreate");
+  if (btnCreate) btnCreate.addEventListener("click", function(){
+    var name = document.getElementById("addLabel").value.trim();
+    if (!name) { say("先填个项目名", ""); return; }
+    if (!confirm("新建一张监控表「" + name + "」？\n\n会在应用自己的空间里建一个多维表格，二十来列一次建齐。")) return;
+    btnCreate.disabled = true;
+    say("建表中…", "muted");
+    post("create", {name: name}).then(function(j){
+      var c = j.created;
+      document.getElementById("addTarget").value = c.target;
+      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它 →</a>\n链接已经填进上面的输入框，点「体检一下」再入册。", "ok");
+      btnCreate.disabled = false;
+    }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
   });
 })();
 """
@@ -304,6 +413,30 @@ def _runs_section(runs, log_error: str, offset_hours: float) -> str:
             f"<table><thead>{head}</thead><tbody>{rows}</tbody></table>")
 
 
+def _projects_section(config) -> str:
+    """项目管理。**内容由前端异步拉** —— 它要读注册表，
+    而注册表和聚合缓存是两条独立的路：注册表读不到不该让整个面板变空白。
+    """
+    patch = ("自动补选项：<b>已开</b>" if getattr(config, "allow_option_patch", False)
+             else "自动补选项：<b>关</b>（缺选项只给清单，"
+                  "在废表上验过再开 <code>PANEL_ALLOW_OPTION_PATCH=1</code>）")
+    return f"""<h2>项目</h2>
+<div class=muted style='margin-bottom:8px'>加表、停用、移除都在这儿。
+「移除」只是不再监控，<b>不动你飞书表里的任何数据</b>。{patch}</div>
+<div id=projects class=empty>读取中…</div>
+<div class=addbox>
+  <div style='font-weight:600;margin-bottom:8px'>加一张表</div>
+  <div class=row>
+    <input type=text id=addLabel placeholder='项目名，比如 途鸽三期'>
+    <input type=text id=addTarget placeholder='粘表格链接（/base/ 或 /wiki/ 都行）'>
+    <button type=button id=btnCheck>体检一下</button>
+  </div>
+  <div class=muted>体检不花钱。也可以 <button type=button id=btnCreate>直接新建一张</button>
+    —— 二十来列连类型带选项一次建齐，一次飞书都不用点。</div>
+  <div id=addOut class=out></div>
+</div>"""
+
+
 def overview_page(*, overview: Optional[summary.Overview], error: str,
                   fetched_at: float, config, csrf: str = "",
                   runs=None, log_error: str = "",
@@ -361,6 +494,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
 <h2>各项目</h2>
 <div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
+
+{_projects_section(config)}
 
 {_runs_section(runs or [], log_error, offset_hours)}
 

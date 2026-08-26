@@ -1037,7 +1037,7 @@ def cmd_serve(selected: list[str] | None = None) -> int:
             feishu_base=config.feishu_base,
             secrets=config.secrets)
 
-    return panel.serve(config, produce)
+    return panel.serve(config, produce, settings)
 
 
 def main(argv: list[str]) -> int:
