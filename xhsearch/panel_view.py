@@ -327,7 +327,7 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
 # ⚠️ 这段脚本会**原样进到页面里**，所以连注释都不放 emoji——
 # `tests/test_design.py` 的「不许拿 emoji 当图标」是按页面字节查的，
 # 它不区分注释和正文，这样最严也最省事。Python 侧的注释不受影响。
-_SCRIPT = """
+_SCRIPT = r"""
 (function(){
   var token = document.body.dataset.csrf || "";
 
