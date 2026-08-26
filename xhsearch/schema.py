@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from . import runner
 from .config import Settings
 
@@ -163,3 +165,132 @@ def options_from_meta(meta, column: str):
         return None
     options = meta[column]["options"]
     return options if options is not None else []
+
+
+# ---------- 建列：把同一份定义翻译成飞书的请求体 ----------
+#
+# `expected_schema` 本来就是「这张表应该长什么样」的唯一真相，`doctor` 拿它
+# 做体检判据。这一段把它再用一次，当建表脚本——同一份定义两个用途，不会漂移。
+#
+# 「允许的类型码」是个元组（比如 `(4, 1)` = 多选或文本都行），建列时得挑一个。
+# 挑**第一个**：那是文档里推荐的那种，也是 `_expected_schema` 里排在前面的原因。
+
+# 类型码 → 建列时要带的 property。缺了它飞书会用默认值，而默认值不一定是
+# 我们要的（数字默认带小数、日期默认带时间）。
+_CREATE_PROPERTY = {
+    2: {"formatter": "0"},                       # 数字：整数
+    5: {"date_formatter": "yyyy/MM/dd HH:mm"},   # 日期：要到分钟，巡查时间靠它
+}
+
+
+def create_field_body(name: str, type_code: int, options=None) -> dict:
+    """一列 → `POST .../fields` 的请求体。
+
+    选择类字段（单选 3 / 多选 4）**连选项一起建**：新建的列没有存量数据，
+    带着选项一次建完是纯追加、零风险，比「先建空列再补选项」少一整类问题
+    （补选项对已有列是整体覆盖，见 feishu.add_field_options）。
+    """
+    body: dict = {"field_name": name, "type": type_code}
+    prop = dict(_CREATE_PROPERTY.get(type_code) or {})
+    if type_code in (3, 4) and options:
+        prop["options"] = [{"name": value} for value in options]
+    if prop:
+        body["property"] = prop
+    return body
+
+
+@dataclass
+class MissingColumn:
+    name: str
+    type_code: int
+    type_label: str
+    options: list = field(default_factory=list)
+    note: str = ""
+
+    def body(self) -> dict:
+        return create_field_body(self.name, self.type_code, self.options)
+
+    def describe(self) -> str:
+        tail = f"（选项：{'、'.join(self.options)}）" if self.options else ""
+        return f"{self.name} · {self.type_label}{tail}"
+
+
+@dataclass
+class MissingOptions:
+    column: str
+    missing: list
+    existing: list = field(default_factory=list)
+
+    def describe(self) -> str:
+        return f"{self.column} 缺选项：{'、'.join(self.missing)}"
+
+
+@dataclass
+class WrongType:
+    column: str
+    actual: str
+    expected: str
+    note: str = ""
+
+    def describe(self) -> str:
+        tail = f"。{self.note}" if self.note else ""
+        return (f"{self.column} 现在是「{self.actual}」，应该是「{self.expected}」"
+                f"{tail}")
+
+
+@dataclass
+class SchemaDiff:
+    """现有表 vs 期望，差在哪。三类的处置完全不同，所以分开装。"""
+
+    missing_columns: list = field(default_factory=list)
+    missing_options: list = field(default_factory=list)
+    wrong_types: list = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        return not (self.missing_columns or self.missing_options or self.wrong_types)
+
+    @property
+    def auto_fixable(self) -> bool:
+        """有没有面板能一键做掉的事。
+
+        建列永远算（纯追加）。补选项算不算取决于调用方给不给开关——
+        它对已有列是整体覆盖，未经真机验证之前只给清单。
+        """
+        return bool(self.missing_columns)
+
+
+def diff(settings: Settings, meta: dict) -> SchemaDiff:
+    """按期望逐列核对现有表。**纯函数。**
+
+    和 `schema_problems()` 看的是同一批东西，但产出不同：那个产的是给人读的
+    句子，这个产的是**可执行的差异**（建哪些列、补哪些选项、哪些列类型建错）。
+    两个都留着——体检报文案要稳定，一键建齐要结构化。
+    """
+    result = SchemaDiff()
+    for name, allowed, type_label, required_options, note in expected_schema(settings):
+        info = (meta or {}).get(name)
+        if info is None:
+            result.missing_columns.append(MissingColumn(
+                name=name, type_code=allowed[0], type_label=type_label,
+                options=list(required_options or []), note=note or ""))
+            continue
+        if info["type"] not in allowed:
+            # 类型建错**不自动改**：改类型会转换/丢已有数据。只报。
+            result.wrong_types.append(WrongType(
+                column=name, actual=type_name(info["type"]),
+                expected=type_label, note=note or ""))
+            continue
+        ui = info.get("ui_type") or ""
+        if ui in EXOTIC_UI_TYPES:
+            result.wrong_types.append(WrongType(
+                column=name, actual=EXOTIC_UI_TYPES[ui], expected=type_label,
+                note="它和普通类型共用类型码，但写入行为不同"))
+            continue
+        if required_options and info["type"] in (3, 4):
+            existing = list(info.get("options") or [])
+            gap = [v for v in required_options if v not in existing]
+            if gap:
+                result.missing_options.append(MissingOptions(
+                    column=name, missing=gap, existing=existing))
+    return result

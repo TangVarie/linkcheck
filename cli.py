@@ -26,7 +26,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from xhsearch import feishu, providers, rows as rows_mod, runlock, runner, schema
+from xhsearch import (feishu, providers, rows as rows_mod, runlock, runner,
+                      schema, tablespec)
 from xhsearch.config import Budget, Channels, Settings
 from xhsearch.envfile import load_dotenv
 
@@ -144,94 +145,47 @@ def _api_keys() -> dict[str, str]:
     return {k: v for k, v in keys.items() if v}
 
 
-# 飞书的 app_token / table_id 只会是字母数字。**必须校验**，因为它们会被拼进
-# 接口地址，而这个请求带着 tenant_access_token——一个含 `/` 或 `..` 的值就能
-# 把它改写到别的 open-apis 端点上。来源正在变多（环境变量、面板表单、注册表），
-# 校验放在解析这一层，所有来源都过得到。feishu._url() 里还有第二道转义。
-#
-# 管的是**字符集**，不是长度：真实 token 是 17–27 位，但长度下限拦不住任何
-# 攻击（`..` 才两个字符，`aaaaaaaa/x` 有十个），只会在飞书哪天缩短 token
-# 格式时误伤合法配置。上限留着挡明显荒唐的值。
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]{1,64}")
-
-
-def valid_token(value: str) -> bool:
-    return bool(_TOKEN_RE.fullmatch(value or ""))
+# 解析和校验都在 xhsearch/tablespec.py（注册表和面板要用同一套：报错文案不能漂、
+# 安全校验不能漏）。这两个名字保留成别名，旧调用点和旧测试不用改。
+valid_token = tablespec.valid_token
+_TOKEN_RE = tablespec._TOKEN_RE
 
 
 def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
 
-    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项几种写法都认：
+    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项的写法见
+    `tablespec.parse_target`。标签用在日志分节和 `--table` 筛选上。
 
-        OKMAN一期=bascnXXX:tblAAA
-        OKMAN二期=https://xx.feishu.cn/base/bascnXXX?table=tblBBB
-        企业C期=https://xx.feishu.cn/wiki/wikcnXXX?table=tblDDD   （挂在知识库里的表也认）
-        bascnYYY:tblCCC                     （不带标签时标签取 table_id）
-
-    标签用在日志分节和 --table 筛选上，起个人能认的名字。
     单表继续用 FEISHU_APP_TOKEN + FEISHU_TABLE_ID；两种都配了以
     FEISHU_TABLES 为准。所有表共用同一个飞书应用（App ID/Secret），
     应用要逐张表「添加文档应用」授权。
 
-    /wiki/ 链接实测直接把地址栏里那段 token 当 app_token 用，多维表格接口
-    照样认——不需要额外调接口换算、也不需要给应用多开知识库权限，跟
-    /base/ 链接一视同仁，只是换了个前缀。
+    **这里的失败一律 `sys.exit`**：环境变量是部署方填的，填错了整个进程就该
+    起不来。注册表那条路不一样——那是运营填的，一行错不该让其余表停摆，
+    所以它自己 catch `BadTarget` 把那一行标成配置有误（见 xhsearch/registry.py）。
     """
     spec = environ.get("FEISHU_TABLES", "").strip()
     if spec:
-        entries: list[tuple[str, str, str]] = []
-        for chunk in re.split(r"[;；\n]+", spec):
-            chunk = chunk.strip().strip(",")
-            if not chunk:
-                continue
-            head, sep, rest = chunk.partition("=")
-            # URL 里本来就有 =（?table=tbl...），只有「短标签=」才当标签用
-            if sep and "://" not in head and "/" not in head and ":" not in head:
-                label, target = head.strip(), rest.strip()
-            else:
-                label, target = "", chunk
-            match = re.search(r"/(?:base|wiki)/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
-            if match:
-                app_token, table_id = match.group(1), match.group(2)
-            elif "://" in target:
-                sys.exit(f"FEISHU_TABLES 里这个网址提不出表信息：{target!r}。"
-                         "要用 /base/xxx?table=tblxxx 或 /wiki/xxx?table=tblxxx 形式的地址"
-                         "（打开目标数据表时浏览器地址栏那串）")
-            elif ":" in target:
-                app_token, _, table_id = target.partition(":")
-                app_token, table_id = app_token.strip(), table_id.strip()
-            else:
-                sys.exit(f"FEISHU_TABLES 里这一项看不懂：{chunk!r}。每一项写成 "
-                         "标签=app_token:table_id 或 标签=表格完整网址，"
-                         "多项之间用分号隔开（参考 .env.example）")
-            if not app_token or not table_id:
-                sys.exit(f"FEISHU_TABLES 里这一项缺 app_token 或 table_id：{chunk!r}")
-            for label_text, token in (("app_token", app_token), ("table_id", table_id)):
-                if not valid_token(token):
-                    sys.exit(
-                        f"FEISHU_TABLES 里这一项的 {label_text} 不合法：{token!r}。"
-                        "飞书的 token 只会是字母和数字——"
-                        "带别的字符的值会被拼进接口地址，那个请求带着你的"
-                        "tenant_access_token，不能放行")
-            entries.append((label or table_id, app_token, table_id))
-        if not entries:
+        try:
+            targets = tablespec.parse_many(spec)
+        except tablespec.BadTarget as exc:
+            sys.exit(f"FEISHU_TABLES 里有一项解析不了：{exc}（参考 .env.example）")
+        if not targets:
             sys.exit("FEISHU_TABLES 设了但一张表都没解析出来，检查格式（参考 .env.example）")
-        seen: set[tuple[str, str]] = set()
-        for _, app_token, table_id in entries:
-            if (app_token, table_id) in seen:
-                sys.exit(f"FEISHU_TABLES 里 {table_id} 配了两遍——同一张表刷两次是白花钱")
-            seen.add((app_token, table_id))
-        labels = [label for label, _, _ in entries]
-        if len(set(labels)) != len(labels):
-            sys.exit("FEISHU_TABLES 里有重复的标签，--table 会分不清——给每张表起个不同的名字")
-        return entries
+        problem = tablespec.find_duplicate(targets)
+        if problem:
+            sys.exit(f"FEISHU_TABLES 里 {problem}")
+        return [t.as_tuple() for t in targets]
 
     app_token = environ.get("FEISHU_APP_TOKEN", "").strip()
     table_id = environ.get("FEISHU_TABLE_ID", "").strip()
     if not app_token or not table_id:
         sys.exit("没配任何表：多表设 FEISHU_TABLES，单表设 "
                  "FEISHU_APP_TOKEN + FEISHU_TABLE_ID（参考 .env.example）")
+    for what, token in (("FEISHU_APP_TOKEN", app_token), ("FEISHU_TABLE_ID", table_id)):
+        if not tablespec.valid_token(token):
+            sys.exit(f"{what} 不合法：{token!r}。飞书的 token 只会是字母和数字")
     return [(table_id, app_token, table_id)]
 
 
