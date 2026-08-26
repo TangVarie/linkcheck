@@ -5,9 +5,11 @@
 """
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import cli
+from xhsearch import feishu, runner
 from xhsearch.config import Settings
 
 
@@ -242,6 +244,21 @@ class TestNumericEnvBounds(unittest.TestCase):
         settings = self._settings_with(TAG_OBSERVING="冷启动")
         self.assertEqual(settings.tags.heat_tiers()[0], "冷启动")
         self.assertIn("冷启动", settings.tags.machine_written())
+
+    def test_renaming_keeps_the_old_name_revocable(self):
+        """改名和关掉一样要退役**旧**名字。漏了的话，已经写出去的「观察中」
+        掉到机器命名空间外面、被当成人工标签保护起来，于是一行会同时挂着
+        「观察中」和改名后的档位——两个热度档并排，棘轮形同虚设。"""
+        settings = self._settings_with(TAG_OBSERVING="冷启动")
+        self.assertIn("观察中", settings.tags.namespace())
+        self.assertNotIn("观察中", settings.tags.machine_written())
+
+    def test_setting_the_same_name_changes_nothing(self):
+        """显式填成默认值不该把默认名退役掉——那会让它立刻被自己摘掉。"""
+        settings = self._settings_with(TAG_OBSERVING="观察中")
+        self.assertEqual(settings.tags.observing, "观察中")
+        self.assertIn("观察中", settings.tags.machine_written())
+        self.assertEqual(settings.tags.retired, Settings().tags.retired)
 
     def test_switching_observing_off_keeps_it_revocable(self):
         """关掉这一档 ≠ 放着不管：已经写出去的「观察中」要还在机器命名空间里，
@@ -704,7 +721,7 @@ class TestMistypedWarning(unittest.TestCase):
             def summary(self):
                 return ""
 
-            def checked_span(self, display):
+            def checked_span(self, display, *, skip=()):
                 return ""
 
         class _Table:
@@ -731,6 +748,76 @@ class TestMistypedWarning(unittest.TestCase):
         self.assertEqual(self._run_write_back(self._meta()), 0)
         self.assertEqual(
             self._run_write_back(self._meta(**{self.f.traffic_status: 3})), 1)
+
+
+class TestReportedSpanOnlyCoversRowsThatLanded(unittest.TestCase):
+    """「已写回 N 行，本轮『最近检查时间』= …」那一行只能报**真的落表**的时刻。
+
+    报一个表里不存在的时刻，就是这次要修的「日志和表对不上」本身。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+        self.f = self.settings.fields
+        self.stamp = datetime(2026, 8, 26, 0, 7, 14, tzinfo=timezone.utc)
+
+    def _report(self):
+        report = runner.RunReport()
+        for index in range(2):
+            report.outcomes.append(runner.Outcome(
+                f"rec{index}", runner.STATUS_OK,
+                {self.f.refresh_status: "正常",
+                 self.f.last_updated: int(self.stamp.timestamp() * 1000)},
+                checked_at=self.stamp + timedelta(minutes=index),
+            ))
+        return report
+
+    def _write_back(self, meta, *, row_error=None):
+        settings = self.settings
+
+        class _Table:
+            def batch_get(self, ids):
+                return [{"record_id": i, "fields": {}} for i in ids]
+
+            def batch_update(self, updates, errors=None):
+                if row_error is not None and errors is not None:
+                    errors.append(
+                        (row_error, feishu.FeishuError(1254005, "record_id 不存在")))
+                    return len(updates) - 1
+                return len(updates)
+
+        printed = []
+        with mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(
+                " ".join(str(x) for x in a))):
+            cli._write_back_table(_Table(), self._report(), meta, settings, "表A")
+        return "\n".join(printed)
+
+    def _meta(self, **overrides):
+        meta = {}
+        for name, allowed, _l, options, _n in cli._expected_schema(self.settings):
+            t = overrides.get(name, allowed[0])
+            meta[name] = {"type": t, "ui_type": "",
+                          "options": list(options or []) if t in (3, 4) else None}
+        return meta
+
+    def test_all_rows_landed_reports_the_full_span(self):
+        out = self._write_back(self._meta())
+        self.assertIn("2026-08-26 08:07:14 +08", out)
+        self.assertIn("08:08:14", out)
+
+    def test_a_row_that_failed_to_write_is_excluded(self):
+        """rec1 没写进去 → 跨度不能把它的时刻当成终点。"""
+        out = self._write_back(self._meta(), row_error="rec1")
+        self.assertIn("2026-08-26 08:07:14 +08", out)
+        self.assertNotIn("08:08:14", out)
+
+    def test_the_span_is_omitted_when_the_timestamp_column_itself_was_blocked(self):
+        """「最近检查时间」整列被挡下来（列没建 / 类型建错）= 一行都没盖上。"""
+        without_column = self._meta()
+        del without_column[self.f.last_updated]
+        self.assertNotIn("最近检查时间」=", self._write_back(without_column))
+        mistyped = self._meta(**{self.f.last_updated: 1})   # 建成了文本
+        self.assertNotIn("最近检查时间」=", self._write_back(mistyped))
 
 
 if __name__ == "__main__":

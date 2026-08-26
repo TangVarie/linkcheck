@@ -445,17 +445,27 @@ def decide(
         default=None,
     )
     if count is not None:
-        tier = th.heat_tier(count, t)
+        # 评论数够得上档位时，发布时长根本不参与判定——先把这一档单独算出来，
+        # 后面「发布时间有没有毛病」才问得准（它只在评论数定不了档时才是关键）。
+        count_tier = th.heat_tier(count, t)
+        # 发布时长能不能用，有两种坏法，处置相同、话术必须分开：
+        # None = 那一格是空的；负数 = 填成了未来（手滑填错年份、时区搞反）。
+        # 未来时间必须挡在这里：它满足「不足 48 小时」，会让一条日期填错的行
+        # 拿到一个看着很合理的「观察中」，然后一直挂到那个错误时间点之后
+        # 48 小时——错误被标签盖住，没人会发现。表里「最近检查时间」被填成
+        # 未来时同样是显式挡掉的（见 rows.is_due / in_cooldown），口径一致。
+        age_usable = age_hours is not None and age_hours >= 0
         # 发出去够久了还够不上最低热度档 → 无水花。这不是异常，就是没起来——
         # 和「疑似限流」（有量之后异常下跌）必须分开，证据完全不同。
-        flopped = (tier is None and age_hours is not None
+        flopped = (count_tier is None and age_usable
                    and age_hours >= th.flop_hours)
         # 还在冷启动窗口里 → 观察中。刚发两小时只有几条评论再正常不过，
         # 这时候判「无水花」是误标；但**什么都不写**同样是错的：
         # 空格分不出「还没巡查」「巡查了没结论」「机器坏了」，
         # 于是这一批新帖只能靠人手工去填。这一档就是为了不留空格。
-        observing = (tier is None and not flopped and bool(t.observing)
-                     and age_hours is not None and age_hours < th.flop_hours)
+        observing = (count_tier is None and not flopped and bool(t.observing)
+                     and age_usable and age_hours < th.flop_hours)
+        tier = count_tier
         if flopped:
             tier = t.flop
         elif observing:
@@ -481,13 +491,21 @@ def decide(
                     f"冷启动窗口内，暂不下结论 → {t.observing}")
             else:
                 verdict.notes.append(f"评论数 {count} → {best}")
-        elif age_hours is None:
-            # 「发布时间」为空：算不出发布多久，也就分不清「刚发出去」和
-            # 「发了两周还是没起来」，热度档位这一轮判不了。这是**表里缺数据**，
-            # 不是机器出错——如实说出来，运营把那一格填上下一轮就自动补判。
-            verdict.notes.append(
-                f"「{settings.fields.publish_time}」是空的，算不出发布多久，"
-                "本轮判不了热度档位（把发布时间填上，下一轮自动补判）")
+        # 发布时间有毛病、而且这一轮**正好要靠它**定档（评论数够不上任何一档）
+        # → 如实报出来。这一条**不能**挂在 `if best` 的 else 上：表里已经有档位时
+        # `best` 是真值，那条路径只会说「保留高档位」，而真正的问题是那一格坏了。
+        # 最难发现的正是这种：一行卡在「观察中」，发布时间却是空的或未来的，
+        # 于是它永远熬不到 48 小时、永远升不成「无水花」，表面上一切正常。
+        if count_tier is None and not age_usable:
+            column = settings.fields.publish_time
+            if age_hours is None:
+                verdict.notes.append(
+                    f"⚠「{column}」是空的，算不出发布多久，本轮判不了热度档位"
+                    "（把发布时间填上，下一轮自动补判）")
+            else:
+                verdict.notes.append(
+                    f"⚠「{column}」填的是未来时间（还差 {-age_hours:.0f} 小时才到），"
+                    "本轮判不了热度档位，请核对这一格")
     else:
         # 评论数未知（抖音评论接口的 total 是 integer|null，detail 兜底又恰好
         # 失败）——这一轮对热度和风控**没有获得任何新证据**。此时必须把已有的

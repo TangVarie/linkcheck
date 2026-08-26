@@ -555,6 +555,36 @@ class TestRiskDetection(unittest.TestCase):
         self.assertEqual({t for t in v.tags if self.settings.tags.rank(t) >= 0}, set())
         self.assertTrue(any("发布时间" in n for n in v.notes), v.notes)
 
+    def test_bad_publish_time_is_reported_even_when_a_tier_is_retained(self):
+        """表里已经有档位时也必须报出来——这是最难发现的一种卡死。
+
+        一行卡在「观察中」、发布时间却是空的或未来的：棘轮保住了旧档位，
+        诊断信息只会说「保留高档位」，而真正的问题是那一格坏了——
+        它永远熬不到 48 小时，也就永远升不成「无水花」，表面上一切正常。
+        """
+        for age, keyword in ((None, "是空的"), (-30.0, "未来时间")):
+            with self.subTest(age=age):
+                v = self.decide(3, age_hours=age, current_tags=["观察中"])
+                self.assertIn("观察中", v.tags)       # 棘轮照旧不倒退
+                self.assertTrue(any(keyword in n for n in v.notes), v.notes)
+                self.assertTrue(any("发布时间" in n for n in v.notes), v.notes)
+
+    def test_future_publish_time_never_gets_the_cold_start_tier(self):
+        """发布时间填成未来（年份手滑、时区搞反）：负的时长同样「不足 48 小时」，
+        照打「观察中」的话，一个看着很合理的标签会把日期错误盖住，
+        而且要等到那个错误时间点之后 48 小时才可能露出来。"""
+        v = self.decide(3, age_hours=-30.0)
+        self.assertEqual({t for t in v.tags if self.settings.tags.rank(t) >= 0}, set())
+        self.assertNotIn("观察中", v.tags)
+        self.assertTrue(any("未来时间" in n for n in v.notes), v.notes)
+
+    def test_a_real_tier_from_comment_count_does_not_need_the_publish_time(self):
+        """评论数够得上档位时发布时长根本不参与判定——这时不该报缺数据，
+        否则每一行没填发布时间的爆贴都会带一句与判定无关的告警。"""
+        v = self.decide(60, age_hours=None)
+        self.assertIn("爆贴", v.tags)
+        self.assertFalse(any("发布时间" in n for n in v.notes), v.notes)
+
     def test_flop_ratchets_up_but_never_back(self):
         """无水花是最低热度档：起来了就换高档，绝不从评估中退回无水花。"""
         up = self.decide(25, age_hours=72, current_tags=["无水花"])

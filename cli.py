@@ -281,10 +281,11 @@ def build_settings() -> Settings:
     if raw_observing is not None:
         default_observing = settings.tags.observing
         settings.tags.observing = raw_observing.strip()
-        if not settings.tags.observing:
-            # 关掉不等于放着不管：已经写出去的「观察中」要留在机器命名空间里，
-            # 下一轮才摘得掉。不加这一条，那些格子就永远卡在一个
-            # 谁也不会再更新的标签上。
+        if settings.tags.observing != default_observing:
+            # 改名或关掉，都要把**旧名字**留在机器命名空间里，下一轮才摘得掉。
+            # 漏了这一条，已经写出去的「观察中」就掉到命名空间外面，
+            # 被 merge 当成人工标签保护起来——于是一行会同时挂着「观察中」和
+            # 改名后的（或升上去的）档位，两个热度档并排，棘轮形同虚设。
             settings.tags.retired = tuple(
                 dict.fromkeys((*settings.tags.retired, default_observing)))
 
@@ -747,7 +748,14 @@ def _write_back_table(table: feishu.Bitable, report,
         # 未写回的行 last_updated 没动，下一轮会自然重捞。
         print(f"❌ 写回失败（表级错误）：{exc}")
         return 1
-    span = report.checked_span(settings.display)
+    # 报出去的时间跨度只能覆盖**真的写进去了**的行：逐行失败的那些
+    # （读表之后记录被删等）时间戳压根没落表，「最近检查时间」整列被挡下来时
+    # （列没建、类型建错）更是一行都没盖上。报一个表里不存在的时刻，
+    # 恰恰就是这次要修的「日志和表对不上」。
+    stamp_column = settings.fields.last_updated
+    span = "" if stamp_column in dropped_fields or stamp_column in mistyped_fields \
+        else report.checked_span(settings.display,
+                                 skip=[record_id for record_id, _ in write_errors])
     print(f"已写回 {written} 行" + (f"，本轮「最近检查时间」= {span}" if span else ""))
     if dropped_fields:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："

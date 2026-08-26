@@ -268,6 +268,21 @@ class TestCheckedAtIsPerRow(RunnerTest):
         self.assertIn("2026-08-21 20:01:00 +08", span)
         self.assertIn("20:02:00", span)
 
+    def test_rows_that_failed_to_write_drop_out_of_the_span(self):
+        """写回逐行失败的那些（读表之后记录被删等）时间戳压根没落表。
+        把它们算进跨度，就是报一个表里根本不存在的时刻——正是这次要修的毛病。"""
+        report = self.run_with(
+            [sse(comment_page(count=150)) for _ in range(3)],
+            [xhs_row("rec1"), xhs_row("rec2"), xhs_row("rec3")],
+            clock=self._ticking_clock(step_seconds=60),
+        )
+        display = self.settings.display
+        # 首尾两行没写进去 → 跨度只能是中间那一行
+        span = report.checked_span(display, skip=["rec1", "rec3"])
+        self.assertEqual(span, display.stamp(report.outcomes[1].checked_at))
+        # 一行都没写进去 → 什么都不报，别编一个时刻出来
+        self.assertEqual(report.checked_span(display, skip=["rec1", "rec2", "rec3"]), "")
+
     def test_breaker_voided_rows_drop_out_of_the_span(self):
         """熔断作废了时间戳，报告里就不能再声称这些行盖过章。"""
         rows = [xhs_row(f"rec{i}", tags=["已复盘"]) for i in range(3)]

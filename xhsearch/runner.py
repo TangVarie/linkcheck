@@ -19,7 +19,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from . import analyze, feishu, protocol, providers, tags, transport
 from .config import Budget, Display, Settings
@@ -128,14 +128,21 @@ class RunReport:
             tally[outcome.status] = tally.get(outcome.status, 0) + 1
         return tally
 
-    def checked_span(self, display: Display) -> str:
+    def checked_span(self, display: Display, *, skip: Iterable[str] = ()) -> str:
         """本轮真正盖上「最近检查时间」的时间跨度，按显示时区渲染。
 
         写在「已写回 N 行」那一行后面，是为了让日志和表能**直接对上**：
         表里那一格显示的是什么，这里就打印什么。跨度而不是单个时刻，
         是因为几百行的一轮会跨好几分钟，而每一行盖的是自己的那个时刻。
+
+        skip 传入**没写进去**的行（batch_update 逐行失败的那些，比如读表之后
+        记录被删了）。算错了方向就白改了：报一个表里根本不存在的时刻，
+        正是这次要修的「日志和表对不上」本身。同理，「最近检查时间」整列被
+        挡下来时（列没建、类型建错）调用方根本不该问这个跨度——一行都没盖上。
         """
-        stamps = sorted(o.checked_at for o in self.outcomes if o.checked_at)
+        skipped = set(skip)
+        stamps = sorted(o.checked_at for o in self.outcomes
+                        if o.checked_at and o.record_id not in skipped)
         if not stamps:
             return ""
         if stamps[0] == stamps[-1]:
