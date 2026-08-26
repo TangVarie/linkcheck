@@ -125,6 +125,36 @@ def _urls(text: str) -> list[str]:
     return [_clean_url(u) for u in _URL_RE.findall(text)]
 
 
+# 裸域名后面粘着的那一段路径。只剥域名的话，`xhslink.com/a/AbC` 会在文本里
+# 留下一截 `/a/AbC`，比留着整条链接还难认。右边界和 `_URL_RE` 同一套。
+_BARE_URL_TAIL = r"(?:/[^\s，。、！？；：）】》（《【\"'<>一-鿿]*)*"
+_BARE_URL_RES = [
+    re.compile(_XHS_BARE.pattern + _BARE_URL_TAIL, re.I),
+    re.compile(_DOUYIN_BARE.pattern + _BARE_URL_TAIL, re.I),
+]
+
+# 抠完链接之后，两头常剩下孤零零的标点和分隔符。
+_EDGE_JUNK = _TRAILING_PUNCT + "-—_|/\\，。、！？；：（【《「『 \t"
+
+
+def text_without_urls(cell: str) -> str:
+    """把一格里的链接全抠掉，返回剩下的文字。
+
+    用在「这一行是哪一条」上：小红书的分享文案开头往往就是笔记标题
+    （`77 露营装备清单 - 小红书 😆 abcDEF😆 https://…`），
+    抠掉链接之后剩的那段比光秃秃的网址前缀好认得多——后者每一行都长一样，
+    等于没有。
+
+    **复用 `_URL_RE`**：那个正则的中文右边界是踩过坑调出来的
+    （「看这条https://v.douyin.com/xxx很火」不排 CJK 会把「很火」吞进 URL），
+    不要在别处另写一个。
+    """
+    text = _URL_RE.sub(" ", cell or "")
+    for pattern in _BARE_URL_RES:
+        text = pattern.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip().strip(_EDGE_JUNK)
+
+
 def _host_matches(url: str, domains: tuple[str, ...]) -> bool:
     """URL 的 hostname 是不是白名单域名本身或它的子域。
 

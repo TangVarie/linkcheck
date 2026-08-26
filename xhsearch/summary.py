@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from . import feishu, rows as rows_mod, runner
+from . import feishu, links, rows as rows_mod, runner
 from .config import Settings
 
 # 「卡住了」的判据：超过它应有刷新间隔的这么多倍还没被刷到。
@@ -38,6 +38,10 @@ class TodoRow:
     project: str
     record_url: str
     link_cell: str
+    # 人一眼认得出「这是哪一条」的短标识。运营拿它去飞书表里 Ctrl+F
+    # 直接定位，不用每条都点开一个新网页——「去这一行」是兜底不是主路径。
+    # 来源见 `row_label()`。
+    label: str = ""
     # 勾「排队刷新」要拿这两个去定位那张表。
     app_token: str = ""
     table_id: str = ""
@@ -128,7 +132,59 @@ class ProjectSnapshot:
         return not self.error and not self.health
 
 
-def panel_fields(settings: Settings, *, show_digest: bool = False) -> list[str]:
+# 「哪一条」优先去这些列里找。第一个命中的就用，所以顺序 = 优先级。
+# 「笔记内容」排第一是因为运营表里那一列就叫这个名字（2026-08 确认）；
+# 后面几个是兜底，别的表换了叫法不至于整栏空掉。
+LABEL_CANDIDATES = ("笔记内容", "文案", "笔记标题", "标题", "内容")
+
+
+def pick_label_column(known: set[str], configured: str = "") -> str:
+    """这张表拿哪一列当「哪一条」。**纯函数**，在 search 之前调。
+
+    要在 search 之前定下来，因为按名字请求一个不存在的列会让整个 search
+    报 1254045、一行都读不回来（和 `runner.load_rows` 同一条纪律）。
+    字段元数据 `_collect_one` 本来就读了，列名是白拿的。
+
+    `configured`（`PANEL_LABEL_COLUMN`）写了就**只认它**：显式配置压过自动识别，
+    表里没有那一列就返回空串，让调用方去报「列名写错了」，
+    而不是悄悄换一列——悄悄换等于配置没生效却没人知道。
+    """
+    if configured:
+        return configured if configured in known else ""
+    for name in LABEL_CANDIDATES:
+        if name in known:
+            return name
+    return ""
+
+
+def row_label(row: rows_mod.Row, cells: dict, settings: Settings,
+              column: str = "") -> str:
+    """这一行给人看的短标识。**纯函数。**
+
+    运营拿它去飞书表里 Ctrl+F 直接定位——「去这一行」那个链接是兜底，
+    不该是主路径（每条都要开一个新网页，很麻烦）。
+
+    取值顺序：
+
+    1. `column`（`pick_label_column` 挑出来的内容列）的文本——**主路径**；
+    2. 「反馈链接」那格**抠掉链接之后**剩的文字：分享文案开头往往就是笔记标题。
+       注意不能直接用整格原文，那一格多数是 `https://www.xiaohongsh…`，
+       每一行前十几个字**一模一样**，等于没显示；
+    3. 笔记 ID——认不出内容，但在表里搜得到；
+    4. 都没有 → 空串，视图渲染成「—」。
+    """
+    if column:
+        text = feishu.read_text(cells.get(column)).strip()
+        if text:
+            return text
+    text = links.text_without_urls(row.link_cell or "")
+    if text:
+        return text
+    return row.parsed.content_id or ""
+
+
+def panel_fields(settings: Settings, *, show_digest: bool = False,
+                 extra: tuple = ()) -> list[str]:
     """面板一次 search 要拉的列。
 
     比 `FieldNames.must_read()` 宽：判定链路用不到 巡查状态/负面状态/诊断信息，
@@ -145,6 +201,9 @@ def panel_fields(settings: Settings, *, show_digest: bool = False) -> list[str]:
     ]
     if show_digest:
         wanted += [f.comment_digest, f.negative_digest]
+    # 额外要读的列（现在只有「哪一条」那一列，见 `pick_label_column`）。
+    # 读表不计费，多读一列只是多几个字节。
+    wanted += [c for c in extra if c]
     # 去重但保持顺序：列名允许被配置成同一个（不推荐，但不该在这里崩）。
     return list(dict.fromkeys(wanted))
 
@@ -215,6 +274,7 @@ def build_snapshot(
     max_todos: int = 200,
     scrub: Optional[Any] = None,
     route: str = "base",
+    label_column: str = "",
 ) -> ProjectSnapshot:
     """把一张表读回来的 records 聚合成一个项目快照。
 
@@ -301,6 +361,7 @@ def build_snapshot(
                 app_token=app_token,
                 table_id=table_id,
                 link_cell=row.link_cell,
+                label=clean(row_label(row, cells, settings, label_column)),
                 reasons=reasons,
                 refresh_status=refresh_status,
                 diagnosis=clean(feishu.read_text(cells.get(f.failure_reason))),
