@@ -750,6 +750,32 @@ class TestMistypedWarning(unittest.TestCase):
             self._run_write_back(self._meta(**{self.f.traffic_status: 3})), 1)
 
 
+class TestSpendCapIsLoudWhenAbsent(unittest.TestCase):
+    """没设金额上限时，以前**一个字都不打**。
+
+    `Budget.describe()` 在什么都没设时返回「无上限」，而收尾那行只在
+    `!= "无上限"` 时才打印——于是唯一真正能兜住「全表被误勾」「最近检查
+    时间列被清空」「上游故障每轮重刷」这三类事故的闸门，没设时是最安静的。
+    """
+
+    def test_describe_still_says_unbounded(self):
+        from xhsearch.config import Budget
+        self.assertEqual(Budget().describe(), "无上限")
+
+    def test_doctor_has_a_budget_section(self):
+        import inspect
+        source = inspect.getsource(cli.cmd_doctor)
+        self.assertIn("MAX_YUAN_PER_RUN", source)
+        self.assertIn("没有上界", source)
+
+    def test_a_paid_run_warns_before_spending(self):
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        head = source[:source.index("for index, (label, table)")]
+        self.assertIn("没有金额上界", head,
+                      "警告必须在开跑之前打，事后说没有意义")
+
+
 class TestEveryExitPathReportsTheRunEnd(unittest.TestCase):
     """面板靠「有 run_start 没有 run_end」认出被容器杀掉的那些轮。
 

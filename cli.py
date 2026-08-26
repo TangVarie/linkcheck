@@ -144,6 +144,21 @@ def _api_keys() -> dict[str, str]:
     return {k: v for k, v in keys.items() if v}
 
 
+# 飞书的 app_token / table_id 只会是字母数字。**必须校验**，因为它们会被拼进
+# 接口地址，而这个请求带着 tenant_access_token——一个含 `/` 或 `..` 的值就能
+# 把它改写到别的 open-apis 端点上。来源正在变多（环境变量、面板表单、注册表），
+# 校验放在解析这一层，所有来源都过得到。feishu._url() 里还有第二道转义。
+#
+# 管的是**字符集**，不是长度：真实 token 是 17–27 位，但长度下限拦不住任何
+# 攻击（`..` 才两个字符，`aaaaaaaa/x` 有十个），只会在飞书哪天缩短 token
+# 格式时误伤合法配置。上限留着挡明显荒唐的值。
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]{1,64}")
+
+
+def valid_token(value: str) -> bool:
+    return bool(_TOKEN_RE.fullmatch(value or ""))
+
+
 def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
 
@@ -192,6 +207,13 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
                          "多项之间用分号隔开（参考 .env.example）")
             if not app_token or not table_id:
                 sys.exit(f"FEISHU_TABLES 里这一项缺 app_token 或 table_id：{chunk!r}")
+            for label_text, token in (("app_token", app_token), ("table_id", table_id)):
+                if not valid_token(token):
+                    sys.exit(
+                        f"FEISHU_TABLES 里这一项的 {label_text} 不合法：{token!r}。"
+                        "飞书的 token 只会是字母和数字——"
+                        "带别的字符的值会被拼进接口地址，那个请求带着你的"
+                        "tenant_access_token，不能放行")
             entries.append((label or table_id, app_token, table_id))
         if not entries:
             sys.exit("FEISHU_TABLES 设了但一张表都没解析出来，检查格式（参考 .env.example）")
@@ -412,6 +434,23 @@ def cmd_doctor(selected: list[str] | None = None) -> int:
     if keys:
         print(f"   已配置的 Key：{'、'.join(sorted(keys))}"
               "（是否有效需要真实调用一次才知道）")
+
+    print("\n⑤ 单轮花费的上界 …")
+    budget = settings.budget
+    if budget.max_yuan_per_run:
+        print(f"   ✅ 金额上限 ¥{budget.max_yuan_per_run:.2f}/轮")
+    else:
+        # 这一段存在的全部理由：没设上限时**以前一个字都不打**。
+        # Budget.describe() 返回「无上限」，而运行时只在 != 无上限 时才打印
+        # ——最危险的那种配置反而是最安静的。
+        print("   ⚠️  没设 MAX_YUAN_PER_RUN：**单轮花费没有上界**")
+        print("      「全表被误勾排队刷新」「最近检查时间列被清空」"
+              "「上游故障导致每轮重刷」这三类事故，")
+        print("      单轮成本都是没有上界的，而且都不会报错。"
+              "建议按你们一轮的正常花费给 3–5 倍。")
+        total += 0        # 不算问题，但要吵闹：拒跑是部署方的决定，不是这里的
+    print(f"   行数上限：{budget.max_records_per_run or '无'}"
+          f"   调用数上限：{budget.max_calls_per_run or '无'}")
 
     print()
     if total:
@@ -727,6 +766,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 每一次「日志和表对不上」都要有人重新算一遍 8 小时。
     print(f"⏱ {mode} 开跑：{settings.display.stamp(now)}"
           f"（UTC {now:%H:%M:%S}，容器日志用的就是这个）")
+    if mode in ("sweep", "queue", "row") and not settings.budget.max_yuan_per_run:
+        # 以前这里是沉默的：Budget.describe() 说「无上限」，而收尾只在
+        # 有上限时才打印。于是唯一真正能兜住烧钱事故的那道闸没设时，
+        # 日志里一个字都没有。
+        print("⚠ 本轮**没有金额上界**（MAX_YUAN_PER_RUN 未设）"
+              "——建议设一个，见 .env.example")
 
     # 软截止是整次运行的预算，不是每张表各领一份——在这里算一次绝对
     # 截止点传给每张表共享，五张表就不会把时限放大成五倍。
@@ -915,7 +960,8 @@ def cmd_serve(selected: list[str] | None = None) -> int:
         return panel.collect(
             tables, settings, api_keys,
             show_digest=config.show_digest,
-            feishu_base=config.feishu_base)
+            feishu_base=config.feishu_base,
+            secrets=config.secrets)
 
     return panel.serve(config, produce)
 

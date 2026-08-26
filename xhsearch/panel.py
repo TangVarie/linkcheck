@@ -40,7 +40,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import feishu, railway, schema, summary
@@ -157,26 +157,53 @@ def _secrets(env) -> tuple:
     return tuple(v for v in ((env.get(n) or "").strip() for n in names) if v)
 
 
+# 直达链接只允许指向飞书自己。这个域名会被渲染进页面上每一个「去这一行」，
+# 而它的来源是配置（将来还会是注册表——运营能改的地方）。不过白名单的话，
+# 一个改过的域名就是一整屏钓鱼链接，指向的还是「点进去填飞书账号」的场景。
+FEISHU_HOSTS = ("feishu.cn", "larksuite.com", "feishu-pre.net")
+DEFAULT_FEISHU_BASE = "https://feishu.cn"
+
+
+def allowed_feishu_base(raw: str) -> str:
+    """把一个候选域名收敛成安全的 base，不合格返回空串。
+
+    只放行 https + 飞书自己的域名（含子域）。
+    """
+    text = (raw or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if not text.startswith(("http://", "https://")):
+        text = "https://" + text
+    parsed = urlparse(text)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return ""
+    host = parsed.hostname.lower()
+    if not any(host == d or host.endswith("." + d) for d in FEISHU_HOSTS):
+        return ""
+    return f"https://{parsed.netloc}"
+
+
 def _feishu_base(env) -> str:
     """直达链接的域名。
 
     优先 `FEISHU_DOMAIN`；没设就从 `FEISHU_TABLES` 里第一条完整网址上扒一个下来
     （多表配置里本来就常常直接粘网址）；都没有就退回 `https://feishu.cn`。
     退回值多半也能跳转，但不保证——所以面板上会提示去设 `FEISHU_DOMAIN`。
+
+    每一个候选都要过 `allowed_feishu_base`：不认识的域名一律丢掉退回默认值，
+    而不是「用户填什么就渲染什么」。
     """
-    explicit = (env.get("FEISHU_DOMAIN") or "").strip().rstrip("/")
+    explicit = allowed_feishu_base(env.get("FEISHU_DOMAIN") or "")
     if explicit:
-        if not explicit.startswith(("http://", "https://")):
-            explicit = "https://" + explicit
         return explicit
     spec = env.get("FEISHU_TABLES") or ""
     for chunk in spec.replace("；", ";").split(";"):
         if "://" not in chunk:
             continue
-        parsed = urlparse(chunk[chunk.index("http"):].strip())
-        if parsed.scheme and parsed.netloc:
-            return f"{parsed.scheme}://{parsed.netloc}"
-    return "https://feishu.cn"
+        candidate = allowed_feishu_base(chunk[chunk.index("http"):].strip().split("/base")[0].split("/wiki")[0])
+        if candidate:
+            return candidate
+    return DEFAULT_FEISHU_BASE
 
 
 # ---------- 取数 ----------
@@ -187,25 +214,35 @@ def collect(
     api_keys: dict[str, str],
     *,
     show_digest: bool = False,
-    feishu_base: str = "https://feishu.cn",
+    feishu_base: str = DEFAULT_FEISHU_BASE,
     now: Optional[datetime] = None,
+    secrets: Iterable[str] = (),
 ) -> summary.Overview:
     """把每张表读一遍、聚合成 Overview。**只读，不花钱。**
 
     一张表出问题只影响它自己那张卡：错误写进 `ProjectSnapshot.error`，
     其余表照常展示。整个面板因为一张表挂掉而空白，是最没用的失败方式。
+
+    `secrets` 是最后一道脱敏：`诊断信息` 那一列存的是上游的错误话术，
+    `providers._redact` 在写进表之前已经脱过一次，但那只脱了当时那家的 Key，
+    而且是**写入时**的行为——表里可能还留着更早版本写下的值。
+    这里是送上公网页面前的最后一次机会，成本只是几次字符串替换。
     """
     now = now or datetime.now(timezone.utc)
     projects: list[summary.ProjectSnapshot] = []
+    scrub = (lambda text: railway.redact(text, secrets)) if secrets else None
     for label, table in tables:
         projects.append(_collect_one(
             label, table, settings, api_keys,
-            show_digest=show_digest, feishu_base=feishu_base, now=now))
+            show_digest=show_digest, feishu_base=feishu_base, now=now,
+            scrub=scrub))
     return summary.Overview(projects=projects, generated_at=now)
 
 
 def _collect_one(label, table, settings, api_keys, *,
-                 show_digest, feishu_base, now) -> summary.ProjectSnapshot:
+                 show_digest, feishu_base, now,
+                 scrub: Optional[Callable[[str], str]] = None
+                 ) -> summary.ProjectSnapshot:
     blank = summary.ProjectSnapshot(
         label=label, app_token=table.app_token, table_id=table.table_id,
         table_url=summary.table_url(feishu_base, table.app_token, table.table_id))
@@ -245,11 +282,21 @@ def _collect_one(label, table, settings, api_keys, *,
     snap = summary.build_snapshot(
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
-        health=health, feishu_base=feishu_base, show_digest=show_digest)
+        health=health, feishu_base=feishu_base, show_digest=show_digest,
+        scrub=scrub)
     if filter_spec is None:
         snap.health = list(snap.health) + [
             f"表里没有「{f.monitoring}」列，面板无法只统计在管的行，"
             f"下面的数字包含了本该被排除的行"]
+    if not records:
+        # 飞书在「应用被移出协作者」时是**静默返回 0 行**，不报错。
+        # 不单独点名的话，这张表会渲染成一张所有数字都是 0 的健康卡片——
+        # 和「这个项目结案了、行都取消巡查了」长得一模一样，
+        # 而前者意味着这张表已经完全没在被巡查，没人会发现。
+        snap.health = list(snap.health) + [
+            f"读到 0 行在管的记录。要么这个项目确实全部取消了「{f.monitoring}」，"
+            "要么应用被移出了这张表的协作者——飞书对后者是静默返回空结果、"
+            "不报错的。去表格右上角「…」→「添加文档应用」确认一下。"]
     return snap
 
 

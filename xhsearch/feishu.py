@@ -205,7 +205,19 @@ class Bitable:
         }
 
     def _url(self, suffix: str) -> str:
-        return f"{BASE}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/{suffix}"
+        """拼接接口地址。**两个 token 必须转义。**
+
+        它们的来源正在变多：早期只有环境变量（部署方自己填），现在还会
+        来自监控面板的表单和注册表——那是运营能改的地方。一个含 `/` 或 `..`
+        的 app_token 直接 f-string 拼进去，就能把这个**带着
+        tenant_access_token 的请求**改写到别的 open-apis 端点上。
+
+        上游还有一道字符集校验（见 cli.parse_table_target），这里是第二道：
+        将来多一个输入源，绕过第一道也仍然安全。
+        """
+        app_token = urllib.parse.quote(self.app_token, safe="")
+        table_id = urllib.parse.quote(self.table_id, safe="")
+        return f"{BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/{suffix}"
 
     # ---------- 读 ----------
 

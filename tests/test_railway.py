@@ -48,8 +48,9 @@ class TestConfig(unittest.TestCase):
     def test_reports_exactly_which_variables_are_missing(self):
         """「日志不可用」这种话没用。要说清差哪个变量。"""
         config = railway.RailwayConfig.from_env({})
-        self.assertEqual(config.missing(),
-                         ["RAILWAY_API_TOKEN", "RAILWAY_ENVIRONMENT_ID"])
+        gaps = config.missing()
+        self.assertIn("RAILWAY_API_TOKEN", " ".join(gaps))
+        self.assertIn("RAILWAY_ENVIRONMENT_ID", gaps)
         self.assertFalse(config.enabled)
 
     def test_enabled_when_both_present(self):
@@ -66,6 +67,37 @@ class TestConfig(unittest.TestCase):
     def test_fetch_without_config_raises_not_configured(self):
         with self.assertRaises(railway.NotConfigured):
             railway.fetch_logs(railway.RailwayConfig(token="", environment_id=""))
+
+
+class TestTokenScope(unittest.TestCase):
+    """同一套 GraphQL 上有 `variables` 查询——一个能读日志的 account token
+    同样能读回项目的全部环境变量（TikHub Key、飞书 Secret 都在里面）。
+    所以范围更小的 project token 必须优先，而且它走另一个请求头。
+    """
+
+    def test_project_token_wins_over_account_token(self):
+        config = railway.RailwayConfig.from_env(
+            {"RAILWAY_PROJECT_TOKEN": "proj-1", "RAILWAY_API_TOKEN": "acct-1"})
+        self.assertEqual(config.token, "proj-1")
+        self.assertTrue(config.project_scoped)
+
+    def test_project_token_uses_its_own_header(self):
+        config = railway.RailwayConfig.from_env({"RAILWAY_PROJECT_TOKEN": "proj-1"})
+        headers = config.headers()
+        self.assertEqual(headers["Project-Access-Token"], "proj-1")
+        self.assertNotIn("Authorization", headers)
+
+    def test_account_token_uses_bearer(self):
+        config = railway.RailwayConfig.from_env({"RAILWAY_API_TOKEN": "acct-1"})
+        self.assertEqual(config.headers()["Authorization"], "Bearer acct-1")
+        self.assertNotIn("Project-Access-Token", config.headers())
+
+    def test_the_right_header_actually_goes_out(self):
+        post, seen = sender(resp(payload=envelope([])))
+        railway.fetch_logs(
+            railway.RailwayConfig(token="proj-1", environment_id="env-1",
+                                  project_scoped=True), post=post)
+        self.assertEqual(seen["headers"]["Project-Access-Token"], "proj-1")
 
 
 class TestRequestShape(unittest.TestCase):
@@ -92,9 +124,56 @@ class TestRequestShape(unittest.TestCase):
     def test_limit_is_clamped(self):
         post, seen = sender(resp(payload=envelope([])))
         railway.fetch_logs(cfg(), limit=999999, post=post)
-        self.assertEqual(seen["body"]["variables"]["limit"], railway.MAX_LIMIT)
+        self.assertEqual(seen["body"]["variables"]["beforeLimit"], railway.MAX_LIMIT)
         railway.fetch_logs(cfg(), limit=-5, post=post)
-        self.assertEqual(seen["body"]["variables"]["limit"], 1)
+        self.assertEqual(seen["body"]["variables"]["beforeLimit"], 1)
+
+
+class TestVerifiedSignature(unittest.TestCase):
+    """签名对着 backboard 做过 introspection（2026-08-26）：
+
+        environmentLogs(afterDate, afterLimit, anchorDate, beforeDate,
+                        beforeLimit, environmentId, filter)
+
+    这几条测试钉住两个照着 deploymentLogs 想当然就会踩的坑。
+    """
+
+    def test_uses_before_limit_not_limit(self):
+        """environmentLogs **没有** limit 参数（有的是 deploymentLogs）。
+        传了的话 GraphQL 在校验期整个查询报错，一条都拿不到。"""
+        post, seen = sender(resp(payload=envelope([])))
+        railway.fetch_logs(cfg(), limit=42, post=post)
+        self.assertEqual(seen["body"]["variables"]["beforeLimit"], 42)
+        self.assertNotIn("limit", seen["body"]["variables"])
+        self.assertNotIn("$limit", seen["body"]["query"])
+
+    def test_service_filter_is_not_a_graphql_argument(self):
+        """environmentLogs 没有 serviceId **参数**，只能走 filter 字符串。
+
+        （`serviceId` 作为 `tags {}` 里的**返回字段**是存在的，
+        所以这里只看 `environmentLogs(...)` 括号里那一段。）
+        """
+        post, seen = sender(resp(payload=envelope([])))
+        railway.fetch_logs(cfg(service_id="svc-9"), post=post)
+        query = seen["body"]["query"]
+        call = query[query.index("environmentLogs(", query.index("{")):]
+        args = call[call.index("(") + 1:call.index(")")]
+        self.assertNotIn("serviceId", args)
+        self.assertNotIn("limit:", args)
+        self.assertIn("@service:svc-9", seen["body"]["variables"]["filter"])
+
+    def test_only_requests_fields_that_exist_on_the_log_type(self):
+        """Log 只有 attributes / message / severity / tags / timestamp；
+        LogTags 只有 deploymentId / deploymentInstanceId / environmentId /
+        projectId / serviceId / snapshotId。多问一个字段整条查询就报错。"""
+        post, seen = sender(resp(payload=envelope([])))
+        railway.fetch_logs(cfg(), post=post)
+        query = seen["body"]["query"]
+        for field in ("timestamp", "message", "severity", "tags",
+                      "serviceId", "deploymentId"):
+            self.assertIn(field, query)
+        for absent in ("level", "text", "podName", "$limit"):
+            self.assertNotIn(absent, query)
 
 
 class TestErrorHandling(unittest.TestCase):

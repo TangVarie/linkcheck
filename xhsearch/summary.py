@@ -172,6 +172,7 @@ def build_snapshot(
     feishu_base: str = "https://feishu.cn",
     show_digest: bool = False,
     max_todos: int = 200,
+    scrub: Optional[Any] = None,
 ) -> ProjectSnapshot:
     """把一张表读回来的 records 聚合成一个项目快照。
 
@@ -179,6 +180,7 @@ def build_snapshot(
     明确说了「这行别管了」，把它算进任何一个数字都是在制造噪声。
     """
     now = now or datetime.now(timezone.utc)
+    clean = scrub or (lambda text: text)
     f = settings.fields
     snap = ProjectSnapshot(
         label=label, app_token=app_token, table_id=table_id,
@@ -243,15 +245,15 @@ def build_snapshot(
                 link_cell=row.link_cell,
                 reasons=reasons,
                 refresh_status=refresh_status,
-                diagnosis=feishu.read_text(cells.get(f.failure_reason)),
+                diagnosis=clean(feishu.read_text(cells.get(f.failure_reason))),
                 comment_count=row.previous_comment_count,
                 traffic_tags=list(row.current_tags),
                 seed_keywords=list(row.seed_keywords),
                 negative_keywords=list(row.negative_keywords),
                 checked_at_ms=row.last_updated_ms,
-                digest=(feishu.read_text(cells.get(f.comment_digest))
+                digest=(clean(feishu.read_text(cells.get(f.comment_digest)))
                         if show_digest else ""),
-                negative_digest=(feishu.read_text(cells.get(f.negative_digest))
+                negative_digest=(clean(feishu.read_text(cells.get(f.negative_digest)))
                                  if show_digest else ""),
             ))
 

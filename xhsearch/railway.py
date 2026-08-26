@@ -40,8 +40,31 @@ ENDPOINT = "https://backboard.railway.com/graphql/v2"
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 5000
 
-_QUERY = """query environmentLogs($environmentId: String!, $filter: String, $limit: Int) {
-  environmentLogs(environmentId: $environmentId, filter: $filter, limit: $limit) {
+# 查询签名**已对着 backboard 做过 introspection 核实**（2026-08-26）：
+#
+#   environmentLogs(afterDate: String, afterLimit: Int, anchorDate: String,
+#                   beforeDate: String, beforeLimit: Int,
+#                   environmentId: String, filter: String): [Log!]!
+#   Log     { attributes, message, severity, tags, timestamp }
+#   LogTags { deploymentId, deploymentInstanceId, environmentId,
+#             projectId, serviceId, snapshotId }
+#
+# 两个容易写错的地方，都是照着 `deploymentLogs` 想当然会踩的：
+#
+# * **没有 `limit`。** 有 `limit` 的是 `deploymentLogs` 和 `buildLogs`。
+#   往 environmentLogs 上传 limit，GraphQL 在校验期就整个查询报错，
+#   一条都拿不到——不是「少拿几条」。条数用 `beforeLimit`（从锚点往回取几条）。
+# * **没有 `serviceId`。** `dnsQueryLogs` / `networkFlowLogs` 有，它没有。
+#   按服务筛选只能走 `filter` 字符串里的 `@service:<id>`。
+#
+# introspection 不需要鉴权，签名哪天变了自己再打一次就知道：
+#   curl -s -X POST https://backboard.railway.com/graphql/v2 \
+#     -H 'Content-Type: application/json' \
+#     -d '{"query":"{__type(name:\"Query\"){fields{name args{name}}}}"}'
+_QUERY = """query environmentLogs($environmentId: String!, $filter: String,
+                            $beforeLimit: Int) {
+  environmentLogs(environmentId: $environmentId, filter: $filter,
+                  beforeLimit: $beforeLimit) {
     timestamp
     message
     severity
@@ -60,10 +83,30 @@ class NotConfigured(RailwayError):
 
 @dataclass
 class RailwayConfig:
+    """Railway 凭据。
+
+    ⚠️ **token 的选型是个安全决定，不只是配置。**
+
+    同一套 GraphQL 上有 `variables` 查询。也就是说一个能读日志的
+    **account / workspace token，同样能读回这个项目的全部环境变量**
+    ——`TIKHUB_API_KEY`、`SOCIALDATAX_API_KEY`、`FEISHU_APP_SECRET` 全在里面。
+    用一把能解开所有密钥的钥匙去换一段日志摘要，这笔交换不一定划算。
+
+    所以优先用 **project token**（`RAILWAY_PROJECT_TOKEN`）：它只作用于
+    一个项目的一个环境，走 `Project-Access-Token` 头。两个都配时用 project token。
+
+    project token 能不能读 `environmentLogs` 还没实测过（见 docs/待验证清单.md）。
+    读不了就只能退回 account token——那时请至少：建在**面板服务的服务级**变量里
+    而不是项目级，并且知道这条风险的存在。实在不放心就整块关掉
+    （不配任何 Railway 变量），面板其余部分照常работа。
+    """
+
     token: str
     environment_id: str
     service_id: str = ""
     timeout: float = 20.0
+    # project token 走的是另一个请求头，权限范围也小得多。
+    project_scoped: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -71,18 +114,28 @@ class RailwayConfig:
 
     @staticmethod
     def from_env(environ: dict) -> "RailwayConfig":
+        project = (environ.get("RAILWAY_PROJECT_TOKEN") or "").strip()
+        account = (environ.get("RAILWAY_API_TOKEN") or "").strip()
         return RailwayConfig(
-            token=(environ.get("RAILWAY_API_TOKEN") or "").strip(),
+            # project token 优先：两个都配时用范围更小的那个。
+            token=project or account,
+            project_scoped=bool(project),
             environment_id=(environ.get("RAILWAY_ENVIRONMENT_ID") or "").strip(),
             service_id=(environ.get("RAILWAY_SERVICE_ID") or
                         environ.get("RAILWAY_CRON_SERVICE_ID") or "").strip(),
         )
 
+    def headers(self) -> dict:
+        """两种 token 走不同的头，Railway 对此没有兼容处理。"""
+        key = "Project-Access-Token" if self.project_scoped else "Authorization"
+        value = self.token if self.project_scoped else f"Bearer {self.token}"
+        return {key: value, "Content-Type": "application/json"}
+
     def missing(self) -> list[str]:
         """还差哪些变量。面板要照原样说给人听，而不是只显示「日志不可用」。"""
         gaps = []
         if not self.token:
-            gaps.append("RAILWAY_API_TOKEN")
+            gaps.append("RAILWAY_PROJECT_TOKEN（或 RAILWAY_API_TOKEN）")
         if not self.environment_id:
             gaps.append("RAILWAY_ENVIRONMENT_ID")
         return gaps
@@ -159,23 +212,24 @@ def fetch_logs(
     if not config.enabled:
         raise NotConfigured("、".join(config.missing()) + " 没配")
     limit = max(1, min(int(limit), MAX_LIMIT))
-    variables: dict[str, Any] = {
-        "environmentId": config.environment_id,
-        "limit": limit,
-    }
     expr = filter_expr.strip()
     if config.service_id:
         # 只要这个服务的日志。面板服务自己的访问日志混进来毫无价值，
         # 还会把真正要看的巡检输出挤出翻页窗口。
+        #
+        # 走 filter 字符串而不是参数：environmentLogs **没有** serviceId 参数
+        # （有的是 dnsQueryLogs / networkFlowLogs）。
         expr = f"@service:{config.service_id} {expr}".strip()
-    variables["filter"] = expr
 
     sender = post or transport.post_with_retry
     resp = sender(
         ENDPOINT,
-        {"Authorization": f"Bearer {config.token}",
-         "Content-Type": "application/json"},
-        json.dumps({"query": _QUERY, "variables": variables}),
+        config.headers(),
+        json.dumps({"query": _QUERY, "variables": {
+            "environmentId": config.environment_id,
+            "filter": expr,
+            "beforeLimit": limit,
+        }}),
         timeout=config.timeout,
         should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
     )
