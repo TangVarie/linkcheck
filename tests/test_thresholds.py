@@ -13,49 +13,57 @@ from xhsearch.config import Settings
 from tests.test_summary import NOW, record
 
 
+BASE = Settings()          # 全局默认：评估中 20 / 爆贴 50 / 大爆 100
+
+
 def entry(**thresholds):
     return registry.Entry(label="项目A", app_token="a", table_id="t",
                           thresholds=thresholds)
 
 
+def read(**thresholds):
+    """校验要看**生效后**的三档，所以得把全局基准一起给它。"""
+    return registry.read_overrides(entry(**thresholds), BASE)
+
+
 class TestReadOverrides(unittest.TestCase):
     def test_empty_means_global_defaults(self):
-        override = registry.read_overrides(entry())
+        override = read()
         self.assertFalse(override.any)
         self.assertEqual(override.problems, [])
 
     def test_valid_values_come_through(self):
-        override = registry.read_overrides(entry(**{
-            registry.COL_TIER_HOT: 30, registry.COL_FLOP_HOURS: 72}))
+        override = read(**{
+            registry.COL_TIER_HOT: 30, registry.COL_FLOP_HOURS: 72})
         self.assertEqual(override.values[registry.COL_TIER_HOT], 30)
         self.assertEqual(override.values[registry.COL_FLOP_HOURS], 72)
 
     def test_non_ascending_tiers_are_rejected_as_a_group(self):
         """「爆贴」门槛比「大爆」还高的话，热度档永远是错的。"""
-        override = registry.read_overrides(entry(**{
-            registry.COL_TIER_HOT: 100, registry.COL_TIER_SUPER_HOT: 50}))
+        override = read(**{
+            registry.COL_TIER_HOT: 100, registry.COL_TIER_SUPER_HOT: 50})
         self.assertNotIn(registry.COL_TIER_HOT, override.values)
         self.assertIn("递增", override.problems[0])
 
     def test_ascending_tiers_pass(self):
-        override = registry.read_overrides(entry(**{
+        override = read(**{
             registry.COL_TIER_EVALUATING: 10, registry.COL_TIER_HOT: 30,
-            registry.COL_TIER_SUPER_HOT: 90}))
+            registry.COL_TIER_SUPER_HOT: 90})
         self.assertEqual(len(override.values), 3)
         self.assertEqual(override.problems, [])
 
     def test_out_of_range_values_are_reported_not_silently_dropped(self):
         """静默忽略一个配置，比不支持它更糟。"""
-        override = registry.read_overrides(entry(**{
-            registry.COL_FLOP_HOURS: 0, registry.COL_ARCHIVE_DAYS: 99999}))
+        override = read(**{
+            registry.COL_FLOP_HOURS: 0, registry.COL_ARCHIVE_DAYS: 99999})
         self.assertEqual(override.values, {})
         self.assertEqual(len(override.problems), 2)
         self.assertTrue(all("已忽略" in p for p in override.problems))
 
     def test_a_bad_group_does_not_kill_the_good_ones(self):
-        override = registry.read_overrides(entry(**{
+        override = read(**{
             registry.COL_TIER_HOT: 100, registry.COL_TIER_SUPER_HOT: 50,
-            registry.COL_FLOP_HOURS: 72}))
+            registry.COL_FLOP_HOURS: 72})
         self.assertEqual(override.values, {registry.COL_FLOP_HOURS: 72})
 
 

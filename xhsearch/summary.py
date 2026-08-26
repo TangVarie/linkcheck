@@ -75,6 +75,8 @@ class ProjectSnapshot:
     app_token: str
     table_id: str
     table_url: str = ""
+    # /base/ 还是 /wiki/，只用于拼链接。见 tablespec.TableTarget.route。
+    route: str = "base"
     # 读这张表失败时只填这一个，其余字段保持零值。一张表挂了不该让整个面板空掉。
     error: str = ""
     # 体检问题（_schema_problems 的原文）。空 = 这张表配置没问题。
@@ -107,10 +109,19 @@ class ProjectSnapshot:
     rows_without_negative_keyword: list[str] = field(default_factory=list)
 
     todos: list[TodoRow] = field(default_factory=list)
+    # 按 max_todos 截掉了多少条。**必须显示出来**：把截断后的长度当成精确的
+    # 「要人管」行数报出去，等于在大面积事故的时候少报，而那正是最不该少报
+    # 的时候。0 = 一条没丢，那个计数就是精确的。
+    todos_dropped: int = 0
 
     @property
     def needs_attention(self) -> int:
         return len(self.todos)
+
+    @property
+    def attention_exact(self) -> bool:
+        """`needs_attention` 是不是精确值。False = 还有 `todos_dropped` 条没算进来。"""
+        return self.todos_dropped == 0
 
     @property
     def healthy(self) -> bool:
@@ -138,15 +149,25 @@ def panel_fields(settings: Settings, *, show_digest: bool = False) -> list[str]:
     return list(dict.fromkeys(wanted))
 
 
-def table_url(base: str, app_token: str, table_id: str) -> str:
-    return f"{base.rstrip('/')}/base/{app_token}?table={table_id}"
+def table_url(base: str, app_token: str, table_id: str,
+              *, route: str = "base") -> str:
+    """拼一个能点开这张表的链接。
+
+    `route` 是原来那条链接走的 /base/ 还是 /wiki/（见
+    `tablespec.TableTarget.route`）。一律拼成 /base/ 的话，用 wiki 链接
+    登记的项目点开是打不开的——接口两种 token 通用，浏览器地址不通用。
+    """
+    prefix = "wiki" if route == "wiki" else "base"
+    return f"{base.rstrip('/')}/{prefix}/{app_token}?table={table_id}"
 
 
-def record_url(base: str, app_token: str, table_id: str, record_id: str) -> str:
+def record_url(base: str, app_token: str, table_id: str, record_id: str,
+               *, route: str = "base") -> str:
     """直达某一行。面板的全部价值有一半在这个链接上——
     「这 7 行要处理」如果还要人自己去表里找，等于没解决问题。
     """
-    return f"{table_url(base, app_token, table_id)}&record={record_id}"
+    return (f"{table_url(base, app_token, table_id, route=route)}"
+            f"&record={record_id}")
 
 
 def _ms(value: Optional[int]) -> Optional[datetime]:
@@ -193,6 +214,7 @@ def build_snapshot(
     show_digest: bool = False,
     max_todos: int = 200,
     scrub: Optional[Any] = None,
+    route: str = "base",
 ) -> ProjectSnapshot:
     """把一张表读回来的 records 聚合成一个项目快照。
 
@@ -203,12 +225,13 @@ def build_snapshot(
     clean = scrub or (lambda text: text)
     f = settings.fields
     snap = ProjectSnapshot(
-        label=label, app_token=app_token, table_id=table_id,
-        table_url=table_url(feishu_base, app_token, table_id),
+        label=label, app_token=app_token, table_id=table_id, route=route,
+        table_url=table_url(feishu_base, app_token, table_id, route=route),
         health=list(health or []),
     )
 
     due: list[rows_mod.Row] = []
+    todos: list[TodoRow] = []
     for record in records:
         cells = record.get("fields") or {}
         row = runner.row_from_record(record, settings)
@@ -225,7 +248,14 @@ def build_snapshot(
         elif (snap.oldest_checked_ms is None
               or row.last_updated_ms < snap.oldest_checked_ms):
             snap.oldest_checked_ms = row.last_updated_ms
-        if row.is_due(settings, now):
+        # `queued` 也要算：`runner.load_rows` 决定花钱时写的是
+        # `wanted or row.queued or not only_due or row.is_due(...)`。
+        # 光看 is_due 会漏掉「人工勾了、但还没到自然间隔」的行——**恰恰是
+        # 面板自己那个批量勾按钮制造出来的行**。漏了就意味着：用完面板的
+        # 批量勾，面板显示的待刷行数和预估花费比下一轮真实要花的少。
+        # （is_due 对已归档行返回 False，而 queued 本来就绕过归档线，
+        # 这个写法把两边的语义也对齐了。）
+        if row.queued or row.is_due(settings, now):
             due.append(row)
 
         refresh_status = feishu.read_text(cells.get(f.refresh_status))
@@ -257,12 +287,17 @@ def build_snapshot(
         reasons = _todo_reasons(
             row, settings, refresh_status=refresh_status,
             negative_status=negative_status, stale=stale)
-        if reasons and len(snap.todos) < max_todos:
-            snap.todos.append(TodoRow(
+        if reasons:
+            # **全部收进来，排完序再截断**（见函数末尾）。在这里按飞书返回的
+            # 记录顺序截，一次大面积事故就能用低优先级的「卡住了」占满前
+            # max_todos 格，把后面的 风控中/已失效/刷新失败 整个藏掉。
+            # 待办只是异常行，records 本来就整份在内存里，全收不多占什么。
+            todos.append(TodoRow(
                 archived=archived,
                 record_id=row.record_id,
                 project=label,
-                record_url=record_url(feishu_base, app_token, table_id, row.record_id),
+                record_url=record_url(feishu_base, app_token, table_id,
+                                      row.record_id, route=route),
                 app_token=app_token,
                 table_id=table_id,
                 link_cell=row.link_cell,
@@ -283,7 +318,9 @@ def build_snapshot(
     snap.due_rows = len(due)
     if due:
         snap.due_yuan = rows_mod.estimate_yuan(due, settings, now, keys=api_keys)
-    snap.todos.sort(key=_todo_sort_key)
+    todos.sort(key=_todo_sort_key)
+    snap.todos = todos[:max_todos]
+    snap.todos_dropped = max(0, len(todos) - max_todos)
     return snap
 
 
@@ -365,6 +402,23 @@ class Overview:
     @property
     def unhealthy_projects(self) -> list[ProjectSnapshot]:
         return [p for p in self.projects if not p.healthy]
+
+    @property
+    def todos_dropped(self) -> int:
+        """各项目按 max_todos 截掉的总条数。>0 = 顶栏那个「要人管」是下界。"""
+        return sum(p.todos_dropped for p in self.projects)
+
+    def todos_dropped_by(self, limit: int = 500, *,
+                         include_archived: bool = False) -> int:
+        """`todos(limit)` 这一次调用又额外截掉了多少条。
+
+        和 `todos_dropped` 分开：那个是每张表内部截的，这个是跨表拉平之后
+        再截的。两个加起来才是「一共有多少条没显示」。
+        """
+        total = sum(len([t for t in p.todos
+                         if include_archived or not t.archived])
+                    for p in self.projects)
+        return max(0, total - limit)
 
     def todos(self, limit: int = 500, *, include_archived: bool = False
               ) -> list[TodoRow]:

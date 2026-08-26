@@ -27,7 +27,7 @@ from dataclasses import dataclass
 # 上限留着挡明显荒唐的值。
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]{1,64}")
 
-_URL_RE = re.compile(r"/(?:base|wiki)/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)")
+_URL_RE = re.compile(r"/(base|wiki)/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)")
 
 # 分隔多项用的：分号（中英文）和换行。
 SEPARATOR_RE = re.compile(r"[;；\n]+")
@@ -42,6 +42,12 @@ class TableTarget:
     label: str
     app_token: str
     table_id: str
+    # 原来的链接走的是 /base/ 还是 /wiki/。**只用来拼给人点的链接，
+    # 一个字都不参与接口调用**——接口那边两种 token 一视同仁（见 parse_target）。
+    # 丢掉它的后果是：用 wiki 链接登记的项目，面板上「打开这张表」和
+    # 「去这一行」会指向 /base/<wiki-token>，行级直达失效——而这个面板
+    # 一半的价值就在那个链接上。
+    route: str = "base"
 
     def as_tuple(self) -> tuple[str, str, str]:
         return (self.label, self.app_token, self.table_id)
@@ -76,9 +82,10 @@ def parse_target(chunk: str, *, default_label: str = "") -> TableTarget:
     else:
         label, target = "", chunk
 
+    route = "base"
     match = _URL_RE.search(target)
     if match:
-        app_token, table_id = match.group(1), match.group(2)
+        route, app_token, table_id = match.group(1), match.group(2), match.group(3)
     elif "://" in target:
         raise BadTarget(
             f"这个网址提不出表信息：{target!r}。要用 /base/xxx?table=tblxxx 或 "
@@ -99,7 +106,8 @@ def parse_target(chunk: str, *, default_label: str = "") -> TableTarget:
                 f"{what} 不合法：{token!r}。飞书的 token 只会是字母和数字——"
                 "带别的字符的值会被拼进接口地址，而那个请求带着你的 "
                 "tenant_access_token，不能放行")
-    return TableTarget(label or default_label or table_id, app_token, table_id)
+    return TableTarget(label or default_label or table_id, app_token, table_id,
+                       route=route)
 
 
 def parse_many(spec: str, *, default_label: str = "") -> list[TableTarget]:
@@ -111,30 +119,72 @@ def parse_many(spec: str, *, default_label: str = "") -> list[TableTarget]:
     return targets
 
 
-def find_duplicate(targets: list[TableTarget]) -> str:
-    """查重。返回一句人话，没重复返回空串。
+@dataclass(frozen=True)
+class Duplicates:
+    """查重结果。两个命名空间分开放，别混成一个 dict——
+
+    一个表的 label 恰好等于另一个表的 table_id 时，混着放会误伤。
+    概率低，但「因为撞了个名字所以这张表这轮不刷了」是那种查半天的故障。
+    """
+
+    by_table_id: dict
+    by_label: dict
+
+    def __bool__(self) -> bool:
+        return bool(self.by_table_id or self.by_label)
+
+    def message_for(self, *, table_id: str = "", label: str = "") -> str:
+        """这一行有没有踩重复。**精确查表，不做子串匹配。**"""
+        return (self.by_table_id.get(table_id)
+                or self.by_label.get(label)
+                or "")
+
+
+def find_duplicates(targets: list[TableTarget]) -> Duplicates:
+    """查重。**每一组都要抓出来，不是碰到第一组就收工。**
+
+    只报第一组等于把第二组原样放行：那张表会在一轮里被排两遍——钱付两份，
+    两份旧快照互相覆盖运营手工打的标签。这是这套东西最贵的一类故障，
+    值得多走完一遍循环。
 
     **查重键是 `table_id` 单独一维，不是 (app_token, table_id)。**
     同一张表既能写成 `/base/bascnXXX?table=tblAAA` 也能写成
     `/wiki/wikcnYYY?table=tblAAA`——两个 app_token 不同、指的是同一张表。
-    用二元组当键挡不住这种写法，结果是同一批行一轮内付两次钱、
-    两份旧快照互相覆盖。不同 base 里 table_id 撞车的概率可以忽略，
+    用二元组当键挡不住这种写法。不同 base 里 table_id 撞车的概率可以忽略，
     宁可误报也别漏。
     """
-    seen_tables: dict[str, str] = {}
+    by_table_id: dict = {}
+    first_seen: dict = {}
     for target in targets:
-        if target.table_id in seen_tables:
-            other = seen_tables[target.table_id]
+        if target.table_id in first_seen:
+            other = first_seen[target.table_id]
             same = "（同一个 app_token）" if other == target.app_token else (
                 f"（app_token 一个是 {other}、一个是 {target.app_token}——"
                 "/base/ 和 /wiki/ 两种链接指的是同一张表）")
-            return (f"{target.table_id} 配了两遍{same}——"
-                    "同一张表刷两次是白花钱，而且两份旧快照会互相覆盖")
-        seen_tables[target.table_id] = target.app_token
+            by_table_id[target.table_id] = (
+                f"{target.table_id} 配了两遍{same}——"
+                "同一张表刷两次是白花钱，而且两份旧快照会互相覆盖")
+        else:
+            first_seen[target.table_id] = target.app_token
 
+    by_label: dict = {}
     labels = [t.label for t in targets]
-    duplicated = [l for l in set(labels) if labels.count(l) > 1]
+    duplicated = sorted({l for l in labels if labels.count(l) > 1})
     if duplicated:
-        return (f"标签重复：{'、'.join(sorted(duplicated))}——"
-                "--table 会分不清，给每张表起个不同的名字")
+        message = (f"标签重复：{'、'.join(duplicated)}——"
+                   "--table 会分不清，给每张表起个不同的名字")
+        for label in duplicated:
+            by_label[label] = message
+    return Duplicates(by_table_id=by_table_id, by_label=by_label)
+
+
+def find_duplicate(targets: list[TableTarget]) -> str:
+    """查重，返回**第一句**人话，没重复返回空串。
+
+    给只需要报一条就退出的调用方用（cli 的 `sys.exit`）。要逐行标记出
+    **全部**有问题的表，用 `find_duplicates()`。
+    """
+    found = find_duplicates(targets)
+    for message in (*found.by_table_id.values(), *found.by_label.values()):
+        return message
     return ""

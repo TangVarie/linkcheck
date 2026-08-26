@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import feishu, schema
+from . import feishu, schema, summary
 from .config import Settings
 
 # 「应用没被加进这张表」的标准话术。这是接管已有表时唯一必须人做的一步，
@@ -190,5 +190,30 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
     table_id = workspace.create_table(base["app_token"], name, fields)
     if not table_id:
         raise feishu.FeishuError(-1, "建数据表失败：飞书没返回 table_id")
+    # ⚠️ 链接必须带上**新建的这张表**的 table_id。`create_base` 会顺带建一张
+    # 飞书自己的默认表，返回的 base 级 url 点进去就是那一张——运营可能直接
+    # 在里面开始填数据，而注册表监控的是另一张，填的东西一行都不会被巡查。
     return {"app_token": base["app_token"], "table_id": table_id,
-            "url": base["url"], "target": f"{base['app_token']}:{table_id}"}
+            "url": _table_url(base.get("url") or "", base["app_token"], table_id),
+            "base_url": base.get("url") or "",
+            # base 里那张默认表不删——删表不可逆，不该有一个网页按钮能干。
+            # 页面上说一句就够了。
+            "note": "这个 base 里还有一张飞书自动建的默认表，没在监控范围内，"
+                    "别往那张里填东西",
+            "target": f"{base['app_token']}:{table_id}"}
+
+
+def _table_url(base_url: str, app_token: str, table_id: str) -> str:
+    """把飞书返回的 base 级链接改写成指向具体某张表。
+
+    只取 scheme+host 重拼，不在原地址后面接 `?table=`——那个地址可能已经
+    带了查询串，接上去就成了两个 `?`。
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base_url)
+    if not parts.scheme or not parts.netloc:
+        # 飞书没给可用的地址时，退回 base 级原文，别拼一个假的出来。
+        return base_url
+    return summary.table_url(f"{parts.scheme}://{parts.netloc}",
+                             app_token, table_id)

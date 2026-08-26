@@ -57,6 +57,11 @@ SESSION_TTL_SECONDS = 12 * 3600
 # 口令最短长度。**拒绝启动**而不是警告——一个 4 位口令的公网面板，
 # 和没有口令的区别只是攻击者要多试几千次。
 MIN_PASSWORD_LENGTH = 12
+# 显式配的签名密钥至少这么长。猜中它就能自己签一个未来过期的会话 Cookie，
+# **完全绕过 PANEL_PASSWORD**——而且伪造 Cookie 这条路根本不经过
+# LoginThrottle，连节流都碰不到，可以离线穷举。不填时自动生成的就是
+# 32 字节，显式填的没理由比它弱。
+MIN_SECRET_LENGTH = 32
 # 一次最多勾多少行「排队刷新」。「全选」一次勾几千行 = 下一轮直接顶穿预算。
 # 这个上限和 MAX_RECORDS_PER_RUN 是两回事：那个是 cron 那边的，
 # 这个是防手滑的——面板上一个「全选」比误改一列容易得多。
@@ -106,6 +111,13 @@ class PanelConfig:
                 f"PANEL_PASSWORD 只有 {len(password)} 个字符，至少要 "
                 f"{MIN_PASSWORD_LENGTH} 个。公网上的短口令等于没有口令")
         raw_secret = (env.get("PANEL_SECRET") or "").strip()
+        if raw_secret and len(raw_secret) < MIN_SECRET_LENGTH:
+            raise ConfigError(
+                f"PANEL_SECRET 只有 {len(raw_secret)} 个字符，至少要 "
+                f"{MIN_SECRET_LENGTH} 个。它签的是会话 Cookie——猜中就能"
+                "绕过 PANEL_PASSWORD 直接进来，而且伪造 Cookie 不走登录节流，"
+                "可以离线慢慢试。生成一个："
+                'python3 -c "import secrets; print(secrets.token_hex(32))"')
         # 不填就每次启动随机生成：重启即掉线，比一个默认密钥好得多——
         # 默认密钥会被写进文档、被复制到每一个部署里，等于人人都能伪造会话。
         secret = raw_secret.encode("utf-8") if raw_secret else secrets.token_bytes(32)
@@ -168,9 +180,13 @@ def _secrets(env) -> tuple:
     宁可多列几个：漏一个的代价是把生产密钥贴在一个公网页面上，
     多列一个的代价只是某条日志里多几个星号。
     """
+    # ⚠️ `RailwayConfig.from_env()` **优先**用 RAILWAY_PROJECT_TOKEN，
+    # 漏掉它就等于把正在用的那把钥匙原样贴在公网页面上。
+    # `tests/test_panel.py` 里有一条 AST 不变量钉住这件事：railway.py 读的
+    # 每一个凭据环境变量都必须出现在这个名单里。
     names = ("TIKHUB_API_KEY", "SOCIALDATAX_API_KEY", "FEISHU_APP_SECRET",
-             "FEISHU_APP_ID", "RAILWAY_API_TOKEN", "PANEL_PASSWORD",
-             "PANEL_SECRET")
+             "FEISHU_APP_ID", "RAILWAY_PROJECT_TOKEN", "RAILWAY_API_TOKEN",
+             "PANEL_PASSWORD", "PANEL_SECRET")
     return tuple(v for v in ((env.get(n) or "").strip() for n in names) if v)
 
 
@@ -234,6 +250,7 @@ def collect(
     feishu_base: str = DEFAULT_FEISHU_BASE,
     now: Optional[datetime] = None,
     secrets: Iterable[str] = (),
+    settings_for: Optional[Callable[[str], Settings]] = None,
 ) -> summary.Overview:
     """把每张表读一遍、聚合成 Overview。**只读，不花钱。**
 
@@ -249,8 +266,12 @@ def collect(
     projects: list[summary.ProjectSnapshot] = []
     scrub = (lambda text: railway.redact(text, secrets)) if secrets else None
     for label, table in tables:
+        # 逐表 Settings：cron 那边 `_run_locked` 是逐表 `apply_overrides` 的。
+        # 这里不跟着做，改过 归档天数 的项目会出现「面板说到期 12 行、
+        # cron 刷了 40 行」这种谁都不信的局面。不传就是全局那一份。
+        per_table = settings_for(table.table_id) if settings_for else settings
         projects.append(_collect_one(
-            label, table, settings, api_keys,
+            label, table, per_table, api_keys,
             show_digest=show_digest, feishu_base=feishu_base, now=now,
             scrub=scrub))
     return summary.Overview(projects=projects, generated_at=now)
@@ -260,9 +281,12 @@ def _collect_one(label, table, settings, api_keys, *,
                  show_digest, feishu_base, now,
                  scrub: Optional[Callable[[str], str]] = None
                  ) -> summary.ProjectSnapshot:
+    route = getattr(table, "route", "base")
     blank = summary.ProjectSnapshot(
         label=label, app_token=table.app_token, table_id=table.table_id,
-        table_url=summary.table_url(feishu_base, table.app_token, table.table_id))
+        route=route,
+        table_url=summary.table_url(feishu_base, table.app_token,
+                                    table.table_id, route=route))
     f = settings.fields
     try:
         meta = table.fields_meta()
@@ -300,7 +324,7 @@ def _collect_one(label, table, settings, api_keys, *,
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
-        scrub=scrub)
+        scrub=scrub, route=route)
     if filter_spec is None:
         snap.health = list(snap.health) + [
             f"表里没有「{f.monitoring}」列，面板无法只统计在管的行，"
@@ -394,6 +418,12 @@ class LogFeed:
         self._lines: list = []
         self._error = ""
         self._fetched_at = 0.0
+        # 这一轮有没有结果可以端出去（有日志、零日志、或者一个错误都算）。
+        # **不能用 `self._lines or self._error` 代替**：
+        # 一次成功但零行的拉取会让两个都为假，于是 TTL 内每次开页面都重打
+        # Railway——而新服务、或 RUN_LOG_JSON 还没产出的时候正好就是这个
+        # 状态，缓存在最该生效的空态下失效。
+        self._loaded = False
 
     @property
     def enabled(self) -> bool:
@@ -409,7 +439,7 @@ class LogFeed:
             return [], self._missing_hint()
         with self._lock:
             fresh = (time.time() - self._fetched_at) < self._ttl
-            if fresh and not force and (self._lines or self._error):
+            if fresh and not force and self._loaded:
                 return list(self._lines), self._error
         try:
             lines = self._fetch(self._config.railway,
@@ -417,15 +447,18 @@ class LogFeed:
             with self._lock:
                 self._lines, self._error = lines, ""
                 self._fetched_at = time.time()
+                self._loaded = True
         except railway.RailwayError as exc:
             # 保留上一批：日志少一次刷新不该让页面上那一块变空白。
             with self._lock:
                 self._error = str(exc)
                 self._fetched_at = time.time()
+                self._loaded = True
         except Exception as exc:                                # noqa: BLE001
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
                 self._fetched_at = time.time()
+                self._loaded = True
         with self._lock:
             return list(self._lines), self._error
 
@@ -590,7 +623,7 @@ class Projects:
         old = registry.apply_overrides(self.settings, entry)
         after = registry.Entry(label=entry.label,
                                thresholds={**entry.thresholds, **values})
-        override = registry.read_overrides(after)
+        override = registry.read_overrides(after, self.settings)
         new = registry.apply_overrides(self.settings, after)
 
         table = self._bitable(entry.app_token, entry.table_id)

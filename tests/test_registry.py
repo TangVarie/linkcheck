@@ -219,7 +219,7 @@ class TestCliFallback(unittest.TestCase):
                "FEISHU_TABLES": "甲=bascnA:tbl1"}
         with mock.patch("builtins.print") as printed:
             got = self._entries(env, registry.RegistryError("网络挂了"))
-        self.assertEqual(got, [("甲", "bascnA", "tbl1")])
+        self.assertEqual([t.as_tuple() for t in got], [("甲", "bascnA", "tbl1")])
         said = " ".join(str(c) for c in printed.call_args_list)
         self.assertIn("可能是旧的", said)
 
@@ -243,8 +243,9 @@ class TestCliFallback(unittest.TestCase):
     def test_without_the_variable_it_is_the_old_env_path(self):
         with mock.patch.dict("os.environ",
                              {"FEISHU_TABLES": "甲=bascnA:tbl1"}, clear=True):
-            self.assertEqual(self.cli._entries("cli_x", "s"),
-                             [("甲", "bascnA", "tbl1")])
+            self.assertEqual(
+                [t.as_tuple() for t in self.cli._entries("cli_x", "s")],
+                [("甲", "bascnA", "tbl1")])
 
 
 if __name__ == "__main__":

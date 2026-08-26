@@ -230,11 +230,16 @@ class Bitable:
         table_id: str,
         *,
         timeout: float = 30.0,
+        route: str = "base",
     ):
         self.app_id = app_id
         self.app_secret = app_secret
         self.app_token = app_token
         self.table_id = table_id
+        # 原链接走的是 /base/ 还是 /wiki/。**只用来拼给人点的链接，一个字都
+        # 不参与接口调用**——接口两种 token 通用（见 tablespec.parse_target），
+        # 浏览器地址不通用。放在这里是因为面板拿到的就是一个 Bitable。
+        self.route = route
         self.timeout = timeout
         self._token: Optional[_Token] = None
 

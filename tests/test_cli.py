@@ -71,17 +71,23 @@ class TestTablesFromEnv(unittest.TestCase):
     解析错一项就是少刷一整张表（静默）或整个进程起不来（吵闹）——
     必须吵闹，且报错要说得清哪一项、该怎么写。"""
 
+    @staticmethod
+    def tuples(targets):
+        """`_tables_from_env` 返回 TableTarget（要保住 route，见 C6）。
+        这些用例只关心 (标签, app_token, table_id)，路由单独有用例。"""
+        return [t.as_tuple() for t in targets]
+
     def test_single_table_fallback(self):
         entries = cli._tables_from_env(
             {"FEISHU_APP_TOKEN": "bascnA", "FEISHU_TABLE_ID": "tblX"})
-        self.assertEqual(entries, [("tblX", "bascnA", "tblX")])
+        self.assertEqual(self.tuples(entries), [("tblX", "bascnA", "tblX")])
 
     def test_multi_with_labels_and_both_forms(self):
         spec = ("OKMAN一期=bascnA:tbl1; "
                 "OKMAN二期=https://xx.feishu.cn/base/bascnA?table=tbl2&view=vewZ;"
                 "bascnB:tbl3")
         entries = cli._tables_from_env({"FEISHU_TABLES": spec})
-        self.assertEqual(entries, [
+        self.assertEqual(self.tuples(entries), [
             ("OKMAN一期", "bascnA", "tbl1"),
             ("OKMAN二期", "bascnA", "tbl2"),
             ("tbl3", "bascnB", "tbl3"),      # 不带标签时标签取 table_id
@@ -91,12 +97,12 @@ class TestTablesFromEnv(unittest.TestCase):
         entries = cli._tables_from_env({
             "FEISHU_TABLES": "甲=bascnA:tbl1",
             "FEISHU_APP_TOKEN": "bascnZ", "FEISHU_TABLE_ID": "tblZ"})
-        self.assertEqual(entries, [("甲", "bascnA", "tbl1")])
+        self.assertEqual(self.tuples(entries), [("甲", "bascnA", "tbl1")])
 
     def test_newline_and_chinese_semicolon_separators(self):
         entries = cli._tables_from_env(
             {"FEISHU_TABLES": "甲=bascnA:tbl1\n乙=bascnA:tbl2；丙=bascnB:tbl3"})
-        self.assertEqual([e[0] for e in entries], ["甲", "乙", "丙"])
+        self.assertEqual([e.label for e in entries], ["甲", "乙", "丙"])
 
     def test_nothing_configured_exits(self):
         with self.assertRaises(SystemExit):
@@ -127,7 +133,10 @@ class TestTablesFromEnv(unittest.TestCase):
         不需要额外换算——跟 /base/ 一视同仁，只是前缀不同。"""
         entries = cli._tables_from_env(
             {"FEISHU_TABLES": "企业C=https://xx.feishu.cn/wiki/wikcnA?table=tbl9&view=vewZ"})
-        self.assertEqual(entries, [("企业C", "wikcnA", "tbl9")])
+        self.assertEqual(self.tuples(entries), [("企业C", "wikcnA", "tbl9")])
+        # 接口一视同仁，但**链接不能**：/base/<wiki-token> 是打不开的，
+        # 所以走的是哪条路由要留住（C6）。
+        self.assertEqual(entries[0].route, "wiki")
 
 
 class TestMainArgs(unittest.TestCase):

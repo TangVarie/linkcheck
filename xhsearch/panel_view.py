@@ -333,7 +333,7 @@ _SCRIPT = """
     post("create", {name: name}).then(function(j){
       var c = j.created;
       document.getElementById("addTarget").value = c.target;
-      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它 →</a>\n链接已经填进上面的输入框，点「体检一下」再入册。", "ok");
+      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它 →</a>\n链接已经填进上面的输入框，点「体检一下」再入册。\n" + esc(c.note || ""), "ok");
       btnCreate.disabled = false;
     }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
   });
@@ -502,6 +502,10 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
         f"/{p.total_rows}{f'（{neg_gap} 行没填）' if neg_gap else ''}</span></div>")
 
     card_class = "card" if p.healthy else "card bad"
+    # 截断了就必须说：把截断后的长度当成精确计数，等于在大面积事故的时候
+    # 少报——而那正是最不该少报的时候。
+    dropped = (f" <span class=muted>+{p.todos_dropped} 未显示</span>"
+               if p.todos_dropped else "")
     return f"""<div class='{card_class}'>
   <h3>{_e(p.label)}</h3>
   <div class=muted><a href='{_e(p.table_url)}' target=_blank
@@ -510,7 +514,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
   <div class=rows>
     <div><span class=lbl>在管</span><span>{p.total_rows} 行
       {f'<span class=muted>（{p.archived_rows} 已归档）</span>' if p.archived_rows else ''}</span></div>
-    <div><span class=lbl>要人管</span><span>{p.needs_attention} 行</span></div>
+    <div><span class=lbl>要人管</span><span>{p.needs_attention} 行{dropped}</span></div>
     <div><span class=lbl>到期待刷</span><span>{due_text}</span></div>
     <div><span class=lbl>排队中</span><span>{p.queued_rows} 行</span></div>
     <div><span class=lbl>卡住了</span><span>{p.stale_rows} 行
@@ -614,6 +618,18 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
         return _shell("监控面板", inner, csrf=csrf)
 
     todos = overview.todos()
+    # 每张表内部按 max_todos 截掉的 + 跨表拉平之后再截掉的。两个都要算，
+    # 否则「要人管 200 行」在一次大面积事故里会被当成精确值。
+    todos_hidden = overview.todos_dropped + overview.todos_dropped_by()
+    hidden_note = (f" ⚠ 另有 {todos_hidden} 行同样需要处理，"
+                   "因为条数上限没显示——先处理完这一屏再回来看。"
+                   if todos_hidden else "")
+    # 零个项目要说清楚是「还没加」而不是「都健康」。全零的一屏和
+    # 「一切正常」长得一模一样，这是这套东西最难发现的那类故障。
+    empty_note = ("" if overview.projects else
+                  "<div class=note>注册表里还没有一张可用的表——"
+                  "在下面「项目」那一栏加第一张。加完等一轮缓存（或点"
+                  "「重新取数」）就会出现在这里。</div>")
     projects = overview.projects
     stale_note = ""
     if error:
@@ -628,7 +644,9 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
     bar = "".join([
         _stat(overview.total_rows, "在管行数"),
-        _stat(len(todos), "要人管", alert=bool(todos)),
+        _stat(f"{len(todos)}" + ("+" if todos_hidden else ""),
+              "要人管" + (f"（另有 {todos_hidden} 行未显示）" if todos_hidden else ""),
+              alert=bool(todos)),
         _stat(overview.due_rows, "到期待刷"),
         _stat(f"¥{overview.due_yuan:.2f}"
               + (" +?" if overview.unestimatable else ""),
@@ -652,14 +670,14 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 {stale_note}{domain_note}
 <div class=bar>{bar}</div>
 
-<h2>要人管的行（{len(todos)}）</h2>
-<div class=muted style='margin-bottom:8px'>跨所有项目拉平。点「去这一行」直接落到
-飞书表里那一行——面板负责发现，具体处理在飞书里做。</div>
+<h2>要人管的行（{len(todos)}{'+' if todos_hidden else ''}）</h2>
+<div class=muted style='margin-bottom:8px'>跨所有项目拉平，按严重度排序。点「去这一行」
+直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做。{hidden_note}</div>
 {_todo_table(todos, offset_hours, config.show_digest)}
 {_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
 
 <h2>各项目</h2>
-<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
+{empty_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
 
 {_projects_section(config)}
 

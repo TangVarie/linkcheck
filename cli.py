@@ -153,8 +153,13 @@ valid_token = tablespec.valid_token
 _TOKEN_RE = tablespec._TOKEN_RE
 
 
-def _tables_from_env(environ) -> list[tuple[str, str, str]]:
-    """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
+def _tables_from_env(environ) -> list:
+    """解析要巡查的表清单，返回 `[tablespec.TableTarget, ...]`。
+
+    返回 TableTarget 而不是三元组，是为了**保住 `route`**（原链接走的是
+    /base/ 还是 /wiki/）。接口两种 token 通用，浏览器地址不通用——丢了它，
+    用 wiki 链接登记的项目在面板上「去这一行」会指向打不开的地址，
+    而行级直达是这个面板一半的价值。
 
     多表用 FEISHU_TABLES，**分号或换行**分隔，每一项的写法见
     `tablespec.parse_target`。标签用在日志分节和 `--table` 筛选上。
@@ -178,7 +183,7 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
         problem = tablespec.find_duplicate(targets)
         if problem:
             sys.exit(f"FEISHU_TABLES 里 {problem}")
-        return [t.as_tuple() for t in targets]
+        return targets
 
     app_token = environ.get("FEISHU_APP_TOKEN", "").strip()
     table_id = environ.get("FEISHU_TABLE_ID", "").strip()
@@ -188,7 +193,7 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     for what, token in (("FEISHU_APP_TOKEN", app_token), ("FEISHU_TABLE_ID", table_id)):
         if not tablespec.valid_token(token):
             sys.exit(f"{what} 不合法：{token!r}。飞书的 token 只会是字母和数字")
-    return [(table_id, app_token, table_id)]
+    return [tablespec.TableTarget(table_id, app_token, table_id)]
 
 
 def _registry_table(app_id: str, app_secret: str) -> feishu.Bitable | None:
@@ -204,15 +209,30 @@ def _registry_table(app_id: str, app_secret: str) -> feishu.Bitable | None:
                           app_token=target.app_token, table_id=target.table_id)
 
 
-def _entries(app_id: str, app_secret: str) -> list[tuple[str, str, str]]:
-    """表清单：优先注册表，读不到就退回 FEISHU_TABLES 并**大声警告**。
+class NoTables(RuntimeError):
+    """一张能巡查的表都没有。`str(exc)` 是可以直接给人看的中文。"""
+
+
+def _entries_or_raise(app_id: str, app_secret: str, *,
+                      allow_empty: bool = False) -> list:
+    """表清单（`TableTarget` 列表）：优先注册表，读不到就退回 FEISHU_TABLES
+    并**大声警告**。走不通时 `raise NoTables`，不 `sys.exit`。
 
     ⚠️ **绝不静默降级成零张表。** 那种失败长这样：进程正常退出、日志一切
     正常、退出码 0，而实际一行都没刷。等有人发现的时候已经过去几天了。
-    所以两条路都不通时是 `sys.exit`，不是 `return []`。
+
+    `allow_empty` 只给 `serve` 用：面板存在的意义之一就是**在上面加第一张
+    表**，而刚 `init-registry` 出来的注册表是空的。在这条路上拒绝启动，
+    等于「要用面板加表，得先有表」——那一整块功能根本走不到。
+    停用最后一个项目之后同样再也起不来。付费的那几条命令（sweep / queue /
+    estimate）不给这个开关，零表照旧拒跑。
+
+    抛异常而不是 `sys.exit`：面板的后台刷新线程会调它，而 `sys.exit` 在
+    子线程里只是悄悄杀掉那个线程——页面会一直显示上一份快照，看着一切正常。
     """
     registry = _registry_table(app_id, app_secret)
     if registry is None:
+        _REGISTRY_ROWS.clear()
         return _tables_from_env(os.environ)
 
     from xhsearch import registry as registry_mod
@@ -224,9 +244,13 @@ def _entries(app_id: str, app_secret: str) -> list[tuple[str, str, str]]:
                 os.environ.get("FEISHU_APP_TOKEN", "").strip():
             print("  退回环境变量里的表清单。**这份清单可能是旧的**——"
                   "在注册表里停用过的表会在这一轮复活并花钱，注意看下面刷了哪些表")
+            # 上一次读到的逐表阈值一并丢掉。cron 每轮是全新进程，读不到注册表
+            # 就是「没有逐表覆盖」；面板是常驻的，留着上一次的会让它和 cron
+            # 用不同的口径算同一张表——而面板正是用来看这件事的。
+            _REGISTRY_ROWS.clear()
             return _tables_from_env(os.environ)
-        sys.exit("  而且没有 FEISHU_TABLES 可以兜底。本轮拒跑——"
-                 "静默跑成「零张表」比报错难发现得多")
+        raise NoTables("  而且没有 FEISHU_TABLES 可以兜底。本轮拒跑——"
+                       "静默跑成「零张表」比报错难发现得多") from exc
 
     for entry in entries:
         if entry.problem:
@@ -234,11 +258,19 @@ def _entries(app_id: str, app_secret: str) -> list[tuple[str, str, str]]:
                   f"本轮跳过：{entry.problem}")
     _REGISTRY_ROWS.clear()
     _REGISTRY_ROWS.update({e.table_id: e for e in entries if e.usable})
-    usable = registry_mod.to_tuples(entries)
-    if not usable:
-        sys.exit(f"注册表里没有一张可用的表（共 {len(entries)} 行，"
-                 "要么没勾「启用」，要么配置有误）。本轮拒跑")
+    usable = registry_mod.to_targets(entries)
+    if not usable and not allow_empty:
+        raise NoTables(f"注册表里没有一张可用的表（共 {len(entries)} 行，"
+                       "要么没勾「启用」，要么配置有误）。本轮拒跑")
     return usable
+
+
+def _entries(app_id: str, app_secret: str) -> list:
+    """`_entries_or_raise` 的 `sys.exit` 版。付费命令走这条。"""
+    try:
+        return _entries_or_raise(app_id, app_secret)
+    except NoTables as exc:
+        sys.exit(str(exc))
 
 
 # 注册表里那一行，按 table_id 索引。逐表阈值从这儿来；没用注册表时是空的。
@@ -248,17 +280,28 @@ _REGISTRY_ROWS: dict[str, Any] = {}
 def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
-    entries = _entries(app_id, app_secret)
-    if selected:
-        by_label = {label: entry for entry in entries for label in [entry[0]]}
-        missing = [s for s in selected if s not in by_label]
-        if missing:
-            sys.exit(f"--table 指定的表不存在：{'、'.join(missing)}。"
-                     f"可选：{'、'.join(label for label, _, _ in entries)}")
-        entries = [by_label[s] for s in selected]
-    return [(label, feishu.Bitable(app_id=app_id, app_secret=app_secret,
-                                   app_token=app_token, table_id=table_id))
-            for label, app_token, table_id in entries]
+    return _bitables(_env_filtered(_entries(app_id, app_secret), selected),
+                     app_id, app_secret)
+
+
+def _env_filtered(targets: list, selected: list[str] | None) -> list:
+    """按 `--table` 筛。指定了不存在的标签就退出——静默跑成别的表更糟。"""
+    if not selected:
+        return targets
+    by_label = {t.label: t for t in targets}
+    missing = [s for s in selected if s not in by_label]
+    if missing:
+        sys.exit(f"--table 指定的表不存在：{'、'.join(missing)}。"
+                 f"可选：{'、'.join(t.label for t in targets)}")
+    return [by_label[s] for s in selected]
+
+
+def _bitables(targets: list, app_id: str, app_secret: str
+              ) -> list[tuple[str, feishu.Bitable]]:
+    return [(t.label, feishu.Bitable(app_id=app_id, app_secret=app_secret,
+                                     app_token=t.app_token,
+                                     table_id=t.table_id, route=t.route))
+            for t in targets]
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -1045,16 +1088,55 @@ def cmd_serve(selected: list[str] | None = None) -> int:
     api_keys = _api_keys()
     # Key 只用来给「预计花费」选对单价（不同通道差十几倍），一个请求都不发。
     # 没配也能起：那时按默认通道计价，数字会偏，页面上会说明。
-    tables = _tables(selected)
-    print(f"面板要看 {len(tables)} 张表："
-          f"{'、'.join(label for label, _ in tables)}")
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+
+    def resolve_tables():
+        """**每一轮刷新都重新读一次表清单。**
+
+        只在启动时读一次的话：在面板上加表/启用，概览里永远不出现；
+        停用/移除，面板还在读它。cron 下一轮就看见了，面板要重启才看见——
+        两边显示的「在管哪些表」长期分叉，而面板正是用来看这件事的。
+
+        `allow_empty=True`：刚 `init-registry` 出来的注册表是空的，
+        而在面板上加第一张表正是它存在的理由。付费那几条命令不给这个开关。
+        """
+        targets = _entries_or_raise(app_id, app_secret, allow_empty=True)
+        return _bitables(_env_filtered(targets, selected), app_id, app_secret)
+
+    def settings_for(table_id: str):
+        """这张表自己的 Settings。**和 cron 用同一个函数算**，口径不会打架。
+
+        `_run_locked` 的表循环里是 `registry.apply_overrides`；面板这边不做
+        同一件事的话，逐表 `归档天数` 改过之后，面板算出的到期/超期/归档/
+        预估花费和 cron 不是一回事，待办行还会被放进错误的「在管/已归档」分区。
+        """
+        row = _REGISTRY_ROWS.get(table_id)
+        if row is None:
+            return settings
+        from xhsearch import registry as registry_mod
+        # log=None：面板一分钟刷一次，逐表阈值那句话打一遍就够了，
+        # 每分钟重复一遍只会把日志淹掉。cron 那边照常打。
+        return registry_mod.apply_overrides(settings, row)
+
+    try:
+        tables = resolve_tables()
+    except NoTables as exc:
+        sys.exit(str(exc))
+    if tables:
+        print(f"面板要看 {len(tables)} 张表："
+              f"{'、'.join(label for label, _ in tables)}")
+    else:
+        print("⚠ 注册表里还没有可用的表。面板照常启动——"
+              "到「项目」页上加第一张")
 
     def produce():
         return panel.collect(
-            tables, settings, api_keys,
+            resolve_tables(), settings, api_keys,
             show_digest=config.show_digest,
             feishu_base=config.feishu_base,
-            secrets=config.secrets)
+            secrets=config.secrets,
+            settings_for=settings_for)
 
     return panel.serve(config, produce, settings)
 

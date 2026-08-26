@@ -97,6 +97,8 @@ class Entry:
     app_token: str = ""
     table_id: str = ""
     problem: str = ""
+    # /base/ 还是 /wiki/。只用来拼给人点的链接，见 tablespec.TableTarget.route。
+    route: str = "base"
     # 逐表阈值。None = 这一格空着，用全局默认。
     thresholds: dict = field(default_factory=dict)
 
@@ -106,6 +108,10 @@ class Entry:
 
     def as_tuple(self) -> tuple[str, str, str]:
         return (self.label, self.app_token, self.table_id)
+
+    def as_target(self) -> tablespec.TableTarget:
+        return tablespec.TableTarget(self.label, self.app_token,
+                                     self.table_id, route=self.route)
 
 
 def looks_like_registry(meta: Optional[dict]) -> bool:
@@ -166,25 +172,42 @@ def read(table: feishu.Bitable) -> list[Entry]:
                     entry.target, default_label=entry.label)
                 entry.app_token = target.app_token
                 entry.table_id = target.table_id
+                entry.route = target.route
                 entry.label = entry.label or target.label
             except tablespec.BadTarget as exc:
                 entry.problem = str(exc)
         entries.append(entry)
 
     # 查重只看**在用的**行：停用的那些留着当历史，不该因为和在用的撞了就报错。
-    live = [tablespec.TableTarget(e.label, e.app_token, e.table_id)
-            for e in entries if e.usable]
-    duplicate = tablespec.find_duplicate(live)
-    if duplicate:
+    #
+    # 用 `find_duplicates`（复数）而不是 `find_duplicate`：后者只报碰到的
+    # 第一组，第二组重复会原样放行——那张表一轮里被排两遍，钱付两份、
+    # 两份旧快照互相覆盖人工标签。
+    # 而且是**精确查表**，不是拿 table_id 去那句话里做子串匹配：
+    # 一个恰好是别处子串的 table_id 会被误伤，那种故障查起来毫无线索。
+    live = [e.as_target() for e in entries if e.usable]
+    duplicates = tablespec.find_duplicates(live)
+    if duplicates:
         for entry in entries:
-            if entry.usable and (entry.table_id in duplicate
-                                 or entry.label in duplicate):
-                entry.problem = duplicate
+            if not entry.usable:
+                continue
+            message = duplicates.message_for(table_id=entry.table_id,
+                                             label=entry.label)
+            if message:
+                entry.problem = message
     return entries
 
 
+def to_targets(entries: list[Entry]) -> list:
+    """能巡查的那些 → `TableTarget` 列表（带 `route`，拼链接要用）。"""
+    return [e.as_target() for e in entries if e.usable]
+
+
 def to_tuples(entries: list[Entry]) -> list[tuple[str, str, str]]:
-    """能巡查的那些 → `cli._tables_from_env` 的形状。"""
+    """能巡查的那些 → `(label, app_token, table_id)` 三元组。
+
+    路由信息在这里会丢掉，只给不拼链接的调用方用；要拼链接走 `to_targets`。
+    """
     return [e.as_tuple() for e in entries if e.usable]
 
 
@@ -247,18 +270,28 @@ class Override:
         return bool(self.values)
 
 
-def read_overrides(entry: Entry) -> Override:
+def read_overrides(entry: Entry, base) -> Override:
     """把注册表那几格数字读成覆盖值。**纯函数。**
 
     每一格单独校验，一格填错只丢那一格、不影响别的——和「一行填错只影响
     那一行」是同一条纪律。校验不过的**不静默忽略**：写进 problems 让面板
     和日志都能看见。静默忽略一个配置，比不支持它更糟。
+
+    三档门槛是唯一的例外：它们是**一组**，得按**生效后的值**一起看。
+    `base` 就是为这个要的——只校验「填了的那几格」会漏掉两种形态：
+
+    * 只填「爆贴门槛=10」，全局「评估中门槛」是 20 → 生效后是 (20, 10, 100)
+    * 两档填成相等 → `heat_tier()` 从高往低判，下面那一档**永远够不着**
+
+    两种都会让 cron 从下一轮起给这张表写错热度档，而热度是**棘轮
+    （只升不降）**的——写错了不会自己回来。所以要求**严格递增**。
     """
     out = Override()
     raw = dict(entry.thresholds or {})
 
+    tier_columns = (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT)
     tiers = {}
-    for column in (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT):
+    for column in tier_columns:
         value = raw.get(column)
         if value is None:
             continue
@@ -266,15 +299,23 @@ def read_overrides(entry: Entry) -> Override:
             out.problems.append(f"「{column}」= {value}，要是正整数，已忽略")
             continue
         tiers[column] = value
-    ordered = [tiers.get(c) for c in
-               (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT)]
-    given = [v for v in ordered if v is not None]
-    if len(given) > 1 and given != sorted(given):
-        # 三档必须递增，否则「爆贴」的门槛比「大爆」还高，热度档永远错。
-        out.problems.append(
-            f"三档门槛不是递增的（{'、'.join(str(v) for v in given)}），"
-            "整组已忽略——评估中 < 爆贴 < 大爆")
-        tiers = {}
+    if tiers:
+        # 没填的格子用全局值补齐，校验的是**这张表实际会用的那三个数**。
+        fallback = {
+            COL_TIER_EVALUATING: base.thresholds.tier_evaluating,
+            COL_TIER_HOT: base.thresholds.tier_hot,
+            COL_TIER_SUPER_HOT: base.thresholds.tier_super_hot,
+        }
+        effective = [tiers.get(c, fallback[c]) for c in tier_columns]
+        a, b, c = effective
+        if not (a < b < c):
+            shown = "、".join(f"{col}={val}" for col, val
+                             in zip(tier_columns, effective))
+            out.problems.append(
+                f"三档门槛生效后不是严格递增的（{shown}；没填的那几格用的是"
+                "全局默认），整组已忽略——必须 评估中 < 爆贴 < 大爆，"
+                "相等也不行：热度从高往低判，等值会让下面那一档永远够不着")
+            tiers = {}
     out.values.update(tiers)
 
     for column, floor, ceiling in ((COL_FLOP_HOURS, 1, 24 * 365),
@@ -299,7 +340,7 @@ def apply_overrides(base, entry: Entry, *, log=None):
     """
     import copy
 
-    override = read_overrides(entry)
+    override = read_overrides(entry, base)
     if log:
         for problem in override.problems:
             log(f"⚠ 注册表里「{entry.label}」的阈值有问题：{problem}")
