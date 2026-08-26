@@ -71,17 +71,23 @@ class TestTablesFromEnv(unittest.TestCase):
     解析错一项就是少刷一整张表（静默）或整个进程起不来（吵闹）——
     必须吵闹，且报错要说得清哪一项、该怎么写。"""
 
+    @staticmethod
+    def tuples(targets):
+        """`_tables_from_env` 返回 TableTarget（要保住 route，见 C6）。
+        这些用例只关心 (标签, app_token, table_id)，路由单独有用例。"""
+        return [t.as_tuple() for t in targets]
+
     def test_single_table_fallback(self):
         entries = cli._tables_from_env(
             {"FEISHU_APP_TOKEN": "bascnA", "FEISHU_TABLE_ID": "tblX"})
-        self.assertEqual(entries, [("tblX", "bascnA", "tblX")])
+        self.assertEqual(self.tuples(entries), [("tblX", "bascnA", "tblX")])
 
     def test_multi_with_labels_and_both_forms(self):
         spec = ("OKMAN一期=bascnA:tbl1; "
                 "OKMAN二期=https://xx.feishu.cn/base/bascnA?table=tbl2&view=vewZ;"
                 "bascnB:tbl3")
         entries = cli._tables_from_env({"FEISHU_TABLES": spec})
-        self.assertEqual(entries, [
+        self.assertEqual(self.tuples(entries), [
             ("OKMAN一期", "bascnA", "tbl1"),
             ("OKMAN二期", "bascnA", "tbl2"),
             ("tbl3", "bascnB", "tbl3"),      # 不带标签时标签取 table_id
@@ -91,12 +97,12 @@ class TestTablesFromEnv(unittest.TestCase):
         entries = cli._tables_from_env({
             "FEISHU_TABLES": "甲=bascnA:tbl1",
             "FEISHU_APP_TOKEN": "bascnZ", "FEISHU_TABLE_ID": "tblZ"})
-        self.assertEqual(entries, [("甲", "bascnA", "tbl1")])
+        self.assertEqual(self.tuples(entries), [("甲", "bascnA", "tbl1")])
 
     def test_newline_and_chinese_semicolon_separators(self):
         entries = cli._tables_from_env(
             {"FEISHU_TABLES": "甲=bascnA:tbl1\n乙=bascnA:tbl2；丙=bascnB:tbl3"})
-        self.assertEqual([e[0] for e in entries], ["甲", "乙", "丙"])
+        self.assertEqual([e.label for e in entries], ["甲", "乙", "丙"])
 
     def test_nothing_configured_exits(self):
         with self.assertRaises(SystemExit):
@@ -127,7 +133,10 @@ class TestTablesFromEnv(unittest.TestCase):
         不需要额外换算——跟 /base/ 一视同仁，只是前缀不同。"""
         entries = cli._tables_from_env(
             {"FEISHU_TABLES": "企业C=https://xx.feishu.cn/wiki/wikcnA?table=tbl9&view=vewZ"})
-        self.assertEqual(entries, [("企业C", "wikcnA", "tbl9")])
+        self.assertEqual(self.tuples(entries), [("企业C", "wikcnA", "tbl9")])
+        # 接口一视同仁，但**链接不能**：/base/<wiki-token> 是打不开的，
+        # 所以走的是哪条路由要留住（C6）。
+        self.assertEqual(entries[0].route, "wiki")
 
 
 class TestMainArgs(unittest.TestCase):
@@ -750,6 +759,94 @@ class TestMistypedWarning(unittest.TestCase):
             self._run_write_back(self._meta(**{self.f.traffic_status: 3})), 1)
 
 
+class TestSpendCapIsLoudWhenAbsent(unittest.TestCase):
+    """没设金额上限时，以前**一个字都不打**。
+
+    `Budget.describe()` 在什么都没设时返回「无上限」，而收尾那行只在
+    `!= "无上限"` 时才打印——于是唯一真正能兜住「全表被误勾」「最近检查
+    时间列被清空」「上游故障每轮重刷」这三类事故的闸门，没设时是最安静的。
+    """
+
+    def test_describe_still_says_unbounded(self):
+        from xhsearch.config import Budget
+        self.assertEqual(Budget().describe(), "无上限")
+
+    def test_doctor_has_a_budget_section(self):
+        import inspect
+        source = inspect.getsource(cli.cmd_doctor)
+        self.assertIn("MAX_YUAN_PER_RUN", source)
+        self.assertIn("没有上界", source)
+
+    def test_a_paid_run_warns_before_spending(self):
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        head = source[:source.index("for index, (label, table)")]
+        self.assertIn("没有金额上界", head,
+                      "警告必须在开跑之前打，事后说没有意义")
+
+
+class TestEveryExitPathReportsTheRunEnd(unittest.TestCase):
+    """面板靠「有 run_start 没有 run_end」认出被容器杀掉的那些轮。
+
+    所以每一条**正常**退出路径都必须发 run_end。漏一条，那一轮在看板上
+    就长得和「跑到一半被回收」一模一样——一个假的故障信号比没有信号更糟。
+    这里按 AST 检查，因为这类遗漏都是「新加了一个 return 忘了改」，
+    靠人看 diff 挡不住。
+    """
+
+    def _run_locked_ast(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(cli))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_locked":
+                return node
+        self.fail("找不到 cli._run_locked")
+
+    def _returns_in(self, node):
+        """_run_locked 自己的 return，不含嵌套函数（_finish 自己那条不算）。"""
+        import ast
+        found = []
+        stack = list(node.body)
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(item, ast.Return):
+                found.append(item)
+            for child in ast.iter_child_nodes(item):
+                stack.append(child)
+        return found
+
+    def test_every_return_goes_through_finish(self):
+        import ast
+        for node in self._returns_in(self._run_locked_ast()):
+            self.assertIsInstance(
+                node.value, ast.Call,
+                f"cli.py 第 {node.lineno} 行的 return 不是 _finish(...)")
+            self.assertEqual(
+                getattr(node.value.func, "id", None), "_finish",
+                f"cli.py 第 {node.lineno} 行的 return 绕开了 _finish，"
+                "这一轮不会发 run_end，看板会把它当成被杀掉的轮子")
+
+    def test_the_raise_path_also_reports(self):
+        """刷新阶段炸了也要发一条（带错误类型），否则一次 Python 异常
+        和一次 SIGKILL 在看板上分不出来。"""
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        head, _, tail = source.partition("except BaseException:")
+        self.assertTrue(tail, "_run_locked 里的 BaseException 兜底不见了")
+        self.assertIn("_finish(1, error=", tail)
+
+    def test_run_start_is_emitted_before_any_table_runs(self):
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        self.assertIn("EVENT_RUN_START", source)
+        self.assertLess(source.index("EVENT_RUN_START"),
+                        source.index("for index, (label, table) in enumerate(tables)"),
+                        "run_start 要在开跑之前发")
+
+
 class TestReportedSpanOnlyCoversRowsThatLanded(unittest.TestCase):
     """「已写回 N 行，本轮『最近检查时间』= …」那一行只能报**真的落表**的时刻。
 
@@ -822,3 +919,47 @@ class TestReportedSpanOnlyCoversRowsThatLanded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFirstRunCap(unittest.TestCase):
+    """整张表一个「最近检查时间」都没有 = 全新表，或者刚把那一列建出来。
+    两种情况下每一行都判到期，一轮就是全表付费。
+
+    这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，
+    这个是**单张新表**的，防的是「一张 800 行的表刚入册就吃掉整轮预算」。
+    """
+
+    def test_the_cap_is_read_from_the_environment(self):
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn("FIRST_RUN_MAX_RECORDS", source)
+
+    def test_it_only_fires_when_every_row_is_unchecked(self):
+        """有一行刷过就说明这张表已经在跑了，不该再当新表限流。"""
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn("all(r.last_updated_ms is None for r in row_list)", source)
+
+    def test_zero_disables_it(self):
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn("if (first_run_cap and", source,
+                      "0 要能关掉这个闸，否则没法一次刷完")
+
+
+class TestEstimateSaysUnknownNotZero(unittest.TestCase):
+    """缺「最近检查时间」列时 load_rows 直接 return []，
+    于是 estimate 报「¥0.00」——而真相是算不出来。"""
+
+    def test_the_guard_returns_none_not_zero(self):
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        guard = source[source.index("分层刷新没有依据"):]
+        self.assertIn("return 1, found, 0, None, None", guard,
+                      "花费要返回 None（未知），不是 0.0")
+
+    def test_the_total_line_counts_the_unestimatable_tables(self):
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        self.assertIn("unknown_cost", source)
+        self.assertIn("无法估算", source)

@@ -6,6 +6,8 @@
     python3 cli.py queue               # 只刷勾了「排队刷新」的行
     python3 cli.py row <record_id>...  # 刷指定行（无视冷却和分层节流）
     python3 cli.py estimate            # 只估算这一轮要花多少钱，不发请求
+    python3 cli.py serve               # 起监控面板（常驻、只读，一分钱不花）
+    python3 cli.py init-registry       # 建那张存表清单的飞书表（这辈子跑一次）
 
 多表：设 FEISHU_TABLES 一次巡查多张表（见 .env.example），上面每个命令都会
 逐表执行；`--table 标签` 可以只跑其中某几张（逗号分隔）。
@@ -24,8 +26,10 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Any
 
-from xhsearch import feishu, providers, rows as rows_mod, runlock, runner
+from xhsearch import (feishu, providers, rows as rows_mod, runlock, runner,
+                      schema, tablespec)
 from xhsearch.config import Budget, Channels, Settings
 from xhsearch.envfile import load_dotenv
 
@@ -143,89 +147,161 @@ def _api_keys() -> dict[str, str]:
     return {k: v for k, v in keys.items() if v}
 
 
-def _tables_from_env(environ) -> list[tuple[str, str, str]]:
-    """解析要巡查的表清单，返回 [(标签, app_token, table_id), ...]。
+# 解析和校验都在 xhsearch/tablespec.py（注册表和面板要用同一套：报错文案不能漂、
+# 安全校验不能漏）。这两个名字保留成别名，旧调用点和旧测试不用改。
+valid_token = tablespec.valid_token
+_TOKEN_RE = tablespec._TOKEN_RE
 
-    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项几种写法都认：
 
-        OKMAN一期=bascnXXX:tblAAA
-        OKMAN二期=https://xx.feishu.cn/base/bascnXXX?table=tblBBB
-        企业C期=https://xx.feishu.cn/wiki/wikcnXXX?table=tblDDD   （挂在知识库里的表也认）
-        bascnYYY:tblCCC                     （不带标签时标签取 table_id）
+def _tables_from_env(environ) -> list:
+    """解析要巡查的表清单，返回 `[tablespec.TableTarget, ...]`。
 
-    标签用在日志分节和 --table 筛选上，起个人能认的名字。
+    返回 TableTarget 而不是三元组，是为了**保住 `route`**（原链接走的是
+    /base/ 还是 /wiki/）。接口两种 token 通用，浏览器地址不通用——丢了它，
+    用 wiki 链接登记的项目在面板上「去这一行」会指向打不开的地址，
+    而行级直达是这个面板一半的价值。
+
+    多表用 FEISHU_TABLES，**分号或换行**分隔，每一项的写法见
+    `tablespec.parse_target`。标签用在日志分节和 `--table` 筛选上。
+
     单表继续用 FEISHU_APP_TOKEN + FEISHU_TABLE_ID；两种都配了以
     FEISHU_TABLES 为准。所有表共用同一个飞书应用（App ID/Secret），
     应用要逐张表「添加文档应用」授权。
 
-    /wiki/ 链接实测直接把地址栏里那段 token 当 app_token 用，多维表格接口
-    照样认——不需要额外调接口换算、也不需要给应用多开知识库权限，跟
-    /base/ 链接一视同仁，只是换了个前缀。
+    **这里的失败一律 `sys.exit`**：环境变量是部署方填的，填错了整个进程就该
+    起不来。注册表那条路不一样——那是运营填的，一行错不该让其余表停摆，
+    所以它自己 catch `BadTarget` 把那一行标成配置有误（见 xhsearch/registry.py）。
     """
     spec = environ.get("FEISHU_TABLES", "").strip()
     if spec:
-        entries: list[tuple[str, str, str]] = []
-        for chunk in re.split(r"[;；\n]+", spec):
-            chunk = chunk.strip().strip(",")
-            if not chunk:
-                continue
-            head, sep, rest = chunk.partition("=")
-            # URL 里本来就有 =（?table=tbl...），只有「短标签=」才当标签用
-            if sep and "://" not in head and "/" not in head and ":" not in head:
-                label, target = head.strip(), rest.strip()
-            else:
-                label, target = "", chunk
-            match = re.search(r"/(?:base|wiki)/([A-Za-z0-9]+)\S*?[?&]table=([A-Za-z0-9]+)", target)
-            if match:
-                app_token, table_id = match.group(1), match.group(2)
-            elif "://" in target:
-                sys.exit(f"FEISHU_TABLES 里这个网址提不出表信息：{target!r}。"
-                         "要用 /base/xxx?table=tblxxx 或 /wiki/xxx?table=tblxxx 形式的地址"
-                         "（打开目标数据表时浏览器地址栏那串）")
-            elif ":" in target:
-                app_token, _, table_id = target.partition(":")
-                app_token, table_id = app_token.strip(), table_id.strip()
-            else:
-                sys.exit(f"FEISHU_TABLES 里这一项看不懂：{chunk!r}。每一项写成 "
-                         "标签=app_token:table_id 或 标签=表格完整网址，"
-                         "多项之间用分号隔开（参考 .env.example）")
-            if not app_token or not table_id:
-                sys.exit(f"FEISHU_TABLES 里这一项缺 app_token 或 table_id：{chunk!r}")
-            entries.append((label or table_id, app_token, table_id))
-        if not entries:
+        try:
+            targets = tablespec.parse_many(spec)
+        except tablespec.BadTarget as exc:
+            sys.exit(f"FEISHU_TABLES 里有一项解析不了：{exc}（参考 .env.example）")
+        if not targets:
             sys.exit("FEISHU_TABLES 设了但一张表都没解析出来，检查格式（参考 .env.example）")
-        seen: set[tuple[str, str]] = set()
-        for _, app_token, table_id in entries:
-            if (app_token, table_id) in seen:
-                sys.exit(f"FEISHU_TABLES 里 {table_id} 配了两遍——同一张表刷两次是白花钱")
-            seen.add((app_token, table_id))
-        labels = [label for label, _, _ in entries]
-        if len(set(labels)) != len(labels):
-            sys.exit("FEISHU_TABLES 里有重复的标签，--table 会分不清——给每张表起个不同的名字")
-        return entries
+        problem = tablespec.find_duplicate(targets)
+        if problem:
+            sys.exit(f"FEISHU_TABLES 里 {problem}")
+        return targets
 
     app_token = environ.get("FEISHU_APP_TOKEN", "").strip()
     table_id = environ.get("FEISHU_TABLE_ID", "").strip()
     if not app_token or not table_id:
         sys.exit("没配任何表：多表设 FEISHU_TABLES，单表设 "
                  "FEISHU_APP_TOKEN + FEISHU_TABLE_ID（参考 .env.example）")
-    return [(table_id, app_token, table_id)]
+    for what, token in (("FEISHU_APP_TOKEN", app_token), ("FEISHU_TABLE_ID", table_id)):
+        if not tablespec.valid_token(token):
+            sys.exit(f"{what} 不合法：{token!r}。飞书的 token 只会是字母和数字")
+    return [tablespec.TableTarget(table_id, app_token, table_id)]
+
+
+def _registry_table(app_id: str, app_secret: str) -> feishu.Bitable | None:
+    """FEISHU_REGISTRY 指向的那张表，没配返回 None。"""
+    spec = os.environ.get("FEISHU_REGISTRY", "").strip()
+    if not spec:
+        return None
+    try:
+        target = tablespec.parse_target(spec, default_label="registry")
+    except tablespec.BadTarget as exc:
+        sys.exit(f"FEISHU_REGISTRY 看不懂：{exc}")
+    return feishu.Bitable(app_id=app_id, app_secret=app_secret,
+                          app_token=target.app_token, table_id=target.table_id)
+
+
+class NoTables(RuntimeError):
+    """一张能巡查的表都没有。`str(exc)` 是可以直接给人看的中文。"""
+
+
+def _entries_or_raise(app_id: str, app_secret: str, *,
+                      allow_empty: bool = False) -> list:
+    """表清单（`TableTarget` 列表）：优先注册表，读不到就退回 FEISHU_TABLES
+    并**大声警告**。走不通时 `raise NoTables`，不 `sys.exit`。
+
+    ⚠️ **绝不静默降级成零张表。** 那种失败长这样：进程正常退出、日志一切
+    正常、退出码 0，而实际一行都没刷。等有人发现的时候已经过去几天了。
+
+    `allow_empty` 只给 `serve` 用：面板存在的意义之一就是**在上面加第一张
+    表**，而刚 `init-registry` 出来的注册表是空的。在这条路上拒绝启动，
+    等于「要用面板加表，得先有表」——那一整块功能根本走不到。
+    停用最后一个项目之后同样再也起不来。付费的那几条命令（sweep / queue /
+    estimate）不给这个开关，零表照旧拒跑。
+
+    抛异常而不是 `sys.exit`：面板的后台刷新线程会调它，而 `sys.exit` 在
+    子线程里只是悄悄杀掉那个线程——页面会一直显示上一份快照，看着一切正常。
+    """
+    registry = _registry_table(app_id, app_secret)
+    if registry is None:
+        _REGISTRY_ROWS.clear()
+        return _tables_from_env(os.environ)
+
+    from xhsearch import registry as registry_mod
+    try:
+        entries = registry_mod.read(registry)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"⚠ 读不到注册表（{exc}）")
+        if os.environ.get("FEISHU_TABLES", "").strip() or \
+                os.environ.get("FEISHU_APP_TOKEN", "").strip():
+            print("  退回环境变量里的表清单。**这份清单可能是旧的**——"
+                  "在注册表里停用过的表会在这一轮复活并花钱，注意看下面刷了哪些表")
+            # 上一次读到的逐表阈值一并丢掉。cron 每轮是全新进程，读不到注册表
+            # 就是「没有逐表覆盖」；面板是常驻的，留着上一次的会让它和 cron
+            # 用不同的口径算同一张表——而面板正是用来看这件事的。
+            _REGISTRY_ROWS.clear()
+            return _tables_from_env(os.environ)
+        raise NoTables("  而且没有 FEISHU_TABLES 可以兜底。本轮拒跑——"
+                       "静默跑成「零张表」比报错难发现得多") from exc
+
+    for entry in entries:
+        if entry.problem:
+            print(f"⚠ 注册表里「{entry.label or entry.record_id}」这一行有问题，"
+                  f"本轮跳过：{entry.problem}")
+    _REGISTRY_ROWS.clear()
+    _REGISTRY_ROWS.update({e.table_id: e for e in entries if e.usable})
+    usable = registry_mod.to_targets(entries)
+    if not usable and not allow_empty:
+        raise NoTables(f"注册表里没有一张可用的表（共 {len(entries)} 行，"
+                       "要么没勾「启用」，要么配置有误）。本轮拒跑")
+    return usable
+
+
+def _entries(app_id: str, app_secret: str) -> list:
+    """`_entries_or_raise` 的 `sys.exit` 版。付费命令走这条。"""
+    try:
+        return _entries_or_raise(app_id, app_secret)
+    except NoTables as exc:
+        sys.exit(str(exc))
+
+
+# 注册表里那一行，按 table_id 索引。逐表阈值从这儿来；没用注册表时是空的。
+_REGISTRY_ROWS: dict[str, Any] = {}
 
 
 def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
-    entries = _tables_from_env(os.environ)
-    if selected:
-        by_label = {label: entry for entry in entries for label in [entry[0]]}
-        missing = [s for s in selected if s not in by_label]
-        if missing:
-            sys.exit(f"--table 指定的表不存在：{'、'.join(missing)}。"
-                     f"可选：{'、'.join(label for label, _, _ in entries)}")
-        entries = [by_label[s] for s in selected]
-    return [(label, feishu.Bitable(app_id=app_id, app_secret=app_secret,
-                                   app_token=app_token, table_id=table_id))
-            for label, app_token, table_id in entries]
+    return _bitables(_env_filtered(_entries(app_id, app_secret), selected),
+                     app_id, app_secret)
+
+
+def _env_filtered(targets: list, selected: list[str] | None) -> list:
+    """按 `--table` 筛。指定了不存在的标签就退出——静默跑成别的表更糟。"""
+    if not selected:
+        return targets
+    by_label = {t.label: t for t in targets}
+    missing = [s for s in selected if s not in by_label]
+    if missing:
+        sys.exit(f"--table 指定的表不存在：{'、'.join(missing)}。"
+                 f"可选：{'、'.join(t.label for t in targets)}")
+    return [by_label[s] for s in selected]
+
+
+def _bitables(targets: list, app_id: str, app_secret: str
+              ) -> list[tuple[str, feishu.Bitable]]:
+    return [(t.label, feishu.Bitable(app_id=app_id, app_secret=app_secret,
+                                     app_token=t.app_token,
+                                     table_id=t.table_id, route=t.route))
+            for t in targets]
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -323,152 +399,15 @@ def build_settings() -> Settings:
     return settings
 
 
-# 飞书多维表格字段类型码 → 界面上的叫法。体检报错时把数字翻译成人话。
-_FIELD_TYPE_NAMES = {
-    1: "文本", 2: "数字", 3: "单选", 4: "多选", 5: "日期", 7: "复选框",
-    11: "人员", 13: "电话号码", 15: "超链接", 17: "附件", 18: "单向关联",
-    19: "查找引用", 20: "公式", 21: "双向关联", 22: "地理位置", 23: "群组",
-    1001: "创建时间", 1002: "最后更新时间", 1003: "创建人", 1004: "修改人",
-    1005: "自动编号",
-}
-
-
-def _type_name(code) -> str:
-    return _FIELD_TYPE_NAMES.get(code, f"未知类型 {code}")
-
-
-def _expected_schema(settings: Settings) -> list[tuple]:
-    """每一列的期望配置：(列名, 允许的类型码, 类型的人话, 必备选项, 备注)。
-
-    「表面对了，内在配置没对」通常就死在类型上：列名一字不差，
-    但「最近检查时间」建成了系统的「最后更新时间」类型（机器写不进去），
-    或「评论状态」建成了单选（机器按多选合并写入会整批失败）。
-    这张清单就是 docs/表结构.md 的机器可执行版。
-    """
-    f = settings.fields
-    statuses = [runner.STATUS_OK, runner.STATUS_SUSPECT, runner.STATUS_GONE,
-                runner.STATUS_FAILED, runner.STATUS_SKIPPED]
-    return [
-        # —— 人工维护 ——
-        (f.link, (1,), "文本", None,
-         "别建成「超链接」字段——它会规范化链接，可能吞掉小红书短链里的 token"),
-        (f.publish_time, (5,), "日期", None,
-         "要手填的普通日期字段；建成「创建时间」类型拿到的是建行时间，不是发布时间"),
-        (f.seed_keywords, (4, 1), "多选或文本", None,
-         "文本列时用顿号/逗号/分号分隔多个词"),
-        (f.negative_keywords, (4, 1), "多选或文本", None,
-         "负面词 + 竞品词，格式同「评论关键词」；留空的行完全不做负面判定"),
-        (f.monitoring, (7,), "复选框", None, None),
-        (f.queued, (7,), "复选框", None, None),
-        # —— 机器写入 ——
-        (f.platform, (3, 1), "单选或文本", ["小红书", "抖音"], None),
-        (f.comment_count, (2,), "数字", None, None),
-        (f.previous_comment_count, (2,), "数字", None, None),
-        (f.pinned_status, (3,), "单选", settings.pin_status.machine_written(),
-         "机器直接覆盖写入当前状态；抖音行不写这一列"),
-        (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
-         "机器直接覆盖写入当前状态（待评论等旧值会被覆盖）"),
-        (f.comment_digest, (1,), "文本", None, None),
-        (f.negative_status, (3,), "单选", settings.negative_status.machine_written(),
-         "由「负面词」命中驱动，机器直接覆盖；没填负面词的行不碰这一列"),
-        (f.negative_digest, (1,), "文本", None, None),
-        (f.traffic_status, (4,), "多选", settings.tags.machine_written(),
-         "机器按多选合并写入——建成单选会让写回整批失败"),
-        (f.refresh_status, (3, 1), "单选或文本", statuses, None),
-        (f.failure_reason, (1,), "文本", None, None),
-        (f.last_updated, (5,), "日期", None,
-         "必须是普通「日期」字段——建成系统的「最后更新时间」类型机器写不进去，"
-         "而且任何人工编辑都会刷新它，分层刷新的节奏会被打乱"),
-        (f.alive_confirmed, (7,), "复选框", None, None),
-        (f.consecutive_failures, (2,), "数字", None, None),
-    ]
-
-
-# 这些 ui_type 和普通数字/文本共用类型码（2/1），但写入行为完全不同：
-# 评分字段封顶 5 星，写 like_count=3000 会失败或被截断。光看类型码抓不到。
-_EXOTIC_UI_TYPES = {"Progress": "进度", "Currency": "货币",
-                    "Rating": "评分", "Barcode": "条码"}
-
-
-def _schema_problems(settings: Settings, meta: dict) -> list[str]:
-    """按期望 schema 逐列核对 fields_meta 的结果，返回人话问题清单。
-
-    独立成纯函数：doctor 调用它，测试也能直接喂假 meta 驱动。
-    """
-    f = settings.fields
-    problems: list[str] = []
-    missing_required: list[str] = []
-    missing_optional: list[str] = []
-    # 这几列的写入有选项守卫（流量状态走 merge 过滤，评论状态/置顶状态
-    # 写前核对选项清单）：缺选项会被安全跳过。其余带选项要求的列
-    # （平台/巡查状态）是直写字符串，没有写侧守卫，缺选项的后果是
-    # 写回可能失败——两种情况的文案必须如实区分。
-    filtered_columns = {f.traffic_status, f.comment_status, f.negative_status,
-                        f.pinned_status}
-    for name, allowed, type_label, required_options, note in _expected_schema(settings):
-        info = meta.get(name)
-        if info is None:
-            # 缺链接/巡查开关机器一行都读不出来；缺最近检查时间分层刷新
-            # 失去依据，每轮 sweep 都会全表重刷烧钱——这三列单独点名。
-            (missing_required if name in (f.link, f.monitoring, f.last_updated)
-             else missing_optional).append(name)
-            continue
-        if info["type"] not in allowed:
-            hint = f"。{note}" if note else ""
-            problems.append(
-                f"「{name}」的字段类型是「{_type_name(info['type'])}」，"
-                f"需要「{type_label}」——列名对了但类型不对，"
-                f"机器会读不到或写不进这一列{hint}"
-            )
-            continue
-        ui = info.get("ui_type") or ""
-        if ui in _EXOTIC_UI_TYPES:
-            problems.append(
-                f"「{name}」是「{_EXOTIC_UI_TYPES[ui]}」字段——它和普通"
-                f"「{type_label}」共用类型码，但写入行为不同（评分封顶 5 星、"
-                f"进度按百分比），请换成普通「{type_label}」"
-            )
-            continue
-        # 类型对了再看选项。零选项的选择列 options 可能是 [] 也可能整个
-        # 缺 options 键（API 行为未验证）——既然类型已确认是单选/多选，
-        # 一律按「已建选项清单」对待，缺键当成空清单，别放行。
-        if required_options and info["type"] in (3, 4):
-            missing = [v for v in required_options if v not in (info["options"] or [])]
-            if missing:
-                if name in filtered_columns:
-                    problems.append(
-                        f"「{name}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
-                        f"机器要写它们，没建就会被跳过（不会误写，但对应判定等于没生效）。"
-                    )
-                else:
-                    problems.append(
-                        f"「{name}」缺这些选项，请先在飞书里手工建好：{'、'.join(missing)}。"
-                        f"机器写这一列时**不做选项过滤**，缺选项可能让该行整行写回失败。"
-                    )
-    if missing_required:
-        problems.append(
-            f"表里缺必备列：{'、'.join(missing_required)}——"
-            f"缺「{f.link}」「{f.monitoring}」机器一行都读不出来；"
-            f"缺「{f.last_updated}」分层刷新失去依据，每轮 sweep 都会全表重刷烧钱"
-            "（sweep 会拒跑）。列名要和 config.py 逐字一致（含空格和标点）。"
-        )
-    if missing_optional:
-        problems.append(
-            f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_optional)}。"
-            "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
-        )
-    return problems
-
-
-def _options_from_meta(meta, column: str):
-    """从 fields_meta 的结果里取某列的选项清单，语义与旧 list_field_options 一致：
-    None = 查不到别过滤（元数据整体读不到、或列不存在）；
-    []   = 列存在但不是选择类字段，机器值全拦（写文本列本来就写不进多选列表）。
-    """
-    if meta is None or column not in meta:
-        return None
-    options = meta[column]["options"]
-    return options if options is not None else []
+# 表结构的期望值和体检判据都在 xhsearch/schema.py 里（面板也要用，
+# 留在这里就是循环依赖）。这几个名字保留成别名：调用点和测试都不用改，
+# 而「唯一一份定义」的性质没变。
+_FIELD_TYPE_NAMES = schema.FIELD_TYPE_NAMES
+_EXOTIC_UI_TYPES = schema.EXOTIC_UI_TYPES
+_type_name = schema.type_name
+_expected_schema = schema.expected_schema
+_schema_problems = schema.schema_problems
+_options_from_meta = schema.options_from_meta
 
 
 def _doctor_table(settings: Settings, table: feishu.Bitable) -> int:
@@ -549,6 +488,23 @@ def cmd_doctor(selected: list[str] | None = None) -> int:
         print(f"   已配置的 Key：{'、'.join(sorted(keys))}"
               "（是否有效需要真实调用一次才知道）")
 
+    print("\n⑤ 单轮花费的上界 …")
+    budget = settings.budget
+    if budget.max_yuan_per_run:
+        print(f"   ✅ 金额上限 ¥{budget.max_yuan_per_run:.2f}/轮")
+    else:
+        # 这一段存在的全部理由：没设上限时**以前一个字都不打**。
+        # Budget.describe() 返回「无上限」，而运行时只在 != 无上限 时才打印
+        # ——最危险的那种配置反而是最安静的。
+        print("   ⚠️  没设 MAX_YUAN_PER_RUN：**单轮花费没有上界**")
+        print("      「全表被误勾排队刷新」「最近检查时间列被清空」"
+              "「上游故障导致每轮重刷」这三类事故，")
+        print("      单轮成本都是没有上界的，而且都不会报错。"
+              "建议按你们一轮的正常花费给 3–5 倍。")
+        total += 0        # 不算问题，但要吵闹：拒跑是部署方的决定，不是这里的
+    print(f"   行数上限：{budget.max_records_per_run or '无'}"
+          f"   调用数上限：{budget.max_calls_per_run or '无'}")
+
     print()
     if total:
         print(f"共发现 {total} 个问题（明细见上）")
@@ -623,9 +579,15 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         return 1, found, 0, 0.0, None
     if mode in ("sweep", "estimate") and not row_list and known_fields is not None \
             and settings.fields.last_updated not in known_fields:
+        # 花费返回 **None（未知）而不是 0.0**。这条护栏让 load_rows 直接
+        # return []，于是 estimate 会报「待刷 0 行 ≈ ¥0.00」——而真相是
+        # 「这张表还没法估算」。把列建出来之后全表 last_updated 全空、
+        # 一轮 sweep 全判到期，而人刚刚才看着那个 0 放下心来。
         print(f"⚠ 表里还没建「{settings.fields.last_updated}」列：分层刷新没有依据，"
               "每一轮 sweep 都会全表重刷烧钱，先去建列")
-        return 1, found, 0, 0.0, None
+        print("  这张表的「预计花费」**无法估算**（不是 ¥0.00）——"
+              "建完这一列之后全表都会判到期，先看清有多少行再开跑")
+        return 1, found, 0, None, None
     if record_ids and not quiet_missing:
         missing = [rid for rid in record_ids if rid not in found]
         if missing:
@@ -634,6 +596,20 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         if not (record_ids and quiet_missing):
             print("没有需要刷新的行。")
         return (1 if record_ids and not quiet_missing else 0), found, 0, 0.0, None
+
+    # 首轮小闸：整张表**一个**「最近检查时间」都没有 = 要么是全新表，要么是
+    # 刚把这一列建出来。两种情况下每一行都判到期，一轮就是全表付费。
+    # 这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，
+    # 这个是**单张新表**的，防的是「一张 800 行的表刚入册就吃掉整轮预算」。
+    first_run_cap = _numeric_env("FIRST_RUN_MAX_RECORDS", int, 20, minimum=0)
+    if (first_run_cap and len(row_list) > first_run_cap
+            and all(r.last_updated_ms is None for r in row_list)):
+        print(f"🐣 这张表一个「{settings.fields.last_updated}」都没有"
+              f"（{len(row_list)} 行全是新的或刚建完列），本轮只刷前 "
+              f"{first_run_cap} 行。剩下的每轮再来一批，几轮之后就铺满了。"
+              "（想一次刷完：FIRST_RUN_MAX_RECORDS=0）")
+        row_list = row_list[:first_run_cap]
+        found = {r.record_id for r in row_list}
 
     yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
 
@@ -863,6 +839,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 每一次「日志和表对不上」都要有人重新算一遍 8 小时。
     print(f"⏱ {mode} 开跑：{settings.display.stamp(now)}"
           f"（UTC {now:%H:%M:%S}，容器日志用的就是这个）")
+    if mode in ("sweep", "queue", "row") and not settings.budget.max_yuan_per_run:
+        # 以前这里是沉默的：Budget.describe() 说「无上限」，而收尾只在
+        # 有上限时才打印。于是唯一真正能兜住烧钱事故的那道闸没设时，
+        # 日志里一个字都没有。
+        print("⚠ 本轮**没有金额上界**（MAX_YUAN_PER_RUN 未设）"
+              "——建议设一个，见 .env.example")
 
     # 软截止是整次运行的预算，不是每张表各领一份——在这里算一次绝对
     # 截止点传给每张表共享，五张表就不会把时限放大成五倍。
@@ -876,12 +858,39 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     stop = threading.Event()
     _install_stop_handlers(stop)
     on_event, run_id = _event_sink()
+    # 一轮的开头也发一条：面板靠「有 run_start 没有 run_end」认出
+    # 跑到一半被杀掉的那些轮（Railway redeploy、容器回收、OOM）。
+    # 只看结束事件的话，那种轮在看板上根本不存在。
+    runner.emit(on_event, runner.EVENT_RUN_START, mode=mode,
+                tables=[label for label, _ in tables],
+                started_at=now.isoformat(),
+                budget=settings.budget.describe())
+
+    def _finish(code: int, error: str = "") -> int:
+        """收尾事件。**每一条退出路径都要经过它。**
+
+        面板靠「有 run_start 没有 run_end」认出被杀掉的轮子。要是某条正常
+        退出路径漏发了，那一轮在看板上就长得和「跑到一半被容器回收」一模一样
+        ——一个假的故障信号比没有信号更糟。
+        """
+        runner.emit(on_event, runner.EVENT_RUN_END, mode=mode,
+                    tables=len(tables), exit_code=code, error=error,
+                    rows=sum(len(r.outcomes) for _l, _t, r, _m, _c in pending),
+                    cost_yuan=round(
+                        sum(r.cost_yuan for _l, _t, r, _m, _c in pending), 6),
+                    channels_dead=channels_dead, stopped=stop.is_set(),
+                    budget_stopped=budget.stopped_reason)
+        return code
 
     worst = 0
     found_all: set[str] = set()
     total_rows, total_yuan = 0, 0.0
+    # 有几张表压根估不出来（缺「最近检查时间」列）。合计里必须说出来——
+    # 把它们当成 ¥0 加进去，报出来的数字就是个假的下界。
+    unknown_cost = 0
     # 先把所有表都刷完、攒起来，写回放到跨表熔断之后（见下）。
-    pending: list[tuple[str, feishu.Bitable, runner.RunReport, set[str] | None]] = []
+    pending: list[tuple[str, feishu.Bitable, runner.RunReport,
+                       set[str] | None, Settings]] = []
     channels_dead = False
     try:
         for index, (label, table) in enumerate(tables):
@@ -896,9 +905,17 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 print("⚠ 运行已被终止，这张表本轮不再尝试；行都没动过，下一轮自然补上")
                 worst = 1
                 continue
+            # 逐表阈值：深拷贝 + 浅覆盖，绝不就地改基准 Settings——
+            # 就地改会让第一张表的阈值串味到后面所有表，而那种 bug 只在
+            # 多表部署上出现，看起来像「判定口径莫名其妙」。
+            per_table = settings
+            row = _REGISTRY_ROWS.get(table.table_id)
+            if row is not None:
+                from xhsearch import registry as registry_mod
+                per_table = registry_mod.apply_overrides(settings, row, log=print)
             try:
                 code, found, row_count, yuan, prep = _refresh_table(
-                    mode, record_ids, settings, api_keys, table, now,
+                    mode, record_ids, per_table, api_keys, table, now,
                     quiet_missing=multi, deadline=deadline, disabled=disabled,
                     budget=budget, stop=stop)
             except feishu.FeishuError as exc:
@@ -909,10 +926,13 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             worst = max(worst, code)
             found_all |= found
             total_rows += row_count
-            total_yuan += yuan
+            if yuan is None:
+                unknown_cost += 1
+            else:
+                total_yuan += yuan
             if prep is not None:
                 report, fields_meta = prep
-                pending.append((label, table, report, fields_meta))
+                pending.append((label, table, report, fields_meta, per_table))
                 if report.fatal and not [k for k in api_keys if k not in disabled]:
                     channels_dead = True
     except BaseException:
@@ -921,34 +941,37 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         # 下一轮按原样的 last_updated 再付一次。
         if pending:
             print("\n⚠ 运行中断，先把已经完成的表写回（避免已付费的结果丢失）…")
-            for label, table, report, fields_meta in pending:
+            for label, table, report, fields_meta, per_table in pending:
                 try:
-                    _write_back_table(table, report, fields_meta, settings, label)
+                    _write_back_table(table, report, fields_meta, per_table, label)
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
+        _finish(1, error=type(sys.exc_info()[1]).__name__)
         raise
 
     # 跨表熔断：单表可能只有三五行，永远凑不满熔断的最小样本，但上游
     # 故障是通道级的——把这一轮所有表的观测合起来再判一次，该作废的
     # 失效判定在写回**之前**作废掉。
+    # 跨表熔断用**全局** settings：熔断参数刻意不允许逐表（见 registry.py），
+    # 逐表不同的熔断口径会让「这一轮到底该不该熔」说不清。
     if len(pending) > 1 and runner.apply_cross_run_breaker(
-            [report for _, _, report, _ in pending], settings):
+            [report for _, _, report, _, _ in pending], settings):
         print("\n🛑 跨表熔断：本轮各表合计的失效比例异常偏高，疑似上游故障，"
               "已作废所有表的失效判定（明细见各表结果）")
 
     # 结构化事件在**所有**熔断（含上面这次跨表熔断）定案之后才发：
     # 提前发的话，被熔断改写过的行会让看板和告警看到一个比实际落表更吓人的
     # 结论，而那正好发生在上游故障、最不该误报的时候。
-    for label, _table, report, _meta in pending:
-        runner.emit_run_events(report, on_event, table=label)
+    for label, _table, report, _meta, _cfg in pending:
+        runner.emit_run_events(report, on_event, table=label, mode=mode)
 
-    for label, table, report, fields_meta in pending:
+    for label, table, report, fields_meta, per_table in pending:
         if multi:
             print(f"\n━━━━ 表：{label}（结果）━━━━")
         else:
             print()
         try:
-            code = _write_back_table(table, report, fields_meta, settings, label)
+            code = _write_back_table(table, report, fields_meta, per_table, label)
         except feishu.FeishuError as exc:
             print(f"❌ 这张表写回失败（表级错误）：{exc}；继续处理其余表")
             worst = 1
@@ -967,10 +990,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             print(f"\n⚠ 这些 record_id 在所有已配置的表里都没找到："
                   f"{'、'.join(missing)}")
             if not found_all:
-                return 1
+                return _finish(1)
     if mode == "estimate" and multi:
-        print(f"\n合计：待刷 {total_rows} 行，预计花费 ≈ ¥{total_yuan:.2f}")
-    return worst
+        tail = (f"，另有 {unknown_cost} 张表**无法估算**（缺「最近检查时间」列，"
+                "建完之后会全表判到期）" if unknown_cost else "")
+        print(f"\n合计：待刷 {total_rows} 行，预计花费 ≈ ¥{total_yuan:.2f}{tail}")
+    return _finish(worst)
 
 
 def _line_buffer_stdout() -> None:
@@ -997,6 +1022,123 @@ def _line_buffer_stdout() -> None:
             # 被重定向成非 TextIOWrapper（测试里的 StringIO、某些托管运行时）：
             # 日志格式的优化不该让整个进程起不来。
             pass
+
+
+def cmd_init_registry() -> int:
+    """建那张存表清单的飞书表，打印一行环境变量。**这辈子跑一次。**
+
+    为什么要有它、为什么不是「每次启动自己去云盘里找」：见
+    `xhsearch/registry.py` 的模块说明。一句话——面板和 cron 是两个不共享
+    任何东西的容器，「你点了加表」必须落到一个 cron 五分钟后读得到的地方；
+    而隐式发现（找不到 / 找错 / 找到两张）的失败模式比一次复制粘贴贵得多。
+    """
+    from xhsearch import registry as registry_mod
+
+    existing = os.environ.get("FEISHU_REGISTRY", "").strip()
+    if existing:
+        print(f"FEISHU_REGISTRY 已经配了：{existing}")
+        print("要重建就先把这个变量清掉。（重建会得到一张空表，"
+              "原来那张里的项目不会自动搬过去。）")
+        return 1
+
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+    workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
+
+    print("① 建多维表格 …", end=" ", flush=True)
+    base = workspace.create_base("linkcheck 监控台")
+    if not base["app_token"]:
+        sys.exit("失败：飞书没返回 app_token")
+    print(f"OK（{base['app_token']}）")
+
+    print("② 建注册表数据表 …", end=" ", flush=True)
+    table_id = workspace.create_table(
+        base["app_token"], "被监控的表", registry_mod.REGISTRY_FIELDS)
+    if not table_id:
+        sys.exit("失败：飞书没返回 table_id")
+    print(f"OK（{table_id}）")
+
+    print("\n✅ 建好了。把这一行加进 Railway 的变量，**这辈子只加这一次**：\n")
+    print(f"    FEISHU_REGISTRY={base['app_token']}:{table_id}\n")
+    if base["url"]:
+        print(f"表在这儿（平时不用打开）：{base['url']}")
+    print("之后加表删表都在面板上做。留着这张表能进去改，是为了面板挂了的时候"
+          "还有个地方能止损（去掉某张表的「启用」）。")
+    return 0
+
+
+def cmd_serve(selected: list[str] | None = None) -> int:
+    """起监控面板。**常驻进程，但一个付费请求都不发。**
+
+    它和 cron 那个服务是两个独立的 Railway service，彼此不通信——
+    只通过飞书表间接耦合。面板挂了巡检照跑；面板重启，状态从表里重新读一遍就有。
+
+    ⚠️ 这个命令**绝不能**配 cron，也绝不能和 `queue`/`sweep` 配在同一个
+    Start Command 里。两个容器同时刷同一张表 = 钱花两份 + 人工标签被旧快照
+    覆盖 + 飞书写冲突，而 runlock 是文件锁，跨容器拦不住。
+    """
+    from xhsearch import panel
+
+    try:
+        config = panel.PanelConfig.from_env()
+    except panel.ConfigError as exc:
+        sys.exit(f"❌ {exc}")
+
+    settings = build_settings()
+    api_keys = _api_keys()
+    # Key 只用来给「预计花费」选对单价（不同通道差十几倍），一个请求都不发。
+    # 没配也能起：那时按默认通道计价，数字会偏，页面上会说明。
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+
+    def resolve_tables():
+        """**每一轮刷新都重新读一次表清单。**
+
+        只在启动时读一次的话：在面板上加表/启用，概览里永远不出现；
+        停用/移除，面板还在读它。cron 下一轮就看见了，面板要重启才看见——
+        两边显示的「在管哪些表」长期分叉，而面板正是用来看这件事的。
+
+        `allow_empty=True`：刚 `init-registry` 出来的注册表是空的，
+        而在面板上加第一张表正是它存在的理由。付费那几条命令不给这个开关。
+        """
+        targets = _entries_or_raise(app_id, app_secret, allow_empty=True)
+        return _bitables(_env_filtered(targets, selected), app_id, app_secret)
+
+    def settings_for(table_id: str):
+        """这张表自己的 Settings。**和 cron 用同一个函数算**，口径不会打架。
+
+        `_run_locked` 的表循环里是 `registry.apply_overrides`；面板这边不做
+        同一件事的话，逐表 `归档天数` 改过之后，面板算出的到期/超期/归档/
+        预估花费和 cron 不是一回事，待办行还会被放进错误的「在管/已归档」分区。
+        """
+        row = _REGISTRY_ROWS.get(table_id)
+        if row is None:
+            return settings
+        from xhsearch import registry as registry_mod
+        # log=None：面板一分钟刷一次，逐表阈值那句话打一遍就够了，
+        # 每分钟重复一遍只会把日志淹掉。cron 那边照常打。
+        return registry_mod.apply_overrides(settings, row)
+
+    try:
+        tables = resolve_tables()
+    except NoTables as exc:
+        sys.exit(str(exc))
+    if tables:
+        print(f"面板要看 {len(tables)} 张表："
+              f"{'、'.join(label for label, _ in tables)}")
+    else:
+        print("⚠ 注册表里还没有可用的表。面板照常启动——"
+              "到「项目」页上加第一张")
+
+    def produce():
+        return panel.collect(
+            resolve_tables(), settings, api_keys,
+            show_digest=config.show_digest,
+            feishu_base=config.feishu_base,
+            secrets=config.secrets,
+            settings_for=settings_for)
+
+    return panel.serve(config, produce, settings)
 
 
 def main(argv: list[str]) -> int:
@@ -1026,6 +1168,10 @@ def main(argv: list[str]) -> int:
     command = args[0]
     if command == "doctor":
         return cmd_doctor(selected)
+    if command == "serve":
+        return cmd_serve(selected)
+    if command == "init-registry":
+        return cmd_init_registry()
     if command in ("sweep", "queue", "estimate"):
         return _run(command, None, selected)
     if command == "row":

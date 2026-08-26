@@ -1407,11 +1407,44 @@ class TestStructuredEventsSeeTheFinalStatus(RunnerTest):
 
         events: list = []
         runner.emit_run_events(report, events.append, table="表A")
-        self.assertEqual(len(events), 12)
-        for event in events:
+        rows = [e for e in events if e["event"] == runner.EVENT_ROW]
+        self.assertEqual(len(rows), 12)
+        for event in rows:
             self.assertEqual(event["status"], runner.STATUS_FAILED)
             self.assertTrue(event["breaker_tripped"])
             self.assertEqual(event["table"], "表A")
+
+    def test_a_table_level_summary_is_emitted_alongside_the_rows(self):
+        """面板要从容器日志里还原「这张表处理了多少行、花了多少、有没有熔断」，
+        不该为此把几百条行级事件拉回来自己加总。"""
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(12))
+        events: list = []
+        runner.emit_run_events(report, events.append, table="表A", mode="sweep")
+        tables = [e for e in events if e["event"] == runner.EVENT_TABLE]
+        self.assertEqual(len(tables), 1)
+        summary = tables[0]
+        self.assertEqual(summary["table"], "表A")
+        self.assertEqual(summary["mode"], "sweep")
+        self.assertEqual(summary["rows"], 12)
+        self.assertTrue(summary["breaker_tripped"])
+        self.assertEqual(summary["counts"], report.counts())
+        self.assertAlmostEqual(summary["cost_yuan"], report.cost_yuan, places=6)
+
+    def test_the_table_summary_comes_before_its_rows(self):
+        """消费方按顺序读日志时，先看到「这张表开始报了」再看到逐行明细。"""
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
+                               self._gone_rows(12))
+        events: list = []
+        runner.emit_run_events(report, events.append, table="表A")
+        self.assertEqual(events[0]["event"], runner.EVENT_TABLE)
+        self.assertTrue(all(e["event"] == runner.EVENT_ROW for e in events[1:]))
+
+    def test_emit_helper_swallows_a_broken_sink(self):
+        def exploding(_event):
+            raise RuntimeError("日志后端挂了")
+        runner.emit(exploding, runner.EVENT_RUN_START, mode="sweep")   # 不抛即通过
+        runner.emit(None, runner.EVENT_RUN_START, mode="sweep")        # sink 为 None 也行
 
     def test_a_broken_sink_never_breaks_the_run(self):
         report = self.run_with([sse(comment_page(count=150)),

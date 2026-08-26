@@ -26,6 +26,9 @@ BASE = "https://open.feishu.cn/open-apis"
 # 官方文档（app-table-record/batch_update）写明单次最多 500 条记录。
 # 早期注释说「文档上限 1000，这里取一半」是过时信息：500 就是硬上限本身。
 BATCH_SIZE = 500
+# 新增记录的单次上限是 1000（和 batch_update 的 500 不是一个数）。
+# 单独一个常量：共用一个的话，哪天改了其中一边就会静默超限。
+BATCH_CREATE_SIZE = 1000
 
 # 值得二分定位的**行级**错误码：这一行的问题不影响别的行，隔离出来其余照写。
 # 表级错误（权限 91403/99991672、列名 1254045、token 失效、网络中断）会让每个
@@ -71,6 +74,9 @@ class FeishuError(RuntimeError):
     def __init__(self, code: int, msg: str, hint: str = ""):
         self.code = code
         self.msg = msg
+        # 单独留一份：面板要把「怎么修」摆在错误旁边，而不是让人从一长串
+        # 报错文本里自己找。
+        self.hint = hint
         super().__init__(f"飞书接口报错 [{code}] {msg}" + (f"\n → {hint}" if hint else ""))
 
 
@@ -93,6 +99,10 @@ _HINTS = {
              "检查是不是有两个调度器（queue/sweep/手动）同时在跑——"
              "所有付费入口必须共享同一个运行租约（见 xhsearch/runlock.py）",
     91403: "没有权限，检查应用权限范围和文档协作者设置",
+    1254302: "这张表开了「高级权限」：光把应用加成「可编辑」协作者不够，"
+             "还要进高级权限设置给这个应用「可管理」",
+    1254304: "这张表开了「高级权限」：光把应用加成「可编辑」协作者不够，"
+             "还要进高级权限设置给这个应用「可管理」",
 }
 
 
@@ -145,6 +155,70 @@ class _Token:
     expires_at: float
 
 
+class Workspace:
+    """不绑定某一张表的操作：建 base、建数据表。
+
+    和 `Bitable` 分开是因为它们的 URL 形状不同——`Bitable._url()` 永远带
+    `/apps/<app_token>/tables/<table_id>/`，而建 base 根本还没有 app_token。
+    鉴权是同一套（同一个自建应用），所以复用 `Bitable` 的 token 逻辑。
+
+    ⚠️ **应用自己建的 base，应用天然有完全权限，不需要「添加文档应用」。**
+    这是「面板新建监控表 = 一次飞书都不用点」的全部依据，
+    但还没在真机上验过（见 docs/待验证清单.md）。
+    """
+
+    def __init__(self, app_id: str, app_secret: str, *, timeout: float = 30.0):
+        # 借 Bitable 的鉴权：token 那套（缓存、提前 5 分钟续、带重试）
+        # 只该有一份实现。
+        self._auth = Bitable(app_id=app_id, app_secret=app_secret,
+                             app_token="", table_id="", timeout=timeout)
+        self.timeout = timeout
+
+    def _headers(self) -> dict[str, str]:
+        return self._auth._headers()
+
+    def create_base(self, name: str, folder_token: str = "") -> dict[str, str]:
+        """建一个多维表格，返回 {app_token, url, default_table_id}。
+
+        `folder_token` 留空就建在应用自己的云空间根目录——用
+        tenant_access_token 时也**只能**指定应用自己创建的文件夹，
+        所以默认就是留空。
+        """
+        body: dict[str, Any] = {"name": name}
+        if folder_token:
+            body["folder_token"] = folder_token
+        resp = transport.post_with_retry(
+            f"{BASE}/bitable/v1/apps", self._headers(),
+            json.dumps(body, ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        app = _check(resp).get("app") or {}
+        return {
+            "app_token": str(app.get("app_token") or ""),
+            "url": str(app.get("url") or ""),
+            "default_table_id": str(app.get("default_table_id") or ""),
+        }
+
+    def create_table(self, app_token: str, name: str,
+                     fields: list[dict[str, Any]]) -> str:
+        """在一个 base 里建数据表，连列一起建，返回 table_id。
+
+        一次把列都带上，比「先建空表再逐列 POST」少 20 次请求，也少一个
+        「建到一半失败、留下一张残表」的中间状态。
+        """
+        resp = transport.post_with_retry(
+            f"{BASE}/bitable/v1/apps/"
+            f"{urllib.parse.quote(app_token, safe='')}/tables",
+            self._headers(),
+            json.dumps({"table": {"name": name, "fields": fields}},
+                       ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        return str(_check(resp).get("table_id") or "")
+
+
 class Bitable:
     """一张多维表格的读写客户端。"""
 
@@ -156,11 +230,16 @@ class Bitable:
         table_id: str,
         *,
         timeout: float = 30.0,
+        route: str = "base",
     ):
         self.app_id = app_id
         self.app_secret = app_secret
         self.app_token = app_token
         self.table_id = table_id
+        # 原链接走的是 /base/ 还是 /wiki/。**只用来拼给人点的链接，一个字都
+        # 不参与接口调用**——接口两种 token 通用（见 tablespec.parse_target），
+        # 浏览器地址不通用。放在这里是因为面板拿到的就是一个 Bitable。
+        self.route = route
         self.timeout = timeout
         self._token: Optional[_Token] = None
 
@@ -205,7 +284,19 @@ class Bitable:
         }
 
     def _url(self, suffix: str) -> str:
-        return f"{BASE}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/{suffix}"
+        """拼接接口地址。**两个 token 必须转义。**
+
+        它们的来源正在变多：早期只有环境变量（部署方自己填），现在还会
+        来自监控面板的表单和注册表——那是运营能改的地方。一个含 `/` 或 `..`
+        的 app_token 直接 f-string 拼进去，就能把这个**带着
+        tenant_access_token 的请求**改写到别的 open-apis 端点上。
+
+        上游还有一道字符集校验（见 cli.parse_table_target），这里是第二道：
+        将来多一个输入源，绕过第一道也仍然安全。
+        """
+        app_token = urllib.parse.quote(self.app_token, safe="")
+        table_id = urllib.parse.quote(self.table_id, safe="")
+        return f"{BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/{suffix}"
 
     # ---------- 读 ----------
 
@@ -390,18 +481,15 @@ class Bitable:
             mid = len(chunk) // 2
             return self._submit(chunk[:mid], errors) + self._submit(chunk[mid:], errors)
 
-    def fields_meta(self) -> Optional[dict[str, dict]]:
-        """这张表全部字段的元数据：列名 → {"type", "ui_type", "options"}。
+    def _fetch_fields(self) -> Optional[list[dict[str, Any]]]:
+        """这张表全部字段的**原始** item 列表，自动翻页。读不到返回 None。
 
-        读不到（权限/网络）返回 None。options 的三种取值必须区分：
-        列表（可能为空）= 这是个选择类字段，列出已建的选项名；
-        None = 这个字段没有「选项」概念（文本/数字/日期……）。
-
-        doctor 用它做全量体检（列在不在、类型对不对、选项建没建），
-        跑批入口用它一次拿全 列名清单 + 两个选择列的选项，省两次分页请求。
+        分页只写一遍：`fields_meta()`（摘要）和 `fields_meta_raw()`（含
+        field_id 和完整 property）都从这里派生。两处各翻一遍页的话，
+        补选项那条路迟早会拿到和体检不一致的一份元数据。
         """
         page_token = ""
-        meta: dict[str, dict] = {}
+        items: list[dict[str, Any]] = []
         seen_tokens: set[str] = set()
         for _ in range(_page_limit(100)):
             # 列出字段接口的 page_size 上限是 100（比记录接口低），超了会被拒。
@@ -420,31 +508,194 @@ class Bitable:
             if not isinstance(payload, dict) or payload.get("code") not in (0, None):
                 return None
             data = payload.get("data") or {}
-            for field in data.get("items") or []:
-                name = field.get("field_name")
-                if not name:
-                    continue
-                prop = field.get("property") if isinstance(field.get("property"), dict) else {}
-                options: Optional[list[str]] = None
-                if isinstance(prop, dict) and "options" in prop:
-                    # 空列表要保留：「建了选择列但一个选项都没配」和
-                    # 「不是选择列」是两回事。
-                    options = [o["name"] for o in (prop.get("options") or [])
-                               if isinstance(o, dict) and o.get("name")]
-                meta[str(name)] = {
-                    "type": field.get("type"),
-                    "ui_type": str(field.get("ui_type") or ""),
-                    "options": options,
-                }
+            items.extend(f for f in (data.get("items") or []) if isinstance(f, dict))
             if not data.get("has_more"):
-                return meta
+                return items
             page_token = data.get("page_token") or ""
             if not page_token or page_token in seen_tokens:
                 # 重复 token = 上游分页状态异常。返回 None（读不到）而不是
                 # 死循环：调用方会把「元数据读不到」当成拒跑的理由。
-                return meta if not page_token else None
+                return items if not page_token else None
             seen_tokens.add(page_token)
         return None
+
+    def fields_meta(self) -> Optional[dict[str, dict]]:
+        """这张表全部字段的元数据：列名 → {"type", "ui_type", "options"}。
+
+        读不到（权限/网络）返回 None。options 的三种取值必须区分：
+        列表（可能为空）= 这是个选择类字段，列出已建的选项名；
+        None = 这个字段没有「选项」概念（文本/数字/日期……）。
+
+        doctor 用它做全量体检（列在不在、类型对不对、选项建没建），
+        跑批入口用它一次拿全 列名清单 + 两个选择列的选项，省两次分页请求。
+
+        ⚠️ 这里**只留选项的名字**。要改选项（补一个进去）必须用
+        `fields_meta_raw()`——名字不够，飞书那边是按 id 认选项的。
+        """
+        items = self._fetch_fields()
+        if items is None:
+            return None
+        meta: dict[str, dict] = {}
+        for field in items:
+            name = field.get("field_name")
+            if not name:
+                continue
+            prop = field.get("property") if isinstance(field.get("property"), dict) else {}
+            options: Optional[list[str]] = None
+            if isinstance(prop, dict) and "options" in prop:
+                # 空列表要保留：「建了选择列但一个选项都没配」和
+                # 「不是选择列」是两回事。
+                options = [o["name"] for o in (prop.get("options") or [])
+                           if isinstance(o, dict) and o.get("name")]
+            meta[str(name)] = {
+                "type": field.get("type"),
+                "ui_type": str(field.get("ui_type") or ""),
+                "options": options,
+            }
+        return meta
+
+    def fields_meta_raw(self) -> Optional[dict[str, dict]]:
+        """列名 → 原样的 field item（含 `field_id` 和完整 `property`）。
+
+        **补选项必须用这个，不能用 `fields_meta()`。** 飞书的
+        `PUT .../fields/:field_id` 对 `property` 是**整体覆盖**，而选项在
+        飞书那边是有 id 的对象——只按名字重建一遍写回去，旧选项会被当成
+        删除、新建，用到它们的单元格**连值一起没**。要保住值就得把现有选项
+        的 id 原样带回去，而 id 只有这里有。
+        """
+        items = self._fetch_fields()
+        if items is None:
+            return None
+        return {str(f["field_name"]): f for f in items if f.get("field_name")}
+
+    # ---------- 建：列 / 表 / base ----------
+    #
+    # 这几个是监控面板「一键建齐」用的。三条纪律，都在下面的实现里钉死：
+    #
+    # 1. **只追加。** 建列是纯追加，删掉那列就能回退，不销毁任何已有数据。
+    # 2. **绝不改列的类型。** 那会转换/丢已有数据，只报不改（见 schema.diff）。
+    # 3. **补选项只增不减。** 见 add_field_options 的断言。
+
+    def create_field(self, body: dict[str, Any]) -> str:
+        """建一列，返回 field_id。body 由 `schema.create_field_body()` 产。
+
+        `POST .../fields` 是纯追加：这张表已有的列一个都不碰。
+        """
+        resp = transport.post_with_retry(
+            self._url("fields"), self._headers(),
+            json.dumps(body, ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        data = _check(resp)
+        return str((data.get("field") or {}).get("field_id") or "")
+
+    def add_field_options(self, column: str, wanted: Iterable[str]) -> list[str]:
+        """给一个已有的单选/多选列补选项。返回**实际新增**的那几个。
+
+        ⚠️ **这是这个文件里最危险的一个方法。** `PUT .../fields/:field_id` 对
+        `property` 是整体覆盖，飞书按 id 认选项——只发新选项，或者按名字重建
+        一遍，旧选项都会被当成删除，**用到它们的单元格连值一起没**，不可逆。
+        `流量状态` 是多选、人机共用，那意味着运营手工打的标签全丢。
+
+        所以这里是严格的读-改-写：
+
+            现值（原样，带 id 和 color） ∪ 新增的（只有 name）
+
+        写之前**硬断言新集合包含全部旧选项**，出现缩集直接 raise、绝不执行。
+        这和 `xhsearch/tags.py` 合并多选标签是同一个问题、同一套纪律。
+
+        ⚠️ 「带 id 回填能不能保住单元格值」**还没在真机上验过**。
+        调用方要自己决定放不放行（面板默认不放，见 PANEL_ALLOW_OPTION_PATCH），
+        验证步骤见 docs/待验证清单.md。
+        """
+        wanted = [w for w in wanted if w]
+        raw = self.fields_meta_raw()
+        if raw is None:
+            raise FeishuError(-1, f"读不到字段元数据，不能改「{column}」的选项——"
+                                  "补选项是读-改-写，读不到现值就没有安全的写法")
+        info = raw.get(column)
+        if info is None:
+            raise FeishuError(-1, f"表里没有「{column}」这一列")
+        field_id = str(info.get("field_id") or "")
+        if not field_id:
+            raise FeishuError(-1, f"「{column}」没有 field_id，改不了")
+        if info.get("type") not in (3, 4):
+            raise FeishuError(-1, f"「{column}」不是单选/多选列，没有选项可补")
+
+        prop = dict(info.get("property") or {})
+        existing = [o for o in (prop.get("options") or []) if isinstance(o, dict)]
+        existing_names = [str(o.get("name")) for o in existing if o.get("name")]
+        added = [w for w in dict.fromkeys(wanted) if w not in existing_names]
+        if not added:
+            return []
+
+        # 现有的原样带回去（id 和 color 都保住），新的只给 name 让飞书分配 id。
+        merged = existing + [{"name": name} for name in added]
+        merged_names = [str(o.get("name")) for o in merged if o.get("name")]
+        lost = [name for name in existing_names if name not in merged_names]
+        if lost:
+            # 到不了这里——除非上面的合并逻辑被改坏。这一条就是为了那一天。
+            raise FeishuError(
+                -1, f"拒绝执行：这次改动会让「{column}」少掉选项 "
+                    f"{'、'.join(lost)}，用到它们的单元格会连值一起丢")
+        prop["options"] = merged
+
+        resp = transport.request_with_retry(
+            "PUT", self._url(f"fields/{urllib.parse.quote(field_id, safe='')}"),
+            self._headers(),
+            json.dumps({"field_name": column, "type": info.get("type"),
+                        "property": prop}, ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
+        return added
+
+    def batch_create(self, records: list[dict[str, Any]], *,
+                     client_token: str) -> list[str]:
+        """新增记录，返回新行的 record_id。**`client_token` 是必填的。**
+
+        为什么必填而不是可选：`transport` 对超时和 5xx 是自动重试的，而
+        「请求发出去了、响应没回来」和「请求根本没发出去」在客户端看来一样。
+        没有幂等键的话一次超时重试就多出一批重复行——注册表里同一张业务表
+        登记两次 = 一轮内付两次钱、两份旧快照互相覆盖。做成必填参数是为了
+        让「忘了传」变成一个 TypeError，而不是一个偶发的线上问题。
+
+        同一批内容重发要用**同一个** client_token（调用方负责），
+        换一个就等于告诉飞书「这是新的一批」。
+        """
+        if not client_token:
+            raise ValueError("batch_create 需要 client_token（幂等键）")
+        created: list[str] = []
+        for start in range(0, len(records), BATCH_CREATE_SIZE):
+            chunk = records[start : start + BATCH_CREATE_SIZE]
+            # 分片时每片一个稳定的键：整批共用一个的话，第二片会被飞书
+            # 当成第一片的重发而整片丢掉。
+            token = client_token if start == 0 else f"{client_token}-{start}"
+            url = (self._url("records/batch_create")
+                   + f"?client_token={urllib.parse.quote(token, safe='')}")
+            resp = transport.post_with_retry(
+                url, self._headers(),
+                json.dumps({"records": chunk}, ensure_ascii=False),
+                timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            data = _check(resp)
+            created.extend(str(r.get("record_id") or "")
+                           for r in (data.get("records") or []))
+        return created
+
+    def delete_record(self, record_id: str) -> None:
+        """删一行。**只给注册表用**（「不再监控这张表」），业务表永远不删行。"""
+        resp = transport.request_with_retry(
+            "DELETE",
+            self._url(f"records/{urllib.parse.quote(record_id, safe='')}"),
+            self._headers(), "",
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
 
     def field_names(self) -> Optional[set[str]]:
         """这张表实际存在的全部列名；读不到返回 None（= 不过滤，宁可试着写）。

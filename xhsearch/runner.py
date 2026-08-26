@@ -975,32 +975,77 @@ def refresh(
     return report
 
 
+# 结构化事件的四种类型。面板靠它们把一轮跑成什么样从日志里还原出来，
+# 所以每条都带 event 字段——少了它，消费方只能靠「有没有 record_id」猜。
+EVENT_RUN_START = "run_start"
+EVENT_TABLE = "table"
+EVENT_ROW = "row"
+EVENT_RUN_END = "run_end"
+
+
+def emit(sink: Optional[Callable[[dict[str, Any]], None]], event: str,
+         **payload: Any) -> None:
+    """发一条结构化事件。**任何异常都吞掉。**
+
+    日志出问题绝不能影响业务流程——一轮已经付过钱的结果，不该因为
+    序列化一个奇怪的值失败就丢掉。
+    """
+    if sink is None:
+        return
+    try:
+        sink({"event": event, **payload})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]], None]],
                     **context: Any) -> None:
-    """把这份 report 的每一行发成一条结构化事件。
+    """把这份 report 发成结构化事件：一条表级汇总 + 每行一条。
 
     **必须在所有熔断都定案之后调用**（单表熔断在 refresh 末尾、跨表熔断在
     调用方那一层）。在行跑完时就发的话，一旦事后触发熔断，
     原本记成「已失效」的行会被改写成「刷新失败」再落表——
     看板和告警消费到的就是一个比表里更吓人的结论，
     而这恰恰发生在上游故障、最不该误报的时候。
+
+    表级汇总（EVENT_TABLE）是给面板用的：从容器日志里还原「这一轮哪张表
+    处理了多少行、花了多少、有没有熔断、降级几次」，不用把几百条行级事件
+    都拉回来自己加总。行级事件仍然照发，排查具体某一行时要用。
     """
     if sink is None:
         return
+    first = min((o.checked_at for o in report.outcomes if o.checked_at), default=None)
+    last = max((o.checked_at for o in report.outcomes if o.checked_at), default=None)
+    emit(sink, EVENT_TABLE, **{
+        **context,
+        "rows": len(report.outcomes),
+        "counts": report.counts(),
+        "cost_yuan": round(report.cost_yuan, 6),
+        "credits": report.credits,
+        "used_providers": dict(report.used_providers),
+        "failovers": report.failovers,
+        "breaker_tripped": report.breaker_tripped,
+        "breaker_attempted": report.breaker_attempted,
+        "breaker_gone": report.breaker_gone,
+        "budget_stopped": report.budget_stopped,
+        "dead_platforms": dict(report.dead_platforms),
+        "aborted_reason": report.aborted_reason,
+        "fatal": report.fatal,
+        "points_balance": report.points_balance,
+        "checked_from": first.isoformat() if first else None,
+        "checked_to": last.isoformat() if last else None,
+    })
     for outcome in report.outcomes:
-        try:
-            sink({
-                **context,
-                "record_id": outcome.record_id,
-                "status": outcome.status,
-                "reason": outcome.reason,
-                "cost_yuan": round(outcome.cost_yuan, 6),
-                "credits": outcome.credits,
-                "failure_code": outcome.failure_code,
-                "breaker_tripped": report.breaker_tripped,
-            })
-        except Exception:  # noqa: BLE001 —— 日志出问题绝不能影响业务流程
-            pass
+        emit(sink, EVENT_ROW, **{
+            **context,
+            "record_id": outcome.record_id,
+            "status": outcome.status,
+            "reason": outcome.reason,
+            "cost_yuan": round(outcome.cost_yuan, 6),
+            "credits": outcome.credits,
+            "failure_code": outcome.failure_code,
+            "breaker_tripped": report.breaker_tripped,
+        })
 
 
 def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
@@ -1135,6 +1180,32 @@ def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: i
 # ---------- 与飞书表的对接 ----------
 
 
+def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
+    """一条飞书 record → 一个 Row。**纯函数，不发请求。**
+
+    抽出来是为了给第二个读侧用：监控面板要按更宽的列做一次 search
+    （它还要 巡查状态/负面状态/诊断信息 这些判定链路用不到的列），
+    但「这一格怎么读成 Row 的哪个字段」必须和 load_rows 逐字相同——
+    两处各写一遍的话，面板算出来的「到期几行、预计多少钱」迟早和
+    真正开跑时不是一个数，而那正是最难发现的一类不一致。
+    """
+    f = settings.fields
+    cells = record.get("fields") or {}
+    return Row(
+        record_id=record.get("record_id") or "",
+        link_cell=feishu.read_text(cells.get(f.link)),
+        publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
+        seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
+        negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
+        current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
+        previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
+        last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
+        consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
+        pin_status=feishu.read_text(cells.get(f.pinned_status)),
+        queued=feishu.read_bool(cells.get(f.queued)),
+    )
+
+
 def load_rows(
     table: feishu.Bitable,
     settings: Settings,
@@ -1192,20 +1263,7 @@ def load_rows(
         record_id = record.get("record_id") or ""
         if wanted and record_id not in wanted:
             continue
-        cells = record.get("fields") or {}
-        row = Row(
-            record_id=record_id,
-            link_cell=feishu.read_text(cells.get(f.link)),
-            publish_time_ms=feishu.read_timestamp_ms(cells.get(f.publish_time)),
-            seed_keywords=feishu.read_keywords(cells.get(f.seed_keywords)),
-            negative_keywords=feishu.read_keywords(cells.get(f.negative_keywords)),
-            current_tags=feishu.read_multi_select(cells.get(f.traffic_status)),
-            previous_comment_count=feishu.read_int(cells.get(f.comment_count)),
-            last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
-            consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
-            pin_status=feishu.read_text(cells.get(f.pinned_status)),
-            queued=feishu.read_bool(cells.get(f.queued)),
-        )
+        row = row_from_record(record, settings)
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。
         if wanted or row.queued or not only_due or row.is_due(settings, now):
             result.append(row)
