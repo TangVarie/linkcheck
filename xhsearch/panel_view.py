@@ -209,11 +209,16 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
                 "rel='noopener noreferrer'>打开这张表 →</a></div></div></div>")
 
     health = ""
-    if p.health:
-        items = "".join(f"<li>{_e(problem)}</li>" for problem in p.health)
-        health = (f"<div class=problem><b>体检发现 {len(p.health)} 个问题</b>"
+    problems = list(p.health)
+    if p.estimate_blocked:
+        problems.insert(0, p.estimate_blocked)
+    if problems:
+        items = "".join(f"<li>{_e(problem)}</li>" for problem in problems)
+        health = (f"<div class=problem><b>体检发现 {len(problems)} 个问题</b>"
                   f"<ul>{items}</ul></div>")
 
+    due_text = (f"{p.due_rows} 行 ≈ ¥{p.due_yuan:.2f}" if not p.estimate_blocked
+                else "<b style='color:var(--red)'>无法估算</b>")
     seed_gap = p.total_rows - p.seed_keyword_rows
     neg_gap = p.total_rows - p.negative_keyword_rows
     coverage = (
@@ -232,7 +237,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     <div><span class=lbl>在管</span><span>{p.total_rows} 行
       {f'<span class=muted>（{p.archived_rows} 已归档）</span>' if p.archived_rows else ''}</span></div>
     <div><span class=lbl>要人管</span><span>{p.needs_attention} 行</span></div>
-    <div><span class=lbl>到期待刷</span><span>{p.due_rows} 行 ≈ ¥{p.due_yuan:.2f}</span></div>
+    <div><span class=lbl>到期待刷</span><span>{due_text}</span></div>
     <div><span class=lbl>排队中</span><span>{p.queued_rows} 行</span></div>
     <div><span class=lbl>卡住了</span><span>{p.stale_rows} 行
       {f'<span class=muted>（{p.never_checked_rows} 从没刷过）</span>' if p.never_checked_rows else ''}</span></div>
@@ -327,7 +332,10 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
         _stat(overview.total_rows, "在管行数"),
         _stat(len(todos), "要人管", alert=bool(todos)),
         _stat(overview.due_rows, "到期待刷"),
-        _stat(f"¥{overview.due_yuan:.2f}", "预计花费"),
+        _stat(f"¥{overview.due_yuan:.2f}"
+              + (" +?" if overview.unestimatable else ""),
+              "预计花费" + (f"（{len(overview.unestimatable)} 张表算不出）"
+                          if overview.unestimatable else "")),
         _stat(overview.queued_rows, "排队中"),
         _stat(overview.stale_rows, "卡住了", alert=bool(overview.stale_rows)),
     ])

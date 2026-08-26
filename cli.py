@@ -7,6 +7,7 @@
     python3 cli.py row <record_id>...  # 刷指定行（无视冷却和分层节流）
     python3 cli.py estimate            # 只估算这一轮要花多少钱，不发请求
     python3 cli.py serve               # 起监控面板（常驻、只读，一分钱不花）
+    python3 cli.py init-registry       # 建那张存表清单的飞书表（这辈子跑一次）
 
 多表：设 FEISHU_TABLES 一次巡查多张表（见 .env.example），上面每个命令都会
 逐表执行；`--table 标签` 可以只跑其中某几张（逗号分隔）。
@@ -189,10 +190,58 @@ def _tables_from_env(environ) -> list[tuple[str, str, str]]:
     return [(table_id, app_token, table_id)]
 
 
+def _registry_table(app_id: str, app_secret: str) -> feishu.Bitable | None:
+    """FEISHU_REGISTRY 指向的那张表，没配返回 None。"""
+    spec = os.environ.get("FEISHU_REGISTRY", "").strip()
+    if not spec:
+        return None
+    try:
+        target = tablespec.parse_target(spec, default_label="registry")
+    except tablespec.BadTarget as exc:
+        sys.exit(f"FEISHU_REGISTRY 看不懂：{exc}")
+    return feishu.Bitable(app_id=app_id, app_secret=app_secret,
+                          app_token=target.app_token, table_id=target.table_id)
+
+
+def _entries(app_id: str, app_secret: str) -> list[tuple[str, str, str]]:
+    """表清单：优先注册表，读不到就退回 FEISHU_TABLES 并**大声警告**。
+
+    ⚠️ **绝不静默降级成零张表。** 那种失败长这样：进程正常退出、日志一切
+    正常、退出码 0，而实际一行都没刷。等有人发现的时候已经过去几天了。
+    所以两条路都不通时是 `sys.exit`，不是 `return []`。
+    """
+    registry = _registry_table(app_id, app_secret)
+    if registry is None:
+        return _tables_from_env(os.environ)
+
+    from xhsearch import registry as registry_mod
+    try:
+        entries = registry_mod.read(registry)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"⚠ 读不到注册表（{exc}）")
+        if os.environ.get("FEISHU_TABLES", "").strip() or \
+                os.environ.get("FEISHU_APP_TOKEN", "").strip():
+            print("  退回环境变量里的表清单。**这份清单可能是旧的**——"
+                  "在注册表里停用过的表会在这一轮复活并花钱，注意看下面刷了哪些表")
+            return _tables_from_env(os.environ)
+        sys.exit("  而且没有 FEISHU_TABLES 可以兜底。本轮拒跑——"
+                 "静默跑成「零张表」比报错难发现得多")
+
+    for entry in entries:
+        if entry.problem:
+            print(f"⚠ 注册表里「{entry.label or entry.record_id}」这一行有问题，"
+                  f"本轮跳过：{entry.problem}")
+    usable = registry_mod.to_tuples(entries)
+    if not usable:
+        sys.exit(f"注册表里没有一张可用的表（共 {len(entries)} 行，"
+                 "要么没勾「启用」，要么配置有误）。本轮拒跑")
+    return usable
+
+
 def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
-    entries = _tables_from_env(os.environ)
+    entries = _entries(app_id, app_secret)
     if selected:
         by_label = {label: entry for entry in entries for label in [entry[0]]}
         missing = [s for s in selected if s not in by_label]
@@ -480,9 +529,15 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         return 1, found, 0, 0.0, None
     if mode in ("sweep", "estimate") and not row_list and known_fields is not None \
             and settings.fields.last_updated not in known_fields:
+        # 花费返回 **None（未知）而不是 0.0**。这条护栏让 load_rows 直接
+        # return []，于是 estimate 会报「待刷 0 行 ≈ ¥0.00」——而真相是
+        # 「这张表还没法估算」。把列建出来之后全表 last_updated 全空、
+        # 一轮 sweep 全判到期，而人刚刚才看着那个 0 放下心来。
         print(f"⚠ 表里还没建「{settings.fields.last_updated}」列：分层刷新没有依据，"
               "每一轮 sweep 都会全表重刷烧钱，先去建列")
-        return 1, found, 0, 0.0, None
+        print("  这张表的「预计花费」**无法估算**（不是 ¥0.00）——"
+              "建完这一列之后全表都会判到期，先看清有多少行再开跑")
+        return 1, found, 0, None, None
     if record_ids and not quiet_missing:
         missing = [rid for rid in record_ids if rid not in found]
         if missing:
@@ -491,6 +546,20 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         if not (record_ids and quiet_missing):
             print("没有需要刷新的行。")
         return (1 if record_ids and not quiet_missing else 0), found, 0, 0.0, None
+
+    # 首轮小闸：整张表**一个**「最近检查时间」都没有 = 要么是全新表，要么是
+    # 刚把这一列建出来。两种情况下每一行都判到期，一轮就是全表付费。
+    # 这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，
+    # 这个是**单张新表**的，防的是「一张 800 行的表刚入册就吃掉整轮预算」。
+    first_run_cap = _numeric_env("FIRST_RUN_MAX_RECORDS", int, 20, minimum=0)
+    if (first_run_cap and len(row_list) > first_run_cap
+            and all(r.last_updated_ms is None for r in row_list)):
+        print(f"🐣 这张表一个「{settings.fields.last_updated}」都没有"
+              f"（{len(row_list)} 行全是新的或刚建完列），本轮只刷前 "
+              f"{first_run_cap} 行。剩下的每轮再来一批，几轮之后就铺满了。"
+              "（想一次刷完：FIRST_RUN_MAX_RECORDS=0）")
+        row_list = row_list[:first_run_cap]
+        found = {r.record_id for r in row_list}
 
     yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
 
@@ -765,6 +834,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     worst = 0
     found_all: set[str] = set()
     total_rows, total_yuan = 0, 0.0
+    # 有几张表压根估不出来（缺「最近检查时间」列）。合计里必须说出来——
+    # 把它们当成 ¥0 加进去，报出来的数字就是个假的下界。
+    unknown_cost = 0
     # 先把所有表都刷完、攒起来，写回放到跨表熔断之后（见下）。
     pending: list[tuple[str, feishu.Bitable, runner.RunReport, set[str] | None]] = []
     channels_dead = False
@@ -794,7 +866,10 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             worst = max(worst, code)
             found_all |= found
             total_rows += row_count
-            total_yuan += yuan
+            if yuan is None:
+                unknown_cost += 1
+            else:
+                total_yuan += yuan
             if prep is not None:
                 report, fields_meta = prep
                 pending.append((label, table, report, fields_meta))
@@ -855,7 +930,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             if not found_all:
                 return _finish(1)
     if mode == "estimate" and multi:
-        print(f"\n合计：待刷 {total_rows} 行，预计花费 ≈ ¥{total_yuan:.2f}")
+        tail = (f"，另有 {unknown_cost} 张表**无法估算**（缺「最近检查时间」列，"
+                "建完之后会全表判到期）" if unknown_cost else "")
+        print(f"\n合计：待刷 {total_rows} 行，预计花费 ≈ ¥{total_yuan:.2f}{tail}")
     return _finish(worst)
 
 
@@ -883,6 +960,49 @@ def _line_buffer_stdout() -> None:
             # 被重定向成非 TextIOWrapper（测试里的 StringIO、某些托管运行时）：
             # 日志格式的优化不该让整个进程起不来。
             pass
+
+
+def cmd_init_registry() -> int:
+    """建那张存表清单的飞书表，打印一行环境变量。**这辈子跑一次。**
+
+    为什么要有它、为什么不是「每次启动自己去云盘里找」：见
+    `xhsearch/registry.py` 的模块说明。一句话——面板和 cron 是两个不共享
+    任何东西的容器，「你点了加表」必须落到一个 cron 五分钟后读得到的地方；
+    而隐式发现（找不到 / 找错 / 找到两张）的失败模式比一次复制粘贴贵得多。
+    """
+    from xhsearch import registry as registry_mod
+
+    existing = os.environ.get("FEISHU_REGISTRY", "").strip()
+    if existing:
+        print(f"FEISHU_REGISTRY 已经配了：{existing}")
+        print("要重建就先把这个变量清掉。（重建会得到一张空表，"
+              "原来那张里的项目不会自动搬过去。）")
+        return 1
+
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+    workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
+
+    print("① 建多维表格 …", end=" ", flush=True)
+    base = workspace.create_base("linkcheck 监控台")
+    if not base["app_token"]:
+        sys.exit("失败：飞书没返回 app_token")
+    print(f"OK（{base['app_token']}）")
+
+    print("② 建注册表数据表 …", end=" ", flush=True)
+    table_id = workspace.create_table(
+        base["app_token"], "被监控的表", registry_mod.REGISTRY_FIELDS)
+    if not table_id:
+        sys.exit("失败：飞书没返回 table_id")
+    print(f"OK（{table_id}）")
+
+    print("\n✅ 建好了。把这一行加进 Railway 的变量，**这辈子只加这一次**：\n")
+    print(f"    FEISHU_REGISTRY={base['app_token']}:{table_id}\n")
+    if base["url"]:
+        print(f"表在这儿（平时不用打开）：{base['url']}")
+    print("之后加表删表都在面板上做。留着这张表能进去改，是为了面板挂了的时候"
+          "还有个地方能止损（去掉某张表的「启用」）。")
+    return 0
 
 
 def cmd_serve(selected: list[str] | None = None) -> int:
@@ -949,6 +1069,8 @@ def main(argv: list[str]) -> int:
         return cmd_doctor(selected)
     if command == "serve":
         return cmd_serve(selected)
+    if command == "init-registry":
+        return cmd_init_registry()
     if command in ("sweep", "queue", "estimate"):
         return _run(command, None, selected)
     if command == "row":

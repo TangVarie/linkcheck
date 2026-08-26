@@ -70,6 +70,11 @@ class ProjectSnapshot:
     queued_rows: int = 0
     due_rows: int = 0
     due_yuan: float = 0.0
+    # 非空 = 这张表的「到期待刷 / 预计花费」**算不出来**，不是 0。
+    # 缺「最近检查时间」列时 load_rows 直接 return []，两个数都会是 0——
+    # 而真相是「没有依据判到期」，把列建出来之后全表都会判到期。
+    # 显示 0 会让人刚好在最该警惕的时候放下心来。
+    estimate_blocked: str = ""
     stale_rows: int = 0
     oldest_checked_ms: Optional[int] = None
     never_checked_rows: int = 0
@@ -332,6 +337,12 @@ class Overview:
     @property
     def stale_rows(self) -> int:
         return sum(p.stale_rows for p in self.projects)
+
+    @property
+    def unestimatable(self) -> list[ProjectSnapshot]:
+        """算不出「要花多少钱」的项目。顶栏那个金额是**不含它们**的下界，
+        所以必须单独说一句，否则那个数字看着像全部。"""
+        return [p for p in self.projects if p.estimate_blocked]
 
     @property
     def unhealthy_projects(self) -> list[ProjectSnapshot]:

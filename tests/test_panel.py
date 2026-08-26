@@ -841,5 +841,64 @@ class TestRunHistoryRendering(unittest.TestCase):
         self.assertNotIn("<script>alert(1)</script>", page)
 
 
+class TestUnknownEstimateIsNotZero(unittest.TestCase):
+    """缺「最近检查时间」列时，`load_rows` 直接 return []，于是「到期待刷」
+    和「预计花费」都是 0——而真相是**算不出来**。
+
+    这个 0 出现的时机恰恰最危险：把那一列建出来之后全表都会判到期，
+    而人刚刚才看着 0 放下心来。
+    """
+
+    def _snap(self, drop_last_updated):
+        from xhsearch import schema as schema_mod
+        settings = Settings()
+        meta = {}
+        for name, allowed, _l, options, _n in schema_mod.expected_schema(settings):
+            if drop_last_updated and name == settings.fields.last_updated:
+                continue
+            meta[name] = {"type": allowed[0], "ui_type": "",
+                          "options": list(options) if options else None}
+
+        class Table:
+            app_token, table_id = "t", "tb"
+
+            def fields_meta(self):
+                return meta
+
+            def search(self, fields, *, filter_spec=None, **kwargs):
+                return [{"record_id": "r1", "fields": {
+                    settings.fields.link: "https://www.xiaohongshu.com/explore/aa"}}]
+
+        return panel.collect([("A", Table())], settings, {}, now=NOW).projects[0]
+
+    def test_missing_column_blocks_the_estimate(self):
+        snap = self._snap(drop_last_updated=True)
+        self.assertTrue(snap.estimate_blocked)
+        self.assertIn("算不出来", snap.estimate_blocked)
+
+    def test_a_healthy_table_estimates_normally(self):
+        self.assertEqual(self._snap(drop_last_updated=False).estimate_blocked, "")
+
+    def test_the_card_says_so_instead_of_showing_a_number(self):
+        snap = self._snap(drop_last_updated=True)
+        page = panel_view.overview_page(
+            overview=summary.Overview(projects=[snap], generated_at=NOW),
+            error="", fetched_at=NOW.timestamp(), config=config(), csrf="t")
+        self.assertIn("无法估算", page)
+        self.assertNotIn("≈ ¥0.00", page)
+
+    def test_the_top_bar_flags_that_the_total_is_only_a_lower_bound(self):
+        blocked = summary.ProjectSnapshot(label="A", app_token="t", table_id="tb",
+                                          estimate_blocked="缺列")
+        fine = summary.ProjectSnapshot(label="B", app_token="t2", table_id="tb2",
+                                       due_yuan=3.0)
+        overview = summary.Overview(projects=[blocked, fine], generated_at=NOW)
+        self.assertEqual([p.label for p in overview.unestimatable], ["A"])
+        page = panel_view.overview_page(
+            overview=overview, error="", fetched_at=NOW.timestamp(),
+            config=config(), csrf="t")
+        self.assertIn("算不出", page)
+
+
 if __name__ == "__main__":
     unittest.main()

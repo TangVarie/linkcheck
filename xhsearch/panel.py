@@ -288,6 +288,11 @@ def _collect_one(label, table, settings, api_keys, *,
         snap.health = list(snap.health) + [
             f"表里没有「{f.monitoring}」列，面板无法只统计在管的行，"
             f"下面的数字包含了本该被排除的行"]
+    if f.last_updated not in known:
+        snap.estimate_blocked = (
+            f"表里没有「{f.last_updated}」列，判不了哪些行到期——"
+            "「到期待刷」和「预计花费」这两个数**算不出来**（不是 0）。"
+            "把这一列建出来之后全表都会判到期，先看清有多少行")
     if not records:
         # 飞书在「应用被移出协作者」时是**静默返回 0 行**，不报错。
         # 不单独点名的话，这张表会渲染成一张所有数字都是 0 的健康卡片——
@@ -781,6 +786,7 @@ def _project_json(p: summary.ProjectSnapshot) -> dict:
         "health": p.health, "total_rows": p.total_rows,
         "archived_rows": p.archived_rows, "queued_rows": p.queued_rows,
         "due_rows": p.due_rows, "due_yuan": round(p.due_yuan, 2),
+        "estimate_blocked": p.estimate_blocked,
         "stale_rows": p.stale_rows, "never_checked_rows": p.never_checked_rows,
         "oldest_checked_ms": p.oldest_checked_ms,
         "refresh_status_counts": p.refresh_status_counts,

@@ -910,3 +910,47 @@ class TestReportedSpanOnlyCoversRowsThatLanded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFirstRunCap(unittest.TestCase):
+    """整张表一个「最近检查时间」都没有 = 全新表，或者刚把那一列建出来。
+    两种情况下每一行都判到期，一轮就是全表付费。
+
+    这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，
+    这个是**单张新表**的，防的是「一张 800 行的表刚入册就吃掉整轮预算」。
+    """
+
+    def test_the_cap_is_read_from_the_environment(self):
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn("FIRST_RUN_MAX_RECORDS", source)
+
+    def test_it_only_fires_when_every_row_is_unchecked(self):
+        """有一行刷过就说明这张表已经在跑了，不该再当新表限流。"""
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn("all(r.last_updated_ms is None for r in row_list)", source)
+
+    def test_zero_disables_it(self):
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn("if (first_run_cap and", source,
+                      "0 要能关掉这个闸，否则没法一次刷完")
+
+
+class TestEstimateSaysUnknownNotZero(unittest.TestCase):
+    """缺「最近检查时间」列时 load_rows 直接 return []，
+    于是 estimate 报「¥0.00」——而真相是算不出来。"""
+
+    def test_the_guard_returns_none_not_zero(self):
+        import inspect
+        source = inspect.getsource(cli._refresh_table)
+        guard = source[source.index("分层刷新没有依据"):]
+        self.assertIn("return 1, found, 0, None, None", guard,
+                      "花费要返回 None（未知），不是 0.0")
+
+    def test_the_total_line_counts_the_unestimatable_tables(self):
+        import inspect
+        source = inspect.getsource(cli._run_locked)
+        self.assertIn("unknown_cost", source)
+        self.assertIn("无法估算", source)
