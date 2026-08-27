@@ -387,11 +387,16 @@ _SCRIPT = r"""
   var pickN = document.getElementById("pickN");
   var qOut = document.getElementById("queueOut");
   function rowsOf(el){ return el.closest("tr"); }
+  // **只算屏幕上看得见的行。** 筛「风控」勾 20 行、改筛词成「负面」再勾 15 行，
+  // 不看可见性就会提交 35 行——而你只看得见 15 行。勾「排队刷新」是要花钱的，
+  // 提交的行数必须和眼睛看到的一致。
+  function visible(tr){ return tr && tr.style.display !== "none"; }
   function selected(){
     var out = [];
     for (var i = 0; i < picks.length; i++) {
       if (!picks[i].checked) continue;
       var tr = rowsOf(picks[i]);
+      if (!visible(tr)) continue;
       out.push({app_token: tr.dataset.app, table_id: tr.dataset.tbl,
                 record_id: tr.dataset.rec});
     }
@@ -428,6 +433,10 @@ _SCRIPT = r"""
       .then(function(j){
         if (qOut) qOut.textContent = "已勾 " + j.queued + " 行，等 cron 接手" +
           (j.failures.length ? "；" + j.failures.length + " 行失败：" + j.failures.join("；") : "");
+        // 交完就把勾清掉。留着的话按钮重新变可点、数字还是原来那个，
+        // 看着像没成功，运营会再点一次——不会翻倍花钱，但会白白再跑一次全量取数。
+        for (var k = 0; k < picks.length; k++) picks[k].checked = false;
+        if (all) all.checked = false;
         sync();
       })
       .catch(function(err){ if (qOut) qOut.textContent = String(err); btnQ.disabled = false; });
@@ -509,7 +518,8 @@ _SCRIPT = r"""
           "<button type=button data-act=enable data-rec='" + esc(e.record_id) + "' data-on='" + (e.enabled ? "0" : "1") + "'>" + (e.enabled ? "停用" : "启用") + "</button>" +
           "<button type=button data-act=thresholds data-rec='" + esc(e.record_id) + "'>阈值</button>" +
           "<button type=button data-act=remove data-rec='" + esc(e.record_id) + "' data-label='" + esc(e.label) + "'>移除</button>" +
-          "</div>" + thresholdForm(e) + "</div>";
+          "</div><div class='out rowOut' style='flex-basis:100%'></div>" +
+          thresholdForm(e) + "</div>";
       }).join("");
     }).catch(function(err){ list.className = "problem"; list.textContent = String(err); });
   }
@@ -553,10 +563,18 @@ _SCRIPT = r"""
       var body = act === "build" ? {app_token: b.dataset.app, table_id: b.dataset.tbl}
                : act === "enable" ? {record_id: b.dataset.rec, enabled: b.dataset.on === "1"}
                : {record_id: b.dataset.rec};
+      // 报错要显示在**出错的那一行旁边**。原来一律写进下面「加一张表」那个框，
+      // 清单一长就跑到屏幕外，表现成「点了没反应」。
+      var row = b.closest(".proj");
+      var rowOut = row ? row.querySelector(".rowOut") : null;
+      function tell(html, cls){
+        if (rowOut) { rowOut.innerHTML = "<div class='" + (cls || "") + "'>" + html + "</div>"; }
+        else { say(html, cls); }
+      }
       post(act, body).then(function(j){
-        if (act === "build") { say(esc(j.summary) + (j.skipped_options && j.skipped_options.length ? "\n\n这几处要去飞书手工补（补选项会整体覆盖，默认不代劳）：\n· " + j.skipped_options.map(esc).join("\n· ") : ""), j.ok ? "ok" : ""); }
+        if (act === "build") { tell(esc(j.summary) + (j.skipped_options && j.skipped_options.length ? "\n\n这几处要去飞书手工补（补选项会整体覆盖，默认不代劳）：\n· " + j.skipped_options.map(esc).join("\n· ") : ""), j.ok ? "ok" : ""); }
         load();
-      }).catch(function(err){ say(esc(String(err)), ""); b.disabled = false; });
+      }).catch(function(err){ tell(esc(String(err)), ""); b.disabled = false; });
     });
   }
   var btnCheck = document.getElementById("btnCheck");

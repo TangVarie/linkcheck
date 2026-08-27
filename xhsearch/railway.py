@@ -308,6 +308,9 @@ class TableRun:
     budget_stopped: str = ""
     aborted_reason: str = ""
     fatal: bool = False
+    # 这张表刷完时 SocialDataX 还剩多少积分。runner 是在**表级**事件里发它的，
+    # 收尾事件里没有——只从 run_end 读会永远读成 None（踩过）。
+    points_balance: Optional[int] = None
 
 
 @dataclass
@@ -390,6 +393,8 @@ def build_runs(lines: Iterable[LogLine], *, limit: int = 50) -> list[Run]:
                 counts=event.get("counts") or {},
                 used_providers=event.get("used_providers") or {},
                 failovers=_as_int(event.get("failovers")),
+                points_balance=(None if event.get("points_balance") is None
+                                else _as_int(event.get("points_balance"))),
                 breaker_tripped=bool(event.get("breaker_tripped")),
                 budget_stopped=str(event.get("budget_stopped") or ""),
                 aborted_reason=str(event.get("aborted_reason") or ""),
@@ -417,6 +422,14 @@ def build_runs(lines: Iterable[LogLine], *, limit: int = 50) -> list[Run]:
         if not run.finished and run.tables:
             run.rows = run.rows or sum(t.rows for t in run.tables)
             run.cost_yuan = run.cost_yuan or sum(t.cost_yuan for t in run.tables)
+        # 「跑完剩」：收尾事件带了就以它为准（那是这一轮**最后**看到的余额）；
+        # 没带就从表级事件里取**最小**的那个——和 runner 合并同一张表的多次
+        # 读数时一个口径，宁可低报。全走 TikHub 的轮子一个都没有，保持 None，
+        # 页面显示「—」而不是 ¥0。
+        if run.points_balance is None:
+            seen = [t.points_balance for t in run.tables
+                    if t.points_balance is not None]
+            run.points_balance = min(seen) if seen else None
 
     ordered = sorted(runs.values(),
                      key=lambda r: (r.started_at or 0.0, r.run_id), reverse=True)

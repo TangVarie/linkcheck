@@ -417,6 +417,54 @@ class TestCollect(unittest.TestCase):
         self.assertNotIn("PANEL_LABEL_COLUMN", " ".join(overview.projects[0].health))
 
 
+class TestCheckSeesDisabledEntries(unittest.TestCase):
+    """体检查重必须**连停用的行一起看**。
+
+    踩过的坑：查重用的清单过滤了 `usable`，而 `usable = enabled and …`——
+    于是把一张表停用之后再去体检它，会报「配置齐了，可以直接入册」，
+    加进去就是同一张表两行。等两行都启用了才被 `find_duplicates` 抓到，
+    而在那之前，**一轮里这张表会被刷两遍 = 付两次钱**。
+    """
+
+    class _Entry:
+        def __init__(self, label, table_id, enabled):
+            self.label, self.table_id, self.enabled = label, table_id, enabled
+            self.app_token, self.problem = "bascnA", ""
+
+        @property
+        def usable(self):
+            return self.enabled and not self.problem and bool(self.table_id)
+
+    def _known(self, *entries):
+        projects = panel.Projects.__new__(panel.Projects)
+        projects.settings = Settings()
+        projects.list = lambda: list(entries)                   # noqa: ARG005
+        captured = {}
+
+        def fake_check(_table, _settings, *, label, target, known_tables):
+            captured["known"] = list(known_tables)
+            return None
+
+        with mock.patch.object(panel.Projects, "_bitable", lambda *a, **k: None), \
+             mock.patch("xhsearch.provision.check", fake_check):
+            panel.Projects.check(projects, "新项目", "bascnA:tblB")
+        return captured["known"]
+
+    def test_a_disabled_table_still_counts_as_known(self):
+        known = self._known(self._Entry("停用的", "tblB", enabled=False))
+        self.assertIn("tblB", [t for _l, _a, t in known],
+                      "停用的表没进查重清单，再体检会报「可以入册」，加进去就是两行")
+
+    def test_an_enabled_table_counts_too(self):
+        known = self._known(self._Entry("在跑的", "tblB", enabled=True))
+        self.assertIn("tblB", [t for _l, _a, t in known])
+
+    def test_a_row_with_no_table_id_is_skipped(self):
+        """链接没解析出来的行没有 table_id，拿它查重只会误报。"""
+        known = self._known(self._Entry("坏行", "", enabled=True))
+        self.assertEqual(known, [])
+
+
 class TestCache(unittest.TestCase):
     def test_keeps_the_last_good_snapshot_when_a_refresh_fails(self):
         """一次网络抖动不该让整个面板变成白纸。"""
