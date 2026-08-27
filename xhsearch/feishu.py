@@ -16,6 +16,7 @@ import json
 import re
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -28,6 +29,40 @@ BASE = "https://open.feishu.cn/open-apis"
 BATCH_SIZE = 500
 # 新增记录的单次上限是 1000（和 batch_update 的 500 不是一个数）。
 # 单独一个常量：共用一个的话，哪天改了其中一边就会静默超限。
+# 幂等键的命名空间。随便一个固定 UUID 就行，**但一旦定了就不能改**——
+# 改了以后同样的 seed 会算出不同的键，「连点两次不多出一行」当场失效。
+_IDEM_NAMESPACE = uuid.UUID("6f1b0c4e-9d3a-4b27-8e15-a70c2d9f4b83")
+
+
+def _parse_uuid(text: str):
+    """解析失败返回 None——校验用，不该因为一个坏字符串抛出去。"""
+    try:
+        return uuid.UUID(text)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def idempotency_key(seed: str = "") -> str:
+    """把任意字符串变成飞书收得下的 `client_token`。
+
+    飞书要求它是**标准 UUID**，格式不对整条 batch_create 直接报
+    `Invalid client token, make sure that it complies with the specification.`
+    调用方拼出来的幂等键（面板的「加进清单」拼的是 `add-<表链接>-<项目名>`）
+    带着 `://`、`?`、空格和中文，原样送过去必挂——这是真出过的线上故障。
+
+    `seed` 非空 → UUIDv5：**同样的 seed 永远算出同一个 UUID**，
+    所以幂等语义一点没丢，只是换了个飞书认得的外衣。
+    `seed` 为空 → uuid4，随机但仍然合法。
+
+    注意返回的是**规范形式** 8-4-4-4-12。别拿 `uuid.UUID()` 解析得过当判据：
+    Python 的解析器很宽松，`secrets.token_hex(16)` 那种没有连字符的
+    32 位十六进制串它照收，飞书不收。
+    """
+    if not seed:
+        return str(uuid.uuid4())
+    return str(uuid.uuid5(_IDEM_NAMESPACE, seed))
+
+
 BATCH_CREATE_SIZE = 1000
 
 # 值得二分定位的**行级**错误码：这一行的问题不影响别的行，隔离出来其余照写。
@@ -667,12 +702,22 @@ class Bitable:
         """
         if not client_token:
             raise ValueError("batch_create 需要 client_token（幂等键）")
+        # 「格式不对」和「忘了传」是同一类事：飞书只吃标准 UUID，送错了换回来
+        # 的是一个 request_id，不是一句能看懂的话。在本地就炸掉，
+        # 用 `idempotency_key()` 把你的幂等键转成 UUID 再传进来。
+        if str(_parse_uuid(client_token)) != client_token:
+            raise ValueError(
+                f"batch_create 的 client_token 必须是规范 UUID（飞书的要求），"
+                f"收到的是 {client_token!r}——"
+                f"用 feishu.idempotency_key() 转一下")
         created: list[str] = []
         for start in range(0, len(records), BATCH_CREATE_SIZE):
             chunk = records[start : start + BATCH_CREATE_SIZE]
-            # 分片时每片一个稳定的键：整批共用一个的话，第二片会被飞书
-            # 当成第一片的重发而整片丢掉。
-            token = client_token if start == 0 else f"{client_token}-{start}"
+            # 整批共用一个键的话，第二片会被飞书当成第一片的重发而整片丢掉。
+            # 分片时每片一个稳定的键。**不能直接拼后缀**：`<uuid>-1000`
+            # 不再是合法 UUID，飞书会连第二片一起拒掉。
+            token = (client_token if start == 0
+                     else idempotency_key(f"{client_token}:{start}"))
             url = (self._url("records/batch_create")
                    + f"?client_token={urllib.parse.quote(token, safe='')}")
             resp = transport.post_with_retry(

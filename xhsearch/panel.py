@@ -1312,7 +1312,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             record_id = projects.add(
                 text("label"), text("target"), text("note"),
                 # 幂等键由前端生成：连点两次「加」不该多出两行。
-                client_token=text("client_token") or secrets.token_hex(16))
+                # 前端拼的是 `add-<表链接>-<项目名>`——带 `://`、`?`、空格、
+                # 中文，**不是** UUID，而飞书的 client_token 只吃标准 UUID。
+                # 在这里（不可信输入进飞书之前的最后一道）转成 UUIDv5：
+                # 同样的种子永远算出同一个键，幂等性原样保留。
+                client_token=feishu.idempotency_key(text("client_token")))
             self.deps.cache.refresh()
             return {"record_id": record_id}
         if action == "create":

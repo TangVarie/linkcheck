@@ -8,6 +8,7 @@
 import json
 import re
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -1238,10 +1239,52 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
                                headers=self._login(), method="POST")
         self.assertEqual(status, 413)
 
-    def test_add_generates_an_idempotency_key_when_absent(self):
-        self._call("/api/projects/add", data=b'{"label":"x","target":"a:b"}',
+    def _token_of(self, body: bytes) -> str:
+        self._call("/api/projects/add", data=body,
                    headers=self._login(), method="POST")
-        self.assertTrue(self.actions.add.call_args.kwargs["client_token"])
+        return self.actions.add.call_args.kwargs["client_token"]
+
+    def assertCanonicalUuid(self, token: str) -> None:
+        """**规范形式** 8-4-4-4-12，不是「uuid.UUID() 解析得过」。
+
+        Python 的解析器很宽松：`secrets.token_hex(16)` 那种 32 个十六进制
+        字符、一个连字符都没有的串，`uuid.UUID()` 照收不误。飞书要的是
+        标准 UUID，它不收。拿宽松的解析器当断言，这条测试就又没有牙了。
+        """
+        self.assertEqual(str(uuid.UUID(token)), token,
+                         f"不是规范 UUID：{token!r}")
+
+    def test_add_generates_an_idempotency_key_when_absent(self):
+        """**必须是合法 UUID**，不是「非空就行」。
+
+        飞书的 client_token 只吃标准 UUID，格式不对整条 batch_create 就报
+        `Invalid client token, make sure that it complies with the specification.`
+        原来这条只断言非空——空串会红，而线上真正送过去的那个
+        `add-https://…?table=…-中文` 全绿。它就是这次漏网的直接原因。
+        """
+        self.assertCanonicalUuid(self._token_of(b'{"label":"x","target":"a:b"}'))
+
+    def test_the_key_the_browser_sends_is_normalised_not_passed_through(self):
+        """前端那个键是按 (target, label) 拼的，带 `://`、`?`、空格、中文。
+
+        它是**幂等语义的种子**，不是 token 本身——原样透传给飞书就是这次的错。
+        """
+        raw = ("add-https://piqijafyg8a.feishu.cn/base/S72ObviZAa7P0AsueX1cpsYRnN6"
+               "?table=tblXXXX-Hatherine 素人执行表单")
+        token = self._token_of(json.dumps(
+            {"label": "Hatherine 素人执行表单", "target": "a:b",
+             "client_token": raw}).encode())
+        self.assertCanonicalUuid(token)
+        self.assertNotEqual(token, raw)
+
+    def test_the_same_add_twice_keeps_the_same_key(self):
+        """连点两次「加」不该多出两行——归一化不能把幂等性弄丢。"""
+        raw = json.dumps({"label": "甲", "target": "a:b",
+                          "client_token": "add-a:b-甲"}).encode()
+        other = json.dumps({"label": "乙", "target": "a:b",
+                            "client_token": "add-a:b-乙"}).encode()
+        self.assertEqual(self._token_of(raw), self._token_of(raw))
+        self.assertNotEqual(self._token_of(raw), self._token_of(other))
 
     def test_disabled_projects_explain_why(self):
         self.actions.enabled = False

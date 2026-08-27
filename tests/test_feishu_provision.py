@@ -9,6 +9,7 @@
 
 import json
 import unittest
+import uuid
 from unittest import mock
 
 from xhsearch import feishu, transport
@@ -164,6 +165,42 @@ class TestAddFieldOptions(unittest.TestCase):
         self.assertIn("不是单选/多选", str(ctx.exception))
 
 
+UUID_A = "3f8a1c2e-5b64-4d7f-9a01-2c3d4e5f6071"
+
+
+class TestIdempotencyKey(unittest.TestCase):
+    """飞书的 client_token 只吃**标准 UUID**，格式不对整条 batch_create 就报
+    `Invalid client token, make sure that it complies with the specification.`
+    """
+
+    def canonical(self, token: str) -> None:
+        """规范形式 8-4-4-4-12。
+
+        **不要拿 `uuid.UUID()` 解析得过当判据**：Python 的解析器很宽松，
+        `secrets.token_hex(16)` 那种一个连字符都没有的 32 位十六进制串
+        它照收，而飞书不收。
+        """
+        self.assertEqual(str(uuid.UUID(token)), token, f"不是规范 UUID：{token!r}")
+
+    def test_a_seed_becomes_a_canonical_uuid(self):
+        raw = ("add-https://piqijafyg8a.feishu.cn/base/S72ObviZAa7P0AsueX1cpsYRnN6"
+               "?table=tblXXXX-Hatherine 素人执行表单")
+        self.canonical(feishu.idempotency_key(raw))
+
+    def test_the_same_seed_always_gives_the_same_uuid(self):
+        """幂等键的全部意义在这里：连点两次「加」不该多出两行。"""
+        self.assertEqual(feishu.idempotency_key("add-a:b-甲"),
+                         feishu.idempotency_key("add-a:b-甲"))
+        self.assertNotEqual(feishu.idempotency_key("add-a:b-甲"),
+                            feishu.idempotency_key("add-a:b-乙"))
+
+    def test_no_seed_gives_a_random_but_canonical_uuid(self):
+        first, second = feishu.idempotency_key(), feishu.idempotency_key()
+        self.canonical(first)
+        self.canonical(second)
+        self.assertNotEqual(first, second)
+
+
 class TestBatchCreate(unittest.TestCase):
     def test_client_token_is_required(self):
         """transport 对超时是自动重试的，没有幂等键就会多出重复行。"""
@@ -173,14 +210,28 @@ class TestBatchCreate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 table().batch_create([{"fields": {}}], client_token="")
 
+    def test_a_key_that_is_not_a_uuid_is_refused_here_not_by_feishu(self):
+        """和「忘了传」同一类事，同样应该在本地就炸。
+
+        送出去只会换回一个飞书的 request_id——那次线上就是这么坏的：
+        前端拼的 `add-<飞书URL>-<中文项目名>` 一路透传到飞书。
+        """
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"):
+            for bad in ("add-https://x.feishu.cn/base/b?table=t-甲",
+                        "beee1b7a4d022a9f25a3b0bca0fd72c6",   # 没有连字符
+                        "uuid-1"):
+                with self.assertRaises(ValueError, msg=bad) as ctx:
+                    table().batch_create([{"fields": {}}], client_token=bad)
+                self.assertIn("client_token", str(ctx.exception))
+
     def test_token_goes_on_the_url(self):
         cap = Captured(ok({"records": [{"record_id": "rec1"}]}))
         with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
              mock.patch.object(transport, "post_with_retry", cap):
             got = table().batch_create([{"fields": {"名字": "甲"}}],
-                                       client_token="uuid-1")
+                                       client_token=UUID_A)
         self.assertEqual(got, ["rec1"])
-        self.assertIn("client_token=uuid-1", cap.calls[0]["url"])
+        self.assertIn("client_token=" + UUID_A, cap.calls[0]["url"])
 
     def test_retrying_the_same_batch_reuses_the_key(self):
         """同一批内容重发必须用同一个键，否则飞书当成新的一批。"""
@@ -189,7 +240,7 @@ class TestBatchCreate(unittest.TestCase):
             cap = Captured(ok({"records": [{"record_id": "rec1"}]}))
             with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
                  mock.patch.object(transport, "post_with_retry", cap):
-                table().batch_create([{"fields": {}}], client_token="uuid-1")
+                table().batch_create([{"fields": {}}], client_token=UUID_A)
             keys.append(cap.calls[0]["url"])
         self.assertEqual(keys[0], keys[1])
 
@@ -199,9 +250,25 @@ class TestBatchCreate(unittest.TestCase):
         cap = Captured(ok({"records": []}), ok({"records": []}))
         with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
              mock.patch.object(transport, "post_with_retry", cap):
-            table().batch_create(records, client_token="uuid-1")
+            table().batch_create(records, client_token=UUID_A)
         self.assertEqual(len(cap.calls), 2)
         self.assertNotEqual(cap.calls[0]["url"], cap.calls[1]["url"])
+
+    def test_every_chunk_key_is_itself_a_canonical_uuid(self):
+        """互不相同还不够——第二片原来是 `<uuid>-1000`，拼完就不是 UUID 了。
+        分片只在超过 BATCH_CREATE_SIZE 时才走到，所以这条一直潜伏着。"""
+        records = [{"fields": {"i": i}} for i in range(feishu.BATCH_CREATE_SIZE + 5)]
+        cap = Captured(ok({"records": []}), ok({"records": []}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            table().batch_create(records, client_token=UUID_A)
+        seen = set()
+        for call in cap.calls:
+            token = call["url"].split("client_token=")[1].split("&")[0]
+            self.assertEqual(str(uuid.UUID(token)), token,
+                             f"分片的键不是规范 UUID：{token!r}")
+            seen.add(token)
+        self.assertEqual(len(seen), len(cap.calls))
 
 
 class TestFieldsMetaRaw(unittest.TestCase):
