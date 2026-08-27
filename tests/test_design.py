@@ -95,6 +95,36 @@ class TestPalette(unittest.TestCase):
                          "标志正红出现在了标志图形之外")
 
 
+class TestQueueingIsHonest(unittest.TestCase):
+    """勾「排队刷新」是面板唯一会花钱的动作，它的交互不能骗人。
+
+    这几条钉的是 `_SCRIPT` 的源码。JS 行为最终要靠真浏览器验（这个仓库
+    吃过亏：CSP 和内联 JS 语法错误都是离线测试原理上看不见的），
+    但「有没有写这段逻辑」用源码判得住，而且改坏了会红。
+    """
+
+    def setUp(self):
+        self.js = panel_view._SCRIPT
+
+    def test_only_visible_rows_are_submitted(self):
+        """**踩过的坑**：`selected()` 只看 `.checked`，不看行有没有被筛掉。
+        筛「风控」勾 20 行 → 改筛词成「负面」再勾 15 行 → 提交 35 行，
+        而屏幕上只看得见 15 行。这是实打实多花钱。
+        """
+        body = self.js[self.js.index("function selected()"):]
+        body = body[:body.index("\n  }")]
+        self.assertRegex(
+            body, r"offsetParent|display|hidden|visible",
+            "selected() 没有任何可见性判断——被筛掉的勾会一起提交")
+
+    def test_the_ticks_are_cleared_after_a_successful_submit(self):
+        """提交成功之后勾还在、按钮还可点、数字不变，看着像没成功，
+        运营会再点一次（不翻倍花钱，但会白白再触发一次全量取数）。"""
+        self.assertRegex(
+            self.js, r"checked\s*=\s*false",
+            "提交成功后没有取消勾选")
+
+
 def css_without_comments() -> str:
     """去掉 CSS 注释再查。注释里本来就写着「border-radius: 0」这种句子
     ——那是在说明规则，不是在违反它，扫源码文本会把它当成命中。"""

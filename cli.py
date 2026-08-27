@@ -879,7 +879,13 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                     cost_yuan=round(
                         sum(r.cost_yuan for _l, _t, r, _m, _c in pending), 6),
                     channels_dead=channels_dead, stopped=stop.is_set(),
-                    budget_stopped=budget.stopped_reason)
+                    budget_stopped=budget.stopped_reason,
+                    # 「跑完剩」：这一轮最后看到的 SocialDataX 积分余额。
+                    # 取最小的那个（宁可低报）。全走 TikHub 的轮子是 None，
+                    # 面板显示「—」而不是 ¥0——两者要人做的事不一样。
+                    points_balance=min(
+                        (r.points_balance for _l, _t, r, _m, _c in pending
+                         if r.points_balance is not None), default=None))
         return code
 
     worst = 0

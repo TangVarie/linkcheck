@@ -757,8 +757,12 @@ class Projects:
         """体检一个候选表。**不花钱，也不写任何东西。**"""
         from . import tablespec
         parsed = tablespec.parse_target(target, default_label=label)
+        # **停用的行也要参与查重。** `usable` 里含 `enabled`，拿它过滤的话，
+        # 把一张表停用之后再体检它会报「配置齐了，可以直接入册」，
+        # 于是同一张表在清单里出现两行——两行都启用之后，一轮里这张表
+        # 会被刷两遍，等于付两次钱。这里只要求「解析出了 table_id」。
         known = [(e.label, e.app_token, e.table_id)
-                 for e in self.list() if e.usable]
+                 for e in self.list() if e.table_id]
         return provision.check(
             self._bitable(parsed.app_token, parsed.table_id), self.settings,
             label=label or parsed.label, target=target, known_tables=known)

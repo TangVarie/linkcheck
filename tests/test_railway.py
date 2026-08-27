@@ -307,6 +307,53 @@ class TestBuildRuns(unittest.TestCase):
         self.assertTrue(run.finished)
         self.assertTrue(run.ok)
 
+    def test_the_balance_reaches_the_run_from_the_table_event(self):
+        """「跑完剩」那一列的值。
+
+        **踩过的坑**：`points_balance` 是 runner 在**表级**事件里发的
+        （runner.py 的 EVENT_TABLE），而这里原来只从 `run_end` 里读，
+        `cli.py` 发 `run_end` 时又没带它——三处对不上，值根本传不过来，
+        「跑完剩」永远显示「—」。而余额对账（docs/待验证清单.md 17c）
+        整个靠这一列，等于那条验收做不了。
+        """
+        lines = [
+            ev("r1", "run_start", 1000, mode="sweep"),
+            ev("r1", "table", 1010, table="A", rows=5, cost_yuan=0.36,
+               points_balance=4200),
+            ev("r1", "run_end", 1030, mode="sweep", exit_code=0, rows=5,
+               cost_yuan=0.36),
+        ]
+        run = railway.build_runs(lines)[0]
+        self.assertEqual(run.points_balance, 4200)
+        self.assertAlmostEqual(run.points_yuan, 42.0)
+
+    def test_run_end_wins_over_the_table_events(self):
+        """收尾事件带了就以它为准——它是这一轮**最后**看到的余额。"""
+        lines = [
+            ev("r1", "run_start", 1000),
+            ev("r1", "table", 1010, table="A", points_balance=4200),
+            ev("r1", "run_end", 1030, exit_code=0, points_balance=4100),
+        ]
+        self.assertEqual(railway.build_runs(lines)[0].points_balance, 4100)
+
+    def test_the_lowest_balance_wins_across_tables(self):
+        """一轮刷几张表，每张报一次余额。取最小的那个——和 runner 内部
+        合并同一张表的多次读数时一样，宁可低报。"""
+        lines = [
+            ev("r1", "run_start", 1000),
+            ev("r1", "table", 1010, table="A", points_balance=4200),
+            ev("r1", "table", 1020, table="B", points_balance=3900),
+            ev("r1", "run_end", 1030, exit_code=0),
+        ]
+        self.assertEqual(railway.build_runs(lines)[0].points_balance, 3900)
+
+    def test_a_run_with_no_balance_anywhere_stays_none(self):
+        """全走 TikHub 的轮子读不到积分余额。那要显示「—」，不是 ¥0。"""
+        lines = [ev("r1", "run_start", 1000),
+                 ev("r1", "table", 1010, table="A"),
+                 ev("r1", "run_end", 1030, exit_code=0)]
+        self.assertIsNone(railway.build_runs(lines)[0].points_balance)
+
     def test_row_events_are_not_expanded(self):
         """一轮几百行，全塞进内存只为了在页面上显示一个数字。"""
         lines = [ev("r1", "run_start", 1000)]
