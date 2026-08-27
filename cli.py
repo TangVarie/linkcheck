@@ -1144,7 +1144,8 @@ def cmd_serve(selected: list[str] | None = None) -> int:
             show_digest=config.show_digest,
             feishu_base=config.feishu_base,
             secrets=config.secrets,
-            settings_for=settings_for)
+            settings_for=settings_for,
+            label_column=config.label_column)
 
     return panel.serve(config, produce, settings)
 

@@ -93,6 +93,11 @@ class PanelConfig:
     registry_target: str = ""
     app_id: str = ""
     app_secret: str = ""
+    # 待办行上「哪一条」读哪一列。**空 = 面板自己在表里找**
+    # （`summary.LABEL_CANDIDATES`，「笔记内容」打头）。写了就只认它——
+    # 表里没有那一列会在项目卡上点名，而不是悄悄换一列。
+    label_column: str = ""
+
     # 余额那一块。两家的余额端点都是官方标明零费用的（见 xhsearch/balance.py
     # 开头那张表），所以「面板不发付费请求」这条不变量没被动过——
     # 而且面板本来就一直在发免费请求（飞书、Railway）。
@@ -145,6 +150,7 @@ class PanelConfig:
             registry_target=(env.get("FEISHU_REGISTRY") or "").strip(),
             app_id=(env.get("FEISHU_APP_ID") or "").strip(),
             app_secret=(env.get("FEISHU_APP_SECRET") or "").strip(),
+            label_column=(env.get("PANEL_LABEL_COLUMN") or "").strip(),
             show_balance=_bool_env(env, "PANEL_SHOW_BALANCE", True),
             runway_warn_days=_float_env(env, "PANEL_RUNWAY_WARN_DAYS",
                                         14.0, 0.5, 3650.0),
@@ -269,6 +275,7 @@ def collect(
     now: Optional[datetime] = None,
     secrets: Iterable[str] = (),
     settings_for: Optional[Callable[[str], Settings]] = None,
+    label_column: str = "",
 ) -> summary.Overview:
     """把每张表读一遍、聚合成 Overview。**只读，不花钱。**
 
@@ -291,13 +298,14 @@ def collect(
         projects.append(_collect_one(
             label, table, per_table, api_keys,
             show_digest=show_digest, feishu_base=feishu_base, now=now,
-            scrub=scrub))
+            scrub=scrub, label_column=label_column))
     return summary.Overview(projects=projects, generated_at=now)
 
 
 def _collect_one(label, table, settings, api_keys, *,
                  show_digest, feishu_base, now,
-                 scrub: Optional[Callable[[str], str]] = None
+                 scrub: Optional[Callable[[str], str]] = None,
+                 label_column: str = "",
                  ) -> summary.ProjectSnapshot:
     route = getattr(table, "route", "base")
     blank = summary.ProjectSnapshot(
@@ -323,9 +331,12 @@ def _collect_one(label, table, settings, api_keys, *,
 
     known = set(meta)
     health = schema.schema_problems(settings, meta)
+    # 「哪一条」用哪一列，在 search 之前定下来（下面那条纪律的同一个原因）。
+    picked = summary.pick_label_column(known, label_column)
     # 只请求确实存在的列：按名字请求不存在的列会让整个 search 报 1254045，
     # 一行都读不回来（和 runner.load_rows 同一条纪律）。
-    wanted = [c for c in summary.panel_fields(settings, show_digest=show_digest)
+    wanted = [c for c in summary.panel_fields(settings, show_digest=show_digest,
+                                              extra=(picked,))
               if c in known]
     filter_spec = None
     if f.monitoring in known:
@@ -342,11 +353,22 @@ def _collect_one(label, table, settings, api_keys, *,
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
-        scrub=scrub, route=route)
+        scrub=scrub, route=route, label_column=picked)
     if filter_spec is None:
         snap.health = list(snap.health) + [
             f"表里没有「{f.monitoring}」列，面板无法只统计在管的行，"
             f"下面的数字包含了本该被排除的行"]
+    if not picked:
+        # 「哪一条」空掉一整栏，运营就只能一条条点开链接看——正是这个面板
+        # 要消灭的动作。所以要在项目卡上说清楚差什么、怎么补。
+        tried = "」「".join(summary.LABEL_CANDIDATES)
+        snap.health = list(snap.health) + ([
+            f"设了 PANEL_LABEL_COLUMN=「{label_column}」，但这张表没有这一列，"
+            f"「哪一条」那一栏只能退回用「{f.link}」的残余文字。列名写错了？"
+        ] if label_column else [
+            f"这张表里没有笔记内容列（试过「{tried}」），「哪一条」那一栏"
+            f"只能退回用「{f.link}」抠掉链接之后剩的文字。"
+            f"把内容列改名成其中之一，或者设 PANEL_LABEL_COLUMN 指过去。"])
     if f.last_updated not in known:
         snap.estimate_blocked = (
             f"表里没有「{f.last_updated}」列，判不了哪些行到期——"

@@ -189,6 +189,8 @@ td.right{text-align:right}
  * 而模板里通用的 a 是 accent 红——仲裁顺序中**场景文件规则高于模板**，
  * 这一处听场景的。 */
 td a.act{font-size:13px;color:var(--primary)}
+/* 「哪一条」：运营扫这一栏在飞书表里定位，所以要比周围重一点。 */
+td.which{color:var(--text-dark);max-width:15em}
 tr.fresh td:nth-child(2){border-left:3px solid var(--primary)}
 tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary);
   margin-left:6px;font-weight:600}
@@ -701,6 +703,18 @@ def _stamp(ms: Optional[int], offset_hours: float = 8.0) -> str:
     return moment.astimezone(tz).strftime("%m-%d %H:%M")
 
 
+# 「哪一条」显示多少个字。中文十来个字就够在表里 Ctrl+F 定位了，
+# 再长会把表撑宽、把「为什么」和「诊断信息」挤没。完整文本挂在 title 上。
+LABEL_CHARS = 14
+
+
+def _clip(text: str, limit: int = LABEL_CHARS) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    if not text:
+        return "—"
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _chips(values, mapping=None) -> str:
     out = []
     for value in values:
@@ -726,7 +740,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
                 "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
                 "刷新失败 / 卡住了 —— 一条都没有。</div></div>")
     head = ("<tr><th><input type=checkbox id=todoAll title='全选'></th>"
-            "<th>项目</th><th>为什么</th><th>诊断信息</th>"
+            "<th>项目</th><th>哪一条</th><th>为什么</th><th>诊断信息</th>"
             "<th>评论数</th><th>最近检查</th><th></th></tr>")
     body = []
     for todo in todos:
@@ -739,6 +753,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
             f"data-tbl='{_e(todo.table_id)}' data-key='{_e(todo.key)}'>"
             "<td class=nowrap><input type=checkbox class=todoPick></td>"
             f"<td class=nowrap>{_e(todo.project)}</td>"
+            f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
             f"<td>{_chips(todo.reasons, _REASON_CLASS)}</td>"
             f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
             f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
@@ -768,6 +783,7 @@ def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
     rows = "".join(
         "<tr>"
         f"<td class=nowrap>{_e(t.project)}</td>"
+        f"<td class=which title='{_e(t.label)}'>{_e(_clip(t.label))}</td>"
         f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
         f"<td>{_e(t.diagnosis) or '<span class=muted>—</span>'}</td>"
         f"<td class=nowrap><a href='{_e(t.record_url)}' target=_blank "
@@ -780,7 +796,7 @@ def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
     不再自动刷了。「排队刷新」会<b>绕过归档线</b>，所以它们刻意不混进上面那一屏——
     多数时候正确的处置是去飞书<b>取消巡查</b>，而不是再花钱刷一次。</span></div>
   <div class=tablewrap><table>
-  <thead><tr><th>项目</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
+  <thead><tr><th>项目</th><th>哪一条</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
   <tbody>{rows}</tbody></table></div>
 </details>"""
 

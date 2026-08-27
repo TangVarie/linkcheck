@@ -8,7 +8,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from xhsearch import runner, summary
+from xhsearch import links, runner, summary
 from xhsearch.config import Settings
 
 UTC = timezone.utc
@@ -23,7 +23,8 @@ def ms(moment: datetime) -> int:
 def record(record_id="rec1", *, settings=None, link=XHS, published_hours_ago=10,
            checked_hours_ago=1, tags=(), refresh_status="", negative_status="",
            pin_status="", queued=False, seed=None, negative=None,
-           comment_count=None, diagnosis="", digest="", negative_digest=""):
+           comment_count=None, diagnosis="", digest="", negative_digest="",
+           extra=None):
     """造一条飞书 record。只填给到的列——飞书对空单元格根本不返回键，
     测试里也照这个来，否则测不到「这一格没值」的路径。"""
     f = (settings or Settings()).fields
@@ -56,6 +57,8 @@ def record(record_id="rec1", *, settings=None, link=XHS, published_hours_ago=10,
         cells[f.comment_digest] = digest
     if negative_digest:
         cells[f.negative_digest] = negative_digest
+    # 机器不认识的业务列（「笔记内容」之类）。面板要读它，判定链路不碰它。
+    cells.update(extra or {})
     return {"record_id": record_id, "fields": cells}
 
 
@@ -259,6 +262,94 @@ class TestPanelFields(unittest.TestCase):
     def test_no_duplicates(self):
         fields = summary.panel_fields(Settings(), show_digest=True)
         self.assertEqual(len(fields), len(set(fields)))
+
+
+class TestTextWithoutUrls(unittest.TestCase):
+    """「哪一条」的兜底：分享文案抠掉链接之后剩的字。"""
+
+    def test_share_text_keeps_the_title_and_loses_the_link(self):
+        cell = ("77 露营装备清单 - 小红书 😆 abcDEF😆 " + XHS +
+                " 😆 复制本条信息，打开【小红书】App查看精彩内容！")
+        left = links.text_without_urls(cell)
+        self.assertIn("露营装备清单", left)
+        self.assertNotIn("xiaohongshu.com", left)
+        self.assertNotIn("http", left)
+
+    def test_a_bare_link_leaves_nothing(self):
+        """整格只有一条链接 → 空串，让 row_label 落到笔记 ID。
+
+        直接把原文前十几个字拿去显示的话，每一行都是
+        `https://www.xiaohongsh…`，一模一样，等于这一栏没显示。
+        """
+        self.assertEqual(links.text_without_urls(XHS), "")
+
+    def test_a_scheme_less_short_link_takes_its_path_with_it(self):
+        """只剥域名会在文本里留下一截 `/a/AbC`，比留着整条链接还难认。"""
+        self.assertEqual(links.text_without_urls("xhslink.com/a/AbC 露营装备"),
+                         "露营装备")
+
+    def test_chinese_glued_to_the_link_survives(self):
+        """`_URL_RE` 的 CJK 右边界：不排 CJK 会把「很火」一起吞掉。"""
+        self.assertEqual(links.text_without_urls("看这条https://v.douyin.com/xxx很火"),
+                         "看这条 很火")
+
+
+class TestPickLabelColumn(unittest.TestCase):
+    def test_candidates_are_tried_in_order(self):
+        self.assertEqual(summary.pick_label_column({"文案", "笔记内容", "标题"}),
+                         "笔记内容")
+        self.assertEqual(summary.pick_label_column({"文案", "标题"}), "文案")
+
+    def test_no_candidate_matches_gives_empty(self):
+        self.assertEqual(summary.pick_label_column({"反馈链接", "平台"}), "")
+
+    def test_explicit_config_beats_the_candidates(self):
+        self.assertEqual(
+            summary.pick_label_column({"笔记内容", "我自己的文案列"}, "我自己的文案列"),
+            "我自己的文案列")
+
+    def test_a_configured_column_that_is_not_there_is_not_silently_swapped(self):
+        """配错了就该空着、让面板报出来。悄悄换一列 = 配置没生效却没人知道。"""
+        self.assertEqual(summary.pick_label_column({"笔记内容"}, "打错的列名"), "")
+
+
+class TestRowLabel(unittest.TestCase):
+    """待办行上「哪一条」的取值。运营拿它去飞书表里 Ctrl+F 定位，
+    所以每一档兜底都必须是**这一行独有**的字，不能各行长一样。"""
+
+    def _label(self, **kwargs):
+        column = kwargs.pop("label_column", "笔记内容")
+        snap = snapshot([record("r1", tags=["风控中"], **kwargs)],
+                        label_column=column)
+        return snap.todos[0].label
+
+    def test_the_content_column_wins(self):
+        label = self._label(extra={"笔记内容": "露营装备清单｜新手别踩这几个坑"})
+        self.assertEqual(label, "露营装备清单｜新手别踩这几个坑")
+
+    def test_an_empty_content_cell_falls_back_to_the_share_text(self):
+        """列建了但那一格没填 —— 空字符串不是「有值」。"""
+        label = self._label(extra={"笔记内容": ""},
+                            link="77 露营装备清单 - 小红书 " + XHS)
+        self.assertEqual(label, "77 露营装备清单 - 小红书")
+
+    def test_no_content_column_falls_back_to_the_share_text(self):
+        label = self._label(label_column="",
+                            link="77 露营装备清单 - 小红书 " + XHS)
+        self.assertEqual(label, "77 露营装备清单 - 小红书")
+
+    def test_a_bare_link_falls_back_to_the_note_id(self):
+        """网址前缀每行都一样，认不出来；笔记 ID 在表里搜得到。"""
+        self.assertEqual(self._label(label_column="", link=XHS),
+                         "65a1b2c3d4e5f60718293a4b")
+
+    def test_nothing_usable_is_an_empty_label_not_a_crash(self):
+        self.assertEqual(self._label(label_column="", link="   "), "")
+
+    def test_rich_text_content_cells_are_read_as_text(self):
+        """飞书文本列读出来可能是富文本分段数组。"""
+        label = self._label(extra={"笔记内容": [{"type": "text", "text": "露营装备清单"}]})
+        self.assertEqual(label, "露营装备清单")
 
 
 class TestOverview(unittest.TestCase):

@@ -358,6 +358,63 @@ class TestCollect(unittest.TestCase):
         panel.collect([("A", table)], settings, {}, now=NOW)
         self.assertNotIn(settings.fields.comment_digest, table.searched_fields)
 
+    # —— 「哪一条」用哪一列 ——
+
+    def _with_content_column(self, name="笔记内容", *, text="露营装备清单"):
+        settings = Settings()
+        meta = healthy_meta(settings)
+        meta[name] = {"type": "text", "ui_type": "", "options": None}
+        record = {"record_id": "r1", "fields": {
+            settings.fields.link: "https://www.xiaohongshu.com/explore/"
+                                  "65a1b2c3d4e5f60718293a4b",
+            settings.fields.traffic_status: ["风控中"],
+            name: text}}
+        return settings, FakeTable(meta, [record])
+
+    def test_the_content_column_is_found_without_any_configuration(self):
+        """运营不该为了看见「哪一条」再去配一个环境变量——
+        字段元数据本来就读了，列名是白拿的。"""
+        settings, table = self._with_content_column()
+        overview = panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertIn("笔记内容", table.searched_fields)
+        self.assertEqual(overview.projects[0].todos[0].label, "露营装备清单")
+
+    def test_a_configured_column_overrides_the_automatic_pick(self):
+        settings = Settings()
+        meta = healthy_meta(settings)
+        for name in ("笔记内容", "我自己的文案列"):
+            meta[name] = {"type": "text", "ui_type": "", "options": None}
+        record = {"record_id": "r1", "fields": {
+            settings.fields.traffic_status: ["风控中"],
+            "笔记内容": "自动认出来的", "我自己的文案列": "我配的那一列"}}
+        overview = panel.collect([("A", FakeTable(meta, [record]))], settings, {},
+                                 now=NOW, label_column="我自己的文案列")
+        self.assertEqual(overview.projects[0].todos[0].label, "我配的那一列")
+
+    def test_no_content_column_anywhere_is_said_out_loud(self):
+        """整栏空掉，运营就只能一条条点开链接看——正是这个面板要消灭的动作。
+        所以要在项目卡上说清楚试过哪些名字、怎么补。"""
+        settings = Settings()
+        overview = panel.collect([("A", FakeTable(healthy_meta(settings), []))],
+                                 settings, {}, now=NOW)
+        notes = " ".join(overview.projects[0].health)
+        self.assertIn("笔记内容", notes)
+        self.assertIn("PANEL_LABEL_COLUMN", notes)
+
+    def test_a_configured_column_that_the_table_lacks_is_called_out(self):
+        """这条提示是「列名写错了」时唯一的线索。它自己坏掉的话没人会发现。"""
+        settings = Settings()
+        overview = panel.collect([("A", FakeTable(healthy_meta(settings), []))],
+                                 settings, {}, now=NOW, label_column="打错的列名")
+        notes = " ".join(overview.projects[0].health)
+        self.assertIn("打错的列名", notes)
+        self.assertIn("PANEL_LABEL_COLUMN", notes)
+
+    def test_a_column_that_exists_raises_no_complaint(self):
+        settings, table = self._with_content_column()
+        overview = panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertNotIn("PANEL_LABEL_COLUMN", " ".join(overview.projects[0].health))
+
 
 class TestCache(unittest.TestCase):
     def test_keeps_the_last_good_snapshot_when_a_refresh_fails(self):
@@ -430,6 +487,29 @@ class TestRendering(unittest.TestCase):
         self.assertNotIn("<script>alert(1)</script>", page)
         self.assertNotIn("<img src=x onerror", page)
         self.assertIn("&lt;script&gt;", page)
+
+    def test_the_which_one_cell_is_clipped_but_keeps_the_full_text_on_hover(self):
+        """这一栏太长会把「为什么」和「诊断信息」挤没；太短就定位不了。
+        截断的那一份给眼睛，完整的那一份挂 title 给鼠标。"""
+        long = "露营装备清单｜新手最容易踩的五个坑，第三个我自己也中招了"
+        todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               label=long, reasons=["风控中"])
+        page = self._page(self._snap(todos=[todo]))
+        cell = re.search(r"<td class=which title='([^']*)'>([^<]*)</td>", page)
+        self.assertIsNotNone(cell, "待办表里没有「哪一条」那一栏")
+        self.assertEqual(cell.group(1), long)
+        self.assertTrue(cell.group(2).endswith("…"))
+        self.assertLess(len(cell.group(2)), len(long))
+        self.assertTrue(long.startswith(cell.group(2)[:-1]))
+
+    def test_an_empty_label_renders_a_dash_not_a_blank_cell(self):
+        """空单元格和「读到了但是空的」在表格里长得一样，会被当成渲染坏了。"""
+        todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               label="", reasons=["风控中"])
+        page = self._page(self._snap(todos=[todo]))
+        self.assertIn("<td class=which title=''>—</td>", page)
 
     def test_no_external_resources(self):
         page = self._page(self._snap())
