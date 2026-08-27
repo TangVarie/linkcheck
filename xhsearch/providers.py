@@ -45,6 +45,7 @@ from typing import Any, Callable, Optional
 # 直接导名字，不要 `from . import protocol`（历史习惯：这份代码曾被打包成
 # 扁平单文件粘进扣子，模块前缀在那种命名空间里会 NameError；打包路径已
 # 退役，写法保留——零成本，还省了模块前缀噪音）。
+from . import transport
 from .protocol import Err, Failure, Ok, Result, build_body, endpoint, headers, parse_response  # noqa: E501
 
 SOCIALDATAX = "socialdatax"
@@ -95,10 +96,9 @@ def set_tikhub_base(url: str, *, allow_unsafe: bool = False) -> None:
     TIKHUB_BASE = cleaned
 
 # Cloudflare 会按 UA 拦截，裸的 Python-urllib/3.x 直接 403。
-_BROWSER_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-)
+# 定义在 transport 里：余额那条路（balance.py）故意不 import providers，
+# 两边各写一份字符串的结果就是它漏了 UA、被 Cloudflare 403 挡了一整天。
+_BROWSER_UA = transport.BROWSER_UA
 
 TIKHUB_PATHS = {
     ("xhs", "comments"): "/api/v1/xiaohongshu/app_v2/get_note_comments",

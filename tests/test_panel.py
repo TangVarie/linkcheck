@@ -707,6 +707,51 @@ class TestOverHttp(unittest.TestCase):
         self.assertEqual(headers.get("X-Frame-Options"), "DENY")
         self.assertEqual(headers.get("Cache-Control"), "no-store")
 
+    def test_csp_lets_the_page_call_its_own_api(self):
+        """**页面里每一个 fetch() 都必须被 CSP 放行。**
+
+        CSP 只有真浏览器认——这个仓库的测试全走 urllib，截图走 file://，
+        两者都看不见这个头。所以拦不住它的唯一办法是把「脚本里 fetch 了什么」
+        和「CSP 允许连什么」放在一起判，而不是只断言这个头存在。
+
+        踩过的坑：`default-src 'none'` 且没写 `connect-src`，于是 fetch 全部
+        被浏览器拦下，页面上是 `TypeError: Failed to fetch`——项目列表、加表、
+        体检、新建、重新取数、勾排队刷新，一个都点不动。服务端一切正常，
+        请求根本没发出去。
+        """
+        _s, _b, headers = self._call("/healthz")
+        csp = headers.get("Content-Security-Policy", "")
+        directives = {}
+        for chunk in csp.split(";"):
+            parts = chunk.split()
+            if parts:
+                directives[parts[0].lower()] = parts[1:]
+
+        # 脚本里真的 fetch 了哪些地址——从源码里抠，别手写清单，
+        # 否则将来新加一个 fetch 这条测试就又变成摆设了。
+        targets = re.findall(r'fetch\(\s*"([^"]+)"', panel_view._SCRIPT)
+        self.assertTrue(targets, "脚本里一个 fetch 都没找到，这条测试失去意义")
+        self.assertTrue(all(t.startswith("/") for t in targets),
+                        f"出现了非同源的 fetch：{targets}")
+
+        governing = directives.get("connect-src", directives.get("default-src"))
+        self.assertIsNotNone(governing, f"CSP 里既没有 connect-src 也没有 default-src：{csp}")
+        self.assertIn(
+            "'self'", governing,
+            f"CSP 不允许页面连自己的接口，{len(targets)} 个 fetch 会被浏览器全部拦下"
+            f"（管这件事的是 {'connect-src' if 'connect-src' in directives else 'default-src'}"
+            f"：{' '.join(governing)}）")
+
+    def test_csp_still_refuses_everything_it_used_to(self):
+        """放开 connect-src 不等于放开别的。外部脚本/样式/图片仍然不许。"""
+        _s, _b, headers = self._call("/healthz")
+        csp = headers.get("Content-Security-Policy", "")
+        for directive in ("default-src 'none'", "base-uri 'none'",
+                          "frame-ancestors 'none'", "form-action 'self'"):
+            self.assertIn(directive, csp)
+        self.assertNotIn("connect-src *", csp)
+        self.assertNotIn("'unsafe-eval'", csp)
+
     # —— 登录 ——
     def test_wrong_password_is_401_and_grants_nothing(self):
         status, body, headers = self._call("/login", data=b"password=nope")

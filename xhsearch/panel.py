@@ -1143,7 +1143,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; "
+            # connect-src 少了这一条，fetch() 会退到 default-src 'none'，
+            # 于是页面上每一个 fetch 都被**浏览器**拦下，显示
+            # `TypeError: Failed to fetch`——项目列表、加表、体检、新建、
+            # 重新取数、勾排队刷新，全都点不动，而服务端一切正常、
+            # 请求根本没发出去。CSP 只有真浏览器认，urllib 测试看不见它。
+            "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; "
             "script-src 'unsafe-inline'; img-src data:; form-action 'self'; "
             "base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
