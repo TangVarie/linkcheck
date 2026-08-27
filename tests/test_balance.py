@@ -162,6 +162,62 @@ class TestSocialDataX(unittest.TestCase):
 
 # ---------- 一家倒了不拖累另一家 ----------
 
+class TestBrowserUserAgent(unittest.TestCase):
+    """余额请求必须带浏览器 User-Agent。
+
+    **踩过的坑**：TikHub 挡在 Cloudflare 后面，按 UA 拦截——裸的
+    `Python-urllib/3.x` 直接 403（Cloudflare error 1010），面板上显示
+    「读不到：HTTP 403：Key 不对或没权限」，而 Key 是好的。
+    `providers.py` 里那条注释早就写着这件事，`balance.py` 是后写的，
+    抄了 Authorization 却漏了 User-Agent。
+
+    对着真端点验过（2026-08-27）：
+        不带 UA   → 403 Cloudflare 1010
+        带浏览器 UA → 401 Invalid API token（说明请求真的到了 TikHub）
+    """
+
+    def _headers_of(self, reader, **kw):
+        seen = {}
+
+        def spy(url, headers):
+            seen.update(headers)
+            return response(200, "{}")
+
+        reader(get=spy, **kw)
+        return seen
+
+    def test_tikhub_sends_a_browser_ua(self):
+        headers = self._headers_of(
+            lambda get: balance.read_tikhub("key", base="https://api.tikhub.io",
+                                            usd_to_cny=7.2, get=get))
+        ua = headers.get("User-Agent", "")
+        self.assertTrue(ua, "没有 User-Agent，Cloudflare 会 403")
+        self.assertNotIn("urllib", ua.lower())
+        self.assertIn("Mozilla", ua)
+
+    def test_socialdatax_sends_a_browser_ua(self):
+        headers = self._headers_of(
+            lambda get: balance.read_socialdatax(
+                "key", base="https://x.example", get=get))
+        ua = headers.get("User-Agent", "")
+        self.assertTrue(ua)
+        self.assertNotIn("urllib", ua.lower())
+
+    def test_the_ua_has_one_source_shared_with_the_paid_path(self):
+        """两处各写一份字符串就是这个 bug 的成因。唯一事实源在 transport。"""
+        from xhsearch import providers
+        self.assertTrue(transport.BROWSER_UA)
+        self.assertEqual(providers._BROWSER_UA, transport.BROWSER_UA)
+
+    def test_auth_is_still_there(self):
+        """加 UA 不能把 Authorization 挤掉。"""
+        headers = self._headers_of(
+            lambda get: balance.read_tikhub("k3y", base="https://api.tikhub.io",
+                                            usd_to_cny=7.2, get=get))
+        self.assertEqual(headers.get("Authorization"), "Bearer k3y")
+        self.assertEqual(headers.get("Accept"), "application/json")
+
+
 class TestReadAll(unittest.TestCase):
     def test_one_channel_failing_leaves_the_other_readable(self):
         def get(url, headers):

@@ -95,6 +95,17 @@ class Balance:
         return f"{self.label}：{self.amount:.0f} 积分 ≈ ¥{self.yuan:.2f}"
 
 
+def _headers(api_key: str) -> dict:
+    """两家共用的请求头。**一处定义**——分两处写正是 UA 漏掉的原因。
+
+    `User-Agent` 不是可选的：TikHub 挡在 Cloudflare 后面按 UA 拦截，
+    不带它直接 403（Cloudflare 1010），而 403 在页面上长得像「Key 不对」。
+    """
+    return {"Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": transport.BROWSER_UA}
+
+
 def _url(base: str, channel: str) -> str:
     """拼地址。路径只能从 `FREE_ENDPOINTS` 里取，拼不出别的来。"""
     return f"{base.rstrip('/')}{FREE_ENDPOINTS[channel]}"
@@ -134,9 +145,7 @@ def read_tikhub(api_key: str, *, base: str, usd_to_cny: float,
         out.error = "没配 TIKHUB_API_KEY"
         return out
     fetch = get or _get_with_retry
-    response = fetch(_url(base, TIKHUB),
-                     {"Authorization": f"Bearer {api_key}",
-                      "Accept": "application/json"})
+    response = fetch(_url(base, TIKHUB), _headers(api_key))
     data, problem = _payload(response)
     if problem:
         out.error = problem
@@ -171,9 +180,7 @@ def read_socialdatax(api_key: str, *, base: str, get=None) -> Balance:
         out.error = "没配 SOCIALDATAX_API_KEY"
         return out
     fetch = get or _get_with_retry
-    response = fetch(_url(base, SOCIALDATAX),
-                     {"Authorization": f"Bearer {api_key}",
-                      "Accept": "application/json"})
+    response = fetch(_url(base, SOCIALDATAX), _headers(api_key))
     data, problem = _payload(response)
     if problem:
         out.error = problem

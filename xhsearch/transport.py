@@ -25,6 +25,17 @@ import zlib
 from dataclasses import dataclass
 from typing import Any, Optional
 
+# 发出去的 User-Agent。**别用 urllib 的默认值。**
+# TikHub 挡在 Cloudflare 后面、按 UA 拦截，裸的 `Python-urllib/3.x` 直接 403
+# （Cloudflare error 1010）——而 403 长得像「Key 不对」，会把人送去查一把
+# 好好的 Key。放在这一层是因为它是**传输层的事实**，不是某个通道的偏好：
+# providers（付费路径）和 balance（余额，故意不 import providers）都要用它，
+# 各写一份字符串正是漏掉它的原因。
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
 # 解压后的 body 上限。真实响应里最大的是小红书评论页（实测几十 KB），
 # 8 MiB 已经是三个数量级的余量；超过它一定是上游/网关出了问题。
 MAX_BODY_BYTES = 8 * 1024 * 1024
