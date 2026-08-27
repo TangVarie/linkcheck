@@ -512,6 +512,24 @@ class TestRendering(unittest.TestCase):
         page = self._page(self._snap(todos=[todo]))
         self.assertIn("<td class=which title=''>—</td>", page)
 
+    def test_the_commit_comes_from_the_variable_railway_injects(self):
+        """Railway 自己注入 RAILWAY_GIT_COMMIT_SHA，不用额外配。取前 7 位。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": "a-long-enough-password",
+            "RAILWAY_GIT_COMMIT_SHA": "ea69577b2eb12ebfab5e2b9f9a683d37cfa8ddb1"})
+        self.assertEqual(cfg.commit, "ea69577")
+
+    def test_the_footer_says_which_commit_is_running(self):
+        """「这个修复上线了吗」不该靠问。对着 GitHub 上的短号一眼能对。"""
+        page = self._page(self._snap(), commit="abc1234")
+        self.assertIn("版本 abc1234", page)
+
+    def test_no_commit_means_no_version_line_at_all(self):
+        """本地跑、别的平台跑都读不到它——那就整块不显示，
+        而不是显示一个「版本 」或者硬编一个假值。"""
+        page = self._page(self._snap())
+        self.assertNotIn("版本", page)
+
     def test_no_external_resources(self):
         page = self._page(self._snap())
         for pattern in (r'src=["\']https?://', r'href=["\']https?://(?!\w+\.feishu)',
@@ -1245,14 +1263,16 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
         return self.actions.add.call_args.kwargs["client_token"]
 
     def assertCanonicalUuid(self, token: str) -> None:
-        """**规范形式** 8-4-4-4-12，不是「uuid.UUID() 解析得过」。
+        """规范形式 8-4-4-4-12，**而且版本位是 4**。
 
-        Python 的解析器很宽松：`secrets.token_hex(16)` 那种 32 个十六进制
-        字符、一个连字符都没有的串，`uuid.UUID()` 照收不误。飞书要的是
-        标准 UUID，它不收。拿宽松的解析器当断言，这条测试就又没有牙了。
+        飞书文档的原话是「格式为标准的 uuidv4」，不合规报 1254037。
+        判据放松任何一格，这条测试就又没有牙：解析器收没有连字符的
+        十六进制串，规范形式又收 UUIDv5——两次线上失败正好各占一样。
         """
-        self.assertEqual(str(uuid.UUID(token)), token,
-                         f"不是规范 UUID：{token!r}")
+        parsed = uuid.UUID(token)
+        self.assertEqual(str(parsed), token, f"不是规范 UUID：{token!r}")
+        self.assertEqual(parsed.version, 4,
+                         f"飞书要 uuidv4，这个是 v{parsed.version}：{token!r}")
 
     def test_add_generates_an_idempotency_key_when_absent(self):
         """**必须是合法 UUID**，不是「非空就行」。

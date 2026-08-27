@@ -109,6 +109,11 @@ class PanelConfig:
     # 不一样：黄 = 该安排充值了，红 = 再不管就要断供。
     runway_warn_days: float = 14.0
     runway_alert_days: float = 5.0
+    # 面板在跑哪个 commit。Railway 自己会注入 RAILWAY_GIT_COMMIT_SHA。
+    # 有它才能一眼回答「这个修复上线了吗」——这一轮排查里，这个问题
+    # 出现了两次，每次都只能靠问，而问和答之间就是一次白跑的部署。
+    # 读不到就是空串，页脚整块不显示（本地跑、别的平台跑都不该硬编一个假值）。
+    commit: str = ""
     api_keys: dict = field(default_factory=dict)
     railway: railway.RailwayConfig = field(
         default_factory=lambda: railway.RailwayConfig(token="", environment_id=""))
@@ -151,6 +156,7 @@ class PanelConfig:
             app_id=(env.get("FEISHU_APP_ID") or "").strip(),
             app_secret=(env.get("FEISHU_APP_SECRET") or "").strip(),
             label_column=(env.get("PANEL_LABEL_COLUMN") or "").strip(),
+            commit=(env.get("RAILWAY_GIT_COMMIT_SHA") or "").strip()[:7],
             show_balance=_bool_env(env, "PANEL_SHOW_BALANCE", True),
             runway_warn_days=_float_env(env, "PANEL_RUNWAY_WARN_DAYS",
                                         14.0, 0.5, 3650.0),
