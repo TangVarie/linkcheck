@@ -173,19 +173,28 @@ class TestIdempotencyKey(unittest.TestCase):
     `Invalid client token, make sure that it complies with the specification.`
     """
 
-    def canonical(self, token: str) -> None:
-        """规范形式 8-4-4-4-12。
+    def canonical_v4(self, token: str) -> None:
+        """规范形式 8-4-4-4-12，**且版本位必须是 4**。
 
-        **不要拿 `uuid.UUID()` 解析得过当判据**：Python 的解析器很宽松，
-        `secrets.token_hex(16)` 那种一个连字符都没有的 32 位十六进制串
-        它照收，而飞书不收。
+        飞书文档对 client_token 的原话是「格式为标准的 uuidv4」，
+        示例 `fe599b60-450f-46ff-b2ef-9f6675625b97`；不合规是错误码 1254037
+        `Invalid client token, make sure that it complies with the specification.`
+
+        两个都要判，缺一条这测试就还是没牙：
+        · 只判「解析得过」——`secrets.token_hex(16)` 那种没有连字符的
+          32 位十六进制串 Python 照收，飞书不收；
+        · 只判「规范形式」——UUIDv5 也是规范形式，但版本位是 5，飞书照样拒。
+          **线上就是这么第二次红的。**
         """
-        self.assertEqual(str(uuid.UUID(token)), token, f"不是规范 UUID：{token!r}")
+        parsed = uuid.UUID(token)
+        self.assertEqual(str(parsed), token, f"不是规范 UUID：{token!r}")
+        self.assertEqual(parsed.version, 4,
+                         f"飞书要 uuidv4，这个是 v{parsed.version}：{token!r}")
 
     def test_a_seed_becomes_a_canonical_uuid(self):
         raw = ("add-https://piqijafyg8a.feishu.cn/base/S72ObviZAa7P0AsueX1cpsYRnN6"
                "?table=tblXXXX-Hatherine 素人执行表单")
-        self.canonical(feishu.idempotency_key(raw))
+        self.canonical_v4(feishu.idempotency_key(raw))
 
     def test_the_same_seed_always_gives_the_same_uuid(self):
         """幂等键的全部意义在这里：连点两次「加」不该多出两行。"""
@@ -196,8 +205,8 @@ class TestIdempotencyKey(unittest.TestCase):
 
     def test_no_seed_gives_a_random_but_canonical_uuid(self):
         first, second = feishu.idempotency_key(), feishu.idempotency_key()
-        self.canonical(first)
-        self.canonical(second)
+        self.canonical_v4(first)
+        self.canonical_v4(second)
         self.assertNotEqual(first, second)
 
 
@@ -219,6 +228,7 @@ class TestBatchCreate(unittest.TestCase):
         with mock.patch.object(feishu.Bitable, "token", return_value="t"):
             for bad in ("add-https://x.feishu.cn/base/b?table=t-甲",
                         "beee1b7a4d022a9f25a3b0bca0fd72c6",   # 没有连字符
+                        "9a484430-9325-5b53-a1b6-962777ae53b4",  # 合法但是 v5
                         "uuid-1"):
                 with self.assertRaises(ValueError, msg=bad) as ctx:
                     table().batch_create([{"fields": {}}], client_token=bad)
@@ -265,8 +275,9 @@ class TestBatchCreate(unittest.TestCase):
         seen = set()
         for call in cap.calls:
             token = call["url"].split("client_token=")[1].split("&")[0]
-            self.assertEqual(str(uuid.UUID(token)), token,
-                             f"分片的键不是规范 UUID：{token!r}")
+            parsed = uuid.UUID(token)
+            self.assertEqual(str(parsed), token, f"分片的键不是规范 UUID：{token!r}")
+            self.assertEqual(parsed.version, 4, f"分片的键不是 v4：{token!r}")
             seen.add(token)
         self.assertEqual(len(seen), len(cap.calls))
 

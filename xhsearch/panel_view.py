@@ -715,6 +715,18 @@ def _clip(text: str, limit: int = LABEL_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def _build_line(config) -> str:
+    """页脚那行版本号。读不到 commit 就整块不出现。
+
+    存在的理由很实在：「这个修复上线了吗」在这一轮排查里问了两次，
+    而每问一次就可能白跑一次部署。有了它，对着 GitHub 上的短号一眼能对。
+    """
+    commit = getattr(config, "commit", "") or ""
+    if not commit:
+        return ""
+    return f"<br><span class=muted>版本 {_e(commit)}</span>"
+
+
 def _chips(values, mapping=None) -> str:
     out = []
     for value in values:
@@ -1123,7 +1135,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
   <div class=brand>{_MARK}<b>BYWOOD</b><span>监控</span></div>
   {nav}
   <div class=foot>面板只读飞书表，<b>不发任何付费请求</b>。<br>
-    要刷新某一行，勾「排队刷新」，cron 五分钟内接手。</div>
+    要刷新某一行，勾「排队刷新」，cron 五分钟内接手。{_build_line(config)}</div>
 </aside>
 <div class=main>
   <div class=top>

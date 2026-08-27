@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -29,9 +30,6 @@ BASE = "https://open.feishu.cn/open-apis"
 BATCH_SIZE = 500
 # 新增记录的单次上限是 1000（和 batch_update 的 500 不是一个数）。
 # 单独一个常量：共用一个的话，哪天改了其中一边就会静默超限。
-# 幂等键的命名空间。随便一个固定 UUID 就行，**但一旦定了就不能改**——
-# 改了以后同样的 seed 会算出不同的键，「连点两次不多出一行」当场失效。
-_IDEM_NAMESPACE = uuid.UUID("6f1b0c4e-9d3a-4b27-8e15-a70c2d9f4b83")
 
 
 def _parse_uuid(text: str):
@@ -50,17 +48,22 @@ def idempotency_key(seed: str = "") -> str:
     调用方拼出来的幂等键（面板的「加进清单」拼的是 `add-<表链接>-<项目名>`）
     带着 `://`、`?`、空格和中文，原样送过去必挂——这是真出过的线上故障。
 
-    `seed` 非空 → UUIDv5：**同样的 seed 永远算出同一个 UUID**，
-    所以幂等语义一点没丢，只是换了个飞书认得的外衣。
-    `seed` 为空 → uuid4，随机但仍然合法。
+    文档原话是「格式为标准的 **uuidv4**」，示例
+    `fe599b60-450f-46ff-b2ef-9f6675625b97`。**版本位必须是 4**——
+    UUIDv5 也是规范 UUID，但飞书照样拒（线上就是这么第二次红的）。
 
-    注意返回的是**规范形式** 8-4-4-4-12。别拿 `uuid.UUID()` 解析得过当判据：
-    Python 的解析器很宽松，`secrets.token_hex(16)` 那种没有连字符的
-    32 位十六进制串它照收，飞书不收。
+    `seed` 非空 → SHA-256 取前 16 字节，交给 `uuid.UUID(..., version=4)`
+    按 RFC 4122 把版本位和 variant 位改好。这样**同样的 seed 永远算出
+    同一个键**（幂等语义一点没丢），同时又是 v4 形状。
+    `seed` 为空 → uuid4，随机。
+
+    别拿「`uuid.UUID()` 解析得过」当判据：Python 的解析器很宽松，
+    `secrets.token_hex(16)` 那种没有连字符的 32 位十六进制串它照收，飞书不收。
     """
     if not seed:
         return str(uuid.uuid4())
-    return str(uuid.uuid5(_IDEM_NAMESPACE, seed))
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
 
 
 BATCH_CREATE_SIZE = 1000
@@ -123,6 +126,10 @@ _HINTS = {
     1254005: "record_id 不存在，可能这行已被删除",
     1254043: "record_id 不存在（RecordIdNotFound），可能这行在写回前刚被删除",
     1254045: "字段名对不上：config.py 里的列名必须和表头逐字相同（含空格、括号全半角）",
+    1254037: "client_token 必须是标准 uuidv4——用 feishu.idempotency_key() 生成",
+    # 幂等键是按内容算的，所以「同一张表加第二次」必然撞上它。
+    # 这正是它该拦住的事，但要说人话，不能把飞书的原文甩给运营。
+    1255006: "这条刚才已经提交过了（幂等键重复）。要是清单里没看到，刷新一下再看",
     1254060: "字段值类型不对：数字列不能写字符串，日期列要写毫秒时间戳",
     1254063: "多选列的值转换失败（MultiSelectFieldConvFail）：某一列的**类型**和"
              "机器写进去的值形状对不上——最常见的是「流量状态」被建成了单选"
@@ -705,10 +712,11 @@ class Bitable:
         # 「格式不对」和「忘了传」是同一类事：飞书只吃标准 UUID，送错了换回来
         # 的是一个 request_id，不是一句能看懂的话。在本地就炸掉，
         # 用 `idempotency_key()` 把你的幂等键转成 UUID 再传进来。
-        if str(_parse_uuid(client_token)) != client_token:
+        parsed = _parse_uuid(client_token)
+        if str(parsed) != client_token or parsed.version != 4:
             raise ValueError(
-                f"batch_create 的 client_token 必须是规范 UUID（飞书的要求），"
-                f"收到的是 {client_token!r}——"
+                f"batch_create 的 client_token 必须是标准 uuidv4（飞书的要求，"
+                f"不合规是错误码 1254037），收到的是 {client_token!r}——"
                 f"用 feishu.idempotency_key() 转一下")
         created: list[str] = []
         for start in range(0, len(records), BATCH_CREATE_SIZE):
