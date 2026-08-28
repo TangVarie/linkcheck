@@ -20,26 +20,35 @@ from typing import Any, Optional
 from . import summary
 
 _STYLE = """
-/* BYWOOD 设计系统 v3 · 界面轨「管理后台」（scenarios/03-dashboard.md）
+/* BYWOOD 设计系统 v5.0.1 · 界面轨「管理后台」（scenarios/03-dashboard.md）
+ *
+ * v5 品牌换届「青赭双色制」：主色藏青接动作与结构，强调色赭石接旧品牌红
+ * 的价值与增长；「双箭分发」（藏蓝×正红）连同它的链接尾标一起退役，
+ * 标志换成山形。版式零变更——变的是品牌层，不是骨架。
  *
  * 色值全部来自 tokens/palette.json 的 screen 节——它是全轨色板的唯一事实源，
  * 任何一处不一致按设计系统的规矩算**构建错误**，不是审美分歧。
- * 这里不引 tokens/globals.css：那是 Tailwind v4 的 @theme，而这个面板是
+ * 这里不引 tokens/globals.css：那是 Tailwind 的 @theme，而这个面板是
  * 零依赖的标准库 http.server 手拼 HTML，引不进来。所以从 palette.json
- * 取值、手写同名 CSS 变量，角色和取值都对齐。
+ * 取值、手写同名 CSS 变量，角色和取值都对齐。token 一律按角色命名不按
+ * 色相（meta.namingRule）——上一版的 block-blue/tint-sky 这类色相名，
+ * 正是 v4→v5 迁移成本的九成来源。
  *
  * 硬性遵守的几条（DESIGN.md §5 §8 负面清单）：
  *   · 直角制度 border-radius: 0，例外只有本体即圆形的状态点
  *   · 零阴影、零渐变（骨架屏微光是明文例外）、零毛玻璃
  *   · 文字永不用纯黑纯白，只走四阶透明度；深色块内恒白是另一条规则
  *   · 语义色只表状态；浅底上的文字用加深档
- *   · 深色模式只翻 token，组件不写第二套颜色
+ *   · 深色模式只翻 token，组件不写第二套颜色——深色下主按钮改墨字
+ *     （亮青上白字只有 2.67:1，palette.json 的 _darkButtonRule）也是
+ *     靠 --on-primary 这个 token 翻转实现的
  */
 :root{
-  --primary:#235E8E; --primary-dark:#1B4A72;
-  --accent:#D9232B; --money:#D9232B;
-  --block-blue:#235E8E; --block-red:#D9232B;
-  --tint-sky:#E3EDF5; --tint-blush:#FBE3E3;
+  --primary:#1C4F62; --primary-dark:#123A48;
+  --accent:#B8502F; --money:#B8502F;
+  --on-primary:#FFF; --wordmark:#1C4F62;
+  --block-primary:#1C4F62; --block-accent:#B8502F;
+  --tint-primary:#E3EFEF; --tint-accent:#F8EAE2;
   --success:#00B578; --warning:#FF8F1F; --danger:#D92B3C;
   --success-deep:#006B4A; --warning-deep:#995400; --danger-deep:#B02330;
   --bg:#F3F4F6; --bg-secondary:#EAECEF; --surface:#FFFFFF;
@@ -56,12 +65,14 @@ _STYLE = """
     var(--font-sans);
   color-scheme:light;
 }
-/* 深色模式：只翻 token。画布仍比表面深一档，深色块蓝红照旧白字。 */
+/* 深色模式：只翻 token。画布仍比表面深一档；深青主块照旧白字（block-primary
+ * 不翻，palette.json 深色组它也是 #1C4F62）；主按钮换亮青底 + 墨字。 */
 [data-theme=dark]{
-  --primary:#3F7FB2; --primary-dark:#346892;
-  --accent:#E8575C; --money:#E8575C;
-  --block-red:#C22329;
-  --tint-sky:#1E3B54; --tint-blush:#442228;
+  --primary:#3CAAD2; --primary-dark:#2E88AB;
+  --accent:#D97E55; --money:#D97E55;
+  --on-primary:#0F1318; --wordmark:rgba(255,255,255,.92);
+  --block-accent:#A84528;
+  --tint-primary:#16323C; --tint-accent:#3D291F;
   --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
   --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
   --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
@@ -76,10 +87,11 @@ _STYLE = """
 }
 @media (prefers-color-scheme:dark){
   :root:not([data-theme=light]){
-    --primary:#3F7FB2; --primary-dark:#346892;
-    --accent:#E8575C; --money:#E8575C;
-    --block-red:#C22329;
-    --tint-sky:#1E3B54; --tint-blush:#442228;
+    --primary:#3CAAD2; --primary-dark:#2E88AB;
+    --accent:#D97E55; --money:#D97E55;
+    --on-primary:#0F1318; --wordmark:rgba(255,255,255,.92);
+    --block-accent:#A84528;
+    --tint-primary:#16323C; --tint-accent:#3D291F;
     --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
     --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
     --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
@@ -112,10 +124,14 @@ svg{display:block;flex:none}
 .side{background:var(--surface);border-right:1px solid var(--border);
   position:sticky;top:0;height:100vh;overflow:auto;display:flex;
   flex-direction:column}
-.side .brand{height:64px;display:flex;align-items:center;gap:10px;
+.side .brand{height:64px;display:flex;align-items:center;gap:8px;
   padding:0 16px;border-bottom:1px solid var(--border);flex:none}
-.side .brand b{font-size:15px;font-weight:700;color:var(--text-dark);
-  letter-spacing:.02em}
+/* 品牌区：山形 mark + 特粗词标（templates/dashboard.html 的定式）。
+ * 颜色走 --wordmark：浅底藏青、深底白——独立山形在浅底不用标志主青
+ * （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。 */
+.brand{color:var(--wordmark)}
+.brand b{font-size:17px;font-weight:800;letter-spacing:-.01em;
+  font-family:'Arial Black','Helvetica Neue',Futura,var(--font-sans)}
 .side .brand span{font-size:12px;color:var(--text-faint)}
 .side nav{padding:8px 0 24px}
 .side .grp{font-size:12px;color:var(--text-faint);padding:0 16px;
@@ -123,8 +139,9 @@ svg{display:block;flex:none}
 .side nav a{display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;
   font-size:14px;font-weight:500;color:var(--text);text-decoration:none}
 .side nav a:hover{background:var(--fill);text-decoration:none}
-/* 激活态是雾蓝底 + 品牌蓝字，不是深蓝底白字（03 场景点名的高发 bug） */
-.side nav a.on{background:var(--tint-sky);color:var(--primary)}
+/* 激活态是雾青底 + 品牌藏青字，不是深青底白字（03 场景点名的高发 bug） */
+.side nav a.on{background:var(--tint-primary);color:var(--primary);
+  font-weight:600}
 .side nav a .cnt{margin-left:auto;font-size:12px;color:var(--text-faint)}
 .side nav a.on .cnt{color:var(--primary)}
 .side .foot{margin-top:auto;padding:16px;font-size:12px;color:var(--text-faint);
@@ -147,19 +164,18 @@ h2{font-size:16px;font-weight:600;margin:32px 0 4px;color:var(--text-dark);
  * sticky，正好盖在那儿。点「余额」跳过去看到的会是余额区的第二行。
  * 56 顶栏 + 16 呼吸。 */
 h2[id]{scroll-margin-top:72px}
-/* 区块 / 卡片的入口链接。双箭挂这儿——BRAND.md §4 的「链接尾标」，
- * 也是 templates/dashboard.html 里双箭唯一出现的形态。 */
+/* 区块 / 卡片的入口链接。v5 起不再挂双箭尾标——双箭图形语言随换标整体
+ * 退役，链接可辨识性交给赭石色 + 下划线悬停态（BRAND.md §4）。 */
 .enter{font-size:13px}
-/* 品牌双箭：单个蓝色 »，字号同标题、字重 800（BRAND.md §4） */
 h2 .n{font-weight:400;color:var(--text-faint)}
 .sub{font-size:13px;color:var(--text-light);margin:0 0 12px;max-width:78ch}
 
-/* ---------- KPI：1 个深蓝主块 + 最多 3 张白卡 ---------- */
+/* ---------- KPI：1 个深青主块 + 最多 3 张白卡 ---------- */
 .kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;
   margin:0 0 8px}
 .kpi>*{padding:16px 18px;min-height:112px;display:flex;flex-direction:column;
   justify-content:space-between}
-.kpi .lead{background:var(--block-blue);color:#fff}
+.kpi .lead{background:var(--block-primary);color:#fff}
 .kpi .lead .k{font-size:13px;color:rgba(255,255,255,.85)}
 .kpi .lead .n{font-size:40px;font-weight:600;line-height:1.05}
 .kpi .lead .s{font-size:12px;color:rgba(255,255,255,.85)}
@@ -185,8 +201,8 @@ td{padding:12px;border-top:1px solid var(--border);font-size:14px;
 tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
 td.right{text-align:right}
-/* 行操作：13px 品牌蓝。scenarios/03 明写「行操作用 13px 蓝字链接」，
- * 而模板里通用的 a 是 accent 红——仲裁顺序中**场景文件规则高于模板**，
+/* 行操作：13px 品牌藏青。scenarios/03 明写「行操作用 13px 蓝字链接」，
+ * 而模板里通用的 a 是 accent 赭石——仲裁顺序中**场景文件规则高于模板**，
  * 这一处听场景的。 */
 td a.act{font-size:13px;color:var(--primary)}
 /* 「哪一条」：运营扫这一栏在飞书表里定位，所以要比周围重一点。 */
@@ -227,16 +243,22 @@ tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary
 .problem li{margin:3px 0}
 .problem .icon,.note .icon{margin-top:3px}
 
-/* ---------- 控件：高 40 / 直角 / 聚焦 2px 品牌蓝环 ---------- */
+/* ---------- 控件：高 40 / 直角 / 聚焦 2px 品牌藏青环 ---------- */
 button{font:600 14px/1 var(--font-sans);height:40px;padding:0 16px;border:0;
   background:var(--fill);color:var(--text-dark);cursor:pointer}
 button:hover:not(:disabled){background:var(--bg-secondary)}
 button:active:not(:disabled){transform:scale(.98)}
 button:disabled{opacity:.45;cursor:not-allowed}
-button.primary{background:var(--primary);color:#fff}
+button.primary{background:var(--primary);color:var(--on-primary)}
 button.primary:hover:not(:disabled){background:var(--primary-dark)}
 button.sm{height:32px;font-size:13px;font-weight:500;padding:0 12px}
 button.danger{background:var(--danger);color:#fff}
+/* 深浅模式开关：右下角悬浮（templates/dashboard.html 的定式）。
+ * 不透明 surface + 发丝线成形、零阴影——悬浮件的通用做法（DESIGN.md §5）。 */
+.theme-btn{position:fixed;bottom:20px;right:20px;z-index:99;width:36px;
+  height:36px;padding:0;background:var(--surface);
+  border:1px solid var(--border);color:var(--text);display:flex;
+  align-items:center;justify-content:center}
 input[type=password],input[type=search],input[type=text],input[type=number]{
   font:14px/1 var(--font-sans);height:40px;padding:0 12px;
   border:1px solid var(--border-strong);background:var(--surface);
@@ -249,7 +271,7 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 /* ---------- 登录 ---------- */
 .login{max-width:360px;margin:14vh auto;background:var(--surface);
   border:1px solid var(--border);padding:28px}
-.login .brand{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+.login .brand{display:flex;align-items:center;gap:8px;margin-bottom:20px}
 .login h1{font-size:20px;margin:0 0 4px}
 .login p{margin:0 0 20px}
 .login button{width:100%}
@@ -332,6 +354,30 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
 _SCRIPT = r"""
 (function(){
   var token = document.body.dataset.csrf || "";
+
+  // ---- 深浅模式：默认跟随系统；点右下角开关改为手动指定 ----
+  // templates/dashboard.html 的定式：两态翻转。没存过偏好时第一下必须从
+  // 「当前生效的」翻走——不看 prefers-color-scheme 的话，深色系统的用户
+  // 第一下会被翻到深色，等于按了没反应。
+  // 选择存 localStorage：它是每个人自己的偏好，不上服务端。
+  // 样式侧只翻 <html data-theme>，组件颜色零改动（负面清单 #17）。
+  var rootEl = document.documentElement;
+  var THEME_KEY = "linkcheck.theme";
+  try {
+    var savedTheme = localStorage.getItem(THEME_KEY);
+    if (savedTheme === "dark" || savedTheme === "light") {
+      rootEl.dataset.theme = savedTheme;
+    }
+  } catch (e) { /* 隐私模式/禁用存储：开关仍能用，只是不记住 */ }
+  var themeBtn = document.getElementById("themeBtn");
+  if (themeBtn) themeBtn.addEventListener("click", function(){
+    var dark = rootEl.dataset.theme
+      ? rootEl.dataset.theme === "dark"
+      : matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    rootEl.dataset.theme = next;
+    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+  });
 
   // 侧栏跟随滚动高亮。用 IntersectionObserver 触发，不挂 scroll 事件——
   // 后者每帧跑一次，长页面上白烧电池。动效有信息含义：它告诉你现在看的是哪一段。
@@ -612,7 +658,7 @@ _SCRIPT = r"""
     post("create", {name: name}).then(function(j){
       var c = j.created;
       document.getElementById("addTarget").value = c.target;
-      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它 →</a>\n链接已经填进上面的输入框，点「体检一下」再入册。\n" + esc(c.note || ""), "ok");
+      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它</a>\n链接已经填进上面的输入框，点「体检一下」再入册。\n" + esc(c.note || ""), "ok");
       btnCreate.disabled = false;
     }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
   });
@@ -656,6 +702,7 @@ _ICON_PATHS = {
                '-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
     "history": ('<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>'
                 '<path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>'),
+    "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
 }
 
 
@@ -665,26 +712,44 @@ def _icon(name: str, cls: str = "icon") -> str:
             f'{body}</svg>')
 
 
-# 品牌双箭。几何逐字沿用 logo/bywood-mark.svg：stroke 圆头圆角、
-# 粗细 = 高度的 1/4（7/28）、固定朝右、固定蓝前红后（BRAND.md §4）。
-# 这两个色值是标志本身的，不走界面 token —— 标志正红 #E5262B 只出现在
-# 标志图形里，任何文字线条色块都不用这一档。
+# 品牌山形 mark（v5 换标：四条弧带自下而上层叠成山脊）。几何逐字取自
+# logo/elements/bywood-mark-current.svg——禁止重绘、旋转、拆散弧带
+# （BRAND.md §4）。颜色走 currentColor，由 .brand 的 --wordmark 定：
+# 浅底藏青、深底白。标志主青 #7ED1CD 不进来：独立山形在浅底一律不用青
+# （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。
 _MARK = (
-    '<svg width="26" height="19" viewBox="0 0 38 28" role="img"'
-    ' aria-label="BYWOOD"><path d="M5 4 L15 14 L5 24" fill="none"'
-    ' stroke="#235E8E" stroke-width="7" stroke-linecap="round"'
-    ' stroke-linejoin="round"/><path d="M21 4 L31 14 L21 24" fill="none"'
-    ' stroke="#E5262B" stroke-width="7" stroke-linecap="round"'
-    ' stroke-linejoin="round"/></svg>'
+    '<svg width="52" height="16" viewBox="0 0 292.502 90" role="img"'
+    ' aria-label="BYWOOD"><path fill="currentColor" d="M67.727 34.135'
+    'C32.985 45.255 0 45.001 0 45.001L0 45.001L0 51.75C0 51.75 32.855 52.048 '
+    '67.502 40.949L67.502 40.949C103.083 29.553 140.552 6.749 146.251 6.749'
+    'L146.251 6.749C151.956 6.749 189.472 29.567 225.076 40.975L225.076 40.975'
+    'C259.694 52.066 292.502 51.75 292.502 51.75L292.502 51.75L292.502 45.001'
+    'C292.502 45.001 259.826 45.36 225.309 34.291L225.309 34.291'
+    'C189.665 22.865 152.058 0 146.44 0L146.44 0C140.655 0 103.273 22.756 '
+    '67.727 34.135M67.313 56.789C32.182 59.782 0 58.502 0 58.502L0 58.502'
+    'L0 65.251C0 65.251 32.178 66.531 67.277 63.538L67.277 63.538'
+    'C97.807 60.934 130.553 54 146.251 54L146.251 54C161.942 54 194.648 60.931 '
+    '225.156 63.535L225.156 63.535C260.284 66.528 292.502 65.251 292.502 65.251'
+    'L292.502 65.251L292.502 58.502C292.502 58.502 260.273 59.779 225.171 '
+    '56.782L225.171 56.782C194.687 54.182 162.036 47.251 146.44 47.251'
+    'L146.44 47.251C130.65 47.251 97.869 54.185 67.313 56.789M0 72L0 78.749'
+    'C0 78.749 135 74.251 146.251 74.251L146.251 74.251C157.502 74.251 '
+    '292.502 78.749 292.502 78.749L292.502 78.749L292.502 72C292.502 72 '
+    '157.502 67.502 146.44 67.502L146.44 67.502C135 67.502 0 72 0 72M0 90'
+    'L292.502 90L292.502 83.251L0 83.251Z"/></svg>'
 )
 
 
 def _shell(title: str, body: str, *, csrf: str = "") -> str:
+    # 深浅模式开关挂在 body 直下（模板同款）——登录页、骨架页、概览页都有，
+    # 不能只有取到数的那一屏。图标固定月亮，两种模式下都是它（模板如此）。
+    theme_btn = ("<button class=theme-btn id=themeBtn type=button "
+                 f"aria-label='切换深浅模式'>{_icon('moon')}</button>")
     return (
         "<!doctype html><html lang=zh-CN><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{_e(title)}</title><style>{_STYLE}</style></head>"
-        f"<body data-csrf=\"{_e(csrf)}\">{body}"
+        f"<body data-csrf=\"{_e(csrf)}\">{theme_btn}{body}"
         f"<script>{_SCRIPT}</script></body></html>"
     )
 
@@ -693,7 +758,7 @@ def login_page(message: str = "") -> str:
     error = f"<p class=err>{_e(message)}</p>" if message else ""
     return _shell("监控面板", f"""
 <div class=login>
-  <div class=brand>{_MARK}<b style='font-size:15px;letter-spacing:.02em'>BYWOOD</b></div>
+  <div class=brand>{_MARK}<b>BYWOOD</b></div>
   <h1>内容监控面板</h1>
   <p class=muted>小红书 / 抖音笔记巡检</p>
   {error}
@@ -837,7 +902,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
                 f"<div class=problem>{_icon('alert-circle')}"
                 f"<span>{_e(p.error)}</span></div>"
                 f"<div class=rows><div><a href='{_e(p.table_url)}' target=_blank "
-                "rel='noopener noreferrer' class=enter>打开这张表 »</a></div></div></div>")
+                "rel='noopener noreferrer' class=enter>打开这张表</a></div></div></div>")
 
     health = ""
     problems = list(p.health)
@@ -868,7 +933,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     return f"""<div class='{card_class}'>
   <h3>{_e(p.label)}</h3>
   <div class=muted><a href='{_e(p.table_url)}' target=_blank
-     rel='noopener noreferrer' class=enter>打开这张表 »</a></div>
+     rel='noopener noreferrer' class=enter>打开这张表</a></div>
   {health}
   <div class=rows>
     <div><span class=lbl>在管</span><span>{p.total_rows} 行
@@ -1098,7 +1163,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                        "把你们租户的域名（形如 <code>https://xxx.feishu.cn</code>）"
                        "设进去就好了。</span></div>")
 
-    # KPI 行的组成是**设计系统定死的**：1 个深蓝主块 + 最多 3 张白卡
+    # KPI 行的组成是**设计系统定死的**：1 个深青主块 + 最多 3 张白卡
     # （DESIGN.md 负面清单 #9、scenarios/03）。上一版是 6–7 个同规格方块
     # 排排坐，正好是那条禁令点名的形态——数字一样多，但没有主次，
     # 眼睛落不到「今天该干什么」上。
@@ -1216,9 +1281,9 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
 
 
 def _kpi_lead(value, key: str, sub: str = "") -> str:
-    """KPI 行的深蓝主块。**一屏只有一个**，给最该被看见的那个数。
+    """KPI 行的深青主块。**一屏只有一个**，给最该被看见的那个数。
 
-    块内文字恒白（DESIGN.md §2「深色块（蓝/红）恒白」），不用文字色阶
+    块内文字恒白（DESIGN.md §2「深色块恒白」），不用文字色阶
     token —— 那套是给画布上的文字的，放进深底会看不清。
     """
     return (f"<div class=lead><div class=k>{_e(key)}</div>"

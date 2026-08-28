@@ -1,4 +1,4 @@
-"""面板视觉的机器闸（BYWOOD 设计系统 v3 · 界面轨「管理后台」）。
+"""面板视觉的机器闸（BYWOOD 设计系统 v5.0.1 · 界面轨「管理后台」）。
 
 设计系统自己带一个 `tools/check-design.py`，但那个工具在**设计系统包里**，
 不在这个仓库——CI 上跑不到。所以把它管的那几条里**最容易在改样式时踩回去**
@@ -55,16 +55,22 @@ def render() -> str:
         balances=bal, runway=rw, runs=[FakeRun()])
 
 
-# tokens/palette.json 的 screen 节（light + dark）+ 中性值。
+# tokens/palette.json v5.0 的 screen 节（light + dark）+ brand 节 + 中性值。
 # 唯一事实源在设计系统包里；这里是它的一份副本，改色板要两边同改。
+# v5 品牌换届「青赭双色制」：旧的藏蓝×正红（#235E8E/#D9232B/#E5262B 一族）
+# 整体退役，不在此列——它们再出现就是回退，理应红。
 PALETTE = {
-    "#235E8E", "#1B4A72", "#E5262B", "#D9232B",
-    "#E3EDF5", "#FBE3E3", "#00B578", "#FF8F1F", "#D92B3C",
+    # light
+    "#1C4F62", "#123A48", "#B8502F", "#E3EFEF", "#F8EAE2",
+    "#00B578", "#FF8F1F", "#D92B3C",
     "#B02330", "#006B4A", "#995400",
     "#F3F4F6", "#EAECEF", "#FFFFFF", "#E5E6EB",
-    "#3F7FB2", "#346892", "#E8575C", "#C22329", "#1E3B54", "#442228",
-    "#21B183", "#FFA24D", "#C64449", "#7FE0BD", "#FFC38A", "#FF9A9E",
-    "#0F1318", "#151A20", "#1B222B", "#2B3440",
+    # dark
+    "#3CAAD2", "#2E88AB", "#D97E55", "#A84528", "#16323C", "#3D291F",
+    "#21B183", "#FFA24D", "#E8575C", "#C64449", "#7FE0BD", "#FFC38A",
+    "#FF9A9E", "#0F1318", "#151A20", "#1B222B", "#2B3440",
+    # brand（标志主青只许进标志图形；深赭石是浅底文字的加深档）
+    "#7ED1CD", "#8A3A20",
     "#FFF", "#000", "#000000",
 }
 
@@ -73,7 +79,7 @@ class TestPalette(unittest.TestCase):
     def test_every_hex_in_the_page_is_from_the_palette(self):
         """业务代码里禁止裸 hex；这里连渲染出来的页面一起查。
 
-        标志正红 `#E5262B` 只允许出现在标志图形本身（BRAND.md §2），
+        标志主青 `#7ED1CD` 只允许出现在标志图形本身（BRAND.md §2），
         下面单独有一条钉它。
         """
         html = render() + panel_view.login_page("x")
@@ -81,18 +87,30 @@ class TestPalette(unittest.TestCase):
                if h.upper() not in PALETTE}
         self.assertEqual(bad, set(), f"页面上出现了色板外的色值：{sorted(bad)}")
 
-    def test_the_logo_red_appears_only_inside_the_mark(self):
-        """标志正红只给标志图形。文字、线条、色块都不用这一档。"""
-        html = render()
-        for chunk in re.findall(r"#E5262B", html, re.I):
-            pass
-        # 每一处 #E5262B 都必须落在 <svg …aria-label="BYWOOD"> 里
+    def test_the_retired_duo_does_not_come_back(self):
+        """v5 换届：藏蓝×正红双色制连同双箭图形一起退役（BRAND.md §1）。
+        已交付旧件不追溯回刷，但**这个面板跟着设计系统走**——旧色一露头
+        就是有人从旧代码里抄了样式。"""
+        html = render() + panel_view.login_page("x")
+        for old in ("#235E8E", "#1B4A72", "#D9232B", "#E5262B",
+                    "#3F7FB2", "#346892", "#C22329", "#1E3B54", "#442228"):
+            self.assertNotIn(old, html.upper(),
+                             f"退役的旧品牌色 {old} 又出现了")
+
+    def test_the_logo_teal_appears_only_inside_the_mark(self):
+        """标志主青只给标志图形（白底 1.77:1，文字线条色块都不用这一档）。
+
+        本面板的山形走 currentColor（浅底藏青、深底白——独立山形在浅底
+        不用青，BRAND.md §3），所以页面上通常一处都没有；这条钉的是
+        它若出现，只能落在 <svg …aria-label="BYWOOD"> 里。
+        """
+        html = render() + panel_view.login_page("x")
         marks = re.findall(r"<svg[^>]*aria-label=\"BYWOOD\".*?</svg>", html,
                            re.S)
-        inside = sum(m.upper().count("#E5262B") for m in marks)
-        total = html.upper().count("#E5262B")
+        inside = sum(m.upper().count("#7ED1CD") for m in marks)
+        total = html.upper().count("#7ED1CD")
         self.assertEqual(inside, total,
-                         "标志正红出现在了标志图形之外")
+                         "标志主青出现在了标志图形之外")
 
 
 class TestQueueingIsHonest(unittest.TestCase):
@@ -193,23 +211,23 @@ class TestDashboardComponents(unittest.TestCase):
 
     def test_one_deep_block_and_at_most_three_white_cards(self):
         """负面清单 #9：同色同规格统计盒子排排坐。
-        后台轨的上限是 1 个深蓝主块 + 最多 3 张白卡。"""
+        后台轨的上限是 1 个深青主块 + 最多 3 张白卡。"""
         html = render()
         kpi = re.search(r"<div class='kpi[^']*'>(.*?)</div>\s*\n", html, re.S)
         self.assertIsNotNone(kpi, "找不到 KPI 行")
         block = kpi.group(1)
         self.assertEqual(block.count("<div class=lead>"), 1,
-                         "深蓝主块必须恰好一个")
+                         "深青主块必须恰好一个")
         self.assertLessEqual(len(re.findall(r"<div class='box", block)), 3,
                              "白底 KPI 卡最多 3 张")
 
-    def test_sidebar_active_is_tint_not_deep_blue(self):
-        """03 场景明文点名的 bug：侧栏激活态用了深蓝底白字。
-        应该是雾蓝底 + 品牌蓝字。"""
+    def test_sidebar_active_is_tint_not_deep_block(self):
+        """03 场景明文点名的 bug：侧栏激活态用了深底白字。
+        应该是雾青底 + 品牌藏青字。"""
         css = css_without_comments()
         rule = re.search(r"\.side nav a\.on\{([^}]+)\}", css)
         self.assertIsNotNone(rule)
-        self.assertIn("var(--tint-sky)", rule.group(1))
+        self.assertIn("var(--tint-primary)", rule.group(1))
         self.assertIn("var(--primary)", rule.group(1))
 
     def test_tables_have_no_zebra_stripes(self):
@@ -217,24 +235,23 @@ class TestDashboardComponents(unittest.TestCase):
         self.assertNotIn("nth-child(even)", css)
         self.assertNotIn("nth-child(odd)", css)
 
-    def test_the_chevron_is_a_link_tail_not_a_heading_bullet(self):
-        """BRAND.md §4 允许双箭做「区块标题前标」和「链接尾标」两种，
-        但这一轨的定式（templates/dashboard.html）里前标 0 处、尾标 2 处。
+    def test_the_double_chevron_is_fully_retired(self):
+        """v5 换标后双箭图形语言整体退役（BRAND.md §4）：区块前标、
+        链接尾标、加载动画，全部没有对应物。链接可辨识性交给赭石色 +
+        下划线悬停态；区块层级交给字重与藏青字色。
 
-        五个区块各挂一个前标，双箭就从品牌重音降成了项目符号——
-        而且「一屏最多 3 处」那条上限也悬。
+        这条查的是**页面字节**，CSS/JS 注释也算——和 emoji 那条一个道理，
+        最严也最省事。
         """
         css = css_without_comments()
-        self.assertNotIn("h2::before", css, "h2 不该带双箭前标")
-        html = render()
-        self.assertIn("»", html, "双箭该以链接尾标的形态出现")
-        for tail in re.findall(r"([^>]{0,12})»", html):
-            self.assertNotIn("<h2", tail)
+        self.assertNotIn("h2::before", css, "h2 不该带前标")
+        html = render() + panel_view.login_page("x")
+        self.assertNotIn("»", html, "双箭已随 v5 换标退役，页面上不该再出现")
 
     def test_row_actions_are_small_and_blue(self):
-        """scenarios/03：「行操作用 13px 蓝字链接」。
+        """scenarios/03：「行操作用 13px 蓝字链接」（v5 落在藏青上）。
 
-        模板里通用的 `a` 是 accent 红，和这条冲突——仲裁顺序里
+        模板里通用的 `a` 是 accent 赭石，和这条冲突——仲裁顺序里
         **场景文件规则高于可执行模板**，所以行操作听场景的。
         """
         css = css_without_comments()
@@ -467,9 +484,31 @@ class TestDarkMode(unittest.TestCase):
         self.assertEqual(len(dark), 2, "深色模式应该只有手动和跟随系统两处")
         # 组件规则里不许再出现深色专属色值
         body = css.split("*{box-sizing", 1)[1]
-        for token in ("#0F1318", "#1B222B", "#3F7FB2"):
+        for token in ("#0F1318", "#1B222B", "#3CAAD2", "#2E88AB"):
             self.assertNotIn(token, body,
                              f"组件区出现了深色专属色值 {token}")
+
+    def test_the_toggle_is_on_every_page(self):
+        """右下角的深浅开关走 templates/dashboard.html 的定式，挂在 body
+        直下——登录页和骨架页也要有，不能只有取到数的那一屏。"""
+        skeleton = panel_view.overview_page(
+            overview=None, error="", fetched_at=0.0,
+            config=panel.PanelConfig.from_env({
+                "PANEL_PASSWORD": "a-long-enough-password"}))
+        for html in (render(), panel_view.login_page("x"), skeleton):
+            self.assertIn("id=themeBtn", html)
+            self.assertIn("aria-label='切换深浅模式'", html)
+
+    def test_the_choice_is_restored_and_falls_back_to_the_system(self):
+        """开关的两半，各钉一条：存过的选择要在下次打开时生效；没存过时
+        第一下必须从「当前生效的」翻走——不看 prefers-color-scheme 的话，
+        深色系统的用户第一下会被翻到深色，等于按了没反应。"""
+        js = panel_view._SCRIPT
+        self.assertIn("linkcheck.theme", js, "偏好没有存进 localStorage")
+        self.assertIn("prefers-color-scheme", js,
+                      "没存过偏好时不看系统状态，第一下会翻错方向")
+        self.assertIn("dataset.theme", js,
+                      "开关必须只翻 <html data-theme>，不许改组件样式")
 
 
 if __name__ == "__main__":
