@@ -488,6 +488,28 @@ class TestDarkMode(unittest.TestCase):
             self.assertNotIn(token, body,
                              f"组件区出现了深色专属色值 {token}")
 
+    def test_the_toggle_is_on_every_page(self):
+        """右下角的深浅开关走 templates/dashboard.html 的定式，挂在 body
+        直下——登录页和骨架页也要有，不能只有取到数的那一屏。"""
+        skeleton = panel_view.overview_page(
+            overview=None, error="", fetched_at=0.0,
+            config=panel.PanelConfig.from_env({
+                "PANEL_PASSWORD": "a-long-enough-password"}))
+        for html in (render(), panel_view.login_page("x"), skeleton):
+            self.assertIn("id=themeBtn", html)
+            self.assertIn("aria-label='切换深浅模式'", html)
+
+    def test_the_choice_is_restored_and_falls_back_to_the_system(self):
+        """开关的两半，各钉一条：存过的选择要在下次打开时生效；没存过时
+        第一下必须从「当前生效的」翻走——不看 prefers-color-scheme 的话，
+        深色系统的用户第一下会被翻到深色，等于按了没反应。"""
+        js = panel_view._SCRIPT
+        self.assertIn("linkcheck.theme", js, "偏好没有存进 localStorage")
+        self.assertIn("prefers-color-scheme", js,
+                      "没存过偏好时不看系统状态，第一下会翻错方向")
+        self.assertIn("dataset.theme", js,
+                      "开关必须只翻 <html data-theme>，不许改组件样式")
+
 
 if __name__ == "__main__":
     unittest.main()

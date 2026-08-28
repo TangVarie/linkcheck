@@ -253,6 +253,12 @@ button.primary{background:var(--primary);color:var(--on-primary)}
 button.primary:hover:not(:disabled){background:var(--primary-dark)}
 button.sm{height:32px;font-size:13px;font-weight:500;padding:0 12px}
 button.danger{background:var(--danger);color:#fff}
+/* 深浅模式开关：右下角悬浮（templates/dashboard.html 的定式）。
+ * 不透明 surface + 发丝线成形、零阴影——悬浮件的通用做法（DESIGN.md §5）。 */
+.theme-btn{position:fixed;bottom:20px;right:20px;z-index:99;width:36px;
+  height:36px;padding:0;background:var(--surface);
+  border:1px solid var(--border);color:var(--text);display:flex;
+  align-items:center;justify-content:center}
 input[type=password],input[type=search],input[type=text],input[type=number]{
   font:14px/1 var(--font-sans);height:40px;padding:0 12px;
   border:1px solid var(--border-strong);background:var(--surface);
@@ -348,6 +354,30 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
 _SCRIPT = r"""
 (function(){
   var token = document.body.dataset.csrf || "";
+
+  // ---- 深浅模式：默认跟随系统；点右下角开关改为手动指定 ----
+  // templates/dashboard.html 的定式：两态翻转。没存过偏好时第一下必须从
+  // 「当前生效的」翻走——不看 prefers-color-scheme 的话，深色系统的用户
+  // 第一下会被翻到深色，等于按了没反应。
+  // 选择存 localStorage：它是每个人自己的偏好，不上服务端。
+  // 样式侧只翻 <html data-theme>，组件颜色零改动（负面清单 #17）。
+  var rootEl = document.documentElement;
+  var THEME_KEY = "linkcheck.theme";
+  try {
+    var savedTheme = localStorage.getItem(THEME_KEY);
+    if (savedTheme === "dark" || savedTheme === "light") {
+      rootEl.dataset.theme = savedTheme;
+    }
+  } catch (e) { /* 隐私模式/禁用存储：开关仍能用，只是不记住 */ }
+  var themeBtn = document.getElementById("themeBtn");
+  if (themeBtn) themeBtn.addEventListener("click", function(){
+    var dark = rootEl.dataset.theme
+      ? rootEl.dataset.theme === "dark"
+      : matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    rootEl.dataset.theme = next;
+    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+  });
 
   // 侧栏跟随滚动高亮。用 IntersectionObserver 触发，不挂 scroll 事件——
   // 后者每帧跑一次，长页面上白烧电池。动效有信息含义：它告诉你现在看的是哪一段。
@@ -672,6 +702,7 @@ _ICON_PATHS = {
                '-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
     "history": ('<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>'
                 '<path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>'),
+    "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
 }
 
 
@@ -710,11 +741,15 @@ _MARK = (
 
 
 def _shell(title: str, body: str, *, csrf: str = "") -> str:
+    # 深浅模式开关挂在 body 直下（模板同款）——登录页、骨架页、概览页都有，
+    # 不能只有取到数的那一屏。图标固定月亮，两种模式下都是它（模板如此）。
+    theme_btn = ("<button class=theme-btn id=themeBtn type=button "
+                 f"aria-label='切换深浅模式'>{_icon('moon')}</button>")
     return (
         "<!doctype html><html lang=zh-CN><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{_e(title)}</title><style>{_STYLE}</style></head>"
-        f"<body data-csrf=\"{_e(csrf)}\">{body}"
+        f"<body data-csrf=\"{_e(csrf)}\">{theme_btn}{body}"
         f"<script>{_SCRIPT}</script></body></html>"
     )
 
