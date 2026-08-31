@@ -60,6 +60,9 @@ def expected_schema(settings: Settings) -> list[tuple]:
         (f.platform, (3, 1), "单选或文本", ["小红书", "抖音"], None),
         (f.comment_count, (2,), "数字", None, None),
         (f.previous_comment_count, (2,), "数字", None, None),
+        (f.surge_time, (5,), "日期", None,
+         "普通日期字段。机器只在**第一次**判定起量时写一次，之后不再改；"
+         "手工清空这一格就等于让它重新计一次"),
         (f.pinned_status, (3,), "单选", settings.pin_status.machine_written(),
          "机器直接覆盖写入当前状态；抖音行不写这一列"),
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),

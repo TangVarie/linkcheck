@@ -353,6 +353,28 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         self.assertEqual(rows[0].pin_status, "置顶成功")
         self.assertIn(f.pinned_status, table.requested)
 
+    def test_surge_time_cell_is_read_back(self):
+        """「起量时间」的现值决定这一轮写不写它（只记第一次）。
+        读不回来的话每一轮起量都会重新盖戳，第一次起量的时刻就丢了。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                self.requested = list(field_names)
+                return [{"record_id": "rec1", "fields": {
+                    f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24,
+                    f.surge_time: 1_755_000_000_000,
+                }}]
+
+        table = _Table()
+        rows = runner.load_rows(table, settings, only_due=False)
+        self.assertEqual(rows[0].surge_time_ms, 1_755_000_000_000)
+        self.assertIn(f.surge_time, table.requested)
+
     def test_queue_mode_without_queued_column_does_nothing(self):
         """「排队刷新」列没建时 queue 模式必须空转——退化成无过滤全表刷新
         会花掉一整轮 sweep 的钱。"""

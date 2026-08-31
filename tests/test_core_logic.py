@@ -620,6 +620,61 @@ class TestRiskDetection(unittest.TestCase):
         """链接失效 = 风控中的另一种硬证据；「已失效」标签已退役。"""
         self.assertEqual(analyze.gone_verdict(self.settings).tags, {"风控中"})
 
+    def test_a_clear_jump_is_a_surge(self):
+        """起量是掉量的镜像：涨幅够 + 增量够，两个闸门都过才算。"""
+        v = self.decide(60, previous_comment_count=12)
+        self.assertTrue(v.surged)
+        self.assertTrue(any("起量" in n for n in v.notes))
+        # 它不是标签——热度档位说「现在多热」，起量说「这一轮涨得猛」
+        self.assertLessEqual(v.tags, set(self.settings.tags.namespace()))
+
+    def test_the_first_ever_reading_is_never_a_surge(self):
+        """**这一条最要紧。** 第一次量这一行时手里只有一个孤零零的数字，
+        没有任何速率信息。漏了它，一张刚入册的老表（每条都几百评论）
+        会被整表盖上同一个「起量时间」——正好是入册那天，而且是错的。
+        """
+        self.assertFalse(self.decide(800, previous_comment_count=None).surged)
+
+    def test_a_tiny_base_does_not_fake_a_surge(self):
+        """2 → 6 是 +200%，但那是三条评论的事。绝对增量闸挡的就是它。"""
+        self.assertFalse(self.decide(6, previous_comment_count=2).surged)
+
+    def test_a_big_post_growing_normally_is_not_a_surge(self):
+        """1000 → 1100 增量够了，涨幅够不上：大体量帖子的日常波动不是起飞。"""
+        self.assertFalse(self.decide(1100, previous_comment_count=1000).surged)
+
+    def test_zero_baseline_falls_back_to_the_absolute_gate(self):
+        """上一轮真的是 0 条：比例闸退化（乘法不除法，不会炸），
+        由绝对增量说了算。"""
+        self.assertTrue(self.decide(30, previous_comment_count=0).surged)
+        self.assertFalse(self.decide(3, previous_comment_count=0).surged)
+
+    def test_a_round_without_a_count_is_never_a_surge(self):
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        v = analyze.decide(snap, self.settings, previous_comment_count=10,
+                           age_hours=10)
+        self.assertFalse(v.surged)
+
+    def test_both_gates_include_their_boundary(self):
+        """40 → 60 正好涨 50%、正好 +20：算起量。
+
+        含不含边界必须和掉量那边**一样松**——100 → 50 正好腰斩是算限流的，
+        一个口径的两个方向边界松紧不同，散文里怎么写都会有一边是错的。
+        文档一律写 `≥`，不写「超过」。
+        """
+        th = self.settings.thresholds
+        self.assertTrue(th.surged(60, 40))                      # 比例与增量都正好卡线
+        self.assertTrue(50 <= 100 * (1 - th.risk_drop_ratio))   # 掉量那边同样含边界
+        self.assertFalse(th.surged(59, 40))                     # 差一点比例
+        self.assertFalse(th.surged(29, 10))                     # 比例够，增量差一条
+
+    def test_a_drop_and_a_surge_cannot_both_fire(self):
+        """一个数不可能同时涨一半和跌一半。两条口径互斥，钉住别改出交集。"""
+        for prev, count in ((100, 20), (12, 60), (40, 41), (0, 0)):
+            v = self.decide(count, previous_comment_count=prev)
+            self.assertFalse(v.surged and "疑似限流" in v.tags,
+                             f"{prev} → {count} 同时判成了起量和限流")
+
     def test_first_strike_tags_nothing(self):
         """一次抖动就把好帖子标成风控 = 运营全线停投。绝不能发生。"""
         self.assertEqual(analyze.suspect_verdict(self.settings, 1, "取不到").tags, set())

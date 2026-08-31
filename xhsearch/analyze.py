@@ -414,6 +414,10 @@ class Verdict:
     # negative_checked=False（没填负面词、或本轮没看到评论页）时两个负面列都不碰。
     negative_hits: list["KeywordHit"] = field(default_factory=list)
     negative_checked: bool = False
+    # 这一轮的评论数相对上一次是不是「起量」（判据见 Thresholds.surged）。
+    # 它不是标签：热度档位说的是「现在有多热」，这个说的是「这一轮涨得猛」，
+    # 两件事。写不写进表由调用方决定——「起量时间」只记第一次。
+    surged: bool = False
 
 
 def decide(
@@ -532,6 +536,24 @@ def decide(
             f"⚠ 评论数从 {previous_comment_count} 掉到 {count}，"
             f"跌幅超过 {int(th.risk_drop_ratio * 100)}% → {t.throttled}（也可能是删评/折叠）"
         )
+
+    # —— 起量：掉量的镜像。这一轮涨得够猛，记下**发现**它的时刻 ——
+    # 判据在 Thresholds.surged（两个闸门 + 第一次量到不算）。这里只下结论、
+    # 不打标签：热度档位回答「现在有多热」，起量回答「这一轮涨得猛」。
+    # 真正写不写「起量时间」由 runner 决定——那一列只记第一次。
+    if th.surged(count, previous_comment_count):
+        verdict.surged = True
+        gain = count - previous_comment_count
+        # 上一轮是 0 条时算不出百分比（除零），如实只报增量。
+        pace = (f"（+{gain}，涨了 {gain / previous_comment_count:.0%}）"
+                if previous_comment_count else f"（+{gain}）")
+        # 措辞只陈述**这一轮的事实**，不用「→ 起量」那种箭头结论句式——
+        # 箭头在这份诊断里一直表示「所以写了什么」（→ 疑似限流 是真打了标签）。
+        # 而第二波、第三波同样会走到这里，「起量时间」却只记第一次；
+        # 每波都写一句带箭头的话，运营会去表里找一个没有变过的格子。
+        # 真正落了戳的那一轮由 runner 在后面补一句（它才知道格子空不空）。
+        verdict.notes.append(
+            f"评论数从 {previous_comment_count} 涨到 {count}{pace}，这一轮起量")
 
     # —— 审查标记：上游明确说这条在审核/受限，才打「风控中」——
     if snapshot.censored:

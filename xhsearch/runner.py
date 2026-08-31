@@ -745,6 +745,23 @@ def refresh(
                 if row.previous_comment_count is not None:
                     fields[f.previous_comment_count] = row.previous_comment_count
                 fields[f.comment_count] = snapshot.comment_count
+            # 「起量时间」**只写第一次**：它回答「什么时候起来的」，是个历史
+            # 事实；后面每一波都覆盖的话，这一列就退化成「最近一次涨得猛的
+            # 时间」，而那个问题「评论增量」已经回答了。格子空着才写。
+            # 写的时刻和「最近检查时间」是同一个 checked_at——两列必须逐字
+            # 对得上，否则运营拿它对运行日志会差出几分钟。
+            if verdict.surged and row.surge_time_ms is None:
+                fields[f.surge_time] = int(checked_at.timestamp() * 1000)
+                # 补一句「这是第一次」，把这一轮和后面几波区分开。
+                # ⚠️ 措辞刻意**不说「已记进某某列」**：这句话是在这里定的，
+                # 而那一列能不能落表要到 write_back 才知道——表里还没建
+                # 「起量时间」时它会被整列挡下（dropped_fields，运行日志会说），
+                # 诊断却照样落表。那就成了「表里写着已记录、格子根本不存在」。
+                # 同一条纪律在 cli 里已有先例：整列被挡下时连「本轮巡查时间
+                # 区间」都不报，因为报一个表里不存在的时刻正是要修的病。
+                fields[f.failure_reason] = (
+                    fields[f.failure_reason] + "；这是它第一次起量"
+                )[:500]
             # 赞藏不再写表（四列已去掉）。snapshot.like_count / collect_count
             # 仍然解析、仍然当「这一轮真的量到了东西」的存活证据用
             # （见 _observed / _measured_this_round），只是不落表。
@@ -1202,6 +1219,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
         consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
         pin_status=feishu.read_text(cells.get(f.pinned_status)),
+        surge_time_ms=feishu.read_timestamp_ms(cells.get(f.surge_time)),
         queued=feishu.read_bool(cells.get(f.queued)),
     )
 

@@ -45,6 +45,12 @@ class FieldNames:
     platform: str = "平台"
     comment_count: str = "实时数据.评论数"
     previous_comment_count: str = "上次评论数"
+    # 这一行**第一次**被判定为起量的那一次巡查时刻（判据见 Thresholds.surged）。
+    # 写一次就不再改：它回答的是「什么时候起来的」，那是个历史事实。
+    # 第二波、第三波由「评论增量」和热度档位表达，不该把第一次的答案覆盖掉。
+    # ⚠️ 分辨率受分层刷新节奏限制：写进去的是**发现**起量的那一刻，
+    # 真正起飞发生在上一次巡查到这一次之间（0-2 天档 8 小时，往后更粗）。
+    surge_time: str = "起量时间"
     # 「点赞数 / 上次点赞数 / 收藏数 / 上次收藏数」四列已经去掉了。
     # 小红书的赞藏只能从 detail 接口拿（评论接口不带），而 detail 占了
     # 月成本的 39%——运营确认这两个数字不看，那就没有理由继续为它付费。
@@ -85,6 +91,7 @@ class FieldNames:
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
+            self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
         ]
 
 
@@ -236,6 +243,11 @@ class Thresholds:
     够不上 20 条的行由**发布时长**决定落在哪一档：
         发布不满 flop_hours → 观察中（还在冷启动窗口，没到下结论的时候）
         发布满 flop_hours   → 无水花（给了足够时间还是没起来）
+
+    另外两组是**和上一次比**的口径，一涨一跌，互为镜像，**两边都含边界**：
+        跌幅 ≥ risk_drop_ratio（基线 ≥ 20）→ 疑似限流
+        涨幅 ≥ surge_ratio 且增量 ≥ surge_min_gain → 起量，记一个时刻
+    正好 50% 那一档算命中（100 → 50 判限流，40 → 60 判起量）。
     """
 
     tier_evaluating: int = 20
@@ -246,6 +258,12 @@ class Thresholds:
     risk_drop_ratio: float = 0.5
     # 上次评论数低于这个值时不做掉量判定——从 3 掉到 1 没有意义。
     risk_drop_min_baseline: int = 20
+
+    # —— 起量：掉量那一对的镜像，两个闸门都要过 ——
+    # 涨幅比例够 + 绝对增量够，才算「这一轮起来了」，时刻写进「起量时间」。
+    # 两个都是**含边界**（≥），和掉量那边的 `<=` 对称：正好涨 50% 也算。
+    surge_ratio: float = 0.5
+    surge_min_gain: int = 20
 
     # 发布这么多小时后评论数仍够不上「评估中」门槛，判「无水花」。
     # 太短会把正常冷启动误标——刚发两小时只有几条评论再正常不过。
@@ -260,6 +278,35 @@ class Thresholds:
         if count >= self.tier_evaluating:
             return tags.evaluating
         return None
+
+    def surged(self, count: int | None, previous: int | None) -> bool:
+        """这一轮算不算「起量」——涨幅和绝对增量**两个闸门都要过**。
+
+        `previous is None` 一律判否，这一条最要紧：那是**第一次量这一行**
+        （「上次评论数」还空着），手里只有一个孤零零的数字，没有任何速率信息。
+        一张刚入册的老表里每条都有几百条评论，漏了这一条会给全表盖上同一个
+        「起量时间」——正好是入册那天，而且是错的。
+
+        两个闸门的分工，照掉量那一对的镜像来读：
+
+        * 比例闸 `surge_ratio` 挡住「大体量帖子的正常增长」——
+          1000 涨到 1100 是日常波动，不是起飞。
+        * 绝对闸 `surge_min_gain` 挡住「小基数的假暴涨」——
+          2 涨到 6 是 +200%，但那是三条评论的事。
+          掉量那边用的是**基线**下限（跌之前得先有量），起量这边必须换成
+          **增量**下限：起飞的基数按定义就是低的，拿基线卡会把真正的起量全滤掉。
+
+        比例写成乘法不是除法：`previous` 为 0（上一轮真的量到 0 条）时
+        除法要炸，而乘法天然退化成「只看绝对增量」，正是想要的语义。
+
+        两个闸门都**含边界**（`>=`），和掉量那边的 `<=` 对称：100 → 50
+        算腰斩，那么 40 → 60 也该算起量。散文里写「涨幅超 50%」是不准的，
+        文档一律写 `≥`——边界差一档就够让一条真起量的行错过它唯一一次盖戳。
+        """
+        if count is None or previous is None:
+            return False
+        return (count >= previous * (1 + self.surge_ratio)
+                and count - previous >= self.surge_min_gain)
 
 
 @dataclass

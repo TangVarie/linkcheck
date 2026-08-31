@@ -63,6 +63,9 @@ class Row:
     # 「置顶状态」单选的现值：上一轮是 置顶成功/置顶掉了、这一轮没置顶
     # → 置顶掉了；否则 → 无置顶。「掉了」和「从来没有」的区分全靠它。
     pin_status: str = ""
+    # 「起量时间」那一格的现值。None = 还没起过量，这一轮判起量就写；
+    # 有值 = 已经记过第一次，之后再猛的一轮也不覆盖它。
+    surge_time_ms: Optional[int] = None
     queued: bool = False
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)
