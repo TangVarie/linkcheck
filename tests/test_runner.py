@@ -709,6 +709,66 @@ class TestPreviousMetricsShift(RunnerTest):
             self.assertNotIn(gone, written)
 
 
+class TestSurgeTime(RunnerTest):
+    """「起量时间」只记第一次，而且和「最近检查时间」是同一个时刻。"""
+
+    def _run(self, count, *, prev_count, surge_time_ms=None):
+        row = xhs_row(prev_count=prev_count)
+        row.surge_time_ms = surge_time_ms
+        return self.run_with(
+            [sse(comment_page(count=count)),
+             sse({"points": {"cost": 10, "balance": 1}})],
+            [row],
+        )
+
+    def test_a_surge_stamps_the_column(self):
+        fields = self._run(60, prev_count=12).outcomes[0].fields
+        f = self.settings.fields
+        self.assertIn(f.surge_time, fields)
+        # 和「最近检查时间」逐字相同：两列对不上，运营拿它对运行日志
+        # 会差出几分钟，而这个项目已经为「时间对不上」返过工。
+        self.assertEqual(fields[f.surge_time], fields[f.last_updated])
+
+    def test_the_first_stamp_is_never_overwritten(self):
+        """第二波更猛也不覆盖。这一列回答「什么时候起来的」，是历史事实；
+        每轮都覆盖的话它就退化成「最近一次涨得猛的时间」，而那个问题
+        「评论增量」已经回答了。"""
+        old = int((NOW - timedelta(days=9)).timestamp() * 1000)
+        fields = self._run(400, prev_count=100, surge_time_ms=old).outcomes[0].fields
+        self.assertNotIn(self.settings.fields.surge_time, fields)
+
+    def test_only_the_round_that_stamps_says_it_stamped(self):
+        """诊断信息不能让人去表里找一个没变过的格子：
+        第二波照样如实报「这一轮起量」，但**只有真盖了戳的那一轮**
+        才说「已记进『起量时间』」。"""
+        f = self.settings.fields
+        first = self._run(60, prev_count=12).outcomes[0]
+        self.assertIn("这一轮起量", first.fields[f.failure_reason])
+        self.assertIn("已记进", first.fields[f.failure_reason])
+
+        old = int((NOW - timedelta(days=9)).timestamp() * 1000)
+        again = self._run(400, prev_count=100, surge_time_ms=old).outcomes[0]
+        self.assertIn("这一轮起量", again.fields[f.failure_reason])
+        self.assertNotIn("已记进", again.fields[f.failure_reason])
+
+    def test_an_ordinary_round_does_not_stamp(self):
+        fields = self._run(44, prev_count=40).outcomes[0].fields
+        self.assertNotIn(self.settings.fields.surge_time, fields)
+
+    def test_the_first_ever_round_does_not_stamp(self):
+        """「上次评论数」还空着的那一轮没有速率信息，不能盖戳
+        （否则整张新入册的表会被盖上同一个日期）。"""
+        fields = self._run(800, prev_count=None).outcomes[0].fields
+        self.assertNotIn(self.settings.fields.surge_time, fields)
+
+    def test_a_failed_round_does_not_stamp(self):
+        """取不到内容的轮次对「涨没涨」零信息，一个字都不该写。"""
+        row = xhs_row(prev_count=12)
+        report = self.run_with([err(200, 1005, "上游炸了")] * 8, [row])
+        self.assertNotIn(self.settings.fields.surge_time,
+                         report.outcomes[0].fields)
+
+
 class TestAliveConfirmed(RunnerTest):
     def test_ok_ticks_the_box(self):
         report = self.run_with(

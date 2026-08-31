@@ -4,6 +4,7 @@
 这里钉住：代码要读的每一列、要写的每个选择值，都在 doctor 的清单里。
 """
 
+import io
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -27,8 +28,8 @@ class TestDoctorSchema(unittest.TestCase):
     def test_covers_every_machine_written_column(self):
         f = self.settings.fields
         for column in (f.platform, f.comment_count, f.previous_comment_count,
-                       f.pinned_status, f.comment_status, f.comment_digest,
-                       f.negative_status, f.negative_digest,
+                       f.surge_time, f.pinned_status, f.comment_status,
+                       f.comment_digest, f.negative_status, f.negative_digest,
                        f.traffic_status, f.refresh_status,
                        f.failure_reason, f.last_updated, f.alive_confirmed,
                        f.consecutive_failures):
@@ -64,6 +65,10 @@ class TestDoctorSchema(unittest.TestCase):
         self.assertEqual(self.schema[f.comment_status][0], (3,))
         self.assertEqual(self.schema[f.negative_status][0], (3,))
         self.assertEqual(self.schema[f.pinned_status][0], (3,))
+        # 「起量时间」写的是毫秒时间戳，和「最近检查时间」同一种列。
+        # 建成文本/数字的话这一格在飞书里排不了序、也筛不了区间，
+        # 而「这一波谁先起来的」正是要靠排序看的。
+        self.assertEqual(self.schema[f.surge_time][0], (5,))
 
 
 class TestTablesFromEnv(unittest.TestCase):
@@ -555,6 +560,50 @@ class TestOptionsFromMeta(unittest.TestCase):
     def test_select_column_returns_its_options(self):
         meta = {"流量状态": {"type": 4, "ui_type": "MultiSelect", "options": ["爆贴"]}}
         self.assertEqual(cli._options_from_meta(meta, "流量状态"), ["爆贴"])
+
+
+class TestDoctorSampleRead(unittest.TestCase):
+    """体检第③步「试读一行」只能问表里真有的列。
+
+    按名字请求一个还没建的列，飞书会让整个 search 报 1254045、一行都读不到。
+    那时第③步会用一句原始 API 错误盖住第②步已经说清楚的「缺哪几列」——
+    「少建了一列」被显示成「读不了表」，而两者的处置完全不同。
+    真正在跑的读侧（load_rows）本来就按表里实际存在的列过滤，这里对齐它。
+    """
+
+    class _Table:
+        def __init__(self, meta):
+            self._meta = meta
+            self.requested = None
+
+        def token(self):
+            return "t"
+
+        def fields_meta(self):
+            return self._meta
+
+        def search(self, field_names, *, filter_spec=None, max_records=None):
+            self.requested = list(field_names)
+            missing = [c for c in field_names if c not in self._meta]
+            if missing:
+                raise RuntimeError(f"1254045 FieldNameNotFound: {missing}")
+            return []
+
+    def test_a_missing_column_does_not_break_the_sample_read(self):
+        settings = Settings()
+        f = settings.fields
+        meta = {name: {"type": allowed[0], "ui_type": "",
+                       "options": list(options or []) if allowed[0] in (3, 4) else None}
+                for name, allowed, _l, options, _n in cli._expected_schema(settings)}
+        meta.pop(f.surge_time)          # 老表还没建「起量时间」
+        table = self._Table(meta)
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            cli._doctor_table(settings, table)
+        self.assertNotIn(f.surge_time, table.requested or [])
+        text = out.getvalue()
+        self.assertNotIn("1254045", text, "试读把「缺一列」报成了读表失败")
+        # 缺列本身仍要被第②步如实点名，只是不该由第③步用 API 错误来报
+        self.assertIn(f.surge_time, text)
 
 
 class TestSchemaProblems(unittest.TestCase):

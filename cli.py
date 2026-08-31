@@ -442,7 +442,12 @@ def _doctor_table(settings: Settings, table: feishu.Bitable) -> int:
 
     print("③ 试读一行 …", end=" ", flush=True)
     try:
-        sample = table.search(f.must_read(), max_records=1)
+        # 只问表里真有的列。按名字请求一个不存在的列，飞书会整个 search 报
+        # 1254045、一行都读不到——那时这一步会用一句原始 API 错误盖住②已经
+        # 说清楚的「缺哪几列」，把「少建了一列」显示成「读不了表」。
+        # 真正在跑的读侧（load_rows）本来就按 known_fields 过滤，这里对齐它。
+        wanted = [c for c in f.must_read() if not meta or c in meta]
+        sample = table.search(wanted, max_records=1)
         print(f"OK（读到 {len(sample)} 行）")
         if sample:
             present = set((sample[0].get("fields") or {}).keys())
