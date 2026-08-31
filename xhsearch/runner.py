@@ -752,10 +752,15 @@ def refresh(
             # 对得上，否则运营拿它对运行日志会差出几分钟。
             if verdict.surged and row.surge_time_ms is None:
                 fields[f.surge_time] = int(checked_at.timestamp() * 1000)
-                # 只有真盖了戳才说盖了戳。第二波同样判起量、但不覆盖，
-                # 那时诊断里只留 analyze 那句陈述事实的话。
+                # 补一句「这是第一次」，把这一轮和后面几波区分开。
+                # ⚠️ 措辞刻意**不说「已记进某某列」**：这句话是在这里定的，
+                # 而那一列能不能落表要到 write_back 才知道——表里还没建
+                # 「起量时间」时它会被整列挡下（dropped_fields，运行日志会说），
+                # 诊断却照样落表。那就成了「表里写着已记录、格子根本不存在」。
+                # 同一条纪律在 cli 里已有先例：整列被挡下时连「本轮巡查时间
+                # 区间」都不报，因为报一个表里不存在的时刻正是要修的病。
                 fields[f.failure_reason] = (
-                    fields[f.failure_reason] + f"；首次起量，已记进「{f.surge_time}」"
+                    fields[f.failure_reason] + "；这是它第一次起量"
                 )[:500]
             # 赞藏不再写表（四列已去掉）。snapshot.like_count / collect_count
             # 仍然解析、仍然当「这一轮真的量到了东西」的存活证据用

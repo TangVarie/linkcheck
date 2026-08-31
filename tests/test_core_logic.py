@@ -655,6 +655,19 @@ class TestRiskDetection(unittest.TestCase):
                            age_hours=10)
         self.assertFalse(v.surged)
 
+    def test_both_gates_include_their_boundary(self):
+        """40 → 60 正好涨 50%、正好 +20：算起量。
+
+        含不含边界必须和掉量那边**一样松**——100 → 50 正好腰斩是算限流的，
+        一个口径的两个方向边界松紧不同，散文里怎么写都会有一边是错的。
+        文档一律写 `≥`，不写「超过」。
+        """
+        th = self.settings.thresholds
+        self.assertTrue(th.surged(60, 40))                      # 比例与增量都正好卡线
+        self.assertTrue(50 <= 100 * (1 - th.risk_drop_ratio))   # 掉量那边同样含边界
+        self.assertFalse(th.surged(59, 40))                     # 差一点比例
+        self.assertFalse(th.surged(29, 10))                     # 比例够，增量差一条
+
     def test_a_drop_and_a_surge_cannot_both_fire(self):
         """一个数不可能同时涨一半和跌一半。两条口径互斥，钉住别改出交集。"""
         for prev, count in ((100, 20), (12, 60), (40, 41), (0, 0)):

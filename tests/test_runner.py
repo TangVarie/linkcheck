@@ -737,19 +737,57 @@ class TestSurgeTime(RunnerTest):
         fields = self._run(400, prev_count=100, surge_time_ms=old).outcomes[0].fields
         self.assertNotIn(self.settings.fields.surge_time, fields)
 
-    def test_only_the_round_that_stamps_says_it_stamped(self):
+    def test_only_the_first_surge_is_called_the_first(self):
         """诊断信息不能让人去表里找一个没变过的格子：
-        第二波照样如实报「这一轮起量」，但**只有真盖了戳的那一轮**
-        才说「已记进『起量时间』」。"""
+        第二波照样如实报「这一轮起量」，但只有第一次才说「这是它第一次起量」。"""
         f = self.settings.fields
         first = self._run(60, prev_count=12).outcomes[0]
         self.assertIn("这一轮起量", first.fields[f.failure_reason])
-        self.assertIn("已记进", first.fields[f.failure_reason])
+        self.assertIn("第一次起量", first.fields[f.failure_reason])
 
         old = int((NOW - timedelta(days=9)).timestamp() * 1000)
         again = self._run(400, prev_count=100, surge_time_ms=old).outcomes[0]
         self.assertIn("这一轮起量", again.fields[f.failure_reason])
-        self.assertNotIn("已记进", again.fields[f.failure_reason])
+        self.assertNotIn("第一次起量", again.fields[f.failure_reason])
+
+    def test_the_diagnosis_never_claims_the_cell_was_written(self):
+        """**表里还没建「起量时间」时，这一列会被 write_back 整列挡下
+        （dropped_fields），而诊断照样落表。** 所以诊断里绝不能出现
+        「已记进/已写入某某列」——那会变成「表里写着已记录、格子根本不存在」。
+        同一条纪律在 cli 里已有先例：整列被挡下时连「本轮巡查时间区间」都不报。
+        """
+        f = self.settings.fields
+        note = self._run(60, prev_count=12).outcomes[0].fields[f.failure_reason]
+        for claim in ("已记进", "已写入", "已记录", f.surge_time):
+            self.assertNotIn(claim, note, f"诊断里出现了对写入结果的断言：{claim}")
+
+    def test_a_dropped_column_leaves_a_diagnosis_that_is_still_true(self):
+        """把「表里没建这一列」这条路走完整：write_back 挡掉整列之后，
+        真正落表的那份 fields 里不能剩下任何自相矛盾的话。"""
+        f = self.settings.fields
+        report = self._run(60, prev_count=12)
+        known = {f.refresh_status, f.failure_reason, f.last_updated, f.queued,
+                 f.comment_count, f.previous_comment_count, f.platform,
+                 f.traffic_status, f.comment_digest, f.alive_confirmed,
+                 f.consecutive_failures, f.pinned_status}
+        dropped, written = set(), []
+
+        class _Table:
+            def batch_update(self, updates, errors=None):
+                written.extend(updates)
+                return len(updates)
+
+            def search(self, *a, **k):
+                raise AssertionError("重算标签不该在这条用例里发请求")
+
+        with mock.patch.object(runner, "_reconcile_tags", lambda *a, **k: None):
+            runner.write_back(_Table(), report, known_fields=known,
+                              dropped_fields=dropped)
+        self.assertIn(f.surge_time, dropped, "缺列没有被记进 dropped_fields")
+        landed = written[0]["fields"]
+        self.assertNotIn(f.surge_time, landed)
+        self.assertIn("这一轮起量", landed[f.failure_reason])
+        self.assertNotIn("已记进", landed[f.failure_reason])
 
     def test_an_ordinary_round_does_not_stamp(self):
         fields = self._run(44, prev_count=40).outcomes[0].fields
