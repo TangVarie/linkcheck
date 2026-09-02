@@ -282,8 +282,13 @@ def collect(
     secrets: Iterable[str] = (),
     settings_for: Optional[Callable[[str], Settings]] = None,
     label_column: str = "",
+    disabled_tables: Iterable[str] = (),
 ) -> summary.Overview:
     """把每张表读一遍、聚合成 Overview。**只读，不花钱。**
+
+    `disabled_tables` 是注册表里**停用了**的那些表的名字。它们不读、不统计，
+    但要随快照一起带到页面上：停用之后那张表是从页面上**整体消失**的，
+    不说一句的话，「停用了」和「读不到了」在运营眼里长得一模一样。
 
     一张表出问题只影响它自己那张卡：错误写进 `ProjectSnapshot.error`，
     其余表照常展示。整个面板因为一张表挂掉而空白，是最没用的失败方式。
@@ -305,7 +310,8 @@ def collect(
             label, table, per_table, api_keys,
             show_digest=show_digest, feishu_base=feishu_base, now=now,
             scrub=scrub, label_column=label_column))
-    return summary.Overview(projects=projects, generated_at=now)
+    return summary.Overview(projects=projects, generated_at=now,
+                            disabled_tables=[t for t in disabled_tables if t])
 
 
 def _collect_one(label, table, settings, api_keys, *,
@@ -406,10 +412,15 @@ class Cache:
         self._produce = produce
         self._ttl = ttl
         self._lock = threading.Lock()
+        self._done = threading.Condition(self._lock)
         self._value: Optional[summary.Overview] = None
         self._error: str = ""
         self._fetched_at: float = 0.0
         self._refreshing = False
+        # 最近一次取数**开始**的时刻（monotonic）。判「我之后有没有人刷过」
+        # 要看开始时刻而不是完成时刻：一趟在我之前开始、我之后才完成的取数，
+        # 读注册表那一步发生在我之前，我刚写进去的停用它看不见。
+        self._started_at: float = -1.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -418,11 +429,23 @@ class Cache:
             return self._value, self._error, self._fetched_at
 
     def refresh(self) -> None:
-        """跑一次取数。同一时刻只允许一个在跑——并发刷新只是把飞书请求翻倍。"""
-        with self._lock:
-            if self._refreshing:
+        """跑一次取数。**返回时保证有一趟在本次调用之后开始的取数已经完成。**
+
+        同一时刻仍只允许一个在跑——并发刷新只是把飞书请求翻倍。但「有人在跑
+        就直接返回」是不够的：停用一张表之后接着调 refresh()，撞上后台那趟
+        正在跑的（它读注册表时那张表还是启用的）就会空手而归，页面重载后
+        那张表照样在——看着就像停用没生效。所以改成：有人在跑就**等它跑完**，
+        然后看在我之后有没有人已经开始过一趟；没有才自己跑。五个人同时点
+        「重新取数」仍然只会跑一到两趟，不会五趟。
+        """
+        asked = time.monotonic()
+        with self._done:
+            while self._refreshing:
+                self._done.wait()
+            if self._started_at >= asked:
                 return
             self._refreshing = True
+            self._started_at = time.monotonic()
         try:
             value = self._produce()
             with self._lock:
@@ -432,8 +455,9 @@ class Cache:
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
         finally:
-            with self._lock:
+            with self._done:
                 self._refreshing = False
+                self._done.notify_all()
 
     def start(self) -> None:
         def loop():
@@ -662,6 +686,9 @@ class QueueResult:
     queued: int = 0
     skipped_archived: int = 0
     failures: list = field(default_factory=list)
+    # **真的勾上了**的那些行。前端只给这些行标「排队中」——逐行失败的、
+    # 整表写炸的都不在里面，否则标记会说「cron 会来刷」而 cron 根本没收到。
+    record_ids: list = field(default_factory=list)
 
 
 class Queueing:
@@ -709,6 +736,8 @@ class Queueing:
             errors=errors)
         result.queued = written
         result.failures = [f"{rid}：{exc.msg}" for rid, exc in errors]
+        failed = {rid for rid, _ in errors}
+        result.record_ids = [rid for rid in record_ids if rid not in failed]
         self.log(f"☑ 勾「{column}」{written} 行 @ {app_token[-6:]}/{table_id}"
                  f"（cron 五分钟内接手）")
         return result
@@ -1248,7 +1277,50 @@ class PanelHandler(BaseHTTPRequestHandler):
             if all(key) and record_id:
                 grouped.setdefault(key, []).append(record_id)
 
+        # 只给**还在监控中**的表勾。勾上去的行由 cron 接手，而 cron 每轮只跑
+        # 注册表里启用的表——给停用/已移除/配置有误的表勾，勾会写进飞书、
+        # 面板回一句「等 cron 接手」，然后永远没人来接：那句话是假的，而且
+        # 这些勾会一直悬着，哪天一启用就集中花一笔钱。
+        # 这种情况的典型来源正是「停用之后页面还没重载，对着旧待办勾」。
+        skipped: list[str] = []
+        projects = self.deps.projects
+        if projects is not None and projects.enabled and grouped:
+            try:
+                # 同一张表在注册表里可能不止一行：一行在用、一行停用的历史
+                # （registry.read 的查重只看在用的行，刻意放行这种形态）。
+                # 按 table_id 归并时**在用的那行优先**，不能让后面那行停用的
+                # 历史把正在巡查的表盖成「已停用」。
+                entries: dict = {}
+                for e in projects.list():
+                    if not e.table_id:
+                        continue
+                    seen = entries.get(e.table_id)
+                    if seen is None or (e.usable and not seen.usable):
+                        entries[e.table_id] = e
+            except Exception as exc:                            # noqa: BLE001
+                # 读不到注册表就确认不了这些表还在不在监控中。宁可这次不勾：
+                # 勾错了要悬到下次启用才发现，重试只是再点一下。
+                return self._send_json(400, {
+                    "error": f"读不到注册表，没法确认这些表还在监控中，"
+                             f"这次一行都没勾。稍后再试：{exc}"})
+            for key in list(grouped):
+                entry = entries.get(key[1])
+                name = entry.label if entry and entry.label else key[1]
+                if entry is None:
+                    why = "不在监控清单里（已移除？）"
+                elif not entry.enabled:
+                    why = "已停用——先在下面「项目」里启用，再来勾"
+                elif entry.problem:
+                    why = f"配置有误（{entry.problem}）"
+                else:
+                    continue
+                skipped.append(f"「{name}」{why}，cron 不会刷它，"
+                               f"这 {len(grouped.pop(key))} 行没勾")
+
         queued, failures = 0, []
+        # 真勾上了的行。前端只给它们标「排队中」：拒掉的表、整表写炸的、
+        # 逐行失败的，一个都不在里面——标了就是在替 cron 做一个它不会兑现的承诺。
+        queued_records: list[str] = []
         for (app_token, table_id), record_ids in grouped.items():
             try:
                 result = self.deps.queueing.queue(app_token, table_id, record_ids)
@@ -1260,8 +1332,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 continue
             queued += result.queued
             failures.extend(result.failures)
-        self.deps.cache.refresh()
-        return self._send_json(200, {"queued": queued, "failures": failures})
+            queued_records.extend(result.record_ids)
+        if grouped:
+            self.deps.cache.refresh()
+        return self._send_json(200, {"queued": queued, "failures": failures,
+                                     "skipped": skipped,
+                                     "queued_records": queued_records})
 
     def _projects_payload(self) -> dict:
         projects = self.deps.projects
@@ -1436,7 +1512,7 @@ def _todo_json(t: summary.TodoRow) -> dict:
         "refresh_status": t.refresh_status, "diagnosis": t.diagnosis,
         "comment_count": t.comment_count, "traffic_tags": t.traffic_tags,
         "seed_keywords": t.seed_keywords, "negative_keywords": t.negative_keywords,
-        "checked_at_ms": t.checked_at_ms,
+        "checked_at_ms": t.checked_at_ms, "queued": t.queued,
         "digest": t.digest, "negative_digest": t.negative_digest,
     }
 

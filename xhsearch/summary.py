@@ -57,6 +57,10 @@ class TodoRow:
     seed_keywords: list[str] = field(default_factory=list)
     negative_keywords: list[str] = field(default_factory=list)
     checked_at_ms: Optional[int] = None
+    # 「排队刷新」此刻勾着 = 有人要求刷、cron 还没来接。这是面板上唯一能
+    # 分开「同样的错」和「还没刷回来」的信号：勾着，看到的就还是旧结果；
+    # 勾没了、「最近检查」变新了，看到的才是这一次的结论。
+    queued: bool = False
     # 只有 PANEL_SHOW_DIGEST=1 时才填。默认空——评论正文、昵称、IP 属地
     # 是别人的个人信息，不该因为「顺手」就上一个公网页面。
     digest: str = ""
@@ -370,6 +374,7 @@ def build_snapshot(
                 seed_keywords=list(row.seed_keywords),
                 negative_keywords=list(row.negative_keywords),
                 checked_at_ms=row.last_updated_ms,
+                queued=row.queued,
                 digest=(clean(feishu.read_text(cells.get(f.comment_digest)))
                         if show_digest else ""),
                 negative_digest=(clean(feishu.read_text(cells.get(f.negative_digest)))
@@ -433,6 +438,9 @@ class Overview:
 
     projects: list[ProjectSnapshot] = field(default_factory=list)
     generated_at: Optional[datetime] = None
+    # 注册表里停用了的表的名字。它们不在 projects 里——停用的表不读、不统计、
+    # 行也不进待办——但页面上得说一句，否则「停用了」和「读不到了」分不开。
+    disabled_tables: list[str] = field(default_factory=list)
 
     @property
     def total_rows(self) -> int:

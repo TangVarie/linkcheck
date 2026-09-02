@@ -233,6 +233,7 @@ def _entries_or_raise(app_id: str, app_secret: str, *,
     registry = _registry_table(app_id, app_secret)
     if registry is None:
         _REGISTRY_ROWS.clear()
+        _REGISTRY_DISABLED.clear()
         return _tables_from_env(os.environ)
 
     from xhsearch import registry as registry_mod
@@ -248,6 +249,7 @@ def _entries_or_raise(app_id: str, app_secret: str, *,
             # 就是「没有逐表覆盖」；面板是常驻的，留着上一次的会让它和 cron
             # 用不同的口径算同一张表——而面板正是用来看这件事的。
             _REGISTRY_ROWS.clear()
+            _REGISTRY_DISABLED.clear()
             return _tables_from_env(os.environ)
         raise NoTables("  而且没有 FEISHU_TABLES 可以兜底。本轮拒跑——"
                        "静默跑成「零张表」比报错难发现得多") from exc
@@ -258,6 +260,10 @@ def _entries_or_raise(app_id: str, app_secret: str, *,
                   f"本轮跳过：{entry.problem}")
     _REGISTRY_ROWS.clear()
     _REGISTRY_ROWS.update({e.table_id: e for e in entries if e.usable})
+    # 只记「人主动停用」的：配置有误的那些上面已经逐行打印过，
+    # 面板的「项目」清单里也红着，不是同一件事。
+    _REGISTRY_DISABLED[:] = [e.label or e.table_id or e.record_id
+                             for e in entries if not e.enabled]
     usable = registry_mod.to_targets(entries)
     if not usable and not allow_empty:
         raise NoTables(f"注册表里没有一张可用的表（共 {len(entries)} 行，"
@@ -275,6 +281,10 @@ def _entries(app_id: str, app_secret: str) -> list:
 
 # 注册表里那一行，按 table_id 索引。逐表阈值从这儿来；没用注册表时是空的。
 _REGISTRY_ROWS: dict[str, Any] = {}
+# 注册表里**停用了**的表的名字。面板要把它们写在页面上：停用的表是从页面
+# 整体消失的，不说一句，「停用了」和「读不到了」在运营眼里长得一模一样。
+# 和 _REGISTRY_ROWS 同一处更新、同一处清空。
+_REGISTRY_DISABLED: list[str] = []
 
 
 def _tables(selected: list[str] | None = None) -> list[tuple[str, feishu.Bitable]]:
@@ -1156,7 +1166,9 @@ def cmd_serve(selected: list[str] | None = None) -> int:
             feishu_base=config.feishu_base,
             secrets=config.secrets,
             settings_for=settings_for,
-            label_column=config.label_column)
+            label_column=config.label_column,
+            # resolve_tables() 刚刷新过这份清单，这里读到的就是这一趟的。
+            disabled_tables=list(_REGISTRY_DISABLED))
 
     return panel.serve(config, produce, settings)
 

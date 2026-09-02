@@ -1432,6 +1432,8 @@ class TestQueueing(unittest.TestCase):
             result = self._queueing().queue("bascnA", "tblB", ["r1", "r2"])
         self.assertEqual(result.queued, 1)
         self.assertIn("行没了", result.failures[0])
+        # 前端只给真勾上的行标「排队中」：失败的那行不能在里面
+        self.assertEqual(result.record_ids, ["r1"])
 
 
 class TestQueueRoute(unittest.TestCase):
@@ -1546,3 +1548,261 @@ class TestQueueRoute(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCacheRefreshWaitsForTheOneInFlight(unittest.TestCase):
+    """停用一张表之后紧接着 refresh()，撞上后台正在跑的那趟（它读注册表时
+    那张表还是启用的）。原来的写法是「有人在跑就直接返回」——空手而归，
+    页面重载后那张表照样在，看着就像停用没生效。"""
+
+    def _blocking_cache(self):
+        import threading
+        import time
+        entered, release, calls = threading.Event(), threading.Event(), []
+
+        def produce():
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            return summary.Overview(projects=[])
+
+        return panel.Cache(produce, ttl=999), entered, release, calls
+
+    def test_a_refresh_asked_mid_flight_still_gets_a_fresh_snapshot(self):
+        import threading
+        import time
+        cache, entered, release, calls = self._blocking_cache()
+        first = threading.Thread(target=cache.refresh)
+        first.start()
+        self.assertTrue(entered.wait(5))
+        second = threading.Thread(target=cache.refresh)
+        second.start()
+        time.sleep(0.05)
+        self.assertTrue(second.is_alive(), "第二个调用者不该空手而归")
+        release.set()
+        first.join(5)
+        second.join(5)
+        self.assertEqual(len(calls), 2,
+                         "第一趟跑完必须再补一趟——它开跑时读到的世界可能已经变了")
+
+    def test_everyone_who_waited_shares_one_follow_up_refresh(self):
+        """五个人同时点「重新取数」撞上正在跑的那趟：只补跑一趟，不是五趟。"""
+        import threading
+        import time
+        cache, entered, release, calls = self._blocking_cache()
+        first = threading.Thread(target=cache.refresh)
+        first.start()
+        self.assertTrue(entered.wait(5))
+        waiters = [threading.Thread(target=cache.refresh) for _ in range(5)]
+        for w in waiters:
+            w.start()
+        time.sleep(0.1)
+        release.set()
+        first.join(5)
+        for w in waiters:
+            w.join(5)
+        self.assertEqual(len(calls), 2)
+
+
+class TestQueueRefusesTablesNotUnderWatch(unittest.TestCase):
+    """勾「排队刷新」只给还在监控中的表。给停用/已移除/配置有误的表勾，
+    勾会写进飞书、面板回「等 cron 接手」，然后永远没人来接——那句话是假的，
+    而且那些勾会悬着，哪天一启用就集中花一笔钱。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from xhsearch import registry as registry_mod
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        cls.addClassCleanup(quiet.stop)
+        cls.config = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32,
+                                       port=0, cache_seconds=999)
+        cls.config.app_id, cls.config.app_secret = "cli_x", "s"
+        cls.queueing = mock.Mock(spec=panel.Queueing)
+        cls.queueing.queue.return_value = panel.QueueResult(queued=1)
+
+        def entry(label, table_id, enabled, problem=""):
+            e = registry_mod.Entry(record_id="r-" + table_id, label=label,
+                                   target="bascnA:" + table_id, enabled=enabled,
+                                   app_token="bascnA", table_id=table_id)
+            e.problem = problem
+            return e
+        cls.projects = mock.Mock()
+        cls.projects.enabled = True
+        cls.entries = [entry("在管", "tblON", True),
+                       entry("停了", "tblOFF", False),
+                       entry("坏的", "tblBAD", True, "「表格链接」是空的")]
+        cls.projects.list.return_value = cls.entries
+        cache = panel.Cache(lambda: summary.Overview(projects=[]), ttl=999)
+        cache.refresh()
+        cls.cache = cache
+        cls.server = panel.build_server(cls.config, cache, queueing=cls.queueing,
+                                        projects=cls.projects, host="127.0.0.1")
+        cls.port = cls.server.server_address[1]
+        __import__("threading").Thread(
+            target=cls.server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.cache.stop()
+
+    def setUp(self):
+        self.queueing.reset_mock()
+        self.queueing.queue.side_effect = None
+        self.queueing.queue.return_value = panel.QueueResult(queued=1, record_ids=["r1"])
+        self.projects.list.side_effect = None
+        self.projects.list.return_value = self.entries
+
+    def _call(self, data, headers=None):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(f"http://localhost:{self.port}/api/queue",
+                                     data=data, headers=headers or {}, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    def _auth(self):
+        import urllib.error
+        import urllib.request
+
+        class _NR(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(_NR)
+        req = urllib.request.Request(f"http://localhost:{self.port}/login",
+                                     data=b"password=" + GOOD_PASSWORD.encode())
+        try:
+            cookie = opener.open(req, timeout=5).headers.get("Set-Cookie")
+        except urllib.error.HTTPError as exc:
+            cookie = exc.headers.get("Set-Cookie")
+        token = cookie.split("=", 1)[1].split(";")[0]
+        return {"Cookie": f"{panel.COOKIE_NAME}={token}",
+                panel.CSRF_HEADER: panel.csrf_token(self.config, token)}
+
+    def test_only_the_table_still_under_watch_gets_written(self):
+        body = ('{"rows":['
+                '{"app_token":"bascnA","table_id":"tblON","record_id":"r1"},'
+                '{"app_token":"bascnA","table_id":"tblOFF","record_id":"r2"},'
+                '{"app_token":"bascnA","table_id":"tblOFF","record_id":"r3"},'
+                '{"app_token":"bascnA","table_id":"tblBAD","record_id":"r4"},'
+                '{"app_token":"bascnA","table_id":"tblGONE","record_id":"r5"}]}')
+        status, text = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200, text)
+        payload = json.loads(text)
+        # 真正写进飞书的只有还在监控中的那张
+        self.assertEqual(self.queueing.queue.call_count, 1)
+        self.assertEqual(self.queueing.queue.call_args[0][1], "tblON")
+        self.assertEqual(payload["queued"], 1)
+        # 前端只给这些 record_id 标「排队中」——被拒的表一行都不在里面
+        self.assertEqual(payload["queued_records"], ["r1"])
+        # 拒掉的三张各说清楚为什么、几行没勾
+        joined = "\n".join(payload["skipped"])
+        self.assertIn("「停了」已停用", joined)
+        self.assertIn("这 2 行没勾", joined)
+        self.assertIn("「坏的」配置有误", joined)
+        self.assertIn("不在监控清单里", joined)
+        self.assertNotIn("失败", joined, "拒勾是决定，不是写入失败，别混进 failures 的口径")
+
+    def test_a_disabled_duplicate_row_does_not_shadow_the_live_one(self):
+        """注册表允许同一张表「一行在用 + 一行停用的历史」（查重只看在用的行）。
+        按 table_id 归并时在用的那行必须优先——不然一行历史就能把正在巡查的
+        表拒成「已停用」。"""
+        from xhsearch import registry as registry_mod
+        live = self.entries[0]
+        stale = registry_mod.Entry(record_id="r-old", label="在管（旧）",
+                                   target="bascnA:tblON", enabled=False,
+                                   app_token="bascnA", table_id="tblON")
+        self.projects.list.return_value = [live, stale]      # 停用的历史排在后面
+        body = '{"rows":[{"app_token":"bascnA","table_id":"tblON","record_id":"r1"}]}'
+        status, text = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200, text)
+        self.assertEqual(self.queueing.queue.call_count, 1)
+        self.assertEqual(json.loads(text)["skipped"], [])
+
+    def test_rows_of_a_table_whose_write_blew_up_are_not_called_queued(self):
+        """整表写炸的那几行只出现在 failures 里，绝不能出现在 queued_records 里
+        ——前端按后者标「排队中」，标了就是替 cron 做一个它不会兑现的承诺。"""
+        self.queueing.queue.side_effect = panel.feishu.FeishuError(99991663, "token 过期")
+        body = '{"rows":[{"app_token":"bascnA","table_id":"tblON","record_id":"r1"}]}'
+        status, text = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["queued_records"], [])
+        self.assertEqual(payload["queued"], 0)
+        self.assertTrue(payload["failures"] and "token 过期" in payload["failures"][0])
+
+    def test_an_unreadable_registry_refuses_everything(self):
+        """确认不了这些表还在不在监控中，就一行都不勾——勾错了要悬到下次
+        启用才发现，重试只是再点一下。"""
+        self.projects.list.side_effect = RuntimeError("网络挂了")
+        body = '{"rows":[{"app_token":"bascnA","table_id":"tblON","record_id":"r1"}]}'
+        status, text = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 400)
+        self.assertIn("注册表", json.loads(text)["error"])
+        self.queueing.queue.assert_not_called()
+
+
+class TestDisabledTablesAreSaidOutLoud(unittest.TestCase):
+    """停用的表是从页面上整体消失的。不说一句，「停用了」和「读不到了」
+    在运营眼里长得一模一样——而两者要做的事完全不同。"""
+
+    def _page(self, overview):
+        from xhsearch import panel_view
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": "a-long-enough-password",
+            "FEISHU_DOMAIN": "https://x.feishu.cn"})
+        return panel_view.overview_page(overview=overview, error="",
+                                        fetched_at=0.0, config=cfg, csrf="tok")
+
+    def _snap(self, **kwargs):
+        base = dict(label="项目A", app_token="t", table_id="tb")
+        base.update(kwargs)
+        return summary.ProjectSnapshot(**base)
+
+    def test_disabled_tables_are_listed_next_to_the_live_ones(self):
+        page = self._page(summary.Overview(projects=[self._snap()],
+                                           disabled_tables=["旧项目"]))
+        self.assertIn("张表已停用：旧项目", page)
+        self.assertIn("点「启用」", page)
+
+    def test_all_disabled_is_not_reported_as_no_tables(self):
+        """表都在，只是全停了。说「还没有一张可用的表」会把人引去加表。"""
+        page = self._page(summary.Overview(projects=[], disabled_tables=["甲", "乙"]))
+        self.assertIn("2 张表全都停用了", page)
+        self.assertIn("甲、乙", page)
+        self.assertNotIn("还没有一张可用的表", page)
+
+    def test_truly_empty_registry_keeps_the_add_a_table_hint(self):
+        page = self._page(summary.Overview(projects=[]))
+        self.assertIn("还没有一张可用的表", page)
+        # 查的是那两句说明，不是「已停用」四个字——项目清单的 JS 里本来就有
+        # 一枚「已停用」芯片的文案，页面字节里永远含它。
+        self.assertNotIn("张表已停用", page)
+        self.assertNotIn("全都停用了", page)
+
+    def _todo_table(self, todo):
+        """只看待办那张表。「排队中」四个字页面字节里永远有——前端就地补标记
+        的脚本里写着它——所以要查的是服务端有没有把它渲染进那一行。"""
+        page = self._page(summary.Overview(projects=[self._snap(todos=[todo])]))
+        start = page.index("<table id=todos>")
+        return page[start:page.index("</table>", start)]
+
+    def test_a_queued_todo_shows_the_pending_marker(self):
+        todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               label="x", reasons=["刷新失败"], queued=True)
+        self.assertIn("<span class=chip>排队中</span>", self._todo_table(todo))
+
+    def test_an_unqueued_todo_does_not(self):
+        todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               label="x", reasons=["刷新失败"])
+        self.assertNotIn("排队中", self._todo_table(todo))

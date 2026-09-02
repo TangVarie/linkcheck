@@ -389,3 +389,16 @@ class TestOverview(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQueuedMarker(unittest.TestCase):
+    """待办行要带上「排队刷新」此刻勾没勾——这是面板上唯一能分开
+    「同样的错」和「还没刷回来」的信号。"""
+
+    def test_a_queued_row_carries_the_flag(self):
+        snap = snapshot([record(refresh_status="刷新失败", queued=True)])
+        self.assertTrue(snap.todos[0].queued)
+
+    def test_an_unqueued_row_does_not(self):
+        snap = snapshot([record(refresh_status="刷新失败")])
+        self.assertFalse(snap.todos[0].queued)

@@ -142,6 +142,25 @@ class TestQueueingIsHonest(unittest.TestCase):
             self.js, r"checked\s*=\s*false",
             "提交成功后没有取消勾选")
 
+    def test_disabling_or_removing_a_table_reloads_the_page(self):
+        """停用/移除改的是表清单，而这一页是按旧清单渲染的：不重载，
+        运营会对着一张已经不在监控中的表勾「排队刷新」。"""
+        branch = self.js[self.js.index('act === "enable" || act === "remove"'):]
+        branch = branch[:branch.index("return;")]
+        self.assertIn("location.reload()", branch)
+
+    def test_only_rows_the_server_says_it_queued_get_the_marker(self):
+        """勾成功的行就地标「排队中」——面板上分开「同样的错」和「还没刷回来」
+        的唯一信号。判据必须是服务端回的 queued_records（真写进飞书的
+        record_id），不能是「我勾了哪些」：被拒的表、整表写炸的、逐行失败的行
+        都在勾选里，却一个都没进飞书，标了就是假的。"""
+        success = self.js[self.js.index("queued_records"):]
+        success = success[:success.index("sync();")]
+        self.assertIn("排队中", success)
+        self.assertIn("queuedRecords.indexOf(tr2.dataset.rec) < 0) continue", success)
+        self.assertNotIn("skipped_tables", self.js,
+                         "标记判据退回到了「按被拒的表排除」——那漏掉写失败的行")
+
 
 def css_without_comments() -> str:
     """去掉 CSS 注释再查。注释里本来就写着「border-radius: 0」这种句子
