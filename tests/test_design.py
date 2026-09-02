@@ -1,4 +1,4 @@
-"""面板视觉的机器闸（BYWOOD 设计系统 v5.0.1 · 界面轨「管理后台」）。
+"""面板视觉的机器闸（BYWOOD 设计系统 v5.4.0 · 色板 v5.1 · 界面轨「管理后台」）。
 
 设计系统自己带一个 `tools/check-design.py`，但那个工具在**设计系统包里**，
 不在这个仓库——CI 上跑不到。所以把它管的那几条里**最容易在改样式时踩回去**
@@ -55,24 +55,31 @@ def render() -> str:
         balances=bal, runway=rw, runs=[FakeRun()])
 
 
-# tokens/palette.json v5.0 的 screen 节（light + dark）+ brand 节 + 中性值。
+# tokens/palette.json v5.1 的 screen 节（light + dark）+ brand 节 + 中性值。
 # 唯一事实源在设计系统包里；这里是它的一份副本，改色板要两边同改。
 # v5 品牌换届「青赭双色制」：旧的藏蓝×正红（#235E8E/#D9232B/#E5262B 一族）
 # 整体退役，不在此列——它们再出现就是回退，理应红。
+# v5.1「标志青回归」：主色由 #1C4F62（H196°）收回到标志色相 #1E5754（H177°），
+# 深色主色由渐变冷端 #3CAAD2 改暖端 #6AC1BD；v5.0 那五个值同样退役。
 PALETTE = {
     # light
-    "#1C4F62", "#123A48", "#B8502F", "#E3EFEF", "#F8EAE2",
+    "#1E5754", "#16413F", "#B8502F", "#E3EFEF", "#F8EAE2",
     "#00B578", "#FF8F1F", "#D92B3C",
     "#B02330", "#006B4A", "#995400",
     "#F3F4F6", "#EAECEF", "#FFFFFF", "#E5E6EB",
     # dark
-    "#3CAAD2", "#2E88AB", "#D97E55", "#A84528", "#16323C", "#3D291F",
+    "#6AC1BD", "#48A8A3", "#D97E55", "#A84528", "#163B39", "#3D291F",
     "#21B183", "#FFA24D", "#E8575C", "#C64449", "#7FE0BD", "#FFC38A",
     "#FF9A9E", "#0F1318", "#151A20", "#1B222B", "#2B3440",
-    # brand（标志主青只许进标志图形；深赭石是浅底文字的加深档）
+    # brand（标志主青：标志图形 + 品牌面色，做底不做字；深赭石是浅底文字的加深档）
     "#7ED1CD", "#8A3A20",
     "#FFF", "#000", "#000000",
 }
+
+# 标志青 #7ED1CD 在标志图形之外唯一合法的写法：做底（v5.1 品牌面色）。
+# 与设计系统 tools/check-design.py 的 RE_TEAL_FIELD 同一条判据。
+RE_TEAL_FIELD = re.compile(
+    r"(?i)(background(?:-color)?\s*:[^;{}]*#7ED1CD|--field-brand\s*:\s*#7ED1CD)")
 
 
 class TestPalette(unittest.TestCase):
@@ -97,20 +104,85 @@ class TestPalette(unittest.TestCase):
             self.assertNotIn(old, html.upper(),
                              f"退役的旧品牌色 {old} 又出现了")
 
-    def test_the_logo_teal_appears_only_inside_the_mark(self):
-        """标志主青只给标志图形（白底 1.77:1，文字线条色块都不用这一档）。
+    def test_the_v50_teal_blue_does_not_come_back_either(self):
+        """v5.1「标志青回归」：v5.0 的主色取自渐变冷端（H196°），比标志偏蓝
+        19°，整套读成深湖蓝。那五个值退役，再出现就是从上一版抄了样式。"""
+        html = render() + panel_view.login_page("x")
+        for old in ("#1C4F62", "#123A48", "#3CAAD2", "#2E88AB", "#16323C"):
+            self.assertNotIn(old, html.upper(),
+                             f"v5.0 的偏蓝主色 {old} 又出现了")
 
-        本面板的山形走 currentColor（浅底藏青、深底白——独立山形在浅底
-        不用青，BRAND.md §3），所以页面上通常一处都没有；这条钉的是
-        它若出现，只能落在 <svg …aria-label="BYWOOD"> 里。
+    def test_the_logo_teal_is_a_field_never_a_foreground(self):
+        """标志主青（v5.1）：标志图形 + 品牌面色，**做底不做字**。
+
+        白底 1.77:1 管的是「青作前景」——文字、线条、描边、独立山形都不用。
+        所以它在页面字节里只许两种落点：<svg …aria-label="BYWOOD"> 里，
+        或写在 background / --field-brand 里。写进 color / border / stroke /
+        fill 就是当前景用，判据与设计系统 check-design.py 的 RE_TEAL_FIELD 同。
+        本面板的山形走 currentColor，所以前一种落点通常一处都没有。
         """
         html = render() + panel_view.login_page("x")
-        marks = re.findall(r"<svg[^>]*aria-label=\"BYWOOD\".*?</svg>", html,
-                           re.S)
-        inside = sum(m.upper().count("#7ED1CD") for m in marks)
-        total = html.upper().count("#7ED1CD")
-        self.assertEqual(inside, total,
-                         "标志主青出现在了标志图形之外")
+        marks = re.compile(r"<svg[^>]*aria-label=\"BYWOOD\".*?</svg>", re.S)
+        rest = RE_TEAL_FIELD.sub("", marks.sub("", html))
+        self.assertNotIn("#7ED1CD", rest.upper(),
+                         "标志主青当前景用了（color / border / stroke / fill）")
+
+
+class TestBrandField(unittest.TestCase):
+    """品牌面色（v5.1）：标志青做底。BRAND.md §2 的用法纪律——
+    每屏 ≤1 块、块内只放墨字或主色字、不放白字不放赭石、标志用墨版。"""
+
+    def test_the_login_page_has_exactly_one_field(self):
+        """登录页是品牌时刻（接收层），青面的主场；一块，不多。"""
+        html = panel_view.login_page("")
+        self.assertEqual(html.count("class=field>"), 1)
+
+    def test_the_dashboard_has_none(self):
+        """后台那一屏是工作层：工作层的青面只给 deck 幕封（BRAND-LANGUAGE §二），
+        管理后台不开。"""
+        self.assertNotIn("class=field>", render())
+
+    def test_ink_on_teal_and_the_mono_mark(self):
+        """三件套固定不拆：青底 · 墨字 · 墨版标志。块的文字色是墨（rgba 黑
+        .9），山形走 currentColor 继承它——青山形在青面上会消失。"""
+        css = css_without_comments()
+        rule = re.search(r"\.login \.field\{([^}]+)\}", css)
+        self.assertIsNotNone(rule, "登录页没有品牌面色块的样式")
+        self.assertIn("background:var(--field-brand)", rule.group(1))
+        self.assertIn("color:var(--on-field)", rule.group(1))
+        root = re.search(r":root\{([^}]+)\}", css).group(1)
+        self.assertRegex(root, r"--on-field:rgba\(0,0,0,\.9\d*\)")
+        # 块里的标志继承块的字色，不走浅底那套 --wordmark
+        brand = re.search(r"\.login \.field \.brand\{([^}]+)\}", css)
+        self.assertIsNotNone(brand)
+        self.assertIn("color:inherit", brand.group(1))
+
+    def test_nothing_white_or_ochre_inside_the_field(self):
+        """白字压青 1.77、赭石压青 2.81，都不过。块内不放链接（赭）、
+        不放按钮（主色底白字）、不放任何自带颜色的东西。"""
+        html = panel_view.login_page("x")
+        field = re.search(r"<div class=field>(.*?)</div>\s*<div class=body>",
+                          html, re.S)
+        self.assertIsNotNone(field, "登录页的青面块结构变了")
+        inner = field.group(1)
+        for banned in ("<a ", "<button", "class=primary", "class=chip",
+                       "class=muted", "style="):
+            self.assertNotIn(banned, inner, f"青面块里出现了 {banned}")
+
+    def test_the_field_is_the_same_teal_in_both_modes(self):
+        """palette.json：fieldBrand 两模式同值，块内墨字——深色模式不翻它。"""
+        css = css_without_comments()
+        self.assertEqual(css.count("--field-brand:#7ED1CD"), 1,
+                         "品牌面色只在 :root 定一次，深色块不该再写一遍")
+
+    def test_the_field_carries_one_judgement_not_a_slogan(self):
+        """语法「判断先行」：青面上是一句 ≤14 字、能被复述的判断。"""
+        html = panel_view.login_page("")
+        say = re.search(r"<p class=say>([^<]+)</p>", html)
+        self.assertIsNotNone(say, "青面块里没有那一句")
+        text = say.group(1).rstrip("。")
+        self.assertLessEqual(len(text), 14, f"那一句太长了：{text}")
+        self.assertIn("面板负责发现", text)
 
 
 class TestQueueingIsHonest(unittest.TestCase):
@@ -292,7 +364,7 @@ class TestDashboardComponents(unittest.TestCase):
 
     def test_sidebar_active_is_tint_not_deep_block(self):
         """03 场景明文点名的 bug：侧栏激活态用了深底白字。
-        应该是雾青底 + 品牌藏青字。"""
+        应该是主浅调底 + 主色字。"""
         css = css_without_comments()
         rule = re.search(r"\.side nav a\.on\{([^}]+)\}", css)
         self.assertIsNotNone(rule)
@@ -307,7 +379,7 @@ class TestDashboardComponents(unittest.TestCase):
     def test_the_double_chevron_is_fully_retired(self):
         """v5 换标后双箭图形语言整体退役（BRAND.md §4）：区块前标、
         链接尾标、加载动画，全部没有对应物。链接可辨识性交给赭石色 +
-        下划线悬停态；区块层级交给字重与藏青字色。
+        下划线悬停态；区块层级交给字重与深青字色。
 
         这条查的是**页面字节**，CSS/JS 注释也算——和 emoji 那条一个道理，
         最严也最省事。
@@ -318,7 +390,7 @@ class TestDashboardComponents(unittest.TestCase):
         self.assertNotIn("»", html, "双箭已随 v5 换标退役，页面上不该再出现")
 
     def test_row_actions_are_small_and_blue(self):
-        """scenarios/03：「行操作用 13px 蓝字链接」（v5 落在藏青上）。
+        """scenarios/03：「行操作用 13px 蓝字链接」（v5 落在主色深青上）。
 
         模板里通用的 `a` 是 accent 赭石，和这条冲突——仲裁顺序里
         **场景文件规则高于可执行模板**，所以行操作听场景的。
@@ -553,7 +625,7 @@ class TestDarkMode(unittest.TestCase):
         self.assertEqual(len(dark), 2, "深色模式应该只有手动和跟随系统两处")
         # 组件规则里不许再出现深色专属色值
         body = css.split("*{box-sizing", 1)[1]
-        for token in ("#0F1318", "#1B222B", "#3CAAD2", "#2E88AB"):
+        for token in ("#0F1318", "#1B222B", "#6AC1BD", "#48A8A3", "#163B39"):
             self.assertNotIn(token, body,
                              f"组件区出现了深色专属色值 {token}")
 

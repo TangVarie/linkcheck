@@ -20,11 +20,18 @@ from typing import Any, Optional
 from . import summary
 
 _STYLE = """
-/* BYWOOD 设计系统 v5.0.1 · 界面轨「管理后台」（scenarios/03-dashboard.md）
+/* BYWOOD 设计系统 v5.4.0（色板 v5.1）· 界面轨「管理后台」（scenarios/03-dashboard.md）
  *
- * v5 品牌换届「青赭双色制」：主色藏青接动作与结构，强调色赭石接旧品牌红
+ * v5 品牌换届「青赭双色制」：主色深青接动作与结构，强调色赭石接旧品牌红
  * 的价值与增长；「双箭分发」（藏蓝×正红）连同它的链接尾标一起退役，
  * 标志换成山形。版式零变更——变的是品牌层，不是骨架。
+ *
+ * 色板 v5.1「标志青回归」（2026-09-02）：主色由渐变冷端的深档（H196°，
+ * 整套读成深湖蓝）收回到标志实心青同色相的深档 #1E5754（H177°，白底
+ * 8.25:1）；深色模式主色改渐变暖端 #6AC1BD（深底 8.85:1，按钮仍压墨字）。
+ * 标志青由「仅标志图形」放开为**品牌面色**：做底不做字，块内只放
+ * 墨字或主色字，每屏 ≤1 块——本面板只在登录页（品牌时刻）开这一块，
+ * 后台那一屏（工作层）不开。token 一个没改名，只改值（meta.namingRule）。
  *
  * 色值全部来自 tokens/palette.json 的 screen 节——它是全轨色板的唯一事实源，
  * 任何一处不一致按设计系统的规矩算**构建错误**，不是审美分歧。
@@ -44,11 +51,13 @@ _STYLE = """
  *     靠 --on-primary 这个 token 翻转实现的
  */
 :root{
-  --primary:#1C4F62; --primary-dark:#123A48;
+  --primary:#1E5754; --primary-dark:#16413F;
   --accent:#B8502F; --money:#B8502F;
-  --on-primary:#FFF; --wordmark:#1C4F62;
-  --block-primary:#1C4F62; --block-accent:#B8502F;
+  --on-primary:#FFF; --wordmark:#1E5754;
+  --block-primary:#1E5754; --block-accent:#B8502F;
   --tint-primary:#E3EFEF; --tint-accent:#F8EAE2;
+  /* 品牌面色（v5.1）：标志青做底，块内恒墨字。两种模式同值，所以只在这儿定一次。 */
+  --field-brand:#7ED1CD; --on-field:rgba(0,0,0,.90);
   --success:#00B578; --warning:#FF8F1F; --danger:#D92B3C;
   --success-deep:#006B4A; --warning-deep:#995400; --danger-deep:#B02330;
   --bg:#F3F4F6; --bg-secondary:#EAECEF; --surface:#FFFFFF;
@@ -66,13 +75,14 @@ _STYLE = """
   color-scheme:light;
 }
 /* 深色模式：只翻 token。画布仍比表面深一档；深青主块照旧白字（block-primary
- * 不翻，palette.json 深色组它也是 #1C4F62）；主按钮换亮青底 + 墨字。 */
+ * 不翻，palette.json 深色组它也是 #1E5754）；主按钮换亮青底 + 墨字；
+ * 品牌面色不翻（两模式同值，块内照旧墨字）。 */
 [data-theme=dark]{
-  --primary:#3CAAD2; --primary-dark:#2E88AB;
+  --primary:#6AC1BD; --primary-dark:#48A8A3;
   --accent:#D97E55; --money:#D97E55;
   --on-primary:#0F1318; --wordmark:rgba(255,255,255,.92);
   --block-accent:#A84528;
-  --tint-primary:#16323C; --tint-accent:#3D291F;
+  --tint-primary:#163B39; --tint-accent:#3D291F;
   --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
   --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
   --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
@@ -87,11 +97,11 @@ _STYLE = """
 }
 @media (prefers-color-scheme:dark){
   :root:not([data-theme=light]){
-    --primary:#3CAAD2; --primary-dark:#2E88AB;
+    --primary:#6AC1BD; --primary-dark:#48A8A3;
     --accent:#D97E55; --money:#D97E55;
     --on-primary:#0F1318; --wordmark:rgba(255,255,255,.92);
     --block-accent:#A84528;
-    --tint-primary:#16323C; --tint-accent:#3D291F;
+    --tint-primary:#163B39; --tint-accent:#3D291F;
     --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
     --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
     --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
@@ -127,8 +137,9 @@ svg{display:block;flex:none}
 .side .brand{height:64px;display:flex;align-items:center;gap:8px;
   padding:0 16px;border-bottom:1px solid var(--border);flex:none}
 /* 品牌区：山形 mark + 特粗词标（templates/dashboard.html 的定式）。
- * 颜色走 --wordmark：浅底藏青、深底白——独立山形在浅底不用标志主青
- * （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。 */
+ * 颜色走 --wordmark：浅底深青、深底白——独立山形在浅底不用标志主青
+ * （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。
+ * 标志有上限没有下限（v5.1）：页眉 ≤24px，这里的山形 16px。 */
 .brand{color:var(--wordmark)}
 .brand b{font-size:17px;font-weight:800;letter-spacing:-.01em;
   font-family:'Arial Black','Helvetica Neue',Futura,var(--font-sans)}
@@ -139,7 +150,7 @@ svg{display:block;flex:none}
 .side nav a{display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;
   font-size:14px;font-weight:500;color:var(--text);text-decoration:none}
 .side nav a:hover{background:var(--fill);text-decoration:none}
-/* 激活态是雾青底 + 品牌藏青字，不是深青底白字（03 场景点名的高发 bug） */
+/* 激活态是主浅调底 + 主色字，不是深青底白字（03 场景点名的高发 bug） */
 .side nav a.on{background:var(--tint-primary);color:var(--primary);
   font-weight:600}
 .side nav a .cnt{margin-left:auto;font-size:12px;color:var(--text-faint)}
@@ -201,7 +212,7 @@ td{padding:12px;border-top:1px solid var(--border);font-size:14px;
 tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
 td.right{text-align:right}
-/* 行操作：13px 品牌藏青。scenarios/03 明写「行操作用 13px 蓝字链接」，
+/* 行操作：13px 主色深青。scenarios/03 明写「行操作用 13px 蓝字链接」，
  * 而模板里通用的 a 是 accent 赭石——仲裁顺序中**场景文件规则高于模板**，
  * 这一处听场景的。 */
 td a.act{font-size:13px;color:var(--primary)}
@@ -243,7 +254,7 @@ tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary
 .problem li{margin:3px 0}
 .problem .icon,.note .icon{margin-top:3px}
 
-/* ---------- 控件：高 40 / 直角 / 聚焦 2px 品牌藏青环 ---------- */
+/* ---------- 控件：高 40 / 直角 / 聚焦 2px 主色环 ---------- */
 button{font:600 14px/1 var(--font-sans);height:40px;padding:0 16px;border:0;
   background:var(--fill);color:var(--text-dark);cursor:pointer}
 button:hover:not(:disabled){background:var(--bg-secondary)}
@@ -268,10 +279,21 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 :where(button,input,a){transition:background-color .12s ease-out,
   transform .12s ease-out}
 
-/* ---------- 登录 ---------- */
+/* ---------- 登录：品牌时刻，这套面板唯一的一块品牌面色 ---------- */
+/* 登录页是 BRAND.md §2 点名的「品牌时刻」（接收层，BRAND-LANGUAGE §二），
+ * 也是本面板唯一一块**品牌面色**（v5.1 起标志青可以做底不做字）：
+ * 青底 · 墨字 · 墨版标志，三件套固定不拆。块内不放白字（1.77）、不放赭石
+ * （2.81）；主按钮在表单最底，和青面隔着标题与输入框，不相邻。
+ * 块内那一句是这个面板的判断（≤14 字），不是口号——语法「判断先行」。
+ * 后台那一屏（工作层）不开青面：工作层的青面只给 deck 幕封。 */
 .login{max-width:360px;margin:14vh auto;background:var(--surface);
-  border:1px solid var(--border);padding:28px}
-.login .brand{display:flex;align-items:center;gap:8px;margin-bottom:20px}
+  border:1px solid var(--border)}
+.login .field{background:var(--field-brand);color:var(--on-field);
+  padding:20px 28px 18px}
+.login .field .brand{display:flex;align-items:center;gap:8px;color:inherit}
+.login .field .say{margin:14px 0 0;font-size:15px;font-weight:500;
+  color:inherit}
+.login .body{padding:24px 28px 28px}
 .login h1{font-size:20px;margin:0 0 4px}
 .login p{margin:0 0 20px}
 .login button{width:100%}
@@ -842,7 +864,8 @@ def _icon(name: str, cls: str = "icon") -> str:
 # 品牌山形 mark（v5 换标：四条弧带自下而上层叠成山脊）。几何逐字取自
 # logo/elements/bywood-mark-current.svg——禁止重绘、旋转、拆散弧带
 # （BRAND.md §4）。颜色走 currentColor，由 .brand 的 --wordmark 定：
-# 浅底藏青、深底白。标志主青 #7ED1CD 不进来：独立山形在浅底一律不用青
+# 浅底深青、深底白、品牌面色上墨字（青山形在青面上会消失，用墨版）。
+# 标志主青 #7ED1CD 不进这个图形：独立山形在浅底一律不用青
 # （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。
 _MARK = (
     '<svg width="52" height="16" viewBox="0 0 292.502 90" role="img"'
@@ -883,18 +906,25 @@ def _shell(title: str, body: str, *, csrf: str = "") -> str:
 
 def login_page(message: str = "") -> str:
     error = f"<p class=err>{_e(message)}</p>" if message else ""
+    # 品牌面色三件套：青底 · 墨字 · 墨版标志（山形走 currentColor，
+    # .field 的 color 就是墨）。那一句是这个面板的判断，登录前先看到它。
     return _shell("监控面板", f"""
 <div class=login>
-  <div class=brand>{_MARK}<b>BYWOOD</b></div>
-  <h1>内容监控面板</h1>
-  <p class=muted>小红书 / 抖音笔记巡检</p>
-  {error}
-  <form method=post action=/login>
-    <input type=password name=password placeholder=口令 autofocus
-           autocomplete=current-password>
-    <p></p>
-    <button type=submit class=primary>进去</button>
-  </form>
+  <div class=field>
+    <div class=brand>{_MARK}<b>BYWOOD</b></div>
+    <p class=say>面板负责发现，飞书负责处理。</p>
+  </div>
+  <div class=body>
+    <h1>内容监控面板</h1>
+    <p class=muted>小红书 / 抖音笔记巡检</p>
+    {error}
+    <form method=post action=/login>
+      <input type=password name=password placeholder=口令 autofocus
+             autocomplete=current-password>
+      <p></p>
+      <button type=submit class=primary>进去</button>
+    </form>
+  </div>
 </div>""")
 
 
