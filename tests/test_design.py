@@ -161,6 +161,56 @@ class TestQueueingIsHonest(unittest.TestCase):
         self.assertNotIn("skipped_tables", self.js,
                          "标记判据退回到了「按被拒的表排除」——那漏掉写失败的行")
 
+    def test_rows_on_a_hidden_project_page_do_not_count_as_visible(self):
+        """待办按项目分页之后「看得见」多了一层：这一行所在的 tab 页得是
+        当前这一页。别页的行 `display` 不是 none（它们只是整页 hidden），
+        只看 `style.display` 会把别页勾过的行一起提交。"""
+        body = self.js[self.js.index("function visible("):]
+        body = body[:body.index("\n  }")]
+        self.assertRegex(body, r"tabpanel|panelOf",
+                         "visible() 不看所在 tab 页——别页的勾会一起提交")
+        self.assertIn("hidden", body)
+
+    def test_switching_project_page_clears_the_ticks_left_behind(self):
+        """留着别页的勾，下次切回去一点就提交，而你早忘了勾过。
+        勾「排队刷新」是要花钱的，不留这种潜伏状态。"""
+        body = self.js[self.js.index("function showTab("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn(".todoPick", body)
+        self.assertIn(".todoAll", body)
+        self.assertRegex(body, r"checked\s*=\s*false")
+
+    def test_select_all_is_per_page(self):
+        """一个全局「全选」会把别的项目页里的行也勾上——正好是上一条要防的事。
+        所以每页表头一个，只管自己那张表。"""
+        self.assertNotIn('getElementById("todoAll")', self.js)
+        handler = self.js[self.js.index('querySelectorAll("#todos .todoAll")'):]
+        handler = handler[:handler.index("sync();")]
+        self.assertIn('closest("table")', handler)
+
+    def test_the_last_project_page_is_remembered_locally(self):
+        """重载后回到同一页。存本地：这是每个人自己的阅读位置，不是共享状态。"""
+        self.assertIn('"linkcheck.tab"', self.js)
+        self.assertIn("localStorage.getItem(TAB)", self.js)
+        self.assertIn("localStorage.setItem(TAB", self.js)
+        # 加载时的兜底（记住的项目这一轮没待办 → 退回第一页）不是「选」，
+        # 不能覆盖记住的那个：一张表停用又启用，位置不该丢。
+        self.assertIn("showTab(pick.dataset.tab, false)", self.js)
+        self.assertIn("showTab(t.dataset.tab, true)", self.js)
+
+    def test_filtering_updates_the_count_on_every_tab(self):
+        """筛「风控」时别的项目命中了几行，得在各自 tab 上就看得见，
+        不然分页反而把跨表视角弄丢了。"""
+        handler = self.js[self.js.index('getElementById("filter")'):]
+        handler = handler[:handler.index("\n  });")]
+        self.assertIn("recount()", handler)
+
+    def test_the_active_tab_uses_the_primary_colour(self):
+        """设计系统对 tab 只定了一条：激活 Tab 用主色。"""
+        rule = re.search(r"\.tabs \.tab\.on\{([^}]*)\}", css_without_comments())
+        self.assertIsNotNone(rule, "没有激活 tab 的样式")
+        self.assertIn("var(--primary)", rule.group(1))
+
 
 def css_without_comments() -> str:
     """去掉 CSS 注释再查。注释里本来就写着「border-radius: 0」这种句子

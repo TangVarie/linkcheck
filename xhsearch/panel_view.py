@@ -311,6 +311,25 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 .queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
   margin-bottom:12px;background:var(--surface);border:1px solid var(--border);
   padding:12px}
+/* ---------- 待办按项目分页的 tab 条 ---------- */
+/* 设计系统只定了一条：激活 Tab 用主色（DESIGN.md §2）。其余按后台轨控件
+ * 规格来：高 40、14/500、直角、发丝线承重；激活 = 主色字 + 2px 主色底线。
+ * 不做深底白字的 tab——那是按钮的样子，不是导航的样子。 */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);
+  margin-bottom:12px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tabs .tab{height:40px;padding:0 12px;background:none;border:0;
+  border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:500;
+  color:var(--text);white-space:nowrap;display:inline-flex;align-items:center;
+  gap:8px;flex:none}
+.tabs .tab:hover:not(:disabled){background:var(--fill)}
+.tabs .tab.on{color:var(--primary);border-bottom-color:var(--primary);
+  font-weight:600}
+/* tab 上的条数：颜色说的是这个项目最坏的一档（同徽标的加深档），
+ * 所以严重度色要压过激活态的主色——信息先于装饰。 */
+.tabs .cnt{font-size:12px;font-family:var(--font-num);color:var(--text-faint)}
+.tabs .tab.on .cnt{color:var(--primary)}
+.tabs .tab .cnt.r{color:var(--danger-deep)}
+.tabs .tab .cnt.a{color:var(--warning-deep)}
 .proj{display:flex;gap:12px;align-items:flex-start;padding:12px 0;
   border-top:1px solid var(--border);flex-wrap:wrap}
 .proj:first-child{border-top:0}
@@ -417,6 +436,50 @@ _SCRIPT = r"""
       .then(function(){ location.reload(); })
       .catch(function(){ btn.disabled = false; btn.textContent = "重新取数"; });
   });
+  // ---- 待办：按项目分页 ----
+  // 每个项目一个 tab。tab 上的数字是这一页里当前没被筛掉的行数。
+  var tabs = Array.prototype.slice.call(document.querySelectorAll("#todos .tab"));
+  var panels = Array.prototype.slice.call(document.querySelectorAll("#todos .tabpanel"));
+  var TAB = "linkcheck.tab";     // 上次看的是哪个项目，存本地：重载后回到同一页
+  function panelOf(tr){ return tr ? tr.closest(".tabpanel") : null; }
+  function activeTab(){
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].classList.contains("on")) return tabs[i];
+    return null;
+  }
+  function recount(){
+    panels.forEach(function(p){
+      var n = 0, rows = p.querySelectorAll("tbody tr");
+      for (var i = 0; i < rows.length; i++) if (rows[i].style.display !== "none") n++;
+      var cnt = document.querySelector("#todos .tab[data-tab='" + p.dataset.tab + "'] .cnt");
+      if (cnt) cnt.textContent = n;
+    });
+  }
+  // remember=true 只在人亲手切页时给：存的是「你选的是哪个项目」。
+  // 页面加载时的兜底（记住的那个项目这一轮没有待办，退回第一页）不算选，
+  // 不能把记住的覆盖掉——不然一张表停用又启用，你的位置就丢了。
+  function showTab(id, remember){
+    tabs.forEach(function(t){
+      var on = t.dataset.tab === id;
+      t.classList.toggle("on", on);
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+    });
+    panels.forEach(function(p){
+      var on = p.dataset.tab === id;
+      if (!on) {
+        // 切走的那一页把勾清掉。按钮上的数字只算眼前这一页（见 visible），
+        // 留着别页的勾，下次切回去一点就提交，而你早忘了勾过——
+        // 勾「排队刷新」是要花钱的，不留这种潜伏状态。
+        var boxes = p.querySelectorAll(".todoPick, .todoAll");
+        for (var k = 0; k < boxes.length; k++) boxes[k].checked = false;
+      }
+      p.hidden = !on;
+    });
+    var t = activeTab();
+    if (!remember || !t) return;
+    try { localStorage.setItem(TAB, t.dataset.project || ""); } catch (e) {}
+  }
+
   var box = document.getElementById("filter");
   if (box) box.addEventListener("input", function(){
     var q = box.value.trim().toLowerCase();
@@ -425,6 +488,9 @@ _SCRIPT = r"""
       var hit = !q || rows[i].textContent.toLowerCase().indexOf(q) >= 0;
       rows[i].style.display = hit ? "" : "none";
     }
+    // 筛「风控」时别的项目命中了几行，在各自 tab 上就看得见，不用一页页翻。
+    recount();
+    sync();
   });
 
   // ---- 待办：批量勾「排队刷新」 + 标出自上次以来新出现的 ----
@@ -435,8 +501,13 @@ _SCRIPT = r"""
   function rowsOf(el){ return el.closest("tr"); }
   // **只算屏幕上看得见的行。** 筛「风控」勾 20 行、改筛词成「负面」再勾 15 行，
   // 不看可见性就会提交 35 行——而你只看得见 15 行。勾「排队刷新」是要花钱的，
-  // 提交的行数必须和眼睛看到的一致。
-  function visible(tr){ return tr && tr.style.display !== "none"; }
+  // 提交的行数必须和眼睛看到的一致。分页之后「看得见」还多一层：
+  // 这一行所在的 tab 页得是当前这一页（别的页是 hidden 的）。
+  function visible(tr){
+    if (!tr || tr.style.display === "none") return false;
+    var p = panelOf(tr);
+    return !(p && p.hidden);
+  }
   function selected(){
     var out = [];
     for (var i = 0; i < picks.length; i++) {
@@ -454,18 +525,44 @@ _SCRIPT = r"""
     if (btnQ) btnQ.disabled = n === 0;
   }
   for (var i = 0; i < picks.length; i++) picks[i].addEventListener("change", sync);
-  var all = document.getElementById("todoAll");
-  if (all) all.addEventListener("change", function(){
-    for (var i = 0; i < picks.length; i++) {
-      var tr = rowsOf(picks[i]);
-      if (tr.style.display !== "none") picks[i].checked = all.checked;
+  // 每一页表头一个「全选」，只管自己这一页里没被筛掉的行。
+  var alls = document.querySelectorAll("#todos .todoAll");
+  for (var a = 0; a < alls.length; a++) alls[a].addEventListener("change", function(ev){
+    var head = ev.target;
+    var mine = head.closest("table").querySelectorAll(".todoPick");
+    for (var i = 0; i < mine.length; i++) {
+      var tr = rowsOf(mine[i]);
+      if (tr.style.display !== "none") mine[i].checked = head.checked;
     }
     sync();
   });
+
+  if (tabs.length) {
+    var wanted = null;
+    try { wanted = localStorage.getItem(TAB); } catch (e) {}
+    var pick = tabs[0];
+    tabs.forEach(function(t){ if (wanted && t.dataset.project === wanted) pick = t; });
+    showTab(pick.dataset.tab, false);
+    tabs.forEach(function(t){
+      t.addEventListener("click", function(){ showTab(t.dataset.tab, true); sync(); });
+    });
+    // role=tablist 的常规键盘行为：左右方向键切页
+    tabs[0].parentNode.addEventListener("keydown", function(ev){
+      if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+      var cur = tabs.indexOf(activeTab());
+      var next = (cur + (ev.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      showTab(tabs[next].dataset.tab, true);
+      sync();
+      tabs[next].focus();
+      ev.preventDefault();
+    });
+  }
   if (btnQ) btnQ.addEventListener("click", function(){
     var rows = selected();
     if (!rows.length) return;
-    if (!confirm("给这 " + rows.length + " 行勾上「排队刷新」？\n\n" +
+    var cur = activeTab();
+    var who = cur ? "「" + (cur.dataset.project || "") + "」" : "";
+    if (!confirm("给" + who + "这 " + rows.length + " 行勾上「排队刷新」？\n\n" +
                  "面板不发付费请求——由后台 cron 在五分钟内接手，" +
                  "花费和你在飞书里手工勾完全一样。")) return;
     btnQ.disabled = true;
@@ -487,7 +584,7 @@ _SCRIPT = r"""
         for (var m = 0; m < picks.length; m++) {
           var tr2 = rowsOf(picks[m]);
           if (!tr2 || queuedRecords.indexOf(tr2.dataset.rec) < 0) continue;
-          var cell = tr2.children[6];
+          var cell = tr2.querySelector("td.when");
           if (cell && !cell.querySelector(".chip")) {
             var chip = document.createElement("span");
             chip.className = "chip"; chip.textContent = "排队中";
@@ -504,7 +601,7 @@ _SCRIPT = r"""
         // 交完就把勾清掉。留着的话按钮重新变可点、数字还是原来那个，
         // 看着像没成功，运营会再点一次——不会翻倍花钱，但会白白再跑一次全量取数。
         for (var k = 0; k < picks.length; k++) picks[k].checked = false;
-        if (all) all.checked = false;
+        for (var a2 = 0; a2 < alls.length; a2++) alls[a2].checked = false;
         sync();
       })
       .catch(function(err){ if (qOut) qOut.textContent = String(err); btnQ.disabled = false; });
@@ -858,46 +955,96 @@ def _counts_chips(counts: dict) -> str:
     return "".join(out)
 
 
-def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
+def _worst_class(todos) -> str:
+    """一组待办里最坏的那档：r（风控/失效/刷新失败）> a（负面/限流/卡住）> 中性。
+    tab 上那个数字按它着色——tab 顺序不按严重度重排，严重度就得靠颜色说。"""
+    worst = ""
+    for todo in todos:
+        for reason in todo.reasons:
+            cls = _REASON_CLASS.get(reason, "")
+            if cls == "r":
+                return "r"
+            if cls == "a":
+                worst = "a"
+    return worst
+
+
+def _todo_table(todos, offset_hours: float, show_digest: bool,
+                project_order=()) -> str:
+    """待办：**每个项目一个 tab**，页内按严重度排序。
+
+    原来是所有项目拉平成一张长表。跨表视角是这个面板存在的理由，但表一多
+    每个项目的几行告警就被别的项目的几十行淹掉，运营找自己那几行要滚很久。
+    现在按项目分页，tab 上带条数（颜色 = 这个项目最坏的一档），页内仍按
+    严重度排——「哪个项目有事、有多严重」一眼扫完 tab 条就知道。
+
+    tab 顺序跟「各项目」那一栏一致（注册表顺序），**不按严重度重排**：
+    位置每次刷新都跳的话运营找不到自己的项目。严重度靠数字的颜色说。
+    只给有待办的项目开 tab——没事的项目在下面项目卡里本来就是绿的。
+    """
     if not todos:
         return ("<div class=empty>" + _icon("check-circle") +
                 "没有需要处理的行。"
                 "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
                 "刷新失败 / 卡住了 —— 一条都没有。</div></div>")
-    head = ("<tr><th><input type=checkbox id=todoAll title='全选'></th>"
-            "<th>项目</th><th>哪一条</th><th>为什么</th><th>诊断信息</th>"
-            "<th>评论数</th><th>最近检查</th><th></th></tr>")
-    body = []
+    groups: dict = {}
+    for label in project_order:
+        groups.setdefault(label, [])
     for todo in todos:
-        extra = ""
-        if show_digest and (todo.negative_digest or todo.digest):
-            extra = (f"<div class=muted style='margin-top:4px'>"
-                     f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
-        body.append(
-            f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
-            f"data-tbl='{_e(todo.table_id)}' data-key='{_e(todo.key)}'>"
-            "<td class=nowrap><input type=checkbox class=todoPick></td>"
-            f"<td class=nowrap>{_e(todo.project)}</td>"
-            f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
-            f"<td>{_chips(todo.reasons, _REASON_CLASS)}</td>"
-            f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
-            f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
-            # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
-            # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
-            # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT），两边长一样。
-            f"<td class=nowrap>{_e(_stamp(todo.checked_at_ms, offset_hours))}"
-            f"{' <span class=chip>排队中</span>' if todo.queued else ''}</td>"
-            f"<td class=nowrap><a href='{_e(todo.record_url)}' "
-            "target=_blank rel='noopener noreferrer' class=act>去这一行</a></td>"
-            "</tr>")
+        groups.setdefault(todo.project, []).append(todo)
+    groups = {label: items for label, items in groups.items() if items}
+    # 页内不再有「项目」列——整页都是同一个项目，那一栏只会占宽度。
+    # 「新」标记（tr.fresh td:nth-child(2)）随之落到「哪一条」上，正好在标识旁边。
+    head = ("<tr><th><input type=checkbox class=todoAll title='全选这一页'></th>"
+            "<th>哪一条</th><th>为什么</th><th>诊断信息</th>"
+            "<th>评论数</th><th>最近检查</th><th></th></tr>")
+    tabs, panels = [], []
+    for index, (label, items) in enumerate(groups.items()):
+        tid = f"p{index}"
+        first = index == 0
+        cnt_cls = ("cnt " + _worst_class(items)).strip()
+        tabs.append(
+            f"<button type=button role=tab class='tab{' on' if first else ''}' "
+            f"aria-selected={'true' if first else 'false'} data-tab='{tid}' "
+            f"data-project='{_e(label)}' aria-controls='todos-{tid}'>"
+            f"{_e(label)} <span class='{cnt_cls}'>{len(items)}</span></button>")
+        body = []
+        for todo in items:
+            extra = ""
+            if show_digest and (todo.negative_digest or todo.digest):
+                extra = (f"<div class=muted style='margin-top:4px'>"
+                         f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
+            body.append(
+                f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
+                f"data-tbl='{_e(todo.table_id)}' data-key='{_e(todo.key)}'>"
+                "<td class=nowrap><input type=checkbox class=todoPick></td>"
+                f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
+                f"<td>{_chips(todo.reasons, _REASON_CLASS)}</td>"
+                f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
+                f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
+                # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
+                # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
+                # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT，按 td.when 找格子）。
+                f"<td class='nowrap when'>{_e(_stamp(todo.checked_at_ms, offset_hours))}"
+                f"{' <span class=chip>排队中</span>' if todo.queued else ''}</td>"
+                f"<td class=nowrap><a href='{_e(todo.record_url)}' "
+                "target=_blank rel='noopener noreferrer' class=act>去这一行</a></td>"
+                "</tr>")
+        panels.append(
+            f"<div class=tabpanel id='todos-{tid}' role=tabpanel data-tab='{tid}' "
+            f"data-project='{_e(label)}'{'' if first else ' hidden'}>"
+            f"<div class=tablewrap><table class=todos><thead>{head}</thead>"
+            f"<tbody>{''.join(body)}</tbody></table></div></div>")
+    # #todos 包住所有 tab 页：脚本里「所有待办行」仍然是 `#todos tbody tr`，
+    # 「新」标记、筛选、勾选计数都不用知道有几页。
     return (f"""<div class=queuebar>
   <button type=button id=btnQueue disabled>勾「排队刷新」（<span id=pickN>0</span>）</button>
   <span class=muted>面板不发付费请求——勾上之后由 cron 在五分钟内接手，
   和你在飞书里手工勾是同一条路。</span>
   <span id=queueOut class=muted></span>
 </div>
-<div class=tablewrap><table id=todos><thead>{head}</thead>"""
-            f"<tbody>{''.join(body)}</tbody></table></div>")
+<div id=todos><div class=tabs role=tablist aria-label='按项目分开看'>{''.join(tabs)}</div>"""
+            f"{''.join(panels)}</div>")
 
 
 def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
@@ -1287,9 +1434,11 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     <div class='kpi stagger-in'>{bar}</div>
 
     <h2 id=s-todo>要人管的行 <span class=n>{len(todos)}{'+' if todos_hidden else ''}</span></h2>
-    <p class=sub>跨所有项目拉平，按严重度排序。点「去这一行」直接落到飞书表里那一行——
-      面板负责发现，具体处理在飞书里做。{hidden_note}</p>
-    {_todo_table(todos, offset_hours, config.show_digest)}
+    <p class=sub>按项目分开看：每个项目一个标签，标签上的数字是这个项目要人管的行数
+      （红 = 有风控 / 失效 / 刷新失败），每一页里按严重度排序；筛选时各标签上显示命中数。
+      点「去这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做。{hidden_note}</p>
+    {_todo_table(todos, offset_hours, config.show_digest,
+                 project_order=[p.label for p in projects])}
     {_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
 
     <h2 id=s-proj>各项目 <span class=n>{len(projects)}</span></h2>
