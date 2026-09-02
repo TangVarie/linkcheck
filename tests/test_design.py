@@ -142,6 +142,21 @@ class TestQueueingIsHonest(unittest.TestCase):
             self.js, r"checked\s*=\s*false",
             "提交成功后没有取消勾选")
 
+    def test_disabling_or_removing_a_table_reloads_the_page(self):
+        """停用/移除改的是表清单，而这一页是按旧清单渲染的：不重载，
+        运营会对着一张已经不在监控中的表勾「排队刷新」。"""
+        branch = self.js[self.js.index('act === "enable" || act === "remove"'):]
+        branch = branch[:branch.index("return;")]
+        self.assertIn("location.reload()", branch)
+
+    def test_queued_rows_are_marked_in_place_but_refused_tables_are_not(self):
+        """勾成功的行就地标「排队中」——面板上分开「同样的错」和「还没刷回来」
+        的唯一信号；服务端拒掉的表（skipped_tables）不能标，标了就是假的。"""
+        success = self.js[self.js.index("skipped_tables"):]
+        success = success[:success.index("sync();")]
+        self.assertIn("排队中", success)
+        self.assertIn("indexOf(tr2.dataset.tbl) >= 0) continue", success)
+
 
 def css_without_comments() -> str:
     """去掉 CSS 注释再查。注释里本来就写着「border-radius: 0」这种句子

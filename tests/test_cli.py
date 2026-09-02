@@ -1012,3 +1012,39 @@ class TestEstimateSaysUnknownNotZero(unittest.TestCase):
         source = inspect.getsource(cli._run_locked)
         self.assertIn("unknown_cost", source)
         self.assertIn("无法估算", source)
+
+
+class TestDisabledTablesAreRecordedForThePanel(unittest.TestCase):
+    """停用的表是从面板上整体消失的。不把名字带过去，「停用了」和「读不到了」
+    在页面上长得一模一样。清单和 _REGISTRY_ROWS 同一处更新、同一处清空。"""
+
+    def _entry(self, label, table_id, enabled):
+        from xhsearch import registry as registry_mod
+        return registry_mod.Entry(record_id="r-" + table_id, label=label,
+                                  target="bascnA:" + table_id, enabled=enabled,
+                                  app_token="bascnA", table_id=table_id)
+
+    def test_disabled_labels_are_kept_next_to_the_usable_rows(self):
+        import os
+        from xhsearch import registry as registry_mod
+        entries = [self._entry("在管", "tblON", True),
+                   self._entry("停了", "tblOFF", False)]
+        with mock.patch.dict(os.environ, {"FEISHU_REGISTRY": "bascnREG:tblREG"}), \
+             mock.patch.object(registry_mod, "read", return_value=entries):
+            targets = cli._entries_or_raise("cli_x", "s")
+        self.assertEqual([t.table_id for t in targets], ["tblON"])
+        self.assertEqual(cli._REGISTRY_DISABLED, ["停了"])
+        self.assertEqual(set(cli._REGISTRY_ROWS), {"tblON"})
+
+    def test_falling_back_to_the_env_list_clears_the_disabled_names(self):
+        """读不到注册表、退回 FEISHU_TABLES 时，「谁停用了」也一起不知道了——
+        留着上一趟的名字会让页面拿旧事实说话。"""
+        import os
+        from xhsearch import registry as registry_mod
+        cli._REGISTRY_DISABLED[:] = ["上一趟留下的"]
+        env = {"FEISHU_REGISTRY": "bascnREG:tblREG", "FEISHU_TABLES": "甲=bascnA:tblON"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(registry_mod, "read", side_effect=RuntimeError("网络挂了")), \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            cli._entries_or_raise("cli_x", "s")
+        self.assertEqual(cli._REGISTRY_DISABLED, [])

@@ -477,8 +477,29 @@ _SCRIPT = r"""
         if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
         return j; }); })
       .then(function(j){
-        if (qOut) qOut.textContent = "已勾 " + j.queued + " 行，等 cron 接手" +
-          (j.failures.length ? "；" + j.failures.length + " 行失败：" + j.failures.join("；") : "");
+        // 勾成功的行就地标上「排队中」——和服务端渲染的是同一个标记（见
+        // _todo_table）。这是页面上唯一能分开「同样的错」和「还没刷回来」的
+        // 信号：标记在，这一行看到的就还是旧结果；标记没了、「最近检查」变新，
+        // 才是这次刷回来的结论。服务端拒掉的表（已停用/已移除）不标。
+        var skippedTables = j.skipped_tables || [];
+        for (var m = 0; m < picks.length; m++) {
+          var tr2 = rowsOf(picks[m]);
+          if (!picks[m].checked || !visible(tr2)) continue;
+          if (skippedTables.indexOf(tr2.dataset.tbl) >= 0) continue;
+          var cell = tr2.children[6];
+          if (cell && !cell.querySelector(".chip")) {
+            var chip = document.createElement("span");
+            chip.className = "chip"; chip.textContent = "排队中";
+            cell.appendChild(document.createTextNode(" "));
+            cell.appendChild(chip);
+          }
+        }
+        var msg = j.queued
+          ? "已勾 " + j.queued + " 行并标了「排队中」，cron 五分钟内接手。标记消失、「最近检查」变新，才是刷回来的新结论；在那之前看到的还是旧的。"
+          : "一行都没勾上。";
+        if (j.skipped && j.skipped.length) msg += " 没勾的：" + j.skipped.join("；") + "。";
+        if (j.failures.length) msg += " " + j.failures.length + " 行写入失败：" + j.failures.join("；");
+        if (qOut) qOut.textContent = msg;
         // 交完就把勾清掉。留着的话按钮重新变可点、数字还是原来那个，
         // 看着像没成功，运营会再点一次——不会翻倍花钱，但会白白再跑一次全量取数。
         for (var k = 0; k < picks.length; k++) picks[k].checked = false;
@@ -619,6 +640,14 @@ _SCRIPT = r"""
       }
       post(act, body).then(function(j){
         if (act === "build") { tell(esc(j.summary) + (j.skipped_options && j.skipped_options.length ? "\n\n这几处要去飞书手工补（补选项会整体覆盖，默认不代劳）：\n· " + j.skipped_options.map(esc).join("\n· ") : ""), j.ok ? "ok" : ""); }
+        if (act === "enable" || act === "remove") {
+          // 表清单变了。服务端在回包之前已经按新清单重取过一遍（_run_action），
+          // 但这一页是按旧清单渲染的：停用的表的待办、KPI、侧栏计数都还挂着。
+          // 不重载的话，运营会对着一张已经不在监控中的表勾「排队刷新」。
+          tell("已" + (act === "remove" ? "移除" : (b.dataset.on === "1" ? "启用" : "停用")) + "，页面按新的表清单重载中…", "muted");
+          location.reload();
+          return;
+        }
         load();
       }).catch(function(err){ tell(esc(String(err)), ""); b.disabled = false; });
     });
@@ -852,7 +881,11 @@ def _todo_table(todos, offset_hours: float, show_digest: bool) -> str:
             f"<td>{_chips(todo.reasons, _REASON_CLASS)}</td>"
             f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
             f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
-            f"<td class=nowrap>{_e(_stamp(todo.checked_at_ms, offset_hours))}</td>"
+            # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
+            # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
+            # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT），两边长一样。
+            f"<td class=nowrap>{_e(_stamp(todo.checked_at_ms, offset_hours))}"
+            f"{' <span class=chip>排队中</span>' if todo.queued else ''}</td>"
             f"<td class=nowrap><a href='{_e(todo.record_url)}' "
             "target=_blank rel='noopener noreferrer' class=act>去这一行</a></td>"
             "</tr>")
@@ -1144,11 +1177,27 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                    if todos_hidden else "")
     # 零个项目要说清楚是「还没加」而不是「都健康」。全零的一屏和
     # 「一切正常」长得一模一样，这是这套东西最难发现的那类故障。
-    empty_note = ("" if overview.projects else
-                  f"<div class=note>{_icon('alert-triangle')}<span>"
-                  "注册表里还没有一张可用的表——"
-                  "在下面「项目」那一栏加第一张。加完等一轮缓存（或点"
-                  "「重新取数」）就会出现在这里。</span></div>")
+    # 停用的表是从页面上**整体消失**的——不说一句，「停用了」和「读不到了」
+    # 在运营眼里长得一模一样（两者要做的事完全不同）。
+    disabled = list(overview.disabled_tables or [])
+    disabled_names = "、".join(_e(n) for n in disabled)
+    if overview.projects:
+        empty_note = ""
+    elif disabled:
+        # 表都在，只是全停了。说「还没有一张可用的表」会把人引去加表。
+        empty_note = (f"<div class=note>{_icon('alert-triangle')}<span>"
+                      f"<b>{len(disabled)} 张表全都停用了</b>（{disabled_names}），"
+                      "现在没有一张表在巡查。要恢复，去下面「项目」里点「启用」。"
+                      "</span></div>")
+    else:
+        empty_note = (f"<div class=note>{_icon('alert-triangle')}<span>"
+                      "注册表里还没有一张可用的表——"
+                      "在下面「项目」那一栏加第一张。加完等一轮缓存（或点"
+                      "「重新取数」）就会出现在这里。</span></div>")
+    disabled_note = ("" if not (disabled and overview.projects) else
+                     f"<p class=sub>另有 <b>{len(disabled)}</b> 张表已停用：{disabled_names}。"
+                     "停用的表不巡查、不统计，行也不在上面的待办里；"
+                     "要恢复，去下面「项目」里点「启用」。</p>")
     projects = overview.projects
     stale_note = ""
     if error:
@@ -1243,7 +1292,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     {_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
 
     <h2 id=s-proj>各项目 <span class=n>{len(projects)}</span></h2>
-    {empty_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
+    {empty_note}{disabled_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
 
     {_projects_section(config)}
 
