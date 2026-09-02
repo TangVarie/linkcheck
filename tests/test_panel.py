@@ -1792,7 +1792,7 @@ class TestDisabledTablesAreSaidOutLoud(unittest.TestCase):
         """只看待办那张表。「排队中」四个字页面字节里永远有——前端就地补标记
         的脚本里写着它——所以要查的是服务端有没有把它渲染进那一行。"""
         page = self._page(summary.Overview(projects=[self._snap(todos=[todo])]))
-        start = page.index("<table id=todos>")
+        start = page.index("<table class=todos>")
         return page[start:page.index("</table>", start)]
 
     def test_a_queued_todo_shows_the_pending_marker(self):
@@ -1806,3 +1806,112 @@ class TestDisabledTablesAreSaidOutLoud(unittest.TestCase):
                                record_url="https://x/base/t?table=tb&record=r1",
                                label="x", reasons=["刷新失败"])
         self.assertNotIn("排队中", self._todo_table(todo))
+
+
+class TestTodosAreSplitByProject(unittest.TestCase):
+    """待办按项目分 tab。表一多，每个项目那几行告警就被别的项目的几十行
+    淹掉，运营找自己那几行要滚很久——所以每个项目一页，tab 上带条数。"""
+
+    def _page(self, snaps):
+        from xhsearch import panel_view
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": "a-long-enough-password",
+            "FEISHU_DOMAIN": "https://x.feishu.cn"})
+        return panel_view.overview_page(
+            overview=summary.Overview(projects=snaps), error="",
+            fetched_at=0.0, config=cfg, csrf="tok")
+
+    def _snap(self, label, table_id, reasons_per_row):
+        todos = [summary.TodoRow(record_id=f"{table_id}-{i}", project=label,
+                                 link_cell="", label=f"笔记{i}",
+                                 record_url=f"https://x/base/t?table={table_id}&record={table_id}-{i}",
+                                 app_token="t", table_id=table_id, reasons=list(reasons))
+                 for i, reasons in enumerate(reasons_per_row)]
+        return summary.ProjectSnapshot(label=label, app_token="t", table_id=table_id,
+                                       total_rows=len(todos), todos=todos)
+
+    def _todos_block(self, page):
+        start = page.index("<div id=todos>")
+        return page[start:page.index("<h2 id=s-proj>", start)]
+
+    def _tabs(self, page):
+        return re.findall(
+            r"<button type=button role=tab class='tab( on)?' aria-selected=(true|false) "
+            r"data-tab='(p\d+)' data-project='([^']*)' aria-controls='todos-\3'>"
+            r"\4 <span class='(cnt[^']*)'>(\d+)</span></button>", page)
+
+    def _panels(self, page):
+        return re.findall(
+            r"<div class=tabpanel id='todos-(p\d+)' role=tabpanel data-tab='\1' "
+            r"data-project='([^']*)'( hidden)?>", page)
+
+    def test_one_tab_and_one_panel_per_project_with_todos(self):
+        page = self._page([self._snap("甲", "ta", [["有负面"], ["置顶掉了"]]),
+                           self._snap("乙", "tb", [["风控中"]])])
+        tabs = self._tabs(page)
+        self.assertEqual([(t[3], t[5]) for t in tabs], [("甲", "2"), ("乙", "1")])
+        panels = self._panels(page)
+        self.assertEqual([(p[1], bool(p[2])) for p in panels], [("甲", False), ("乙", True)],
+                         "第一页展开、其余 hidden——不靠 JS 也先能看到一页")
+        self.assertEqual([(bool(t[0]), t[1]) for t in tabs],
+                         [(True, "true"), (False, "false")])
+
+    def test_rows_land_in_their_own_project_page(self):
+        page = self._page([self._snap("甲", "ta", [["有负面"]]),
+                           self._snap("乙", "tb", [["风控中"], ["刷新失败"]])])
+        block = self._todos_block(page)
+        pages = re.split(r"<div class=tabpanel ", block)[1:]
+        self.assertEqual(len(pages), 2)
+        self.assertIn("data-project='甲'", pages[0])
+        self.assertEqual(pages[0].count("data-tbl='ta'"), 1)
+        self.assertEqual(pages[0].count("data-tbl='tb'"), 0)
+        self.assertIn("data-project='乙'", pages[1])
+        self.assertEqual(pages[1].count("data-tbl='tb'"), 2)
+        self.assertEqual(pages[1].count("data-tbl='ta'"), 0)
+
+    def test_tab_order_follows_the_registry_not_severity(self):
+        """位置每次刷新都跳的话运营找不到自己的项目。跨表待办本身是按严重度
+        排的（乙的风控排在甲的负面前面），tab 顺序不能跟着它。"""
+        page = self._page([self._snap("甲", "ta", [["有负面"]]),
+                           self._snap("乙", "tb", [["风控中"]])])
+        self.assertEqual([t[3] for t in self._tabs(page)], ["甲", "乙"])
+
+    def test_projects_without_todos_get_no_tab(self):
+        """没事的项目在下面项目卡里本来就是绿的，开一个空页只会让人点进去
+        看一张空表。"""
+        page = self._page([self._snap("甲", "ta", []),
+                           self._snap("乙", "tb", [["风控中"]]),
+                           self._snap("丙", "tc", [])])
+        self.assertEqual([t[3] for t in self._tabs(page)], ["乙"])
+
+    def test_the_count_is_coloured_by_the_worst_reason_on_that_page(self):
+        page = self._page([self._snap("红", "ta", [["有负面"], ["刷新失败"]]),
+                           self._snap("黄", "tb", [["置顶掉了"], ["有负面"]]),
+                           self._snap("素", "tc", [["置顶掉了"]])])
+        by_label = {t[3]: t[4] for t in self._tabs(page)}
+        self.assertEqual(by_label, {"红": "cnt r", "黄": "cnt a", "素": "cnt"})
+
+    def test_the_project_column_is_gone_from_the_todo_pages(self):
+        """整页都是同一个项目，那一栏只会占宽度。（归档区仍是拉平的一张表，
+        它保留「项目」列——所以只查待办页里的表。）"""
+        page = self._page([self._snap("甲", "ta", [["有负面"]])])
+        block = self._todos_block(page)
+        self.assertNotIn("<th>项目</th>", block)
+        self.assertIn("<th>哪一条</th>", block)
+        self.assertIn("class=todoAll title='全选这一页'", block)
+
+    def test_every_page_gets_its_own_select_all(self):
+        page = self._page([self._snap("甲", "ta", [["有负面"]]),
+                           self._snap("乙", "tb", [["风控中"]])])
+        self.assertEqual(self._todos_block(page).count("class=todoAll"), 2)
+
+    def test_project_labels_are_escaped_in_the_tab_attributes(self):
+        evil = "甲' onclick='alert(1)"
+        page = self._page([self._snap(evil, "ta", [["有负面"]])])
+        self.assertNotIn("onclick='alert(1)", page)
+        self.assertIn("data-project='甲&#x27; onclick=&#x27;alert(1)'", page)
+
+    def test_the_lede_explains_the_tabs(self):
+        page = self._page([self._snap("甲", "ta", [["有负面"]])])
+        self.assertIn("每个项目一个标签", page)
+        self.assertIn("aria-label='按项目分开看'", page)
