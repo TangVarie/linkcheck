@@ -1432,6 +1432,8 @@ class TestQueueing(unittest.TestCase):
             result = self._queueing().queue("bascnA", "tblB", ["r1", "r2"])
         self.assertEqual(result.queued, 1)
         self.assertIn("行没了", result.failures[0])
+        # 前端只给真勾上的行标「排队中」：失败的那行不能在里面
+        self.assertEqual(result.record_ids, ["r1"])
 
 
 class TestQueueRoute(unittest.TestCase):
@@ -1651,7 +1653,8 @@ class TestQueueRefusesTablesNotUnderWatch(unittest.TestCase):
 
     def setUp(self):
         self.queueing.reset_mock()
-        self.queueing.queue.return_value = panel.QueueResult(queued=1)
+        self.queueing.queue.side_effect = None
+        self.queueing.queue.return_value = panel.QueueResult(queued=1, record_ids=["r1"])
         self.projects.list.side_effect = None
         self.projects.list.return_value = self.entries
 
@@ -1698,15 +1701,43 @@ class TestQueueRefusesTablesNotUnderWatch(unittest.TestCase):
         self.assertEqual(self.queueing.queue.call_count, 1)
         self.assertEqual(self.queueing.queue.call_args[0][1], "tblON")
         self.assertEqual(payload["queued"], 1)
-        # 拒掉的三张各说清楚为什么、几行没勾——前端靠 skipped_tables 决定
-        # 哪些行不标「排队中」
-        self.assertEqual(payload["skipped_tables"], ["tblOFF", "tblBAD", "tblGONE"])
+        # 前端只给这些 record_id 标「排队中」——被拒的表一行都不在里面
+        self.assertEqual(payload["queued_records"], ["r1"])
+        # 拒掉的三张各说清楚为什么、几行没勾
         joined = "\n".join(payload["skipped"])
         self.assertIn("「停了」已停用", joined)
         self.assertIn("这 2 行没勾", joined)
         self.assertIn("「坏的」配置有误", joined)
         self.assertIn("不在监控清单里", joined)
         self.assertNotIn("失败", joined, "拒勾是决定，不是写入失败，别混进 failures 的口径")
+
+    def test_a_disabled_duplicate_row_does_not_shadow_the_live_one(self):
+        """注册表允许同一张表「一行在用 + 一行停用的历史」（查重只看在用的行）。
+        按 table_id 归并时在用的那行必须优先——不然一行历史就能把正在巡查的
+        表拒成「已停用」。"""
+        from xhsearch import registry as registry_mod
+        live = self.entries[0]
+        stale = registry_mod.Entry(record_id="r-old", label="在管（旧）",
+                                   target="bascnA:tblON", enabled=False,
+                                   app_token="bascnA", table_id="tblON")
+        self.projects.list.return_value = [live, stale]      # 停用的历史排在后面
+        body = '{"rows":[{"app_token":"bascnA","table_id":"tblON","record_id":"r1"}]}'
+        status, text = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200, text)
+        self.assertEqual(self.queueing.queue.call_count, 1)
+        self.assertEqual(json.loads(text)["skipped"], [])
+
+    def test_rows_of_a_table_whose_write_blew_up_are_not_called_queued(self):
+        """整表写炸的那几行只出现在 failures 里，绝不能出现在 queued_records 里
+        ——前端按后者标「排队中」，标了就是替 cron 做一个它不会兑现的承诺。"""
+        self.queueing.queue.side_effect = panel.feishu.FeishuError(99991663, "token 过期")
+        body = '{"rows":[{"app_token":"bascnA","table_id":"tblON","record_id":"r1"}]}'
+        status, text = self._call(body.encode(), self._auth())
+        self.assertEqual(status, 200, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["queued_records"], [])
+        self.assertEqual(payload["queued"], 0)
+        self.assertTrue(payload["failures"] and "token 过期" in payload["failures"][0])
 
     def test_an_unreadable_registry_refuses_everything(self):
         """确认不了这些表还在不在监控中，就一行都不勾——勾错了要悬到下次

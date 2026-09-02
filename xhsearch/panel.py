@@ -686,6 +686,9 @@ class QueueResult:
     queued: int = 0
     skipped_archived: int = 0
     failures: list = field(default_factory=list)
+    # **真的勾上了**的那些行。前端只给这些行标「排队中」——逐行失败的、
+    # 整表写炸的都不在里面，否则标记会说「cron 会来刷」而 cron 根本没收到。
+    record_ids: list = field(default_factory=list)
 
 
 class Queueing:
@@ -733,6 +736,8 @@ class Queueing:
             errors=errors)
         result.queued = written
         result.failures = [f"{rid}：{exc.msg}" for rid, exc in errors]
+        failed = {rid for rid, _ in errors}
+        result.record_ids = [rid for rid in record_ids if rid not in failed]
         self.log(f"☑ 勾「{column}」{written} 行 @ {app_token[-6:]}/{table_id}"
                  f"（cron 五分钟内接手）")
         return result
@@ -1278,11 +1283,20 @@ class PanelHandler(BaseHTTPRequestHandler):
         # 这些勾会一直悬着，哪天一启用就集中花一笔钱。
         # 这种情况的典型来源正是「停用之后页面还没重载，对着旧待办勾」。
         skipped: list[str] = []
-        skipped_tables: list[str] = []
         projects = self.deps.projects
         if projects is not None and projects.enabled and grouped:
             try:
-                entries = {e.table_id: e for e in projects.list() if e.table_id}
+                # 同一张表在注册表里可能不止一行：一行在用、一行停用的历史
+                # （registry.read 的查重只看在用的行，刻意放行这种形态）。
+                # 按 table_id 归并时**在用的那行优先**，不能让后面那行停用的
+                # 历史把正在巡查的表盖成「已停用」。
+                entries: dict = {}
+                for e in projects.list():
+                    if not e.table_id:
+                        continue
+                    seen = entries.get(e.table_id)
+                    if seen is None or (e.usable and not seen.usable):
+                        entries[e.table_id] = e
             except Exception as exc:                            # noqa: BLE001
                 # 读不到注册表就确认不了这些表还在不在监控中。宁可这次不勾：
                 # 勾错了要悬到下次启用才发现，重试只是再点一下。
@@ -1300,11 +1314,13 @@ class PanelHandler(BaseHTTPRequestHandler):
                     why = f"配置有误（{entry.problem}）"
                 else:
                     continue
-                skipped_tables.append(key[1])
                 skipped.append(f"「{name}」{why}，cron 不会刷它，"
                                f"这 {len(grouped.pop(key))} 行没勾")
 
         queued, failures = 0, []
+        # 真勾上了的行。前端只给它们标「排队中」：拒掉的表、整表写炸的、
+        # 逐行失败的，一个都不在里面——标了就是在替 cron 做一个它不会兑现的承诺。
+        queued_records: list[str] = []
         for (app_token, table_id), record_ids in grouped.items():
             try:
                 result = self.deps.queueing.queue(app_token, table_id, record_ids)
@@ -1316,11 +1332,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 continue
             queued += result.queued
             failures.extend(result.failures)
+            queued_records.extend(result.record_ids)
         if grouped:
             self.deps.cache.refresh()
         return self._send_json(200, {"queued": queued, "failures": failures,
                                      "skipped": skipped,
-                                     "skipped_tables": skipped_tables})
+                                     "queued_records": queued_records})
 
     def _projects_payload(self) -> dict:
         projects = self.deps.projects

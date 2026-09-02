@@ -480,12 +480,13 @@ _SCRIPT = r"""
         // 勾成功的行就地标上「排队中」——和服务端渲染的是同一个标记（见
         // _todo_table）。这是页面上唯一能分开「同样的错」和「还没刷回来」的
         // 信号：标记在，这一行看到的就还是旧结果；标记没了、「最近检查」变新，
-        // 才是这次刷回来的结论。服务端拒掉的表（已停用/已移除）不标。
-        var skippedTables = j.skipped_tables || [];
+        // 才是这次刷回来的结论。
+        // 只标服务端说**真勾上了**的那些 record_id。按「我勾了哪些」标是错的：
+        // 被拒的表、整表写炸的、逐行失败的行都在勾选里，却一个都没进飞书。
+        var queuedRecords = j.queued_records || [];
         for (var m = 0; m < picks.length; m++) {
           var tr2 = rowsOf(picks[m]);
-          if (!picks[m].checked || !visible(tr2)) continue;
-          if (skippedTables.indexOf(tr2.dataset.tbl) >= 0) continue;
+          if (!tr2 || queuedRecords.indexOf(tr2.dataset.rec) < 0) continue;
           var cell = tr2.children[6];
           if (cell && !cell.querySelector(".chip")) {
             var chip = document.createElement("span");
