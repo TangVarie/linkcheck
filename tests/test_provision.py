@@ -332,16 +332,30 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_the_next_check_formula_is_the_operators_own_formula(self):
         """「下次检查时间」是公式列，公式是运营给的原文——按列名引用别的列，
-        那些列得先存在，所以也是建完再补。列名从配置取，不写死。"""
+        那些列得先存在，所以也是建完再补。列名从配置取，不写死。
+
+        里层的档位判断用的是 `[最近检查时间]` 那一刻的帖龄，**不是 NOW()**：
+        这一格必须是定值，否则一跨档它自己就往后跳（见 next_check_formula）。
+        """
         call = self._deferred()["下次检查时间"]
         body = call[0][2]
         self.assertEqual(body["type"], 20)
         self.assertEqual(
             body["property"]["formula_expression"],
             'IF(DATEDIF([发布时间], NOW(), "D") > 30, "", '
-            '[最近检查时间] + IF(DATEDIF([发布时间], NOW(), "D") <= 2, 8, '
-            'IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24)')
+            '[最近检查时间] + IF(DATEDIF([发布时间], [最近检查时间], "D") <= 2, 8, '
+            'IF(DATEDIF([发布时间], [最近检查时间], "D") <= 7, 24, 72)) / 24)')
         self.assertIn("下次检查时间", self.made["built"])
+
+    def test_the_tiers_in_the_formula_come_from_the_config(self):
+        """公式里的档位不是写死的 8/24/72，是 settings.refresh.tiers。
+        改了刷新节奏而公式没跟着改，那一列立刻开始说假话。"""
+        settings = Settings()
+        settings.refresh.tiers = [(1, 4), (5, 12)]
+        formula = provision.next_check_formula(settings)
+        self.assertIn('IF(DATEDIF([发布时间], [最近检查时间], "D") <= 1, 4, 12) / 24',
+                      formula)
+        self.assertNotIn("72", formula)
 
     def test_the_archive_cutoff_in_the_formula_follows_the_setting(self):
         """归档后 sweep 不再刷这一行，公式再给一个「下次检查」就是在报一个

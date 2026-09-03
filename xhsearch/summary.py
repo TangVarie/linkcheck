@@ -249,10 +249,11 @@ def _is_stale(row: rows_mod.Row, settings: Settings, now: datetime) -> bool:
     那是「发布时间那一格有问题」，`诊断信息` 里已经在报了，
     在这里再报一次只会让同一个毛病占两个位置。
     """
-    age = row.age_days(now)
-    if age is None:
+    if row.age_days(now) is None:
         return False
-    interval = settings.refresh.interval_hours_for_age(age)
+    # 和 Row.is_due 用同一个间隔（按上次检查时刻定档），否则面板说的
+    # 「卡住了」和机器真正的到期判断不是一个口径。
+    interval = row.refresh_interval_hours(settings, now)
     if interval is None:
         return False
     updated = _ms(row.last_updated_ms)

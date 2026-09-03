@@ -108,26 +108,76 @@ class Row:
         # 否则这一行会被一个未来时间锁死到那个时间点为止。
         return 0 <= elapsed < window
 
-    def is_due(self, settings: Settings, now: Optional[datetime] = None) -> bool:
-        """按分层策略判断这一行现在该不该刷。
+    def hours_since_check(self, now: Optional[datetime] = None) -> float:
+        """距上次检查过了多少小时。从没刷过 = +∞（等最久的那种）。"""
+        updated = _utc(self.last_updated_ms)
+        if updated is None:
+            return float("inf")
+        now = now or datetime.now(timezone.utc)
+        return (now - updated).total_seconds() / 3600
 
-        发布时间未知时按「该刷」处理——宁可多花一毛钱，也别让一行永远不更新
-        而没人发现。
+    def refresh_interval_hours(self, settings: Settings,
+                               now: Optional[datetime] = None) -> Optional[float]:
+        """这一行现在按几小时的间隔刷；None = 已归档，不再自动刷。
+
+        **档位按「上一次检查那一刻」的帖龄算，不是按此刻的帖龄算。**
+        这是为了让「下次检查时间」那一列说的是真话：档位按此刻算的话，
+        中午显示「下次 14:00」的行，下午一跨过 2 天线就自己变成
+        「次日 06:00」——14:00 什么也没发生，而运营完全看不出为什么。
+        改成按上次检查时刻定档之后，`最近检查时间 + 间隔` 是一个**定值**，
+        表里那个公式算出来的就是机器真正会用的时间。
+        代价是跨档前后多刷一轮（按旧档多刷一次就转档了），可以忽略。
+
+        归档仍然看**当下**的帖龄：归档就是归档，不该因为上次检查发生在
+        归档线之前就再刷一轮。
         """
-        age = self.age_days(now)
-        if age is None:
-            return True
-        interval = settings.refresh.interval_hours_for_age(age)
+        age_now = self.age_days(now)
+        if age_now is not None and settings.refresh.interval_hours_for_age(age_now) is None:
+            return None  # 已归档
+        published = _utc(self.publish_time_ms)
+        updated = _utc(self.last_updated_ms)
+        if published is None or updated is None:
+            # 帖龄不知道（发布时间那一格是空的/脏的），或者从没刷过：
+            # 按最快的那一档兜底。见 RefreshTiers.fastest_interval_hours。
+            return settings.refresh.fastest_interval_hours()
+        age_at_check = (updated - published).total_seconds() / 86400
+        interval = settings.refresh.interval_hours_for_age(age_at_check)
+        # None 只可能出现在「最近检查时间」是未来时间的脏数据上（此刻还没
+        # 归档、上次检查却已经过了归档线）。兜底成最快档，让它能被刷一次
+        # 把那个时间戳纠正回来。
+        return settings.refresh.fastest_interval_hours() if interval is None else interval
+
+    def is_due(self, settings: Settings, now: Optional[datetime] = None) -> bool:
+        """按分层策略判断这一行现在该不该刷。"""
+        interval = self.refresh_interval_hours(settings, now)
         if interval is None:
             return False  # 已归档
         updated = _utc(self.last_updated_ms)
         if updated is None:
-            return True
+            return True   # 在管、没归档、从来没刷过
         now = now or datetime.now(timezone.utc)
         elapsed_hours = (now - updated).total_seconds() / 3600
         # 未来的更新时间同样按「该刷」处理：否则一个填错的日期能让这一行
         # 长期不到期，而且没有任何人会发现。
         return elapsed_hours < 0 or elapsed_hours >= interval
+
+    def overdue_hours(self, settings: Settings,
+                      now: Optional[datetime] = None) -> float:
+        """逾期了多久（小时）。**派发排序用的就是它，越大越先刷。**
+
+        以前派发顺序就是飞书返回的表顺序，中间没有任何排序：到期行数超过
+        单轮预算时，排在表上面的那批每一轮都先花掉预算，表尾那批系统性地、
+        反复地输——不是随机漂移，是固定歧视。
+
+        从没刷过 = +∞（等最久，最该先刷）；已归档 = -∞（本来就不该刷）。
+        「最近检查时间」是未来时间的脏行会算出一个很负的值、排到最后：
+        它确实需要被刷一次纠正时间戳，但让整列填错的脏数据插到真正饿着的
+        行前面更糟——有余量的轮次里它照样会被刷到。
+        """
+        interval = self.refresh_interval_hours(settings, now)
+        if interval is None:
+            return float("-inf")
+        return self.hours_since_check(now) - interval
 
 
 def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> list[ToolCall]:

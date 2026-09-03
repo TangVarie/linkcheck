@@ -215,25 +215,45 @@ class BusinessColumn:
         return self.self_link or bool(self.formula)
 
 
-def next_check_formula(settings: Settings) -> str:
-    """「下次检查时间」的公式。里层是运营给的原文，只把列名换成配置里的：
+def _tier_expr(age_expr: str, tiers) -> str:
+    """把分层配置写成嵌套 IF。档位直接来自 settings.refresh.tiers——
+    公式和代码用同一份配置，改了刷新节奏不会只改一半。"""
+    if not tiers:
+        return "0"
+    expr = str(tiers[-1][1])
+    for max_age_days, interval_hours in reversed(tiers[:-1]):
+        expr = f"IF({age_expr} <= {max_age_days}, {interval_hours}, {expr})"
+    return expr
 
-        [最近检查时间] + IF(DATEDIF([发布时间], NOW(), "D") <= 2, 8,
-                         IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24
+
+def next_check_formula(settings: Settings) -> str:
+    """「下次检查时间」的公式。默认配置下长这样：
+
+        IF(DATEDIF([发布时间], NOW(), "D") > 30, "",
+           [最近检查时间] + IF(DATEDIF([发布时间], [最近检查时间], "D") <= 2, 8,
+                            IF(DATEDIF([发布时间], [最近检查时间], "D") <= 7, 24, 72)) / 24)
 
     发布 2 天内每 8 小时、7 天内每 24 小时、之后每 72 小时——和分层刷新的
-    节奏一致，表里看得到「下一次大概什么时候来」。
+    节奏一致，表里看得到「下一次什么时候来」。
 
-    外面再套一层：发布超过归档天数（全局默认 30 天）就显示空——归档后 sweep
-    不再自动刷这一行，再显示一个「下次检查」就是在报一个不会发生的时间。
-    用的是全局默认值：建表时这张表还没入册，没有逐表覆盖可看；改过「归档天数」
-    的表，去列设置里把那个数改一下就行。
+    **档位用的是 `[最近检查时间]` 那一刻的帖龄，不是 `NOW()`。** 原来里层
+    也写 `NOW()`：中午显示「下次 14:00」的行，下午一跨过 2 天线，这一格
+    自己就变成了「次日 06:00」，14:00 什么也没发生。现在它和
+    `Row.refresh_interval_hours` 是同一个口径，算出来的就是机器真正会用的
+    时间——上次检查确定了，下次检查就确定了，不会再自己往后跳。
+
+    外面那层仍然看 `NOW()`：发布超过归档天数（全局默认 30 天）就显示空——
+    归档后 sweep 不再自动刷这一行，再显示一个「下次检查」就是在报一个不会
+    发生的时间。用的是全局默认值：建表时这张表还没入册，没有逐表覆盖可看；
+    改过「归档天数」的表，去列设置里把那个数改一下就行。
     """
     f = settings.fields
-    age = f'DATEDIF([{f.publish_time}], NOW(), "D")'
+    age_now = f'DATEDIF([{f.publish_time}], NOW(), "D")'
+    age_at_check = f'DATEDIF([{f.publish_time}], [{f.last_updated}], "D")'
     days = settings.refresh.archive_after_days
-    inner = f"[{f.last_updated}] + IF({age} <= 2, 8, IF({age} <= 7, 24, 72)) / 24"
-    return f'IF({age} > {days}, "", {inner})'
+    inner = (f"[{f.last_updated}] + "
+             f"{_tier_expr(age_at_check, settings.refresh.tiers)} / 24")
+    return f'IF({age_now} > {days}, "", {inner})'
 
 
 # 字符串 = 巡查列的角色名（settings.fields 上的属性），BusinessColumn = 业务列。

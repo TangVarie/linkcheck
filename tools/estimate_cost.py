@@ -48,15 +48,20 @@ def tier_segments(settings: Settings) -> list[tuple[float, float, int]]:
        反过来 archive 比末端大时，末档要按「沿用最后一档间隔」延长。
        两条都要和 RefreshTiers.interval_hours_for_age 的口径完全一致。
     2. 区间要真的按天切，不能拿档位端点代表整档。
+    3. **端点要 +1。** 档位按完整天数判（`interval_hours_for_age` 里的
+       `math.floor`，和飞书 DATEDIF 同口径），所以「2 天档」覆盖的是
+       第 0、1、2 天，连续时间上是 [0, 3)；归档线 30 同理是「满 31 天才停」。
+       少了这个 +1，projection 会比真实少算整整一天的高频刷新。
     """
-    archive = float(settings.refresh.archive_after_days)
+    # +1 见上面第 3 条：配置里的天数是**完整天数**的上界，不是连续时间的端点。
+    archive = float(settings.refresh.archive_after_days) + 1.0
     segments: list[tuple[float, float, int]] = []
     start = 0.0
     for max_age_days, interval_hours in settings.refresh.tiers:
-        end = min(float(max_age_days), archive)
+        end = min(float(max_age_days) + 1.0, archive)
         if end > start:
             segments.append((start, end, interval_hours))
-        start = float(max_age_days)
+        start = float(max_age_days) + 1.0
         if start >= archive:
             return segments
     # 超出最后一档年龄但还没到归档线：沿用最后一档的间隔。
