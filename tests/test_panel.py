@@ -1192,6 +1192,124 @@ class TestProjectRoutes(unittest.TestCase):
         self.assertEqual(removed.call_args[0][1], "rec1")
 
 
+class FakeStore:
+    """内存版的面板设置表。"""
+
+    def __init__(self, **data):
+        self.data = dict(data)
+
+    def get_json(self, key, default):
+        return self.data.get(key, default)
+
+    def set_json(self, key, value):
+        self.data[key] = value
+
+
+class TestShareSettings(unittest.TestCase):
+    """新建表给谁开权限：环境变量 + 面板上点出来的（存注册表 base 里）。"""
+
+    def _projects(self, store=None, **overrides):
+        from xhsearch import panel_settings
+        cfg = config()
+        cfg.registry_target = "bascnREG:tblREG"
+        cfg.app_id = "cli_x"
+        cfg.app_secret = "s"
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        projects = panel.Projects(cfg, Settings(), log=lambda *a: None)
+        projects._settings_store = store or FakeStore()
+        return projects, panel_settings
+
+    def test_state_merges_env_and_panel_and_says_which_is_which(self):
+        store = FakeStore(**{
+            "share.managers": [{"id": "ou_ziao", "label": "138****8888"}],
+            "share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
+        projects, _ = self._projects(store, table_managers=("boss@x.com",),
+                                     table_editor_chats=("oc_env",), table_owner="")
+        state = projects.share_state()
+        self.assertEqual([(m["id"], m["source"]) for m in state["managers"]],
+                         [("boss@x.com", "env"), ("ou_ziao", "panel")])
+        self.assertEqual([(c["chat_id"], c["name"], c["source"]) for c in state["editor_chats"]],
+                         [("oc_env", "", "env"), ("oc_1", "运营群", "panel")])
+        plan = projects.share_plan()
+        self.assertEqual(plan.managers, ("boss@x.com", "ou_ziao"))
+        self.assertEqual(plan.editor_chats, ("oc_env", "oc_1"))
+        self.assertEqual(plan.label("ou_ziao"), "138****8888")
+        self.assertEqual(plan.label("oc_1"), "运营群")
+        self.assertEqual(plan.label("oc_env"), "oc_env")
+
+    def test_adding_a_manager_by_mobile_stores_the_open_id(self):
+        """手机号在存的时候就换成 open_id：换不到当场报错，不留到建表时才发现。"""
+        projects, ps = self._projects()
+        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id",
+                               return_value="ou_ziao") as resolved:
+            state = projects.add_manager("138 0000 0000")
+        resolved.assert_called_once_with(mobile="13800000000")
+        self.assertEqual(projects._settings_store.data[ps.KEY_MANAGERS],
+                         [{"id": "ou_ziao", "label": "138 0000 0000"}])
+        self.assertEqual(state["managers"][0]["label"], "138 0000 0000")
+        # 再加一次同一个人不重复
+        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id", return_value="ou_ziao"):
+            projects.add_manager("13800000000")
+        self.assertEqual(len(projects._settings_store.data[ps.KEY_MANAGERS]), 1)
+
+    def test_an_unknown_mobile_is_refused_with_a_reason(self):
+        projects, ps = self._projects()
+        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id", return_value=""):
+            with self.assertRaises(ValueError) as ctx:
+                projects.add_manager("13800000000")
+        self.assertIn("13800000000", str(ctx.exception))
+        self.assertNotIn(ps.KEY_MANAGERS, projects._settings_store.data)
+
+    def test_an_email_is_stored_as_is(self):
+        """邮箱协作者接口直接认，不用换 open_id（也就不依赖通讯录权限）。"""
+        projects, ps = self._projects()
+        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id") as resolved:
+            projects.add_manager("ziao@x.com")
+        resolved.assert_not_called()
+        self.assertEqual(projects._settings_store.data[ps.KEY_MANAGERS],
+                         [{"id": "ziao@x.com", "label": "ziao@x.com"}])
+
+    def test_removing_a_manager(self):
+        store = FakeStore(**{"share.managers": [{"id": "ou_a", "label": "a"},
+                                                {"id": "ou_b", "label": "b"}]})
+        projects, ps = self._projects(store)
+        state = projects.remove_manager("ou_a")
+        self.assertEqual([m["id"] for m in state["managers"]], ["ou_b"])
+
+    def test_chats_are_replaced_as_a_whole_and_must_be_oc_ids(self):
+        projects, ps = self._projects()
+        state = projects.set_editor_chats([{"chat_id": "oc_1", "name": "运营群"},
+                                           {"chat_id": "oc_1", "name": "运营群"},
+                                           "garbage"])
+        self.assertEqual(projects._settings_store.data[ps.KEY_EDITOR_CHATS],
+                         [{"chat_id": "oc_1", "name": "运营群"}])
+        self.assertEqual(state["editor_chats"][0]["name"], "运营群")
+        with self.assertRaises(ValueError):
+            projects.set_editor_chats([{"chat_id": "运营群"}])
+        projects.set_editor_chats([])
+        self.assertEqual(projects._settings_store.data[ps.KEY_EDITOR_CHATS], [])
+
+    def test_apply_uses_the_merged_plan_on_an_existing_table(self):
+        from xhsearch import provision as provision_mod
+        store = FakeStore(**{"share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
+        projects, _ = self._projects(store, table_managers=("boss@x.com",))
+        with mock.patch.object(provision_mod, "share_table",
+                               return_value=provision_mod.ShareResult(granted=["x"])) as shared:
+            result = projects.apply_share("bascnOLD")
+        self.assertEqual(result.granted, ["x"])
+        _workspace, app_token, plan = shared.call_args[0]
+        self.assertEqual(app_token, "bascnOLD")
+        self.assertEqual(plan.managers, ("boss@x.com",))
+        self.assertEqual(plan.editor_chats, ("oc_1",))
+        with self.assertRaises(ValueError):
+            projects.apply_share("")
+
+    def test_the_store_lives_in_the_registry_base(self):
+        projects = panel.Projects(self._projects()[0].config, Settings(), log=lambda *a: None)
+        self.assertEqual(projects._store().app_token, "bascnREG")
+
+
 class TestProjectRoutesOverHttp(unittest.TestCase):
     """路由层：鉴权、CSRF、错误翻译。"""
 
@@ -1303,6 +1421,49 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
         status, body = self._call("/api/chats", headers=self._login())
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["chats"][0]["chat_id"], "oc_1")
+
+    def test_share_state_needs_a_session_and_is_read_only(self):
+        self.assertEqual(self._call("/api/share")[0], 401)
+        self.actions.share_state.return_value = {"managers": [], "editor_chats": [], "owner": ""}
+        status, body = self._call("/api/share", headers=self._login())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["share"]["managers"], [])
+
+    def test_share_writes_reach_the_action_layer(self):
+        self.actions.set_editor_chats.return_value = {"ok": 1}
+        self.actions.add_manager.return_value = {"ok": 2}
+        self.actions.remove_manager.return_value = {"ok": 3}
+        headers = self._login()
+        status, body = self._call("/api/projects/share_chats",
+                                  data=json.dumps({"chats": [{"chat_id": "oc_1", "name": "群"}]}).encode(),
+                                  headers=headers, method="POST")
+        self.assertEqual(status, 200)
+        self.actions.set_editor_chats.assert_called_with([{"chat_id": "oc_1", "name": "群"}])
+        status, _ = self._call("/api/projects/share_chats", data=b'{"chats": "x"}',
+                               headers=headers, method="POST")
+        self.assertEqual(status, 400)
+        self._call("/api/projects/share_manager", data=json.dumps({"who": "138"}).encode(),
+                   headers=headers, method="POST")
+        self.actions.add_manager.assert_called_with("138")
+        self._call("/api/projects/share_manager", data=json.dumps({"remove": "ou_a"}).encode(),
+                   headers=headers, method="POST")
+        self.actions.remove_manager.assert_called_with("ou_a")
+        status, _ = self._call("/api/projects/share_manager", data=b"{}",
+                               headers=headers, method="POST")
+        self.assertEqual(status, 400)
+
+    def test_share_apply_reports_granted_and_failures(self):
+        from xhsearch import provision as provision_mod
+        self.actions.apply_share.return_value = provision_mod.ShareResult(
+            granted=["群 运营群 可编辑"], failures=["给「x」开可管理失败：nope"])
+        status, body = self._call("/api/projects/share_apply",
+                                  data=json.dumps({"app_token": "bascnOLD"}).encode(),
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        self.actions.apply_share.assert_called_with("bascnOLD")
+        payload = json.loads(body)
+        self.assertEqual(payload["granted"], ["群 运营群 可编辑"])
+        self.assertFalse(payload["ok"])
 
     def test_listing_chats_translates_the_missing_scope(self):
         self.actions.list_chats.side_effect = feishu.FeishuError(99991672, "no scope")

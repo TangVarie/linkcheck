@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -336,12 +337,18 @@ class SharePlan:
     运营背后的飞书账号各不相同，所以给的是**群**（可编辑）；管理权限给
     具体的人（可管理），不再全绑在应用这个机器人身上。"""
 
-    managers: tuple = ()       # 可管理（full_access）：邮箱，或 ou_ 开头的 open_id
+    managers: tuple = ()       # 可管理（full_access）：手机号 / 邮箱 / ou_ 开头的 open_id
     editor_chats: tuple = ()   # 可编辑（edit）：oc_ 开头的 chat_id。应用得先在群里
     owner: str = ""            # 把所有权转给这个人（应用保留可管理）。可选
+    # 给人看的名字：open_id 是一串乱码，面板上和日志里要显示的是「138****」
+    # 或「梨响运营群」。键是上面三项里的 ID，缺就显示 ID 本身。
+    labels: dict = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return bool(self.managers or self.editor_chats or self.owner)
+
+    def label(self, member_id: str) -> str:
+        return self.labels.get(member_id) or member_id
 
 
 @dataclass
@@ -350,9 +357,19 @@ class ShareResult:
     failures: list = field(default_factory=list)
 
 
+_PHONE = re.compile(r"^\+?\d{6,15}$")
+
+
+def normalize_mobile(value: str) -> str:
+    """去掉空格和连字符。大陆号码飞书收裸的 11 位；非大陆要带 + 区号，原样保留。"""
+    return re.sub(r"[\s\-]", "", (value or "").strip())
+
+
 def member_type(member_id: str) -> str:
-    """一个 ID 长什么样就是什么：邮箱 / ou_ 开头的 open_id / oc_ 开头的 chat_id。
-    认不出返回空串——宁可拒掉让人改配置，也别猜一种类型送给飞书。"""
+    """一个 ID 长什么样就是什么：邮箱 / 手机号 / ou_ 开头的 open_id /
+    oc_ 开头的 chat_id。认不出返回空串——宁可拒掉让人改配置，也别猜一种
+    类型送给飞书。手机号不是协作者接口认的类型，要先换成 open_id
+    （见 share_table）。"""
     value = (member_id or "").strip()
     if "@" in value:
         return "email"
@@ -360,7 +377,35 @@ def member_type(member_id: str) -> str:
         return "openid"
     if value.startswith("oc_"):
         return "openchat"
+    if _PHONE.match(normalize_mobile(value)):
+        return "mobile"
     return ""
+
+
+def resolve_person(workspace: feishu.Workspace, who: str, role: str,
+                   failures: list) -> Optional[tuple[str, str]]:
+    """把一个「人」的写法变成协作者接口认的 (member_type, member_id)。
+    认不出 / 找不到 → 记一条失败，返回 None。"""
+    kind = member_type(who)
+    if kind in ("email", "openid"):
+        return kind, who.strip()
+    if kind == "mobile":
+        mobile = normalize_mobile(who)
+        try:
+            open_id = workspace.resolve_open_id(mobile=mobile)
+        except Exception as exc:                                # noqa: BLE001
+            failures.append(
+                f"按手机号 {who} 找用户失败：{exc}。要给应用开 "
+                "contact:user.id:readonly（通过手机号或邮箱获取用户 ID）权限，开完发布新版本")
+            return None
+        if not open_id:
+            failures.append(
+                f"飞书里没有手机号 {who} 对应的用户——号码要和飞书账号绑定的一致，"
+                "非大陆号码带 + 区号")
+            return None
+        return "openid", open_id
+    failures.append(f"「{who}」认不出是谁：{role}只认手机号、邮箱，或 ou_ 开头的 open_id")
+    return None
 
 
 def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
@@ -374,49 +419,49 @@ def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
     result = ShareResult()
     tag = app_token[-6:]
     for who in plan.managers:
-        kind = member_type(who)
-        if kind not in ("email", "openid"):
-            result.failures.append(
-                f"「{who}」认不出是谁：可管理的人只认邮箱，或 ou_ 开头的 open_id")
+        shown = plan.label(who)
+        person = resolve_person(workspace, who, "可管理的人", result.failures)
+        if person is None:
             continue
+        kind, member_id = person
         try:
-            workspace.add_member(app_token, kind, who, "full_access")
+            workspace.add_member(app_token, kind, member_id, "full_access")
         except Exception as exc:                                # noqa: BLE001
-            result.failures.append(f"给「{who}」开可管理失败：{exc}")
-            log(f"🔑 [{tag}] 开可管理失败 {who}：{exc}")
+            result.failures.append(f"给「{shown}」开可管理失败：{exc}")
+            log(f"🔑 [{tag}] 开可管理失败 {shown}：{exc}")
             continue
-        result.granted.append(f"{who} 可管理")
-        log(f"🔑 [{tag}] 协作者 {who} 可管理")
+        result.granted.append(f"{shown} 可管理")
+        log(f"🔑 [{tag}] 协作者 {shown} 可管理")
     for chat in plan.editor_chats:
+        shown = plan.label(chat)
         if member_type(chat) != "openchat":
             result.failures.append(
                 f"「{chat}」不是群 ID：群要填 oc_ 开头的 chat_id"
-                "（python3 cli.py chats 能列出应用所在的群）")
+                "（面板「选群」或 python3 cli.py chats 能列出应用所在的群）")
             continue
         try:
             workspace.add_member(app_token, "openchat", chat, "edit")
         except Exception as exc:                                # noqa: BLE001
             result.failures.append(
-                f"给群「{chat}」开可编辑失败：{exc}。飞书要求应用本身在这个群里"
-                "——群设置里把它作为机器人加进去，再建一张")
-            log(f"🔑 [{tag}] 开群可编辑失败 {chat}：{exc}")
+                f"给群「{shown}」开可编辑失败：{exc}。飞书要求应用本身在这个群里"
+                "——群设置里把它作为机器人加进去，再来一次")
+            log(f"🔑 [{tag}] 开群可编辑失败 {shown}：{exc}")
             continue
-        result.granted.append(f"群 {chat} 可编辑")
-        log(f"🔑 [{tag}] 协作者 群 {chat} 可编辑")
+        result.granted.append(f"群 {shown} 可编辑")
+        log(f"🔑 [{tag}] 协作者 群 {shown} 可编辑")
     if plan.owner:
-        kind = member_type(plan.owner)
-        if kind not in ("email", "openid"):
-            result.failures.append(
-                f"「{plan.owner}」认不出是谁：所有者只认邮箱，或 ou_ 开头的 open_id")
-        else:
+        shown = plan.label(plan.owner)
+        person = resolve_person(workspace, plan.owner, "所有者", result.failures)
+        if person is not None:
+            kind, member_id = person
             try:
-                workspace.transfer_owner(app_token, kind, plan.owner)
+                workspace.transfer_owner(app_token, kind, member_id)
             except Exception as exc:                            # noqa: BLE001
-                result.failures.append(f"把所有权转给「{plan.owner}」失败：{exc}")
-                log(f"🔑 [{tag}] 转移所有权失败 {plan.owner}：{exc}")
+                result.failures.append(f"把所有权转给「{shown}」失败：{exc}")
+                log(f"🔑 [{tag}] 转移所有权失败 {shown}：{exc}")
             else:
-                result.granted.append(f"{plan.owner} 所有者（应用保留可管理）")
-                log(f"🔑 [{tag}] 所有权 → {plan.owner}（应用保留可管理）")
+                result.granted.append(f"{shown} 所有者（应用保留可管理）")
+                log(f"🔑 [{tag}] 所有权 → {shown}（应用保留可管理）")
     return result
 
 

@@ -375,6 +375,37 @@ class TestWorkspace(unittest.TestCase):
         self.assertEqual(cap.calls[0]["body"],
                          {"member_type": "email", "member_id": "ziao@example.com"})
 
+    def test_list_tables_follows_pagination(self):
+        pages = [ok({"items": [{"table_id": "tblA", "name": "被监控的表"}],
+                     "has_more": True, "page_token": "p2"}),
+                 ok({"items": [{"table_id": "tblB", "name": "面板设置"}], "has_more": False})]
+        cap = Captured(*pages)
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "request_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").list_tables("bascnREG")
+        self.assertEqual([t["name"] for t in got], ["被监控的表", "面板设置"])
+        self.assertIn("/bitable/v1/apps/bascnREG/tables?page_size=100", cap.calls[0]["url"])
+        self.assertIn("page_token=p2", cap.calls[1]["url"])
+
+    def test_resolve_open_id_by_mobile(self):
+        """协作者接口不收手机号；这一步把手机号换成 open_id。"""
+        cap = Captured(ok({"user_list": [{"user_id": "ou_ziao", "mobile": "13800000000"}]}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").resolve_open_id(mobile="13800000000")
+        self.assertEqual(got, "ou_ziao")
+        self.assertIn("/contact/v3/users/batch_get_id?user_id_type=open_id", cap.calls[0]["url"])
+        self.assertEqual(cap.calls[0]["body"],
+                         {"include_resigned": False, "mobiles": ["13800000000"]})
+
+    def test_resolve_open_id_returns_empty_when_nobody_matches(self):
+        """飞书对查不到的号码是**不返回条目**，不是报错。"""
+        cap = Captured(ok({"user_list": [{"mobile": "13800000000"}]}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").resolve_open_id(mobile="13800000000")
+        self.assertEqual(got, "")
+
     def test_list_chats_follows_pagination(self):
         pages = [ok({"items": [{"chat_id": "oc_1", "name": "运营群"}],
                      "has_more": True, "page_token": "p2"}),

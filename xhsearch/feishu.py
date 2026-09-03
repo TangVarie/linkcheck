@@ -330,6 +330,56 @@ class Workspace:
         )
         _check(resp)
 
+    def list_tables(self, app_token: str) -> list[dict[str, str]]:
+        """一个 base 里的数据表：[{table_id, name}]。自动翻页。
+
+        给「面板设置」那张表找位置用（panel_settings）——它按名字认表，
+        建过就复用，没建过才建。
+        """
+        out: list[dict[str, str]] = []
+        page_token = ""
+        for _ in range(50):
+            url = (f"{BASE}/bitable/v1/apps/{urllib.parse.quote(app_token, safe='')}"
+                   f"/tables?page_size=100")
+            if page_token:
+                url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
+            resp = transport.request_with_retry(
+                "GET", url, self._headers(), "", timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            data = _check(resp)
+            for item in data.get("items") or []:
+                if isinstance(item, dict) and item.get("table_id"):
+                    out.append({"table_id": str(item.get("table_id")),
+                                "name": str(item.get("name") or "")})
+            page_token = str(data.get("page_token") or "")
+            if not data.get("has_more") or not page_token:
+                break
+        return out
+
+    def resolve_open_id(self, *, mobile: str = "", email: str = "") -> str:
+        """手机号 / 邮箱 → open_id。找不到返回空串。
+
+        协作者接口不收手机号，而运营的飞书账号多半是手机号登录的——这一步
+        把手机号换成接口认的 open_id。要 contact:user.id:readonly 权限
+        （「通过手机号或邮箱获取用户 ID」）。非大陆号码要带 + 区号。
+        """
+        body: dict[str, Any] = {"include_resigned": False}
+        if mobile:
+            body["mobiles"] = [mobile]
+        if email:
+            body["emails"] = [email]
+        resp = transport.post_with_retry(
+            f"{BASE}/contact/v3/users/batch_get_id?user_id_type=open_id",
+            self._headers(), json.dumps(body, ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        for item in _check(resp).get("user_list") or []:
+            if isinstance(item, dict) and item.get("user_id"):
+                return str(item["user_id"])
+        return ""
+
     def list_chats(self) -> list[dict[str, str]]:
         """应用（作为机器人）所在的群：[{chat_id, name}]。自动翻页。
 

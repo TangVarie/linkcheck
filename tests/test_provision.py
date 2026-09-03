@@ -466,8 +466,52 @@ class TestShareTable(unittest.TestCase):
         self.assertEqual(provision.member_type("a@b.c"), "email")
         self.assertEqual(provision.member_type(" ou_x "), "openid")
         self.assertEqual(provision.member_type("oc_x"), "openchat")
+        self.assertEqual(provision.member_type("13800000000"), "mobile")
+        self.assertEqual(provision.member_type("+86 138-0000-0000"), "mobile")
+        self.assertEqual(provision.member_type("+852 9123 4567"), "mobile")
         self.assertEqual(provision.member_type("张三"), "")
+        self.assertEqual(provision.member_type("123"), "")
         self.assertEqual(provision.member_type(""), "")
+        self.assertEqual(provision.normalize_mobile(" +86 138-0000-0000 "), "+8613800000000")
+
+    def test_a_mobile_manager_is_resolved_to_an_open_id_first(self):
+        """运营的飞书账号多半是手机号登录的，而协作者接口不收手机号。"""
+        workspace = fake_workspace()
+        workspace.resolve_open_id.return_value = "ou_ziao"
+        plan = self._plan(managers=("138 0000 0000",))
+        result = provision.share_table(workspace, "bascnNEW", plan, log=lambda *a: None)
+        workspace.resolve_open_id.assert_called_once_with(mobile="13800000000")
+        workspace.add_member.assert_called_once_with("bascnNEW", "openid", "ou_ziao", "full_access")
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.granted, ["138 0000 0000 可管理"])
+
+    def test_an_unknown_mobile_is_a_failure_with_the_scope_hint(self):
+        workspace = fake_workspace()
+        workspace.resolve_open_id.return_value = ""
+        result = provision.share_table(workspace, "bascnNEW",
+                                       self._plan(managers=("13800000000",)),
+                                       log=lambda *a: None)
+        workspace.add_member.assert_not_called()
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("13800000000", result.failures[0])
+        workspace.resolve_open_id.side_effect = RuntimeError("99991672 no scope")
+        result = provision.share_table(workspace, "bascnNEW",
+                                       self._plan(owner="13800000000"),
+                                       log=lambda *a: None)
+        workspace.transfer_owner.assert_not_called()
+        self.assertIn("contact:user.id:readonly", result.failures[0])
+
+    def test_labels_are_what_people_see_not_the_ids(self):
+        """open_id 是一串乱码，面板和日志里显示的得是人认得出的名字。"""
+        lines = []
+        workspace = fake_workspace()
+        plan = self._plan(managers=("ou_ziao",), editor_chats=("oc_1",),
+                          labels={"ou_ziao": "138****8888", "oc_1": "梨响运营群"})
+        result = provision.share_table(workspace, "bascnNEW", plan, log=lines.append)
+        self.assertEqual(result.granted, ["138****8888 可管理", "群 梨响运营群 可编辑"])
+        self.assertIn("138****8888", lines[0])
+        self.assertIn("梨响运营群", lines[1])
+        workspace.add_member.assert_any_call("bascnNEW", "openid", "ou_ziao", "full_access")
 
 
 if __name__ == "__main__":

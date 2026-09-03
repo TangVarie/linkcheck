@@ -45,7 +45,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
-from . import feishu, provision, railway, registry, schema, summary, tablespec
+from . import (feishu, panel_settings, provision, railway, registry, schema,
+               summary, tablespec)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -830,25 +831,118 @@ class Projects:
         return registry.add(self._registry(), label=label or parsed.label,
                             target=target, note=note, client_token=client_token)
 
+    # ---------- 新建表给谁开权限 ----------
+    #
+    # 两个来源：环境变量（部署时定死的）+ 面板上点出来的（存在注册表 base 里的
+    # 「面板设置」表，见 panel_settings）。两边合并，环境变量那部分面板上只显示
+    # 不能删——它是部署方定的底线。
+
+    def _workspace(self) -> feishu.Workspace:
+        return feishu.Workspace(app_id=self.config.app_id,
+                                app_secret=self.config.app_secret)
+
+    def _store(self) -> panel_settings.SettingsStore:
+        store = getattr(self, "_settings_store", None)
+        if store is None:
+            target = tablespec.parse_target(self.config.registry_target,
+                                            default_label="registry")
+            store = panel_settings.SettingsStore(
+                self._workspace(), self._bitable, target.app_token, log=self.log)
+            self._settings_store = store
+        return store
+
+    def _stored_managers(self) -> list:
+        raw = self._store().get_json(panel_settings.KEY_MANAGERS, [])
+        return [m for m in raw if isinstance(m, dict) and m.get("id")]
+
+    def _stored_chats(self) -> list:
+        raw = self._store().get_json(panel_settings.KEY_EDITOR_CHATS, [])
+        return [c for c in raw if isinstance(c, dict) and c.get("chat_id")]
+
+    def share_state(self) -> dict:
+        """面板「协作者」那一栏要显示的东西：谁可管理、哪些群可编辑、各自从哪来。"""
+        managers = ([{"id": m, "label": m, "source": "env"}
+                     for m in self.config.table_managers]
+                    + [{"id": m["id"], "label": m.get("label") or m["id"],
+                        "source": "panel"} for m in self._stored_managers()])
+        chats = ([{"chat_id": c, "name": "", "source": "env"}
+                  for c in self.config.table_editor_chats]
+                 + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
+                     "source": "panel"} for c in self._stored_chats()])
+        return {"managers": managers, "editor_chats": chats,
+                "owner": self.config.table_owner}
+
     def share_plan(self) -> provision.SharePlan:
-        return provision.SharePlan(
-            managers=tuple(self.config.table_managers),
-            editor_chats=tuple(self.config.table_editor_chats),
-            owner=self.config.table_owner)
+        state = self.share_state()
+        managers, chats, labels = [], [], {}
+        for m in state["managers"]:
+            if m["id"] not in managers:
+                managers.append(m["id"])
+                labels[m["id"]] = m["label"]
+        for c in state["editor_chats"]:
+            if c["chat_id"] not in chats:
+                chats.append(c["chat_id"])
+                if c["name"]:
+                    labels[c["chat_id"]] = c["name"]
+        return provision.SharePlan(managers=tuple(managers), editor_chats=tuple(chats),
+                                   owner=self.config.table_owner, labels=labels)
 
     def list_chats(self) -> list:
-        """应用（作为机器人）所在的群。给「FEISHU_TABLE_EDITOR_CHATS 该填什么」
-        找答案用——飞书界面上普通成员看不到群的 ID。只读，不花钱。"""
-        workspace = feishu.Workspace(app_id=self.config.app_id,
-                                     app_secret=self.config.app_secret)
-        return workspace.list_chats()
+        """应用（作为机器人）所在的群。给「选群」用——飞书界面上普通成员
+        看不到群的 ID。只读，不花钱。"""
+        return self._workspace().list_chats()
+
+    def set_editor_chats(self, chats: list) -> dict:
+        """面板上选好的群，整体覆盖存下来。只认 oc_ 开头的 chat_id。"""
+        clean = []
+        for item in chats:
+            if not isinstance(item, dict):
+                continue
+            chat_id = str(item.get("chat_id") or "").strip()
+            if provision.member_type(chat_id) != "openchat":
+                raise ValueError(f"「{chat_id}」不是群 ID（要 oc_ 开头）")
+            if chat_id in [c["chat_id"] for c in clean]:
+                continue
+            clean.append({"chat_id": chat_id, "name": str(item.get("name") or "").strip()})
+        self._store().set_json(panel_settings.KEY_EDITOR_CHATS, clean)
+        self.log(f"🔑 新建表的可编辑群 → {'、'.join(c['name'] or c['chat_id'] for c in clean) or '（清空）'}")
+        return self.share_state()
+
+    def add_manager(self, who: str) -> dict:
+        """加一个可管理的人：手机号 / 邮箱 / ou_ open_id。手机号在这里就换成
+        open_id 存下——换不到当场报错，不留一个建表时才发现的坑。"""
+        who = (who or "").strip()
+        failures: list = []
+        person = provision.resolve_person(self._workspace(), who, "可管理的人", failures)
+        if person is None:
+            raise ValueError(failures[0] if failures else f"「{who}」认不出是谁")
+        _kind, member_id = person
+        stored = self._stored_managers()
+        if all(m["id"] != member_id for m in stored):
+            stored.append({"id": member_id, "label": who})
+            self._store().set_json(panel_settings.KEY_MANAGERS, stored)
+            self.log(f"🔑 新建表的可管理 +{who}")
+        return self.share_state()
+
+    def remove_manager(self, member_id: str) -> dict:
+        stored = [m for m in self._stored_managers() if m["id"] != member_id]
+        self._store().set_json(panel_settings.KEY_MANAGERS, stored)
+        self.log(f"🔑 新建表的可管理 -{member_id}")
+        return self.share_state()
+
+    def apply_share(self, app_token: str) -> provision.ShareResult:
+        """按当前设置给一张**已经建好的**表补协作者。应用得是这张表的所有者或
+        可管理——自己建的表天然是；接管的业务表要看当初给应用的是什么权限。"""
+        if not app_token:
+            raise ValueError("要选一张表")
+        self.log(f"🔑 给 {app_token[-6:]} 补协作者")
+        return provision.share_table(self._workspace(), app_token, self.share_plan(),
+                                     log=self.log)
 
     def create(self, name: str, template: str = "full") -> dict:
         """从零建一张监控表，建完按配置加协作者。一次飞书都不用点。"""
-        workspace = feishu.Workspace(app_id=self.config.app_id,
-                                     app_secret=self.config.app_secret)
         made = provision.create_monitored_table(
-            workspace, self.settings, name, template=template,
+            self._workspace(), self.settings, name, template=template,
             share=self.share_plan(), log=self.log)
         self.log(f"🧱 新建监控表 {name}（{template}，{made['columns']} 列）→ "
                  f"{made['app_token'][-6:]}/{made['table_id']}")
@@ -1074,7 +1168,24 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._chats_payload()
+        if path == "/api/share":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._share_payload()
         return self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _share_payload(self):
+        """新建表给谁开权限：环境变量里的 + 面板上点出来的。只读。"""
+        projects = self.deps.projects
+        if projects is None or not projects.enabled:
+            return self._send_json(400, {
+                "error": projects.why_disabled() if projects else "面板没配 FEISHU_APP_ID"})
+        try:
+            return self._send_json(200, {"share": projects.share_state()})
+        except feishu.FeishuError as exc:
+            return self._send_json(400, {"error": exc.msg, "hint": exc.hint})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
     def _chats_payload(self):
         """应用所在的群和 chat_id。只读；是给填 FEISHU_TABLE_EDITOR_CHATS 找值用的。"""
@@ -1469,6 +1580,21 @@ class PanelHandler(BaseHTTPRequestHandler):
             if template not in provision.TEMPLATES:
                 raise ValueError(f"template 只认 {'/'.join(provision.TEMPLATES)}")
             return {"created": projects.create(name, template=template)}
+        if action == "share_chats":
+            chats = payload.get("chats")
+            if not isinstance(chats, list):
+                raise ValueError("chats 要是数组")
+            return {"ok": True, "share": projects.set_editor_chats(chats)}
+        if action == "share_manager":
+            if text("remove"):
+                return {"ok": True, "share": projects.remove_manager(text("remove"))}
+            if not text("who"):
+                raise ValueError("要填手机号、邮箱或 open_id")
+            return {"ok": True, "share": projects.add_manager(text("who"))}
+        if action == "share_apply":
+            result = projects.apply_share(text("app_token"))
+            return {"granted": result.granted, "failures": result.failures,
+                    "ok": not result.failures}
         if action == "build":
             result = projects.build(text("app_token"), text("table_id"))
             return {"summary": result.summary(), "created": result.created,
