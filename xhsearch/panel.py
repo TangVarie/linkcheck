@@ -836,6 +836,13 @@ class Projects:
             editor_chats=tuple(self.config.table_editor_chats),
             owner=self.config.table_owner)
 
+    def list_chats(self) -> list:
+        """应用（作为机器人）所在的群。给「FEISHU_TABLE_EDITOR_CHATS 该填什么」
+        找答案用——飞书界面上普通成员看不到群的 ID。只读，不花钱。"""
+        workspace = feishu.Workspace(app_id=self.config.app_id,
+                                     app_secret=self.config.app_secret)
+        return workspace.list_chats()
+
     def create(self, name: str, template: str = "full") -> dict:
         """从零建一张监控表，建完按配置加协作者。一次飞书都不用点。"""
         workspace = feishu.Workspace(app_id=self.config.app_id,
@@ -1063,7 +1070,27 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._send_json(200, self._projects_payload())
+        if path == "/api/chats":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._chats_payload()
         return self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _chats_payload(self):
+        """应用所在的群和 chat_id。只读；是给填 FEISHU_TABLE_EDITOR_CHATS 找值用的。"""
+        projects = self.deps.projects
+        if projects is None or not self.deps.config.app_id:
+            return self._send_json(400, {"error": "面板没配 FEISHU_APP_ID"})
+        try:
+            chats = projects.list_chats()
+        except feishu.FeishuError as exc:
+            return self._send_json(400, {
+                "error": f"列群失败：{exc.msg}",
+                "hint": "多半是应用没开 im:chat:readonly（读群信息）权限：开放平台 → "
+                        "权限管理 → 搜 im:chat → 开通，然后发布一个新版本。"})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        return self._send_json(200, {"chats": chats})
 
     def do_POST(self):                                          # noqa: N802
         path = urlparse(self.path).path

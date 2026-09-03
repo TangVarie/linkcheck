@@ -189,7 +189,8 @@ def build_missing(table: feishu.Bitable, diff: schema.SchemaDiff, *,
 # 巡查列**不在这里重复定义**：它们的名字和类型只有 schema.expected_schema
 # 一份真相，这里只按角色名引用（"link"、"traffic_status"……），改列名两边不漂。
 
-TEXT, NUMBER, SINGLE, MULTI, DATE, CHECKBOX, ATTACHMENT, LINK = 1, 2, 3, 4, 5, 7, 17, 18
+TEXT, NUMBER, SINGLE, MULTI, DATE, CHECKBOX, ATTACHMENT, LINK, FORMULA = (
+    1, 2, 3, 4, 5, 7, 17, 18, 20)
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,28 @@ class BusinessColumn:
     # 单向关联到**本表**（「父记录」）。property 里要填 table_id，而 table_id
     # 要等表建出来才有——所以这种列不能跟着 create_table 一次带上，得建完再补。
     self_link: bool = False
+    # 公式列。公式按列名引用别的列（[最近检查时间]），那些列得先存在，
+    # 所以同样是建完再补。飞书的 POST fields 只会追加到末尾，这两种列
+    # 在新表里会排在最后，而不是西屋表里的位置——顺序在视图里拖一下就好。
+    formula: str = ""
+
+    @property
+    def deferred(self) -> bool:
+        return self.self_link or bool(self.formula)
+
+
+def next_check_formula(settings: Settings) -> str:
+    """「下次检查时间」的公式，运营给的原文，只把列名换成配置里的：
+
+        [最近检查时间] + IF(DATEDIF([发布时间], NOW(), "D") <= 2, 8,
+                         IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24
+
+    发布 2 天内每 8 小时、7 天内每 24 小时、之后每 72 小时——和分层刷新的
+    节奏一致，表里看得到「下一次大概什么时候来」。
+    """
+    f = settings.fields
+    age = f'DATEDIF([{f.publish_time}], NOW(), "D")'
+    return (f"[{f.last_updated}] + IF({age} <= 2, 8, IF({age} <= 7, 24, 72)) / 24")
 
 
 # 字符串 = 巡查列的角色名（settings.fields 上的属性），BusinessColumn = 业务列。
@@ -244,17 +267,17 @@ FULL_LAYOUT: tuple = (
     "comment_digest",
     "comment_count",
     "last_updated",
+    # 公式本体在 next_check_formula()（要按配置里的列名拼），这里只占位。
+    BusinessColumn("下次检查时间", FORMULA, formula="<next_check_formula>"),
     "consecutive_failures",
     "platform",
     "previous_comment_count",
 )
 
-# 西屋表里还有一列「下次检查时间」，是运营自己写的**公式列**。公式的具体写法
-# 每张表不一样，机器不猜——猜错一个公式比少一列更糟（它会一直显示一个
-# 看着像真的的时间）。建完从旧表把那一列复制过来就行。
-NOT_BUILT = (
-    "下次检查时间（公式列，公式每张表不一样，机器不猜——从旧表复制一列过来）",
-)
+# 模板里有但刻意不建的列。现在是空的：西屋表的列全部建得出来。
+# 留着这个口子是给将来「这一列机器不该猜」的情况用——那种列宁可不建、
+# 明说没建，也别建一个看着像真的的。
+NOT_BUILT: tuple = ()
 
 # 人机共用的「流量状态」在业务表里还有两个人工选项。新表一起带上是纯追加、
 # 零风险；接管已有表时**不**补它们——补选项对已有列是整体覆盖（见 build_missing）。
@@ -288,7 +311,10 @@ def template_fields(settings: Settings, template: str = "full"
             options = options + [o for o in EXTRA_OPTIONS.get(item, ()) if o not in options]
             fields.append(schema.create_field_body(name, allowed[0], options or None))
             placed.add(name)
-        elif item.self_link:
+        elif item.deferred:
+            if item.formula == "<next_check_formula>":
+                item = BusinessColumn(item.name, item.type_code,
+                                      formula=next_check_formula(settings))
             deferred.append(item)
         else:
             fields.append(schema.create_field_body(
@@ -399,7 +425,7 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
                            share: Optional[SharePlan] = None,
                            log=print) -> dict:
     """从零建一张监控表：建 base → 建数据表（连列带选项一次建齐）→ 补自关联列
-    → 按 SharePlan 加协作者。
+    和公式列（要等表和被引用的列先存在）→ 按 SharePlan 加协作者。
 
     这条路**一次飞书都不用点**：应用自己建的 base，应用天然有完全权限，
     不需要「添加文档应用」。（这一点还没在真机上验过，见待验证清单。）
@@ -414,8 +440,11 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
     built = [f["field_name"] for f in fields]
     column_failures: list[str] = []
     for column in deferred:
-        body = {"field_name": column.name, "type": column.type_code,
-                "property": {"table_id": table_id, "multiple": False}}
+        if column.formula:
+            prop: dict = {"formula_expression": column.formula}
+        else:
+            prop = {"table_id": table_id, "multiple": False}
+        body = {"field_name": column.name, "type": column.type_code, "property": prop}
         try:
             workspace.create_field(base["app_token"], table_id, body)
         except Exception as exc:                                # noqa: BLE001

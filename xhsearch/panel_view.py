@@ -797,6 +797,29 @@ _SCRIPT = r"""
       });
     }).catch(function(err){ say(esc(String(err)), ""); });
   });
+  // 群的 chat_id 界面上看不到：列出应用所在的群，连要粘的那一行变量一起给。
+  var btnChats = document.getElementById("btnChats");
+  if (btnChats) btnChats.addEventListener("click", function(){
+    btnChats.disabled = true;
+    say("在问飞书应用在哪些群里…", "muted");
+    fetch("/api/chats").then(function(r){ return r.json().then(function(j){
+      if (!r.ok) throw new Error((j.error || ("HTTP " + r.status)) + (j.hint ? "\n" + j.hint : ""));
+      return j; }); })
+      .then(function(j){
+        btnChats.disabled = false;
+        if (!j.chats.length) {
+          say("应用还没在任何群里。到要开编辑权限的那个群：群设置 → 群机器人 → 添加机器人 → 搜应用名，加进去再点一次。", "");
+          return;
+        }
+        var lines = ["应用在 " + j.chats.length + " 个群里：",
+                     j.chats.map(function(c){ return "· <code>" + esc(c.chat_id) + "</code>  " + esc(c.name); }).join("\n"),
+                     "把要开「可编辑」的群的 chat_id 填进面板服务的变量（多个用逗号分开），重启后每张新建的表都会自动加上：",
+                     "<code>FEISHU_TABLE_EDITOR_CHATS=" + esc(j.chats[0].chat_id) + "</code>",
+                     "可管理的人填 <code>FEISHU_TABLE_MANAGERS=你的飞书登录邮箱</code>，不用找 open_id。"];
+        say(lines.join("\n"), "");
+      })
+      .catch(function(err){ say(esc(String(err)), ""); btnChats.disabled = false; });
+  });
   var btnCreate = document.getElementById("btnCreate");
   if (btnCreate) btnCreate.addEventListener("click", function(){
     var name = document.getElementById("addLabel").value.trim();
@@ -1259,8 +1282,13 @@ def _projects_section(config) -> str:
         share = "建完自动加协作者：" + "、".join(bits) + "。"
     else:
         share = ("<b>没配协作者</b>：建出来的表只有应用自己能管，人打开只有「可阅读」，"
-                 "连分享范围都动不了。先配 <code>FEISHU_TABLE_MANAGERS</code>（你的邮箱，"
-                 "可管理）和 <code>FEISHU_TABLE_EDITOR_CHATS</code>（运营群，可编辑）再建。")
+                 "连分享范围都动不了。先配 <code>FEISHU_TABLE_MANAGERS</code>（你的飞书"
+                 "登录邮箱，可管理）和 <code>FEISHU_TABLE_EDITOR_CHATS</code>（运营群，"
+                 "可编辑）再建。")
+    # 群的 chat_id 界面上看不到，这里点一下列出来（要应用先在群里、开了
+    # im:chat:readonly）。放在这儿是因为填那个变量的人就是在这儿建表的人。
+    share += (" <button type=button id=btnChats class=sm>列出应用所在的群</button>"
+              "<span class=muted>（拿 chat_id）</span>")
     return f"""<h2 id=s-manage>项目</h2>
 <div class=muted style='margin-bottom:8px'>加表、停用、移除都在这儿。
 「移除」只是不再监控，<b>不动你飞书表里的任何数据</b>。{patch}</div>

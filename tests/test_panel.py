@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import panel, panel_view, railway, summary
+from xhsearch import feishu, panel, panel_view, railway, summary
 from xhsearch.config import Settings
 
 UTC = timezone.utc
@@ -1296,6 +1296,19 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
                    data=json.dumps({"name": "乙", "template": "monitor"}).encode(),
                    headers=self._login(), method="POST")
         self.actions.create.assert_called_with("乙", template="monitor")
+
+    def test_listing_chats_is_read_only_and_needs_a_session(self):
+        self.assertEqual(self._call("/api/chats")[0], 401)
+        self.actions.list_chats.return_value = [{"chat_id": "oc_1", "name": "运营群"}]
+        status, body = self._call("/api/chats", headers=self._login())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["chats"][0]["chat_id"], "oc_1")
+
+    def test_listing_chats_translates_the_missing_scope(self):
+        self.actions.list_chats.side_effect = feishu.FeishuError(99991672, "no scope")
+        status, body = self._call("/api/chats", headers=self._login())
+        self.assertEqual(status, 400)
+        self.assertIn("im:chat:readonly", body)
 
     def test_create_refuses_an_unknown_template(self):
         status, body = self._call(

@@ -265,9 +265,15 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_columns_follow_the_xiwu_table_in_order(self):
         """顺序也要一样：运营看惯了那个顺序，机器列全堆到末尾反而要重新找。
-        「父记录」建表时带不了（要 table_id），「下次检查时间」是公式列不建。"""
+        「父记录」和「下次检查时间」建表时带不了（一个要 table_id，一个引用
+        别的列），建完再补，落在末尾。"""
         expected = [c for c in XIWU_COLUMNS if c not in ("父记录", "下次检查时间")]
         self.assertEqual([f["field_name"] for f in self.fields], expected)
+
+    def test_every_xiwu_column_ends_up_built(self):
+        self.assertEqual(sorted(self.made["built"]), sorted(XIWU_COLUMNS))
+        self.assertEqual(self.made["columns"], len(XIWU_COLUMNS))
+        self.assertEqual(self.made["skipped_columns"], [])
 
     def test_every_monitor_column_is_in_the_full_template(self):
         names = {f["field_name"] for f in self.fields}
@@ -311,32 +317,55 @@ class TestFullTemplate(unittest.TestCase):
         self.assertEqual(names[:len(self.settings.tags.machine_written())],
                          self.settings.tags.machine_written())
 
+    def _deferred(self):
+        calls = self.workspace.create_field.call_args_list
+        return {c[0][2]["field_name"]: c for c in calls}
+
     def test_the_parent_record_link_is_added_after_the_table_exists(self):
         """单向关联到本表：property 要填 table_id，只能建完再补。"""
-        self.workspace.create_field.assert_called_once()
-        app_token, table_id, body = self.workspace.create_field.call_args[0]
+        call = self._deferred()["父记录"]
+        app_token, table_id, body = call[0]
         self.assertEqual((app_token, table_id), ("bascnNEW", "tblNEW"))
-        self.assertEqual(body["field_name"], "父记录")
         self.assertEqual(body["type"], 18)
-        self.assertEqual(body["property"]["table_id"], "tblNEW")
+        self.assertEqual(body["property"], {"table_id": "tblNEW", "multiple": False})
         self.assertIn("父记录", self.made["built"])
-        self.assertEqual(self.made["columns"], len(self.fields) + 1)
 
-    def test_the_formula_column_is_named_as_not_built(self):
-        """公式每张表不一样，机器不猜——猜错一个公式比少一列更糟。"""
-        self.assertEqual(len(self.made["skipped_columns"]), 1)
-        self.assertIn("下次检查时间", self.made["skipped_columns"][0])
-        self.assertIn("公式", self.made["skipped_columns"][0])
+    def test_the_next_check_formula_is_the_operators_own_formula(self):
+        """「下次检查时间」是公式列，公式是运营给的原文——按列名引用别的列，
+        那些列得先存在，所以也是建完再补。列名从配置取，不写死。"""
+        call = self._deferred()["下次检查时间"]
+        body = call[0][2]
+        self.assertEqual(body["type"], 20)
+        self.assertEqual(
+            body["property"]["formula_expression"],
+            '[最近检查时间] + IF(DATEDIF([发布时间], NOW(), "D") <= 2, 8, '
+            'IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24')
+        self.assertIn("下次检查时间", self.made["built"])
 
-    def test_a_failed_link_column_does_not_fail_the_created_table(self):
+    def test_deferred_columns_are_added_in_layout_order(self):
+        names = [c[0][2]["field_name"] for c in self.workspace.create_field.call_args_list]
+        self.assertEqual(names, ["父记录", "下次检查时间"])
+
+    def test_the_formula_follows_renamed_columns(self):
+        from dataclasses import replace
+        settings = Settings()
+        settings.fields = replace(settings.fields, last_updated="上次巡查",
+                                  publish_time="发帖日期")
+        formula = provision.next_check_formula(settings)
+        self.assertIn("[上次巡查] +", formula)
+        self.assertIn('DATEDIF([发帖日期], NOW(), "D")', formula)
+        self.assertNotIn("最近检查时间", formula)
+
+    def test_a_failed_deferred_column_does_not_fail_the_created_table(self):
         workspace = fake_workspace()
-        workspace.create_field.side_effect = RuntimeError("1254xxx")
+        workspace.create_field.side_effect = [RuntimeError("1254xxx"), "fldOK"]
         made = provision.create_monitored_table(workspace, self.settings, "甲",
                                                 log=lambda *a: None)
         self.assertEqual(made["target"], "bascnNEW:tblNEW")
         self.assertEqual(len(made["column_failures"]), 1)
         self.assertIn("父记录", made["column_failures"][0])
         self.assertNotIn("父记录", made["built"])
+        self.assertIn("下次检查时间", made["built"])
 
     def test_a_renamed_monitor_column_follows_the_rename(self):
         """模板按角色名引用巡查列，改列名两边不漂。"""
