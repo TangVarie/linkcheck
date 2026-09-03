@@ -67,6 +67,11 @@ class Row:
     # 有值 = 已经记过第一次，之后再猛的一轮也不覆盖它。
     surge_time_ms: Optional[int] = None
     queued: bool = False
+    # 「是否巡查」那一格的现值。日常巡查（sweep）只看勾着的行；**queue 不看它**
+    # ——勾「排队刷新」是人明确说「我现在就要这一行的数据」，和「这一行日常
+    # 要不要维护」是两件事（见 load_rows）。读回来只为了在日志里说清
+    # 「这一批里有 N 行没开巡查」，让这种主动取数在运行历史里看得见。
+    monitoring: bool = True
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)
 

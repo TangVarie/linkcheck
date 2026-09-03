@@ -388,6 +388,68 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIsNone(table.requested_fields)   # 连 search 都没发
 
+    def test_queue_does_not_filter_on_the_monitoring_checkbox(self):
+        """勾「排队刷新」是**主动的单次取数请求**，和「这一行日常要不要维护」
+        是两件事。旧行为是 `是否巡查=true AND 排队刷新=true`：取消巡查的行
+        勾了永远不会被接走，勾也永远不会被清掉（清勾是处理完顺带做的），
+        而面板还回一句「cron 五分钟内接手」——一句不成立的承诺。
+        """
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+
+        class _Table:
+            def __init__(self):
+                self.filter_spec = None
+
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                self.filter_spec = filter_spec
+                return []
+
+        queue_table = _Table()
+        runner.load_rows(queue_table, settings, only_due=False, only_queued=True)
+        names = [c["field_name"] for c in queue_table.filter_spec["conditions"]]
+        self.assertEqual(names, [f.queued])
+        self.assertNotIn(f.monitoring, names)
+
+        # sweep 那一侧一个字没变：日常巡查照旧只看勾着「是否巡查」的行。
+        sweep_table = _Table()
+        runner.load_rows(sweep_table, settings, only_due=False)
+        self.assertEqual([c["field_name"] for c in sweep_table.filter_spec["conditions"]],
+                         [f.monitoring])
+
+    def test_a_queued_row_with_monitoring_off_is_refreshed(self):
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        f = settings.fields
+
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                return [{"record_id": "rec1", "fields": {
+                    f.link: "https://xhslink.com/a",
+                    f.monitoring: False,
+                    f.queued: True,
+                }}]
+
+        rows = runner.load_rows(_Table(), settings, only_due=False, only_queued=True)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].queued)
+        self.assertFalse(rows[0].monitoring, "没开巡查这件事要读回来，日志里要说")
+
+    def test_a_row_without_the_monitoring_cell_counts_as_monitored(self):
+        """定点读（batch_get）和老快照都可能不带这一列。默认 False 会让日志
+        把一整批正常的行说成「没开巡查」。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        settings = Settings()
+        row = runner.row_from_record({"record_id": "r", "fields": {}}, settings)
+        self.assertTrue(row.monitoring)
+
     def test_sweep_without_timestamp_column_does_nothing(self):
         """「最近检查时间」列没建时 sweep 必须空转：分层刷新失去依据，
         每一行都会被判成该刷，一轮就是全表重刷；写回侧又写不进时间戳，
