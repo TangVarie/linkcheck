@@ -231,6 +231,19 @@ class TestConfigRefusesToStartUnsafe(unittest.TestCase):
         self.assertEqual((bare.table_managers, bare.table_editor_chats, bare.table_owner),
                          ((), (), ""))
 
+    def test_manager_identities_are_scrubbed_from_the_log_feed(self):
+        """运行日志是 cron 那个进程打的，送到浏览器之前要过一遍脱敏。
+        管理员的手机号不是密钥，但同样不该出现在这个共用口令的页面上。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": GOOD_PASSWORD,
+            "FEISHU_TABLE_MANAGERS": "13800008888, ziao@example.com",
+            "FEISHU_TABLE_OWNER": "ou_boss_identifier"})
+        self.assertIn("13800008888", cfg.secrets)
+        self.assertIn("ziao@example.com", cfg.secrets)
+        self.assertIn("ou_boss_identifier", cfg.secrets)
+        scrubbed = railway.redact("给 13800008888 开可管理失败", cfg.secrets)
+        self.assertNotIn("13800008888", scrubbed)
+
     def test_a_formatted_phone_number_stays_one_manager(self):
         """「+86 138-0000-0000」按空白切会变成两个人，谁都对不上。"""
         cfg = panel.PanelConfig.from_env({
@@ -1258,6 +1271,15 @@ class TestShareSettings(unittest.TestCase):
         self.assertTrue(state["owner_configured"])
         self.assertNotIn("managers", state)
         self.assertNotIn("owner", state)
+
+    def test_the_count_is_deduplicated_like_the_plan(self):
+        """同一个人写了两遍时，面板说「已配 2 人」而实际只开一个——
+        数数和真正开权限必须用同一份清单。"""
+        projects, _ = self._projects(
+            table_managers=("13800008888", "13800008888", "ziao@x.com"))
+        self.assertEqual(projects.share_state()["managers_count"], 2)
+        self.assertEqual(projects.share_plan().managers,
+                         ("13800008888", "ziao@x.com"))
 
     def test_managers_come_only_from_the_backend(self):
         """面板口令是运营共用的：面板上要是能加可管理的人，谁拿到口令谁就能给

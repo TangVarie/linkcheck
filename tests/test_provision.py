@@ -522,6 +522,50 @@ class TestShareTable(unittest.TestCase):
         self.assertIn("contact:user.id:readonly", result.failures[0])
         self.assertNotIn("13800000000", result.failures[0])
 
+    def test_an_upstream_error_that_echoes_the_id_is_redacted(self):
+        """**上游的报错会回声。** 飞书对一个不认识的 open_id / 邮箱，msg 里
+        常常原样带着送过去的那个值，而这段 msg 会进 failures（面板直接显示）
+        和运行日志——上面费劲不写身份，一句 `{exc}` 就全漏回去了。"""
+        lines = []
+        workspace = fake_workspace()
+        workspace.add_member.side_effect = RuntimeError(
+            "1254001 invalid member_id: ziao@example.com（request_id=abc）")
+        result = provision.share_table(
+            workspace, "bascnNEW", self._plan(managers=("ziao@example.com",)),
+            log=lines.append)
+        everything = " ".join(result.failures + lines)
+        self.assertNotIn("ziao@example.com", everything)
+        self.assertIn("…", everything)
+        # 抹的是身份，不是整条报错——request_id 是找厂商排查的唯一凭据
+        self.assertIn("request_id=abc", everything)
+        self.assertIn("1254001", everything)
+
+    def test_a_mobile_echo_is_redacted_on_the_lookup_path_too(self):
+        workspace = fake_workspace()
+        workspace.resolve_open_id.side_effect = RuntimeError(
+            "no user for mobile 13800008888")
+        result = provision.share_table(
+            workspace, "bascnNEW", self._plan(managers=("138 0000 8888",)),
+            log=lambda *a: None)
+        self.assertNotIn("13800008888", result.failures[0])
+        self.assertNotIn("138 0000 8888", result.failures[0])
+        self.assertIn("contact:user.id:readonly", result.failures[0])
+
+    def test_the_resolved_open_id_is_redacted_from_an_echo(self):
+        """手机号换来的 open_id 同样是身份：报错回声它也要抹。"""
+        workspace = fake_workspace()
+        workspace.resolve_open_id.return_value = "ou_resolved_abc"
+        workspace.add_member.side_effect = RuntimeError("bad member ou_resolved_abc")
+        result = provision.share_table(
+            workspace, "bascnNEW", self._plan(managers=("13800008888",)),
+            log=lambda *a: None)
+        self.assertNotIn("ou_resolved_abc", result.failures[0])
+
+    def test_redact_leaves_short_values_alone(self):
+        """一两个字符的值抹下去会把整句话打成马赛克。"""
+        self.assertEqual(provision.redact("a bad id", "a"), "a bad id")
+        self.assertEqual(provision.redact("id=abcd 出错", "abcd"), "id=… 出错")
+
     def test_people_never_appear_in_results_or_logs_but_group_names_do(self):
         """手机号 / 邮箱 / open_id 是个人信息，面板口令又是运营共用的：
         管理员是谁不进结果、不进日志。群名可以——群本来就是给运营看的。"""

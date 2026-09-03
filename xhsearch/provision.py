@@ -390,6 +390,24 @@ def member_type(member_id: str) -> str:
     return ""
 
 
+def redact(text, *identifiers) -> str:
+    """把人的身份从一段文字里抹掉，用「…」顶上。
+
+    **上游的报错会回声。** 飞书对一个不认识的 open_id / 邮箱，msg 里常常
+    原样带着你送过去的那个值；这段 msg 会进 `ShareResult.failures`（面板直接
+    显示给运营）和运行日志。上面费劲不写身份，这里一句 `{exc}` 就全漏回去了。
+    所以凡是把异常文本往外抛的地方，先过这一道。
+
+    只抹够长的（≥3）：一个一两个字符的值抹下去会把整句话打成马赛克。
+    """
+    out = str(text)
+    for value in identifiers:
+        value = str(value or "").strip()
+        if len(value) >= 3 and value in out:
+            out = out.replace(value, "…")
+    return out
+
+
 def resolve_person(workspace: feishu.Workspace, who: str, shown: str,
                    failures: list) -> Optional[tuple[str, str]]:
     """把一个「人」的写法变成协作者接口认的 (member_type, member_id)。
@@ -407,7 +425,7 @@ def resolve_person(workspace: feishu.Workspace, who: str, shown: str,
             open_id = workspace.resolve_open_id(mobile=mobile)
         except Exception as exc:                                # noqa: BLE001
             failures.append(
-                f"按{shown}的手机号找用户失败：{exc}。要给应用开 "
+                f"按{shown}的手机号找用户失败：{redact(exc, who, mobile)}。要给应用开 "
                 "contact:user.id:readonly（通过手机号或邮箱获取用户 ID）权限，开完发布新版本")
             return None
         if not open_id:
@@ -442,8 +460,10 @@ def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
         try:
             workspace.add_member(app_token, kind, member_id, "full_access")
         except Exception as exc:                                # noqa: BLE001
-            result.failures.append(f"给{shown}开可管理失败：{exc}")
-            log(f"🔑 [{tag}] 开可管理失败（{shown}）：{exc}")
+            # 报错文本先抹身份：飞书对不认识的 open_id / 邮箱常把原值回声回来。
+            why = redact(exc, who, normalize_mobile(who), member_id)
+            result.failures.append(f"给{shown}开可管理失败：{why}")
+            log(f"🔑 [{tag}] 开可管理失败（{shown}）：{why}")
             continue
         managers_ok += 1
         log(f"🔑 [{tag}] 可管理 +1（{shown}）")
@@ -474,8 +494,9 @@ def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
             try:
                 workspace.transfer_owner(app_token, kind, member_id)
             except Exception as exc:                            # noqa: BLE001
-                result.failures.append(f"把所有权转给 {shown} 配的人失败：{exc}")
-                log(f"🔑 [{tag}] 转移所有权失败（{shown}）：{exc}")
+                why = redact(exc, plan.owner, normalize_mobile(plan.owner), member_id)
+                result.failures.append(f"把所有权转给 {shown} 配的人失败：{why}")
+                log(f"🔑 [{tag}] 转移所有权失败（{shown}）：{why}")
             else:
                 result.granted.append("所有权已转给后台配置的人（应用保留可管理）")
                 log(f"🔑 [{tag}] 所有权 → {shown} 配的人（应用保留可管理）")
