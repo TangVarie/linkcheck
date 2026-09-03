@@ -401,6 +401,13 @@ python3 cli.py doctor
 把它打印的 `FEISHU_REGISTRY=...` 加到**项目级**变量里——cron 和面板都要读它。
 **这辈子只做一次**，之后加表全在面板上。
 
+要让面板「直接新建」的表**人也能管**，再给面板服务加两个变量：
+`FEISHU_TABLE_MANAGERS=你的飞书邮箱`（可管理），
+`FEISHU_TABLE_EDITOR_CHATS=运营群的 chat_id`（群里所有人可编辑；
+chat_id 用 `python3 cli.py chats` 列，要先把应用作为机器人加进那个群，
+并给应用开 `im:chat:readonly`）。不配的话建出来的表只有应用能管，
+人打开只有「可阅读」。详见 [`面板.md`](面板.md) 二·五。
+
 常驻进程约 $0.3–1/月。相对数据接口的 ¥950/月，这是噪声。
 
 > ⚠️ **两条不能踩的线**

@@ -260,6 +260,102 @@ class Workspace:
         )
         return str(_check(resp).get("table_id") or "")
 
+    def create_field(self, app_token: str, table_id: str,
+                     body: dict[str, Any]) -> str:
+        """给一张刚建好的表补一列，返回 field_id。
+
+        建表时一次带齐是常态（见 create_table）；这条路只给**建表时带不了**的列
+        ——「父记录」这种关联到本表的列，property 里要填 table_id，
+        而 table_id 要等表建出来才有。
+        """
+        resp = transport.post_with_retry(
+            f"{BASE}/bitable/v1/apps/{urllib.parse.quote(app_token, safe='')}"
+            f"/tables/{urllib.parse.quote(table_id, safe='')}/fields",
+            self._headers(), json.dumps(body, ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        return str((_check(resp).get("field") or {}).get("field_id") or "")
+
+    # ---------- 建好之后：把人和群加成协作者 ----------
+    #
+    # 应用自己建的 base，应用是**所有者**——而所有者能给任何人开权限，这一步
+    # 不需要额外的权限范围（bitable:app 就够，官方文档写明）。这正是「接管
+    # 已有表」做不到而「新建表」做得到的事：那边是别人的文档，应用给自己开
+    # 权限就是提权漏洞；这边是应用自己的文档，把人加进来是它的本分。
+    #
+    # 不加的话，建出来的表只有应用能管：人打开只有「可阅读」，连链接分享范围
+    # 都动不了（提示「联系文档所有者 @<应用名>」——一个不会回话的所有者）。
+
+    def add_member(self, app_token: str, member_type: str, member_id: str,
+                   perm: str, *, notify: bool = True) -> None:
+        """给一个人 / 群 / 部门开协作权限。perm ∈ view / edit / full_access。
+
+        member_type 按飞书的叫法：email / openid / userid / unionid /
+        openchat（群）/ opendepartmentid。**加群要求应用本身在那个群里**
+        （官方原话：需要将应用作为机器人添加至群组），不在会报错，不会静默。
+        """
+        query = urllib.parse.urlencode({
+            "type": "bitable", "need_notification": "true" if notify else "false"})
+        resp = transport.post_with_retry(
+            f"{BASE}/drive/v1/permissions/"
+            f"{urllib.parse.quote(app_token, safe='')}/members?{query}",
+            self._headers(),
+            json.dumps({"member_type": member_type, "member_id": member_id,
+                        "perm": perm}, ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
+
+    def transfer_owner(self, app_token: str, member_type: str, member_id: str,
+                       *, old_owner_perm: str = "full_access") -> None:
+        """把这个 base 的所有权转给一个人。member_type ∈ email / openid / userid。
+
+        应用（原所有者）**默认保留可管理**（old_owner_perm=full_access）：
+        它还要往这张表里写巡查结果、以后还要给新加进来的人开权限。
+        转走的是「谁说了算」，不是「机器还能不能干活」。
+        """
+        query = urllib.parse.urlencode({
+            "type": "bitable", "remove_old_owner": "false",
+            "old_owner_perm": old_owner_perm})
+        resp = transport.post_with_retry(
+            f"{BASE}/drive/v1/permissions/"
+            f"{urllib.parse.quote(app_token, safe='')}/members/transfer_owner?{query}",
+            self._headers(),
+            json.dumps({"member_type": member_type, "member_id": member_id},
+                       ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
+
+    def list_chats(self) -> list[dict[str, str]]:
+        """应用（作为机器人）所在的群：[{chat_id, name}]。自动翻页。
+
+        给「给哪个群开编辑权限」这件事找 chat_id 用——飞书界面上普通成员
+        看不到群的 ID，只有这条接口能列出来。要 im:chat:readonly 权限。
+        """
+        out: list[dict[str, str]] = []
+        page_token = ""
+        for _ in range(50):
+            url = f"{BASE}/im/v1/chats?page_size=100"
+            if page_token:
+                url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
+            resp = transport.request_with_retry(
+                "GET", url, self._headers(), "", timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            data = _check(resp)
+            for item in data.get("items") or []:
+                if isinstance(item, dict) and item.get("chat_id"):
+                    out.append({"chat_id": str(item.get("chat_id")),
+                                "name": str(item.get("name") or "")})
+            page_token = str(data.get("page_token") or "")
+            if not data.get("has_more") or not page_token:
+                break
+        return out
+
 
 class Bitable:
     """一张多维表格的读写客户端。"""

@@ -217,6 +217,20 @@ class TestConfigRefusesToStartUnsafe(unittest.TestCase):
             with self.assertRaises(panel.ConfigError):
                 panel.PanelConfig.from_env(env)
 
+    def test_new_table_collaborators_come_from_the_environment(self):
+        """建完表给谁开权限：逗号 / 分号 / 空白分隔都认，空就是空元组。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": GOOD_PASSWORD,
+            "FEISHU_TABLE_MANAGERS": "ziao@example.com, ou_abc；ou_def",
+            "FEISHU_TABLE_EDITOR_CHATS": "oc_1 oc_2",
+            "FEISHU_TABLE_OWNER": " ziao@example.com "})
+        self.assertEqual(cfg.table_managers, ("ziao@example.com", "ou_abc", "ou_def"))
+        self.assertEqual(cfg.table_editor_chats, ("oc_1", "oc_2"))
+        self.assertEqual(cfg.table_owner, "ziao@example.com")
+        bare = panel.PanelConfig.from_env({"PANEL_PASSWORD": GOOD_PASSWORD})
+        self.assertEqual((bare.table_managers, bare.table_editor_chats, bare.table_owner),
+                         ((), (), ""))
+
 
 class TestSessions(unittest.TestCase):
     def test_roundtrip(self):
@@ -1269,6 +1283,28 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
                                headers=self._login(), method="POST")
         self.assertEqual(status, 200)
         self.actions.remove.assert_called_once_with("rec9")
+
+    def test_create_passes_the_template_and_defaults_to_full(self):
+        self.actions.create.return_value = {"target": "b:t", "columns": 37}
+        status, body = self._call(
+            "/api/projects/create", data=json.dumps({"name": "甲"}).encode(),
+            headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        self.actions.create.assert_called_with("甲", template="full")
+        self.assertEqual(json.loads(body)["created"]["columns"], 37)
+        self._call("/api/projects/create",
+                   data=json.dumps({"name": "乙", "template": "monitor"}).encode(),
+                   headers=self._login(), method="POST")
+        self.actions.create.assert_called_with("乙", template="monitor")
+
+    def test_create_refuses_an_unknown_template(self):
+        status, body = self._call(
+            "/api/projects/create",
+            data=json.dumps({"name": "甲", "template": "everything"}).encode(),
+            headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("template", body)
+        self.actions.create.assert_not_called()
 
     def test_a_bad_link_becomes_a_400_with_the_reason(self):
         from xhsearch import tablespec

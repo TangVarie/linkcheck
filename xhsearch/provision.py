@@ -13,6 +13,9 @@
 「把应用加进这张表当协作者」这一步机器代替不了——飞书没有接口能让应用给
 自己开别人文档的权限，有的话就是提权漏洞。体检读不到字段列表时，
 九成是这一步没做，所以那句提示要写得能直接照着操作。
+
+反过来，**应用自己建的表**是应用的文档，把人和群加成协作者是它的本分
+（见 share_table）——不加的话人打开只有「可阅读」，连分享范围都动不了。
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from typing import Optional
 
 from . import feishu, schema, summary
 from .config import Settings
+from .schema import expected_schema
 
 # 「应用没被加进这张表」的标准话术。这是接管已有表时唯一必须人做的一步，
 # 也是最容易卡住半天的一步——飞书对它是**静默返回空结果**，不报错。
@@ -174,22 +178,253 @@ def build_missing(table: feishu.Bitable, diff: schema.SchemaDiff, *,
     return result
 
 
+# ---------- 从零建表：标准业务表模板 ----------
+#
+# 「直接新建一张」原来只建巡查要用的那二十来列。但运营真正用的表远不止这些
+# ——素人编号、文案、配图、截图、蓝词、笔记状态……建完还得回飞书手工补十几列，
+# 等于没省事。下面这份模板照 2026-09 的「西屋」表导出逐列抄的：列名、类型、
+# 选项、**顺序**都跟它一致，巡查列夹在业务列中间的位置也原样保留
+# （运营看惯了那个顺序，把机器列全堆到末尾反而要重新找）。
+#
+# 巡查列**不在这里重复定义**：它们的名字和类型只有 schema.expected_schema
+# 一份真相，这里只按角色名引用（"link"、"traffic_status"……），改列名两边不漂。
+
+TEXT, NUMBER, SINGLE, MULTI, DATE, CHECKBOX, ATTACHMENT, LINK = 1, 2, 3, 4, 5, 7, 17, 18
+
+
+@dataclass(frozen=True)
+class BusinessColumn:
+    """一列机器**完全不读不写**的业务列。选项为空 = 建成空的选择列，运营
+    往里填的时候飞书会自动加选项（蓝词、作者这类每个项目都不一样的词）。"""
+
+    name: str
+    type_code: int
+    options: tuple = ()
+    # 单向关联到**本表**（「父记录」）。property 里要填 table_id，而 table_id
+    # 要等表建出来才有——所以这种列不能跟着 create_table 一次带上，得建完再补。
+    self_link: bool = False
+
+
+# 字符串 = 巡查列的角色名（settings.fields 上的属性），BusinessColumn = 业务列。
+FULL_LAYOUT: tuple = (
+    BusinessColumn("素人编号", TEXT),
+    "publish_time",
+    "link",
+    BusinessColumn("已删除评论留底", ATTACHMENT),
+    "traffic_status",
+    "surge_time",
+    BusinessColumn("笔记状态", MULTI, ("已发布", "重点关注⭐️", "控评&置顶✅",
+                                      "已投流，等回收数据", "待回复", "待删除竞品评论")),
+    BusinessColumn("方向", SINGLE, ("流量贴", "产品贴")),
+    BusinessColumn("找人备注", TEXT),
+    BusinessColumn("内容配图", ATTACHMENT),
+    BusinessColumn("文案", TEXT),
+    BusinessColumn("随贴评论", TEXT),
+    BusinessColumn("评论的素人编号", TEXT),
+    BusinessColumn("评论配图", ATTACHMENT),
+    "comment_status",
+    BusinessColumn("发布截图", ATTACHMENT),
+    BusinessColumn("相关截图", ATTACHMENT),
+    # 蓝词是人工在手机端自查的，机器不碰（docs/表结构.md §〇）；每个项目的词
+    # 都不一样，所以建成空多选，填的时候自动加选项。
+    BusinessColumn("蓝词字段", MULTI),
+    BusinessColumn("蓝词图片", ATTACHMENT),
+    BusinessColumn("作者", SINGLE),
+    BusinessColumn("父记录", LINK, self_link=True),
+    "negative_keywords",
+    "seed_keywords",
+    "monitoring",
+    "queued",
+    "failure_reason",
+    "pinned_status",
+    "alive_confirmed",
+    "refresh_status",
+    "negative_status",
+    "negative_digest",
+    "comment_digest",
+    "comment_count",
+    "last_updated",
+    "consecutive_failures",
+    "platform",
+    "previous_comment_count",
+)
+
+# 西屋表里还有一列「下次检查时间」，是运营自己写的**公式列**。公式的具体写法
+# 每张表不一样，机器不猜——猜错一个公式比少一列更糟（它会一直显示一个
+# 看着像真的的时间）。建完从旧表把那一列复制过来就行。
+NOT_BUILT = (
+    "下次检查时间（公式列，公式每张表不一样，机器不猜——从旧表复制一列过来）",
+)
+
+# 人机共用的「流量状态」在业务表里还有两个人工选项。新表一起带上是纯追加、
+# 零风险；接管已有表时**不**补它们——补选项对已有列是整体覆盖（见 build_missing）。
+EXTRA_OPTIONS = {"traffic_status": ("观察中", "爆帖预备")}
+
+TEMPLATES = ("full", "monitor")
+
+
+def template_fields(settings: Settings, template: str = "full"
+                    ) -> tuple[list[dict], list[BusinessColumn], list[str]]:
+    """把模板翻译成建表请求：(建表时一次带上的列, 建完再补的自关联列, 没建的列)。
+
+    `monitor` = 只建巡查列（旧行为，顺序按 expected_schema）；
+    `full` = 按西屋表的结构连业务列一起建。
+    """
+    if template not in TEMPLATES:
+        raise ValueError(f"不认识的建表模板 {template!r}，只有 {'/'.join(TEMPLATES)}")
+    expected = {name: (allowed, list(options or []))
+                for name, allowed, _label, options, _note in expected_schema(settings)}
+    if template == "monitor":
+        return ([schema.create_field_body(name, allowed[0], options or None)
+                 for name, (allowed, options) in expected.items()], [], [])
+
+    fields: list[dict] = []
+    deferred: list[BusinessColumn] = []
+    placed: set = set()
+    for item in FULL_LAYOUT:
+        if isinstance(item, str):
+            name = getattr(settings.fields, item)
+            allowed, options = expected[name]
+            options = options + [o for o in EXTRA_OPTIONS.get(item, ()) if o not in options]
+            fields.append(schema.create_field_body(name, allowed[0], options or None))
+            placed.add(name)
+        elif item.self_link:
+            deferred.append(item)
+        else:
+            fields.append(schema.create_field_body(
+                item.name, item.type_code, list(item.options) or None))
+    # expected_schema 以后再加的巡查列，模板还没来得及排位置也不能漏建——
+    # 少一列巡查列的后果（体检红、数据落不下来）比排在末尾大得多。
+    for name, (allowed, options) in expected.items():
+        if name not in placed:
+            fields.append(schema.create_field_body(name, allowed[0], options or None))
+    return fields, deferred, list(NOT_BUILT)
+
+
+# ---------- 建好之后：把人和群加成协作者 ----------
+
+
+@dataclass(frozen=True)
+class SharePlan:
+    """建完表要给谁开什么权限。全部来自环境变量，每次建表都一样——
+    运营背后的飞书账号各不相同，所以给的是**群**（可编辑）；管理权限给
+    具体的人（可管理），不再全绑在应用这个机器人身上。"""
+
+    managers: tuple = ()       # 可管理（full_access）：邮箱，或 ou_ 开头的 open_id
+    editor_chats: tuple = ()   # 可编辑（edit）：oc_ 开头的 chat_id。应用得先在群里
+    owner: str = ""            # 把所有权转给这个人（应用保留可管理）。可选
+
+    def __bool__(self) -> bool:
+        return bool(self.managers or self.editor_chats or self.owner)
+
+
+@dataclass
+class ShareResult:
+    granted: list = field(default_factory=list)
+    failures: list = field(default_factory=list)
+
+
+def member_type(member_id: str) -> str:
+    """一个 ID 长什么样就是什么：邮箱 / ou_ 开头的 open_id / oc_ 开头的 chat_id。
+    认不出返回空串——宁可拒掉让人改配置，也别猜一种类型送给飞书。"""
+    value = (member_id or "").strip()
+    if "@" in value:
+        return "email"
+    if value.startswith("ou_"):
+        return "openid"
+    if value.startswith("oc_"):
+        return "openchat"
+    return ""
+
+
+def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
+                *, log=print) -> ShareResult:
+    """按 SharePlan 给一张**应用自己建的** base 加协作者。
+
+    一条失败不拦下一条，也不拦建表——表已经建好了，权限少给一个人的代价是
+    去飞书里补一下，比「建了又建」便宜。每一步单独打日志：给谁开了什么权限
+    是这套东西改别人可见范围的唯一审计线索。
+    """
+    result = ShareResult()
+    tag = app_token[-6:]
+    for who in plan.managers:
+        kind = member_type(who)
+        if kind not in ("email", "openid"):
+            result.failures.append(
+                f"「{who}」认不出是谁：可管理的人只认邮箱，或 ou_ 开头的 open_id")
+            continue
+        try:
+            workspace.add_member(app_token, kind, who, "full_access")
+        except Exception as exc:                                # noqa: BLE001
+            result.failures.append(f"给「{who}」开可管理失败：{exc}")
+            log(f"🔑 [{tag}] 开可管理失败 {who}：{exc}")
+            continue
+        result.granted.append(f"{who} 可管理")
+        log(f"🔑 [{tag}] 协作者 {who} 可管理")
+    for chat in plan.editor_chats:
+        if member_type(chat) != "openchat":
+            result.failures.append(
+                f"「{chat}」不是群 ID：群要填 oc_ 开头的 chat_id"
+                "（python3 cli.py chats 能列出应用所在的群）")
+            continue
+        try:
+            workspace.add_member(app_token, "openchat", chat, "edit")
+        except Exception as exc:                                # noqa: BLE001
+            result.failures.append(
+                f"给群「{chat}」开可编辑失败：{exc}。飞书要求应用本身在这个群里"
+                "——群设置里把它作为机器人加进去，再建一张")
+            log(f"🔑 [{tag}] 开群可编辑失败 {chat}：{exc}")
+            continue
+        result.granted.append(f"群 {chat} 可编辑")
+        log(f"🔑 [{tag}] 协作者 群 {chat} 可编辑")
+    if plan.owner:
+        kind = member_type(plan.owner)
+        if kind not in ("email", "openid"):
+            result.failures.append(
+                f"「{plan.owner}」认不出是谁：所有者只认邮箱，或 ou_ 开头的 open_id")
+        else:
+            try:
+                workspace.transfer_owner(app_token, kind, plan.owner)
+            except Exception as exc:                            # noqa: BLE001
+                result.failures.append(f"把所有权转给「{plan.owner}」失败：{exc}")
+                log(f"🔑 [{tag}] 转移所有权失败 {plan.owner}：{exc}")
+            else:
+                result.granted.append(f"{plan.owner} 所有者（应用保留可管理）")
+                log(f"🔑 [{tag}] 所有权 → {plan.owner}（应用保留可管理）")
+    return result
+
+
 def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
-                           name: str) -> dict[str, str]:
-    """从零建一张监控表：建 base → 建数据表（连列带选项一次建齐）。
+                           name: str, *, template: str = "full",
+                           share: Optional[SharePlan] = None,
+                           log=print) -> dict:
+    """从零建一张监控表：建 base → 建数据表（连列带选项一次建齐）→ 补自关联列
+    → 按 SharePlan 加协作者。
 
     这条路**一次飞书都不用点**：应用自己建的 base，应用天然有完全权限，
     不需要「添加文档应用」。（这一点还没在真机上验过，见待验证清单。）
     """
+    fields, deferred, skipped = template_fields(settings, template)
     base = workspace.create_base(f"linkcheck · {name}")
     if not base["app_token"]:
         raise feishu.FeishuError(-1, "建 base 失败：飞书没返回 app_token")
-    fields = [schema.create_field_body(col, allowed[0], options)
-              for col, allowed, _label, options, _note
-              in schema.expected_schema(settings)]
     table_id = workspace.create_table(base["app_token"], name, fields)
     if not table_id:
         raise feishu.FeishuError(-1, "建数据表失败：飞书没返回 table_id")
+    built = [f["field_name"] for f in fields]
+    column_failures: list[str] = []
+    for column in deferred:
+        body = {"field_name": column.name, "type": column.type_code,
+                "property": {"table_id": table_id, "multiple": False}}
+        try:
+            workspace.create_field(base["app_token"], table_id, body)
+        except Exception as exc:                                # noqa: BLE001
+            # 表已经建好了。一列关联列没补上，不该让整张表变成「建失败」。
+            column_failures.append(f"建列「{column.name}」失败：{exc}")
+            log(f"🧱 [{base['app_token'][-6:]}/{table_id}] 补列失败 {column.name}：{exc}")
+        else:
+            built.append(column.name)
+    shared = share_table(workspace, base["app_token"], share, log=log) if share else ShareResult()
     # ⚠️ 链接必须带上**新建的这张表**的 table_id。`create_base` 会顺带建一张
     # 飞书自己的默认表，返回的 base 级 url 点进去就是那一张——运营可能直接
     # 在里面开始填数据，而注册表监控的是另一张，填的东西一行都不会被巡查。
@@ -200,7 +435,11 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
             # 页面上说一句就够了。
             "note": "这个 base 里还有一张飞书自动建的默认表，没在监控范围内，"
                     "别往那张里填东西",
-            "target": f"{base['app_token']}:{table_id}"}
+            "target": f"{base['app_token']}:{table_id}",
+            "template": template,
+            "columns": len(built), "built": built,
+            "skipped_columns": skipped, "column_failures": column_failures,
+            "shared": shared.granted, "share_failures": shared.failures}
 
 
 def _table_url(base_url: str, app_token: str, table_id: str) -> str:

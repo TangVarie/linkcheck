@@ -34,6 +34,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -97,6 +98,12 @@ class PanelConfig:
     # （`summary.LABEL_CANDIDATES`，「笔记内容」打头）。写了就只认它——
     # 表里没有那一列会在项目卡上点名，而不是悄悄换一列。
     label_column: str = ""
+    # 「直接新建一张」建完给谁开权限。不配的话建出来的表只有应用能管：
+    # 人打开只有「可阅读」，连链接分享范围都动不了。运营背后的飞书账号各不
+    # 相同，所以编辑权限给**群**；管理权限给具体的人，不再全绑在机器人上。
+    table_managers: tuple = ()        # FEISHU_TABLE_MANAGERS：邮箱 / ou_ open_id → 可管理
+    table_editor_chats: tuple = ()    # FEISHU_TABLE_EDITOR_CHATS：oc_ chat_id → 可编辑
+    table_owner: str = ""             # FEISHU_TABLE_OWNER：把所有权转给这个人（可选）
 
     # 余额那一块。两家的余额端点都是官方标明零费用的（见 xhsearch/balance.py
     # 开头那张表），所以「面板不发付费请求」这条不变量没被动过——
@@ -156,6 +163,9 @@ class PanelConfig:
             app_id=(env.get("FEISHU_APP_ID") or "").strip(),
             app_secret=(env.get("FEISHU_APP_SECRET") or "").strip(),
             label_column=(env.get("PANEL_LABEL_COLUMN") or "").strip(),
+            table_managers=_list_env(env, "FEISHU_TABLE_MANAGERS"),
+            table_editor_chats=_list_env(env, "FEISHU_TABLE_EDITOR_CHATS"),
+            table_owner=(env.get("FEISHU_TABLE_OWNER") or "").strip(),
             commit=(env.get("RAILWAY_GIT_COMMIT_SHA") or "").strip()[:7],
             show_balance=_bool_env(env, "PANEL_SHOW_BALANCE", True),
             runway_warn_days=_float_env(env, "PANEL_RUNWAY_WARN_DAYS",
@@ -191,6 +201,12 @@ def _float_env(env, name, default, minimum, maximum) -> float:
     if value != value or not minimum <= value <= maximum:
         raise ConfigError(f"环境变量 {name} 的值 {raw} 超出 [{minimum}, {maximum}]")
     return value
+
+
+def _list_env(env, name) -> tuple:
+    """逗号 / 分号 / 空白分隔的一组值。空 = 空元组。"""
+    raw = env.get(name) or ""
+    return tuple(v for v in re.split(r"[,;，；\s]+", raw) if v)
 
 
 def _bool_env(env, name, default: bool) -> bool:
@@ -814,12 +830,21 @@ class Projects:
         return registry.add(self._registry(), label=label or parsed.label,
                             target=target, note=note, client_token=client_token)
 
-    def create(self, name: str) -> dict:
-        """从零建一张监控表。一次飞书都不用点。"""
+    def share_plan(self) -> provision.SharePlan:
+        return provision.SharePlan(
+            managers=tuple(self.config.table_managers),
+            editor_chats=tuple(self.config.table_editor_chats),
+            owner=self.config.table_owner)
+
+    def create(self, name: str, template: str = "full") -> dict:
+        """从零建一张监控表，建完按配置加协作者。一次飞书都不用点。"""
         workspace = feishu.Workspace(app_id=self.config.app_id,
                                      app_secret=self.config.app_secret)
-        made = provision.create_monitored_table(workspace, self.settings, name)
-        self.log(f"🧱 新建监控表 {name} → {made['app_token'][-6:]}/{made['table_id']}")
+        made = provision.create_monitored_table(
+            workspace, self.settings, name, template=template,
+            share=self.share_plan(), log=self.log)
+        self.log(f"🧱 新建监控表 {name}（{template}，{made['columns']} 列）→ "
+                 f"{made['app_token'][-6:]}/{made['table_id']}")
         return made
 
     def preview_thresholds(self, record_id: str, values: dict) -> dict:
@@ -1382,6 +1407,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 400, {"error": exc.msg, "hint": exc.hint, "code": exc.code})
         except registry.RegistryError as exc:
             return self._send_json(400, {"error": str(exc)})
+        except ValueError as exc:
+            # _run_action 里对请求内容的校验（空项目名、不认识的模板、阈值不是
+            # 整数）都抛 ValueError——那是请求的错，不是服务器的错，给 400。
+            return self._send_json(400, {"error": str(exc)})
         except NotImplementedError:
             return self._send_json(404, {"error": f"没有这个动作：{action}"})
         except Exception as exc:                                # noqa: BLE001
@@ -1409,7 +1438,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             name = text("name")
             if not name:
                 raise ValueError("要填个项目名")
-            return {"created": projects.create(name)}
+            template = text("template") or "full"
+            if template not in provision.TEMPLATES:
+                raise ValueError(f"template 只认 {'/'.join(provision.TEMPLATES)}")
+            return {"created": projects.create(name, template=template)}
         if action == "build":
             result = projects.build(text("app_token"), text("table_id"))
             return {"summary": result.summary(), "created": result.created,

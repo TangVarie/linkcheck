@@ -8,6 +8,7 @@
     python3 cli.py estimate            # 只估算这一轮要花多少钱，不发请求
     python3 cli.py serve               # 起监控面板（常驻、只读，一分钱不花）
     python3 cli.py init-registry       # 建那张存表清单的飞书表（这辈子跑一次）
+    python3 cli.py chats               # 列出应用所在的群和 chat_id（给新建表开群编辑权限用）
 
 多表：设 FEISHU_TABLES 一次巡查多张表（见 .env.example），上面每个命令都会
 逐表执行；`--table 标签` 可以只跑其中某几张（逗号分隔）。
@@ -1088,6 +1089,35 @@ def cmd_init_registry() -> int:
     return 0
 
 
+def cmd_chats() -> int:
+    """列出应用（作为机器人）所在的群——`FEISHU_TABLE_EDITOR_CHATS` 要填的
+    就是这里打印的 chat_id。
+
+    为什么要有它：飞书界面上普通成员看不到群的 ID，只有接口能列。
+    要在开放平台给应用开 `im:chat:readonly`（读群信息）；加群协作者本身
+    不需要额外权限，但**应用得先在那个群里**（群设置 → 群机器人 → 添加）。
+    """
+    workspace = feishu.Workspace(app_id=_env("FEISHU_APP_ID"),
+                                 app_secret=_env("FEISHU_APP_SECRET"))
+    try:
+        chats = workspace.list_chats()
+    except feishu.FeishuError as exc:
+        sys.exit(f"列群失败：{exc}\n多半是应用没开 im:chat:readonly 权限"
+                 "（开放平台 → 权限管理 → 搜 im:chat），开完要发布新版本。")
+    if not chats:
+        print("应用还没在任何群里。到要开编辑权限的那个群：群设置 → 群机器人 → "
+              "添加机器人 → 搜应用名，加进去再来跑一次。")
+        return 1
+    print(f"应用在 {len(chats)} 个群里：\n")
+    for chat in chats:
+        print(f"    {chat['chat_id']}  {chat['name']}")
+    print("\n把要开「可编辑」的群的 chat_id 填进面板服务的变量（多个用逗号分开）：\n")
+    print(f"    FEISHU_TABLE_EDITOR_CHATS={chats[0]['chat_id']}\n")
+    print("再配 FEISHU_TABLE_MANAGERS=你的飞书邮箱（可管理）。之后每一张"
+          "「直接新建」的表都会自动加上这些协作者。")
+    return 0
+
+
 def cmd_serve(selected: list[str] | None = None) -> int:
     """起监控面板。**常驻进程，但一个付费请求都不发。**
 
@@ -1204,6 +1234,8 @@ def main(argv: list[str]) -> int:
         return cmd_serve(selected)
     if command == "init-registry":
         return cmd_init_registry()
+    if command == "chats":
+        return cmd_chats()
     if command in ("sweep", "queue", "estimate"):
         return _run(command, None, selected)
     if command == "row":

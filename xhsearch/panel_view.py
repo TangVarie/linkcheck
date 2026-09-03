@@ -801,13 +801,23 @@ _SCRIPT = r"""
   if (btnCreate) btnCreate.addEventListener("click", function(){
     var name = document.getElementById("addLabel").value.trim();
     if (!name) { say("先填个项目名", ""); return; }
-    if (!confirm("新建一张监控表「" + name + "」？\n\n会在应用自己的空间里建一个多维表格，二十来列一次建齐。")) return;
+    var fullBox = document.getElementById("addFull");
+    var full = !fullBox || fullBox.checked;
+    var what = full ? "按标准业务表的结构建齐（业务列 + 巡查列，近 40 列）" : "只建巡查要用的二十来列";
+    if (!confirm("新建一张监控表「" + name + "」？\n\n会在应用自己的空间里建一个多维表格，" + what + "，建完按配置给人和群开权限。")) return;
     btnCreate.disabled = true;
     say("建表中…", "muted");
-    post("create", {name: name}).then(function(j){
+    post("create", {name: name, template: full ? "full" : "monitor"}).then(function(j){
       var c = j.created;
       document.getElementById("addTarget").value = c.target;
-      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它</a>\n链接已经填进上面的输入框，点「体检一下」再入册。\n" + esc(c.note || ""), "ok");
+      var lines = ["建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它</a>（" + c.columns + " 列）",
+                   "链接已经填进上面的输入框，点「体检一下」再入册。"];
+      if (c.shared && c.shared.length) lines.push("协作者：" + c.shared.map(esc).join("；"));
+      var bad = (c.share_failures || []).concat(c.column_failures || []);
+      if (bad.length) lines.push("没成的：\n· " + bad.map(esc).join("\n· "));
+      if (c.skipped_columns && c.skipped_columns.length) lines.push("没建的列：" + c.skipped_columns.map(esc).join("；"));
+      if (c.note) lines.push(esc(c.note));
+      say(lines.join("\n"), bad.length ? "" : "ok");
       btnCreate.disabled = false;
     }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
   });
@@ -1233,6 +1243,24 @@ def _projects_section(config) -> str:
     patch = ("自动补选项：<b>已开</b>" if getattr(config, "allow_option_patch", False)
              else "自动补选项：<b>关</b>（缺选项只给清单，"
                   "在废表上验过再开 <code>PANEL_ALLOW_OPTION_PATCH=1</code>）")
+    # 建完给谁开权限，建之前就说清——不配的话建出来的表人打开只有「可阅读」，
+    # 连分享范围都动不了，而这时候表已经建了。
+    managers = tuple(getattr(config, "table_managers", ()) or ())
+    chats = tuple(getattr(config, "table_editor_chats", ()) or ())
+    owner = getattr(config, "table_owner", "") or ""
+    if managers or chats or owner:
+        bits = []
+        if managers:
+            bits.append(f"{len(managers)} 位可管理（{_e('、'.join(managers))}）")
+        if chats:
+            bits.append(f"{len(chats)} 个群可编辑")
+        if owner:
+            bits.append(f"所有权转给 {_e(owner)}")
+        share = "建完自动加协作者：" + "、".join(bits) + "。"
+    else:
+        share = ("<b>没配协作者</b>：建出来的表只有应用自己能管，人打开只有「可阅读」，"
+                 "连分享范围都动不了。先配 <code>FEISHU_TABLE_MANAGERS</code>（你的邮箱，"
+                 "可管理）和 <code>FEISHU_TABLE_EDITOR_CHATS</code>（运营群，可编辑）再建。")
     return f"""<h2 id=s-manage>项目</h2>
 <div class=muted style='margin-bottom:8px'>加表、停用、移除都在这儿。
 「移除」只是不再监控，<b>不动你飞书表里的任何数据</b>。{patch}</div>
@@ -1245,7 +1273,11 @@ def _projects_section(config) -> str:
     <button type=button id=btnCheck>体检一下</button>
   </div>
   <div class=muted>体检不花钱。也可以 <button type=button id=btnCreate>直接新建一张</button>
-    —— 二十来列连类型带选项一次建齐，一次飞书都不用点。</div>
+    —— 连类型带选项一次建齐，一次飞书都不用点。
+    <label style='white-space:nowrap'><input type=checkbox id=addFull checked>
+    连业务列一起建</label>（素人编号、文案、配图、截图、蓝词、笔记状态……
+    照西屋表的结构和顺序，近 40 列；不勾就只建巡查要用的二十来列）。</div>
+  <div class=muted style='margin-top:6px'>{share}</div>
   <div id=addOut class=out></div>
 </div>"""
 
