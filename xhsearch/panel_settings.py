@@ -13,10 +13,12 @@
 
 ## 它是键值表，不是配置文件
 
-两列：`键` / `值`。值一律是 JSON 文本。现在只有两个键：
+两列：`键` / `值`。值一律是 JSON 文本。现在只有一个键：
 
-* `share.managers`      → `[{"id": "ou_…", "label": "138****8888"}, …]`
 * `share.editor_chats`  → `[{"chat_id": "oc_…", "name": "梨响运营群"}, …]`
+
+「谁可管理」刻意**不**存在这里——它来自后台环境变量 FEISHU_TABLE_MANAGERS。
+面板口令是运营共用的，管理权限不能是面板上点一下就给的东西（见 panel.Projects）。
 
 按**名字**认表（「面板设置」）：没建过就建，建过就复用——不用再多一个环境变量。
 读结果在进程里缓存几分钟；写完立刻失效。面板只有一个进程，够了。
@@ -35,7 +37,6 @@ COL_KEY = "键"
 COL_VALUE = "值"
 FIELDS = [{"field_name": COL_KEY, "type": 1}, {"field_name": COL_VALUE, "type": 1}]
 
-KEY_MANAGERS = "share.managers"
 KEY_EDITOR_CHATS = "share.editor_chats"
 
 CACHE_SECONDS = 300.0

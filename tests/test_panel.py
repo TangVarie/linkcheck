@@ -1206,7 +1206,8 @@ class FakeStore:
 
 
 class TestShareSettings(unittest.TestCase):
-    """新建表给谁开权限：环境变量 + 面板上点出来的（存注册表 base 里）。"""
+    """新建表给谁开权限：可管理只来自后台环境变量；可编辑的群在面板上选
+    （存注册表 base 里），环境变量里配的群也认。"""
 
     def _projects(self, store=None, **overrides):
         from xhsearch import panel_settings
@@ -1221,61 +1222,29 @@ class TestShareSettings(unittest.TestCase):
         return projects, panel_settings
 
     def test_state_merges_env_and_panel_and_says_which_is_which(self):
-        store = FakeStore(**{
-            "share.managers": [{"id": "ou_ziao", "label": "138****8888"}],
-            "share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
-        projects, _ = self._projects(store, table_managers=("boss@x.com",),
+        store = FakeStore(**{"share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
+        projects, _ = self._projects(store, table_managers=("13800008888",),
                                      table_editor_chats=("oc_env",), table_owner="")
         state = projects.share_state()
         self.assertEqual([(m["id"], m["source"]) for m in state["managers"]],
-                         [("boss@x.com", "env"), ("ou_ziao", "panel")])
+                         [("13800008888", "env")])
         self.assertEqual([(c["chat_id"], c["name"], c["source"]) for c in state["editor_chats"]],
                          [("oc_env", "", "env"), ("oc_1", "运营群", "panel")])
         plan = projects.share_plan()
-        self.assertEqual(plan.managers, ("boss@x.com", "ou_ziao"))
+        self.assertEqual(plan.managers, ("13800008888",))
         self.assertEqual(plan.editor_chats, ("oc_env", "oc_1"))
-        self.assertEqual(plan.label("ou_ziao"), "138****8888")
         self.assertEqual(plan.label("oc_1"), "运营群")
         self.assertEqual(plan.label("oc_env"), "oc_env")
 
-    def test_adding_a_manager_by_mobile_stores_the_open_id(self):
-        """手机号在存的时候就换成 open_id：换不到当场报错，不留到建表时才发现。"""
-        projects, ps = self._projects()
-        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id",
-                               return_value="ou_ziao") as resolved:
-            state = projects.add_manager("138 0000 0000")
-        resolved.assert_called_once_with(mobile="13800000000")
-        self.assertEqual(projects._settings_store.data[ps.KEY_MANAGERS],
-                         [{"id": "ou_ziao", "label": "138 0000 0000"}])
-        self.assertEqual(state["managers"][0]["label"], "138 0000 0000")
-        # 再加一次同一个人不重复
-        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id", return_value="ou_ziao"):
-            projects.add_manager("13800000000")
-        self.assertEqual(len(projects._settings_store.data[ps.KEY_MANAGERS]), 1)
-
-    def test_an_unknown_mobile_is_refused_with_a_reason(self):
-        projects, ps = self._projects()
-        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id", return_value=""):
-            with self.assertRaises(ValueError) as ctx:
-                projects.add_manager("13800000000")
-        self.assertIn("13800000000", str(ctx.exception))
-        self.assertNotIn(ps.KEY_MANAGERS, projects._settings_store.data)
-
-    def test_an_email_is_stored_as_is(self):
-        """邮箱协作者接口直接认，不用换 open_id（也就不依赖通讯录权限）。"""
-        projects, ps = self._projects()
-        with mock.patch.object(panel.feishu.Workspace, "resolve_open_id") as resolved:
-            projects.add_manager("ziao@x.com")
-        resolved.assert_not_called()
-        self.assertEqual(projects._settings_store.data[ps.KEY_MANAGERS],
-                         [{"id": "ziao@x.com", "label": "ziao@x.com"}])
-
-    def test_removing_a_manager(self):
-        store = FakeStore(**{"share.managers": [{"id": "ou_a", "label": "a"},
-                                                {"id": "ou_b", "label": "b"}]})
-        projects, ps = self._projects(store)
-        state = projects.remove_manager("ou_a")
-        self.assertEqual([m["id"] for m in state["managers"]], ["ou_b"])
+    def test_managers_come_only_from_the_backend(self):
+        """面板口令是运营共用的：面板上要是能加可管理的人，谁拿到口令谁就能给
+        自己开所有新表的管理权。所以设置表里就算有人塞了一份，也不认。"""
+        store = FakeStore(**{"share.managers": [{"id": "ou_evil", "label": "x"}]})
+        projects, _ = self._projects(store, table_managers=())
+        self.assertEqual(projects.share_state()["managers"], [])
+        self.assertEqual(projects.share_plan().managers, ())
+        self.assertFalse(hasattr(projects, "add_manager"))
+        self.assertFalse(hasattr(projects, "remove_manager"))
 
     def test_chats_are_replaced_as_a_whole_and_must_be_oc_ids(self):
         projects, ps = self._projects()
@@ -1431,8 +1400,6 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
 
     def test_share_writes_reach_the_action_layer(self):
         self.actions.set_editor_chats.return_value = {"ok": 1}
-        self.actions.add_manager.return_value = {"ok": 2}
-        self.actions.remove_manager.return_value = {"ok": 3}
         headers = self._login()
         status, body = self._call("/api/projects/share_chats",
                                   data=json.dumps({"chats": [{"chat_id": "oc_1", "name": "群"}]}).encode(),
@@ -1442,15 +1409,13 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
         status, _ = self._call("/api/projects/share_chats", data=b'{"chats": "x"}',
                                headers=headers, method="POST")
         self.assertEqual(status, 400)
-        self._call("/api/projects/share_manager", data=json.dumps({"who": "138"}).encode(),
-                   headers=headers, method="POST")
-        self.actions.add_manager.assert_called_with("138")
-        self._call("/api/projects/share_manager", data=json.dumps({"remove": "ou_a"}).encode(),
-                   headers=headers, method="POST")
-        self.actions.remove_manager.assert_called_with("ou_a")
-        status, _ = self._call("/api/projects/share_manager", data=b"{}",
-                               headers=headers, method="POST")
-        self.assertEqual(status, 400)
+
+    def test_there_is_no_route_to_add_a_manager(self):
+        """可管理的人只在后台环境变量里定：面板上没有这条路，连动作都没有。"""
+        status, _ = self._call("/api/projects/share_manager",
+                               data=json.dumps({"who": "13800000000"}).encode(),
+                               headers=self._login(), method="POST")
+        self.assertEqual(status, 404)
 
     def test_share_apply_reports_granted_and_failures(self):
         from xhsearch import provision as provision_mod

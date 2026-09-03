@@ -369,11 +369,8 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
   font-size:13px}
 .share .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .share .lbl{color:var(--text-light);min-width:7em}
-.share input[type=text]{flex:none;min-width:0;width:200px;height:32px;font-size:13px}
 .share select{height:32px;border:1px solid var(--border-strong);background:var(--surface);
   color:var(--text-dark);font:13px var(--font-sans);padding:0 8px}
-.share .chip .x{height:auto;padding:0 0 0 6px;background:none;color:var(--primary);
-  font-size:12px;font-weight:500}
 .share .pick{margin-top:8px;padding:10px 12px;background:var(--bg);
   border:1px solid var(--border)}
 .share .pick label{display:block;margin:4px 0}
@@ -813,9 +810,10 @@ _SCRIPT = r"""
       });
     }).catch(function(err){ say(esc(String(err)), ""); });
   });
-  // ---- 新建表给谁开权限：面板上点出来，存在注册表 base 里，不用碰部署 ----
-  // 可管理 = 人（手机号 / 邮箱 / open_id），群可编辑 = 从应用所在的群里勾选。
-  // 环境变量里配的那部分只显示不能删——那是部署方定的底线。
+  // ---- 新建表给谁开权限 ----
+  // 群可编辑：面板上从应用所在的群里勾选，存在注册表 base 里，不用碰部署。
+  // 可管理：**只显示**。它来自后台环境变量 FEISHU_TABLE_MANAGERS——面板口令是
+  // 运营共用的，管理权限不能是面板上点一下就给自己的东西。
   var shareBox = document.getElementById("share");
   var shareState = null;
   function getJson(url){
@@ -824,9 +822,7 @@ _SCRIPT = r"""
       return j; }); });
   }
   function personChip(m){
-    var tail = m.source === "env" ? " <span class=muted>环境变量</span>"
-      : " <button type=button class=x data-share=rm-manager data-id='" + esc(m.id) + "'>去掉</button>";
-    return "<span class=chip>" + esc(m.label || m.id) + tail + "</span>";
+    return "<span class=chip>" + esc(m.label || m.id) + "</span>";
   }
   function chatChip(c){
     var tail = c.source === "env" ? " <span class=muted>环境变量</span>" : "";
@@ -835,16 +831,17 @@ _SCRIPT = r"""
   function renderShare(){
     if (!shareBox || !shareState) return;
     var s = shareState;
-    var people = s.managers.map(personChip).join(" ") || "<span class=muted>还没有人——建出来的表只有应用能管</span>";
+    var people = s.managers.length
+      ? s.managers.map(personChip).join(" ") + " <span class=muted>在后台定（面板服务的环境变量 <code>FEISHU_TABLE_MANAGERS</code>），面板上改不了</span>"
+      : "<span class='chip r'>没配</span> <span class=muted>建出来的表没人能管——去 Railway 给面板服务配 <code>FEISHU_TABLE_MANAGERS=你的手机号</code>（也认邮箱），重启生效</span>";
     var groups = s.editor_chats.map(chatChip).join(" ") || "<span class=muted>还没选群</span>";
     var opts = entriesCache.filter(function(e){ return e.app_token; }).map(function(e){
       return "<option value='" + esc(e.app_token) + "'>" + esc(e.label) + "</option>"; }).join("");
     shareBox.innerHTML =
-      "<div><b>新建的表给谁开权限</b> <span class=muted>每张「直接新建」的表建完自动加上。在这里改，不用重新部署。</span></div>" +
-      "<div class=srow><span class=lbl>可管理</span>" + people +
-        " <input type=text id=shareWho placeholder='手机号 / 邮箱 / open_id'> <button type=button class=sm data-share=add-manager>加为可管理</button></div>" +
+      "<div><b>新建的表给谁开权限</b> <span class=muted>每张「直接新建」的表建完自动加上。</span></div>" +
+      "<div class=srow><span class=lbl>可管理</span>" + people + "</div>" +
       "<div class=srow><span class=lbl>群可编辑</span>" + groups +
-        " <button type=button class=sm data-share=pick-chats>选群</button></div>" +
+        " <button type=button class=sm data-share=pick-chats>选群</button> <span class=muted>在这里改，不用重新部署</span></div>" +
       "<div id=chatPick class=pick hidden></div>" +
       (opts ? "<div class=srow><span class=lbl>给已建的表补权限</span><select id=shareApply>" + opts + "</select> " +
         "<button type=button class=sm data-share=apply>按上面的设置补</button> <span class=muted>应用得是那张表的所有者或可管理</span></div>" : "") +
@@ -866,20 +863,6 @@ _SCRIPT = r"""
       var b = ev.target.closest ? ev.target.closest("button[data-share]") : null;
       if (!b) return;
       var what = b.dataset.share;
-      if (what === "add-manager") {
-        var who = document.getElementById("shareWho").value.trim();
-        if (!who) { shareSay("填手机号、邮箱或 ou_ 开头的 open_id", ""); return; }
-        b.disabled = true;
-        post("share_manager", {who: who}).then(function(j){ shareState = j.share; renderShare(); shareSay("加上了。", "ok"); })
-          .catch(function(err){ shareSay(esc(String(err)), ""); b.disabled = false; });
-        return;
-      }
-      if (what === "rm-manager") {
-        b.disabled = true;
-        post("share_manager", {remove: b.dataset.id}).then(function(j){ shareState = j.share; renderShare(); })
-          .catch(function(err){ shareSay(esc(String(err)), ""); b.disabled = false; });
-        return;
-      }
       if (what === "pick-chats") {
         var pick = document.getElementById("chatPick");
         b.disabled = true;

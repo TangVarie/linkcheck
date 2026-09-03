@@ -60,7 +60,7 @@ class TestSettingsStore(unittest.TestCase):
         """只读的时候不建表——面板只是打开看看，不该在别人的 base 里留东西。"""
         store, workspace, made, _ = self._store([{"table_id": "tblREG", "name": "被监控的表"}],
                                                 FakeBitable())
-        self.assertEqual(store.get_json(panel_settings.KEY_MANAGERS, []), [])
+        self.assertEqual(store.get_json("some.key", []), [])
         workspace.create_table.assert_not_called()
         self.assertEqual(made, [])
 
@@ -80,54 +80,54 @@ class TestSettingsStore(unittest.TestCase):
         self.assertEqual(len(client_token), 36)
 
     def test_an_existing_table_is_reused_by_name(self):
-        bitable = FakeBitable([row("rec1", panel_settings.KEY_MANAGERS,
+        bitable = FakeBitable([row("rec1", "some.key",
                                    json.dumps([{"id": "ou_a", "label": "138"}]))])
         store, workspace, made, _ = self._store(
             [{"table_id": "tblREG", "name": "被监控的表"},
              {"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}], bitable)
-        self.assertEqual(store.get_json(panel_settings.KEY_MANAGERS, []),
+        self.assertEqual(store.get_json("some.key", []),
                          [{"id": "ou_a", "label": "138"}])
         workspace.create_table.assert_not_called()
         self.assertEqual(made[0], ("bascnREG", "tblOLD"))
 
     def test_rewriting_a_key_updates_the_same_row(self):
-        bitable = FakeBitable([row("rec1", panel_settings.KEY_MANAGERS, "[]")])
+        bitable = FakeBitable([row("rec1", "some.key", "[]")])
         store, _w, _m, _ = self._store([{"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}],
                                        bitable)
-        store.set_json(panel_settings.KEY_MANAGERS, [{"id": "ou_b", "label": "b@x"}])
+        store.set_json("some.key", [{"id": "ou_b", "label": "b@x"}])
         self.assertEqual(bitable.created, [])
         self.assertEqual(bitable.updated[0]["record_id"], "rec1")
         self.assertEqual(json.loads(bitable.updated[0]["fields"][panel_settings.COL_VALUE]),
                          [{"id": "ou_b", "label": "b@x"}])
         # 写完立刻读到新值（缓存失效）
-        self.assertEqual(store.get_json(panel_settings.KEY_MANAGERS, []),
+        self.assertEqual(store.get_json("some.key", []),
                          [{"id": "ou_b", "label": "b@x"}])
 
     def test_reads_are_cached_and_expire(self):
-        bitable = FakeBitable([row("rec1", panel_settings.KEY_MANAGERS, "[]")])
+        bitable = FakeBitable([row("rec1", "some.key", "[]")])
         calls = []
         real_search = bitable.search
         bitable.search = lambda *a, **k: (calls.append(1), real_search(*a, **k))[1]
         store, _w, _m, ticks = self._store([{"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}],
                                            bitable)
-        store.get_json(panel_settings.KEY_MANAGERS, [])
-        store.get_json(panel_settings.KEY_MANAGERS, [])
+        store.get_json("some.key", [])
+        store.get_json("some.key", [])
         self.assertEqual(len(calls), 1)
         ticks[0] = panel_settings.CACHE_SECONDS + 1
-        store.get_json(panel_settings.KEY_MANAGERS, [])
+        store.get_json("some.key", [])
         self.assertEqual(len(calls), 2)
 
     def test_garbage_in_the_cell_falls_back_to_the_default(self):
         """人手改坏了那一格，面板不该整栏炸掉。"""
-        bitable = FakeBitable([row("rec1", panel_settings.KEY_MANAGERS, "not json")])
+        bitable = FakeBitable([row("rec1", "some.key", "not json")])
         store, *_ = self._store([{"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}], bitable)
-        self.assertEqual(store.get_json(panel_settings.KEY_MANAGERS, []), [])
+        self.assertEqual(store.get_json("some.key", []), [])
 
     def test_a_failed_table_creation_raises(self):
         store, workspace, *_ = self._store([], FakeBitable())
         workspace.create_table.return_value = ""
         with self.assertRaises(feishu.FeishuError):
-            store.set_json(panel_settings.KEY_MANAGERS, [])
+            store.set_json("some.key", [])
 
 
 if __name__ == "__main__":

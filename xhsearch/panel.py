@@ -833,9 +833,13 @@ class Projects:
 
     # ---------- 新建表给谁开权限 ----------
     #
-    # 两个来源：环境变量（部署时定死的）+ 面板上点出来的（存在注册表 base 里的
-    # 「面板设置」表，见 panel_settings）。两边合并，环境变量那部分面板上只显示
-    # 不能删——它是部署方定的底线。
+    # 两种权限两个来源，刻意不一样：
+    # * **可管理（人）只来自环境变量**（FEISHU_TABLE_MANAGERS，部署方在后台定）。
+    #   面板口令是运营共用的，要是面板上能随手把一个人加成所有新表的管理员，
+    #   那就等于谁拿到面板口令谁就能给自己开全部表的管理权。面板上只显示。
+    # * **可编辑（群）在面板上选**，存在注册表 base 里的「面板设置」表
+    #   （见 panel_settings）。给哪个运营群开编辑权限本来就是运营自己的事，
+    #   而且编辑权限的上限是「改数据」，不是「改权限」。环境变量里配的群也认，合并。
 
     def _workspace(self) -> feishu.Workspace:
         return feishu.Workspace(app_id=self.config.app_id,
@@ -851,20 +855,14 @@ class Projects:
             self._settings_store = store
         return store
 
-    def _stored_managers(self) -> list:
-        raw = self._store().get_json(panel_settings.KEY_MANAGERS, [])
-        return [m for m in raw if isinstance(m, dict) and m.get("id")]
-
     def _stored_chats(self) -> list:
         raw = self._store().get_json(panel_settings.KEY_EDITOR_CHATS, [])
         return [c for c in raw if isinstance(c, dict) and c.get("chat_id")]
 
     def share_state(self) -> dict:
-        """面板「协作者」那一栏要显示的东西：谁可管理、哪些群可编辑、各自从哪来。"""
-        managers = ([{"id": m, "label": m, "source": "env"}
-                     for m in self.config.table_managers]
-                    + [{"id": m["id"], "label": m.get("label") or m["id"],
-                        "source": "panel"} for m in self._stored_managers()])
+        """面板「协作者」那一栏要显示的东西：谁可管理（只读）、哪些群可编辑、各自从哪来。"""
+        managers = [{"id": m, "label": m, "source": "env"}
+                    for m in self.config.table_managers]
         chats = ([{"chat_id": c, "name": "", "source": "env"}
                   for c in self.config.table_editor_chats]
                  + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
@@ -906,28 +904,6 @@ class Projects:
             clean.append({"chat_id": chat_id, "name": str(item.get("name") or "").strip()})
         self._store().set_json(panel_settings.KEY_EDITOR_CHATS, clean)
         self.log(f"🔑 新建表的可编辑群 → {'、'.join(c['name'] or c['chat_id'] for c in clean) or '（清空）'}")
-        return self.share_state()
-
-    def add_manager(self, who: str) -> dict:
-        """加一个可管理的人：手机号 / 邮箱 / ou_ open_id。手机号在这里就换成
-        open_id 存下——换不到当场报错，不留一个建表时才发现的坑。"""
-        who = (who or "").strip()
-        failures: list = []
-        person = provision.resolve_person(self._workspace(), who, "可管理的人", failures)
-        if person is None:
-            raise ValueError(failures[0] if failures else f"「{who}」认不出是谁")
-        _kind, member_id = person
-        stored = self._stored_managers()
-        if all(m["id"] != member_id for m in stored):
-            stored.append({"id": member_id, "label": who})
-            self._store().set_json(panel_settings.KEY_MANAGERS, stored)
-            self.log(f"🔑 新建表的可管理 +{who}")
-        return self.share_state()
-
-    def remove_manager(self, member_id: str) -> dict:
-        stored = [m for m in self._stored_managers() if m["id"] != member_id]
-        self._store().set_json(panel_settings.KEY_MANAGERS, stored)
-        self.log(f"🔑 新建表的可管理 -{member_id}")
         return self.share_state()
 
     def apply_share(self, app_token: str) -> provision.ShareResult:
@@ -1585,12 +1561,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not isinstance(chats, list):
                 raise ValueError("chats 要是数组")
             return {"ok": True, "share": projects.set_editor_chats(chats)}
-        if action == "share_manager":
-            if text("remove"):
-                return {"ok": True, "share": projects.remove_manager(text("remove"))}
-            if not text("who"):
-                raise ValueError("要填手机号、邮箱或 open_id")
-            return {"ok": True, "share": projects.add_manager(text("who"))}
+        # 刻意**没有** share_manager 这个动作：可管理的人只在后台环境变量里定
+        # （见 Projects 里那段说明），面板上不能加。
         if action == "share_apply":
             result = projects.apply_share(text("app_token"))
             return {"granted": result.granted, "failures": result.failures,
