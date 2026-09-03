@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import panel, panel_view, railway, summary
+from xhsearch import feishu, panel, panel_view, railway, summary
 from xhsearch.config import Settings
 
 UTC = timezone.utc
@@ -216,6 +216,30 @@ class TestConfigRefusesToStartUnsafe(unittest.TestCase):
             env = {"PANEL_PASSWORD": GOOD_PASSWORD, **env}
             with self.assertRaises(panel.ConfigError):
                 panel.PanelConfig.from_env(env)
+
+    def test_new_table_collaborators_come_from_the_environment(self):
+        """建完表给谁开权限：逗号 / 分号分隔都认，两头空白去掉，空就是空元组。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": GOOD_PASSWORD,
+            "FEISHU_TABLE_MANAGERS": "ziao@example.com, ou_abc；ou_def",
+            "FEISHU_TABLE_EDITOR_CHATS": " oc_1 ; oc_2 ",
+            "FEISHU_TABLE_OWNER": " ziao@example.com "})
+        self.assertEqual(cfg.table_managers, ("ziao@example.com", "ou_abc", "ou_def"))
+        self.assertEqual(cfg.table_editor_chats, ("oc_1", "oc_2"))
+        self.assertEqual(cfg.table_owner, "ziao@example.com")
+        bare = panel.PanelConfig.from_env({"PANEL_PASSWORD": GOOD_PASSWORD})
+        self.assertEqual((bare.table_managers, bare.table_editor_chats, bare.table_owner),
+                         ((), (), ""))
+
+    def test_a_formatted_phone_number_stays_one_manager(self):
+        """「+86 138-0000-0000」按空白切会变成两个人，谁都对不上。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": GOOD_PASSWORD,
+            "FEISHU_TABLE_MANAGERS": "+86 138-0000-0000, 139 0000 0000"})
+        self.assertEqual(cfg.table_managers, ("+86 138-0000-0000", "139 0000 0000"))
+        from xhsearch import provision
+        self.assertEqual([provision.member_type(m) for m in cfg.table_managers],
+                         ["mobile", "mobile"])
 
 
 class TestSessions(unittest.TestCase):
@@ -1178,6 +1202,112 @@ class TestProjectRoutes(unittest.TestCase):
         self.assertEqual(removed.call_args[0][1], "rec1")
 
 
+class FakeStore:
+    """内存版的面板设置表。"""
+
+    def __init__(self, **data):
+        self.data = dict(data)
+
+    def get_json(self, key, default):
+        return self.data.get(key, default)
+
+    def set_json(self, key, value):
+        self.data[key] = value
+
+
+class TestShareSettings(unittest.TestCase):
+    """新建表给谁开权限：可管理只来自后台环境变量；可编辑的群在面板上选
+    （存注册表 base 里），环境变量里配的群也认。"""
+
+    def _projects(self, store=None, **overrides):
+        from xhsearch import panel_settings
+        cfg = config()
+        cfg.registry_target = "bascnREG:tblREG"
+        cfg.app_id = "cli_x"
+        cfg.app_secret = "s"
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        projects = panel.Projects(cfg, Settings(), log=lambda *a: None)
+        projects._settings_store = store or FakeStore()
+        return projects, panel_settings
+
+    def test_state_merges_env_and_panel_and_says_which_is_which(self):
+        store = FakeStore(**{"share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
+        projects, _ = self._projects(store, table_managers=("13800008888",),
+                                     table_editor_chats=("oc_env",), table_owner="")
+        state = projects.share_state()
+        self.assertEqual([(m["id"], m["source"]) for m in state["managers"]],
+                         [("13800008888", "env")])
+        self.assertEqual([(c["chat_id"], c["name"], c["source"]) for c in state["editor_chats"]],
+                         [("oc_env", "", "env"), ("oc_1", "运营群", "panel")])
+        plan = projects.share_plan()
+        self.assertEqual(plan.managers, ("13800008888",))
+        self.assertEqual(plan.editor_chats, ("oc_env", "oc_1"))
+        self.assertEqual(plan.label("oc_1"), "运营群")
+        self.assertEqual(plan.label("oc_env"), "oc_env")
+
+    def test_managers_come_only_from_the_backend(self):
+        """面板口令是运营共用的：面板上要是能加可管理的人，谁拿到口令谁就能给
+        自己开所有新表的管理权。所以设置表里就算有人塞了一份，也不认。"""
+        store = FakeStore(**{"share.managers": [{"id": "ou_evil", "label": "x"}]})
+        projects, _ = self._projects(store, table_managers=())
+        self.assertEqual(projects.share_state()["managers"], [])
+        self.assertEqual(projects.share_plan().managers, ())
+        self.assertFalse(hasattr(projects, "add_manager"))
+        self.assertFalse(hasattr(projects, "remove_manager"))
+
+    def test_chats_are_replaced_as_a_whole_and_must_be_oc_ids(self):
+        projects, ps = self._projects()
+        state = projects.set_editor_chats([{"chat_id": "oc_1", "name": "运营群"},
+                                           {"chat_id": "oc_1", "name": "运营群"},
+                                           "garbage"])
+        self.assertEqual(projects._settings_store.data[ps.KEY_EDITOR_CHATS],
+                         [{"chat_id": "oc_1", "name": "运营群"}])
+        self.assertEqual(state["editor_chats"][0]["name"], "运营群")
+        with self.assertRaises(ValueError):
+            projects.set_editor_chats([{"chat_id": "运营群"}])
+        projects.set_editor_chats([])
+        self.assertEqual(projects._settings_store.data[ps.KEY_EDITOR_CHATS], [])
+
+    def test_apply_uses_the_merged_plan_on_an_existing_table(self):
+        from xhsearch import provision as provision_mod
+        from xhsearch import registry as registry_mod
+        store = FakeStore(**{"share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
+        projects, _ = self._projects(store, table_managers=("boss@x.com",))
+        known = [registry_mod.Entry(label="旧表", target="bascnOLD:tblA",
+                                    app_token="bascnOLD", table_id="tblA")]
+        with mock.patch.object(panel.Projects, "list", return_value=known), \
+             mock.patch.object(provision_mod, "share_table",
+                               return_value=provision_mod.ShareResult(granted=["x"])) as shared:
+            result = projects.apply_share("bascnOLD")
+        self.assertEqual(result.granted, ["x"])
+        _workspace, app_token, plan = shared.call_args[0]
+        self.assertEqual(app_token, "bascnOLD")
+        self.assertEqual(plan.managers, ("boss@x.com",))
+        self.assertEqual(plan.editor_chats, ("oc_1",))
+        with self.assertRaises(ValueError):
+            projects.apply_share("")
+
+    def test_apply_refuses_a_table_that_is_not_in_the_registry(self):
+        """面板口令是运营共用的：不查清单的话，知道任何一个应用能管的 base 的
+        app_token，就能把配好的群和人加到那个 base 上去。"""
+        from xhsearch import provision as provision_mod
+        from xhsearch import registry as registry_mod
+        projects, _ = self._projects(table_managers=("boss@x.com",))
+        known = [registry_mod.Entry(label="旧表", target="bascnOLD:tblA",
+                                    app_token="bascnOLD", table_id="tblA")]
+        with mock.patch.object(panel.Projects, "list", return_value=known), \
+             mock.patch.object(provision_mod, "share_table") as shared:
+            with self.assertRaises(ValueError) as ctx:
+                projects.apply_share("bascnSOMEONE_ELSES")
+        shared.assert_not_called()
+        self.assertIn("不在监控清单里", str(ctx.exception))
+
+    def test_the_store_lives_in_the_registry_base(self):
+        projects = panel.Projects(self._projects()[0].config, Settings(), log=lambda *a: None)
+        self.assertEqual(projects._store().app_token, "bascnREG")
+
+
 class TestProjectRoutesOverHttp(unittest.TestCase):
     """路由层：鉴权、CSRF、错误翻译。"""
 
@@ -1269,6 +1399,80 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
                                headers=self._login(), method="POST")
         self.assertEqual(status, 200)
         self.actions.remove.assert_called_once_with("rec9")
+
+    def test_create_passes_the_template_and_defaults_to_full(self):
+        self.actions.create.return_value = {"target": "b:t", "columns": 37}
+        status, body = self._call(
+            "/api/projects/create", data=json.dumps({"name": "甲"}).encode(),
+            headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        self.actions.create.assert_called_with("甲", template="full")
+        self.assertEqual(json.loads(body)["created"]["columns"], 37)
+        self._call("/api/projects/create",
+                   data=json.dumps({"name": "乙", "template": "monitor"}).encode(),
+                   headers=self._login(), method="POST")
+        self.actions.create.assert_called_with("乙", template="monitor")
+
+    def test_listing_chats_is_read_only_and_needs_a_session(self):
+        self.assertEqual(self._call("/api/chats")[0], 401)
+        self.actions.list_chats.return_value = [{"chat_id": "oc_1", "name": "运营群"}]
+        status, body = self._call("/api/chats", headers=self._login())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["chats"][0]["chat_id"], "oc_1")
+
+    def test_share_state_needs_a_session_and_is_read_only(self):
+        self.assertEqual(self._call("/api/share")[0], 401)
+        self.actions.share_state.return_value = {"managers": [], "editor_chats": [], "owner": ""}
+        status, body = self._call("/api/share", headers=self._login())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["share"]["managers"], [])
+
+    def test_share_writes_reach_the_action_layer(self):
+        self.actions.set_editor_chats.return_value = {"ok": 1}
+        headers = self._login()
+        status, body = self._call("/api/projects/share_chats",
+                                  data=json.dumps({"chats": [{"chat_id": "oc_1", "name": "群"}]}).encode(),
+                                  headers=headers, method="POST")
+        self.assertEqual(status, 200)
+        self.actions.set_editor_chats.assert_called_with([{"chat_id": "oc_1", "name": "群"}])
+        status, _ = self._call("/api/projects/share_chats", data=b'{"chats": "x"}',
+                               headers=headers, method="POST")
+        self.assertEqual(status, 400)
+
+    def test_there_is_no_route_to_add_a_manager(self):
+        """可管理的人只在后台环境变量里定：面板上没有这条路，连动作都没有。"""
+        status, _ = self._call("/api/projects/share_manager",
+                               data=json.dumps({"who": "13800000000"}).encode(),
+                               headers=self._login(), method="POST")
+        self.assertEqual(status, 404)
+
+    def test_share_apply_reports_granted_and_failures(self):
+        from xhsearch import provision as provision_mod
+        self.actions.apply_share.return_value = provision_mod.ShareResult(
+            granted=["群 运营群 可编辑"], failures=["给「x」开可管理失败：nope"])
+        status, body = self._call("/api/projects/share_apply",
+                                  data=json.dumps({"app_token": "bascnOLD"}).encode(),
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        self.actions.apply_share.assert_called_with("bascnOLD")
+        payload = json.loads(body)
+        self.assertEqual(payload["granted"], ["群 运营群 可编辑"])
+        self.assertFalse(payload["ok"])
+
+    def test_listing_chats_translates_the_missing_scope(self):
+        self.actions.list_chats.side_effect = feishu.FeishuError(99991672, "no scope")
+        status, body = self._call("/api/chats", headers=self._login())
+        self.assertEqual(status, 400)
+        self.assertIn("im:chat:readonly", body)
+
+    def test_create_refuses_an_unknown_template(self):
+        status, body = self._call(
+            "/api/projects/create",
+            data=json.dumps({"name": "甲", "template": "everything"}).encode(),
+            headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("template", body)
+        self.actions.create.assert_not_called()
 
     def test_a_bad_link_becomes_a_400_with_the_reason(self):
         from xhsearch import tablespec

@@ -364,6 +364,16 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 .addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .addbox input[type=text]{flex:1;min-width:200px}
 .out{margin-top:12px;font-size:13px;white-space:pre-wrap;color:var(--text)}
+/* 新建表给谁开权限：在建表那个框里、发丝线隔开。改这里不用重新部署。 */
+.share{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);
+  font-size:13px}
+.share .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.share .lbl{color:var(--text-light);min-width:7em}
+.share select{height:32px;border:1px solid var(--border-strong);background:var(--surface);
+  color:var(--text-dark);font:13px var(--font-sans);padding:0 8px}
+.share .pick{margin-top:8px;padding:10px 12px;background:var(--bg);
+  border:1px solid var(--border)}
+.share .pick label{display:block;margin:4px 0}
 .ok{color:var(--success-deep)}
 code{background:var(--fill);padding:2px 6px;font-size:13px;
   font-family:var(--font-num)}
@@ -685,11 +695,14 @@ _SCRIPT = r"""
     return out;
   }
 
+  var entriesCache = [];
   function load(){
     if (!list) return;
     fetch("/api/projects").then(function(r){ return r.json(); }).then(function(j){
       if (!j.enabled) { list.className = "note"; list.innerHTML = esc(j.hint); return; }
       if (j.error) { list.className = "problem"; list.innerHTML = esc(j.error); return; }
+      // 「给已建的表补权限」那个下拉要用表清单；清单变了重画一遍协作者那一栏。
+      entriesCache = j.entries; renderShare();
       if (!j.entries.length) { list.className = "empty"; list.textContent = "注册表还是空的，从下面加第一张。"; return; }
       list.className = "";
       list.innerHTML = j.entries.map(function(e){
@@ -797,17 +810,131 @@ _SCRIPT = r"""
       });
     }).catch(function(err){ say(esc(String(err)), ""); });
   });
+  // ---- 新建表给谁开权限 ----
+  // 群可编辑：面板上从应用所在的群里勾选，存在注册表 base 里，不用碰部署。
+  // 可管理：**只显示**。它来自后台环境变量 FEISHU_TABLE_MANAGERS——面板口令是
+  // 运营共用的，管理权限不能是面板上点一下就给自己的东西。
+  var shareBox = document.getElementById("share");
+  var shareState = null;
+  function getJson(url){
+    return fetch(url).then(function(r){ return r.json().then(function(j){
+      if (!r.ok) throw new Error((j.error || ("HTTP " + r.status)) + (j.hint ? "\n" + j.hint : ""));
+      return j; }); });
+  }
+  function personChip(m){
+    return "<span class=chip>" + esc(m.label || m.id) + "</span>";
+  }
+  function chatChip(c){
+    var tail = c.source === "env" ? " <span class=muted>环境变量</span>" : "";
+    return "<span class=chip>" + esc(c.name || c.chat_id) + tail + "</span>";
+  }
+  function renderShare(){
+    if (!shareBox || !shareState) return;
+    var s = shareState;
+    var people = s.managers.length
+      ? s.managers.map(personChip).join(" ") + " <span class=muted>在后台定（面板服务的环境变量 <code>FEISHU_TABLE_MANAGERS</code>），面板上改不了</span>"
+      : "<span class='chip r'>没配</span> <span class=muted>建出来的表没人能管——去 Railway 给面板服务配 <code>FEISHU_TABLE_MANAGERS=你的手机号</code>（也认邮箱），重启生效</span>";
+    var groups = s.editor_chats.map(chatChip).join(" ") || "<span class=muted>还没选群</span>";
+    var opts = entriesCache.filter(function(e){ return e.app_token; }).map(function(e){
+      return "<option value='" + esc(e.app_token) + "'>" + esc(e.label) + "</option>"; }).join("");
+    shareBox.innerHTML =
+      "<div><b>新建的表给谁开权限</b> <span class=muted>每张「直接新建」的表建完自动加上。</span></div>" +
+      "<div class=srow><span class=lbl>可管理</span>" + people + "</div>" +
+      "<div class=srow><span class=lbl>群可编辑</span>" + groups +
+        " <button type=button class=sm data-share=pick-chats>选群</button> <span class=muted>在这里改，不用重新部署</span></div>" +
+      "<div id=chatPick class=pick hidden></div>" +
+      (opts ? "<div class=srow><span class=lbl>给已建的表补权限</span><select id=shareApply>" + opts + "</select> " +
+        "<button type=button class=sm data-share=apply>按上面的设置补</button> <span class=muted>应用得是那张表的所有者或可管理</span></div>" : "") +
+      (s.owner ? "<div class=muted style='margin-top:6px'>所有权转给：" + esc(s.owner) + "（环境变量）</div>" : "") +
+      "<div id=shareOut class=out></div>";
+  }
+  function shareSay(html, cls){
+    var o = document.getElementById("shareOut");
+    if (o) o.innerHTML = "<div class='" + (cls || "") + "'>" + html + "</div>";
+  }
+  function loadShare(){
+    if (!shareBox) return;
+    getJson("/api/share").then(function(j){ shareState = j.share; renderShare(); })
+      .catch(function(err){ shareBox.innerHTML = "<div class=muted>" + esc(String(err)) + "</div>"; });
+  }
+  if (shareBox) {
+    loadShare();
+    shareBox.addEventListener("click", function(ev){
+      var b = ev.target.closest ? ev.target.closest("button[data-share]") : null;
+      if (!b) return;
+      var what = b.dataset.share;
+      if (what === "pick-chats") {
+        var pick = document.getElementById("chatPick");
+        b.disabled = true;
+        pick.hidden = false;
+        pick.innerHTML = "<span class=muted>在问飞书应用在哪些群里…</span>";
+        getJson("/api/chats").then(function(j){
+          b.disabled = false;
+          if (!j.chats.length) {
+            pick.innerHTML = "应用还没在任何群里。到要开编辑权限的那个群：群设置 → 群机器人 → 添加机器人 → 搜应用名，加进去再点一次「选群」。";
+            return;
+          }
+          var chosen = {};
+          shareState.editor_chats.forEach(function(c){ chosen[c.chat_id] = true; });
+          pick.innerHTML = "<div class=muted style='margin-bottom:4px'>勾上要开「可编辑」的群（群里所有人都能编辑新建的表）：</div>" +
+            j.chats.map(function(c){
+              return "<label><input type=checkbox data-chat='" + esc(c.chat_id) + "' data-name='" + esc(c.name) + "'" +
+                (chosen[c.chat_id] ? " checked" : "") + "> " + esc(c.name || c.chat_id) + "</label>";
+            }).join("") +
+            "<div style='margin-top:8px'><button type=button class=sm data-share=save-chats>保存</button> " +
+            "<button type=button class=sm data-share=close-pick>收起</button></div>";
+        }).catch(function(err){ pick.innerHTML = esc(String(err)); b.disabled = false; });
+        return;
+      }
+      if (what === "close-pick") { document.getElementById("chatPick").hidden = true; return; }
+      if (what === "save-chats") {
+        var boxes = document.querySelectorAll("#chatPick input[data-chat]:checked");
+        var chats = [];
+        for (var i = 0; i < boxes.length; i++) chats.push({chat_id: boxes[i].dataset.chat, name: boxes[i].dataset.name});
+        b.disabled = true;
+        post("share_chats", {chats: chats}).then(function(j){
+          shareState = j.share; renderShare();
+          shareSay("存好了：" + (chats.length ? chats.map(function(c){ return esc(c.name || c.chat_id); }).join("、") : "没有群") + " 可编辑。之后每张新建的表都会加上。", "ok");
+        }).catch(function(err){ shareSay(esc(String(err)), ""); b.disabled = false; });
+        return;
+      }
+      if (what === "apply") {
+        var sel = document.getElementById("shareApply");
+        if (!sel || !sel.value) return;
+        b.disabled = true;
+        shareSay("在给这张表加协作者…", "muted");
+        post("share_apply", {app_token: sel.value}).then(function(j){
+          var lines = [];
+          if (j.granted.length) lines.push("加上了：" + j.granted.map(esc).join("；"));
+          if (j.failures.length) lines.push("没成的：\n· " + j.failures.map(esc).join("\n· "));
+          if (!lines.length) lines.push("上面还没配任何人和群，没什么可加的。");
+          shareSay(lines.join("\n"), j.ok && j.granted.length ? "ok" : "");
+          b.disabled = false;
+        }).catch(function(err){ shareSay(esc(String(err)), ""); b.disabled = false; });
+      }
+    });
+  }
   var btnCreate = document.getElementById("btnCreate");
   if (btnCreate) btnCreate.addEventListener("click", function(){
     var name = document.getElementById("addLabel").value.trim();
     if (!name) { say("先填个项目名", ""); return; }
-    if (!confirm("新建一张监控表「" + name + "」？\n\n会在应用自己的空间里建一个多维表格，二十来列一次建齐。")) return;
+    var fullBox = document.getElementById("addFull");
+    var full = !fullBox || fullBox.checked;
+    var what = full ? "按标准业务表的结构建齐（业务列 + 巡查列，近 40 列）" : "只建巡查要用的二十来列";
+    if (!confirm("新建一张监控表「" + name + "」？\n\n会在应用自己的空间里建一个多维表格，" + what + "，建完按配置给人和群开权限。")) return;
     btnCreate.disabled = true;
     say("建表中…", "muted");
-    post("create", {name: name}).then(function(j){
+    post("create", {name: name, template: full ? "full" : "monitor"}).then(function(j){
       var c = j.created;
       document.getElementById("addTarget").value = c.target;
-      say("建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它</a>\n链接已经填进上面的输入框，点「体检一下」再入册。\n" + esc(c.note || ""), "ok");
+      var lines = ["建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它</a>（" + c.columns + " 列）",
+                   "链接已经填进上面的输入框，点「体检一下」再入册。"];
+      if (c.shared && c.shared.length) lines.push("协作者：" + c.shared.map(esc).join("；"));
+      var bad = (c.share_failures || []).concat(c.column_failures || []);
+      if (bad.length) lines.push("没成的：\n· " + bad.map(esc).join("\n· "));
+      if (c.skipped_columns && c.skipped_columns.length) lines.push("没建的列：" + c.skipped_columns.map(esc).join("；"));
+      if (c.note) lines.push(esc(c.note));
+      say(lines.join("\n"), bad.length ? "" : "ok");
       btnCreate.disabled = false;
     }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
   });
@@ -1245,8 +1372,12 @@ def _projects_section(config) -> str:
     <button type=button id=btnCheck>体检一下</button>
   </div>
   <div class=muted>体检不花钱。也可以 <button type=button id=btnCreate>直接新建一张</button>
-    —— 二十来列连类型带选项一次建齐，一次飞书都不用点。</div>
+    —— 连类型带选项一次建齐，一次飞书都不用点。
+    <label style='white-space:nowrap'><input type=checkbox id=addFull checked>
+    连业务列一起建</label>（素人编号、文案、配图、截图、蓝词、笔记状态……
+    照西屋表的结构和顺序，近 40 列；不勾就只建巡查要用的二十来列）。</div>
   <div id=addOut class=out></div>
+  <div id=share class=share><div class=muted>协作者设置加载中…</div></div>
 </div>"""
 
 

@@ -324,6 +324,103 @@ class TestWorkspace(unittest.TestCase):
         self.assertEqual(got, "tblNEW")
         self.assertEqual(cap.calls[0]["body"]["table"]["fields"], fields)
 
+    def test_create_field_posts_to_the_new_table(self):
+        cap = Captured(ok({"field": {"field_id": "fldNEW"}}))
+        body = {"field_name": "父记录", "type": 18,
+                "property": {"table_id": "tblNEW", "multiple": False}}
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").create_field("bascnNEW", "tblNEW", body)
+        self.assertEqual(got, "fldNEW")
+        self.assertTrue(cap.calls[0]["url"].endswith(
+            "/bitable/v1/apps/bascnNEW/tables/tblNEW/fields"))
+        self.assertEqual(cap.calls[0]["body"], body)
+
+    def test_add_member_uses_the_drive_permission_api(self):
+        """协作者接口在 drive 下，不在 bitable 下；type=bitable 走查询串。"""
+        cap = Captured(ok({}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            feishu.Workspace("cli_x", "s").add_member(
+                "bascnNEW", "openchat", "oc_1", "edit")
+        url = cap.calls[0]["url"]
+        self.assertIn("/drive/v1/permissions/bascnNEW/members?", url)
+        self.assertIn("type=bitable", url)
+        self.assertIn("need_notification=true", url)
+        self.assertEqual(cap.calls[0]["body"],
+                         {"member_type": "openchat", "member_id": "oc_1", "perm": "edit"})
+
+    def test_add_member_raises_on_a_business_error(self):
+        refused = transport.Response(
+            status=200, content_type="application/json",
+            body=json.dumps({"code": 230001, "msg": "bot not in chat"}))
+        cap = Captured(refused)
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap), \
+             self.assertRaises(feishu.FeishuError):
+            feishu.Workspace("cli_x", "s").add_member("bascnNEW", "openchat", "oc_1", "edit")
+
+    def test_transfer_owner_keeps_the_app_as_full_access(self):
+        """转走的是「谁说了算」，不是「机器还能不能干活」。"""
+        cap = Captured(ok({}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            feishu.Workspace("cli_x", "s").transfer_owner(
+                "bascnNEW", "email", "ziao@example.com")
+        url = cap.calls[0]["url"]
+        self.assertIn("/drive/v1/permissions/bascnNEW/members/transfer_owner?", url)
+        self.assertIn("type=bitable", url)
+        self.assertIn("remove_old_owner=false", url)
+        self.assertIn("old_owner_perm=full_access", url)
+        self.assertEqual(cap.calls[0]["body"],
+                         {"member_type": "email", "member_id": "ziao@example.com"})
+
+    def test_list_tables_follows_pagination(self):
+        pages = [ok({"items": [{"table_id": "tblA", "name": "被监控的表"}],
+                     "has_more": True, "page_token": "p2"}),
+                 ok({"items": [{"table_id": "tblB", "name": "面板设置"}], "has_more": False})]
+        cap = Captured(*pages)
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "request_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").list_tables("bascnREG")
+        self.assertEqual([t["name"] for t in got], ["被监控的表", "面板设置"])
+        self.assertIn("/bitable/v1/apps/bascnREG/tables?page_size=100", cap.calls[0]["url"])
+        self.assertIn("page_token=p2", cap.calls[1]["url"])
+
+    def test_resolve_open_id_by_mobile(self):
+        """协作者接口不收手机号；这一步把手机号换成 open_id。"""
+        cap = Captured(ok({"user_list": [{"user_id": "ou_ziao", "mobile": "13800000000"}]}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").resolve_open_id(mobile="13800000000")
+        self.assertEqual(got, "ou_ziao")
+        self.assertIn("/contact/v3/users/batch_get_id?user_id_type=open_id", cap.calls[0]["url"])
+        self.assertEqual(cap.calls[0]["body"],
+                         {"include_resigned": False, "mobiles": ["13800000000"]})
+
+    def test_resolve_open_id_returns_empty_when_nobody_matches(self):
+        """飞书对查不到的号码是**不返回条目**，不是报错。"""
+        cap = Captured(ok({"user_list": [{"mobile": "13800000000"}]}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").resolve_open_id(mobile="13800000000")
+        self.assertEqual(got, "")
+
+    def test_list_chats_follows_pagination(self):
+        pages = [ok({"items": [{"chat_id": "oc_1", "name": "运营群"}],
+                     "has_more": True, "page_token": "p2"}),
+                 ok({"items": [{"chat_id": "oc_2", "name": "老板群"}],
+                     "has_more": False})]
+        cap = Captured(*pages)
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "request_with_retry", cap):
+            got = feishu.Workspace("cli_x", "s").list_chats()
+        self.assertEqual(got, [{"chat_id": "oc_1", "name": "运营群"},
+                               {"chat_id": "oc_2", "name": "老板群"}])
+        self.assertEqual(len(cap.calls), 2)
+        self.assertIn("/im/v1/chats?page_size=100", cap.calls[0]["url"])
+        self.assertIn("page_token=p2", cap.calls[1]["url"])
+
 
 if __name__ == "__main__":
     unittest.main()

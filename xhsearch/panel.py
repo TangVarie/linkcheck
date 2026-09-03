@@ -34,6 +34,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -44,7 +45,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
-from . import feishu, provision, railway, registry, schema, summary, tablespec
+from . import (feishu, panel_settings, provision, railway, registry, schema,
+               summary, tablespec)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -97,6 +99,12 @@ class PanelConfig:
     # （`summary.LABEL_CANDIDATES`，「笔记内容」打头）。写了就只认它——
     # 表里没有那一列会在项目卡上点名，而不是悄悄换一列。
     label_column: str = ""
+    # 「直接新建一张」建完给谁开权限。不配的话建出来的表只有应用能管：
+    # 人打开只有「可阅读」，连链接分享范围都动不了。运营背后的飞书账号各不
+    # 相同，所以编辑权限给**群**；管理权限给具体的人，不再全绑在机器人上。
+    table_managers: tuple = ()        # FEISHU_TABLE_MANAGERS：邮箱 / ou_ open_id → 可管理
+    table_editor_chats: tuple = ()    # FEISHU_TABLE_EDITOR_CHATS：oc_ chat_id → 可编辑
+    table_owner: str = ""             # FEISHU_TABLE_OWNER：把所有权转给这个人（可选）
 
     # 余额那一块。两家的余额端点都是官方标明零费用的（见 xhsearch/balance.py
     # 开头那张表），所以「面板不发付费请求」这条不变量没被动过——
@@ -156,6 +164,9 @@ class PanelConfig:
             app_id=(env.get("FEISHU_APP_ID") or "").strip(),
             app_secret=(env.get("FEISHU_APP_SECRET") or "").strip(),
             label_column=(env.get("PANEL_LABEL_COLUMN") or "").strip(),
+            table_managers=_list_env(env, "FEISHU_TABLE_MANAGERS"),
+            table_editor_chats=_list_env(env, "FEISHU_TABLE_EDITOR_CHATS"),
+            table_owner=(env.get("FEISHU_TABLE_OWNER") or "").strip(),
             commit=(env.get("RAILWAY_GIT_COMMIT_SHA") or "").strip()[:7],
             show_balance=_bool_env(env, "PANEL_SHOW_BALANCE", True),
             runway_warn_days=_float_env(env, "PANEL_RUNWAY_WARN_DAYS",
@@ -191,6 +202,17 @@ def _float_env(env, name, default, minimum, maximum) -> float:
     if value != value or not minimum <= value <= maximum:
         raise ConfigError(f"环境变量 {name} 的值 {raw} 超出 [{minimum}, {maximum}]")
     return value
+
+
+def _list_env(env, name) -> tuple:
+    """逗号 / 分号分隔的一组值，每一项两头的空白去掉。空 = 空元组。
+
+    **不按空白切**：手机号常写成「+86 138-0000-0000」，按空白切会变成两个人
+    （`+86` 和 `138-0000-0000`），谁都对不上。号码内部的空格和连字符交给
+    provision.normalize_mobile 去掉。
+    """
+    raw = env.get(name) or ""
+    return tuple(v.strip() for v in re.split(r"[,;，；]+", raw) if v.strip())
 
 
 def _bool_env(env, name, default: bool) -> bool:
@@ -814,12 +836,105 @@ class Projects:
         return registry.add(self._registry(), label=label or parsed.label,
                             target=target, note=note, client_token=client_token)
 
-    def create(self, name: str) -> dict:
-        """从零建一张监控表。一次飞书都不用点。"""
-        workspace = feishu.Workspace(app_id=self.config.app_id,
-                                     app_secret=self.config.app_secret)
-        made = provision.create_monitored_table(workspace, self.settings, name)
-        self.log(f"🧱 新建监控表 {name} → {made['app_token'][-6:]}/{made['table_id']}")
+    # ---------- 新建表给谁开权限 ----------
+    #
+    # 两种权限两个来源，刻意不一样：
+    # * **可管理（人）只来自环境变量**（FEISHU_TABLE_MANAGERS，部署方在后台定）。
+    #   面板口令是运营共用的，要是面板上能随手把一个人加成所有新表的管理员，
+    #   那就等于谁拿到面板口令谁就能给自己开全部表的管理权。面板上只显示。
+    # * **可编辑（群）在面板上选**，存在注册表 base 里的「面板设置」表
+    #   （见 panel_settings）。给哪个运营群开编辑权限本来就是运营自己的事，
+    #   而且编辑权限的上限是「改数据」，不是「改权限」。环境变量里配的群也认，合并。
+
+    def _workspace(self) -> feishu.Workspace:
+        return feishu.Workspace(app_id=self.config.app_id,
+                                app_secret=self.config.app_secret)
+
+    def _store(self) -> panel_settings.SettingsStore:
+        store = getattr(self, "_settings_store", None)
+        if store is None:
+            target = tablespec.parse_target(self.config.registry_target,
+                                            default_label="registry")
+            store = panel_settings.SettingsStore(
+                self._workspace(), self._bitable, target.app_token, log=self.log)
+            self._settings_store = store
+        return store
+
+    def _stored_chats(self) -> list:
+        raw = self._store().get_json(panel_settings.KEY_EDITOR_CHATS, [])
+        return [c for c in raw if isinstance(c, dict) and c.get("chat_id")]
+
+    def share_state(self) -> dict:
+        """面板「协作者」那一栏要显示的东西：谁可管理（只读）、哪些群可编辑、各自从哪来。"""
+        managers = [{"id": m, "label": m, "source": "env"}
+                    for m in self.config.table_managers]
+        chats = ([{"chat_id": c, "name": "", "source": "env"}
+                  for c in self.config.table_editor_chats]
+                 + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
+                     "source": "panel"} for c in self._stored_chats()])
+        return {"managers": managers, "editor_chats": chats,
+                "owner": self.config.table_owner}
+
+    def share_plan(self) -> provision.SharePlan:
+        state = self.share_state()
+        managers, chats, labels = [], [], {}
+        for m in state["managers"]:
+            if m["id"] not in managers:
+                managers.append(m["id"])
+                labels[m["id"]] = m["label"]
+        for c in state["editor_chats"]:
+            if c["chat_id"] not in chats:
+                chats.append(c["chat_id"])
+                if c["name"]:
+                    labels[c["chat_id"]] = c["name"]
+        return provision.SharePlan(managers=tuple(managers), editor_chats=tuple(chats),
+                                   owner=self.config.table_owner, labels=labels)
+
+    def list_chats(self) -> list:
+        """应用（作为机器人）所在的群。给「选群」用——飞书界面上普通成员
+        看不到群的 ID。只读，不花钱。"""
+        return self._workspace().list_chats()
+
+    def set_editor_chats(self, chats: list) -> dict:
+        """面板上选好的群，整体覆盖存下来。只认 oc_ 开头的 chat_id。"""
+        clean = []
+        for item in chats:
+            if not isinstance(item, dict):
+                continue
+            chat_id = str(item.get("chat_id") or "").strip()
+            if provision.member_type(chat_id) != "openchat":
+                raise ValueError(f"「{chat_id}」不是群 ID（要 oc_ 开头）")
+            if chat_id in [c["chat_id"] for c in clean]:
+                continue
+            clean.append({"chat_id": chat_id, "name": str(item.get("name") or "").strip()})
+        self._store().set_json(panel_settings.KEY_EDITOR_CHATS, clean)
+        self.log(f"🔑 新建表的可编辑群 → {'、'.join(c['name'] or c['chat_id'] for c in clean) or '（清空）'}")
+        return self.share_state()
+
+    def apply_share(self, app_token: str) -> provision.ShareResult:
+        """按当前设置给一张**已经建好的**表补协作者。应用得是这张表的所有者或
+        可管理——自己建的表天然是；接管的业务表要看当初给应用的是什么权限。
+
+        **只认注册表里的表。** 面板口令是运营共用的；不查的话，知道任何一个
+        应用能管的 base 的 app_token，就能把配好的群（和人）加到那个 base 上去
+        ——下拉框只列清单里的表，但服务端不能指望前端。
+        """
+        if not app_token:
+            raise ValueError("要选一张表")
+        known = {e.app_token for e in self.list() if e.app_token}
+        if app_token not in known:
+            raise ValueError("这张表不在监控清单里——只给清单里的表补协作者")
+        self.log(f"🔑 给 {app_token[-6:]} 补协作者")
+        return provision.share_table(self._workspace(), app_token, self.share_plan(),
+                                     log=self.log)
+
+    def create(self, name: str, template: str = "full") -> dict:
+        """从零建一张监控表，建完按配置加协作者。一次飞书都不用点。"""
+        made = provision.create_monitored_table(
+            self._workspace(), self.settings, name, template=template,
+            share=self.share_plan(), log=self.log)
+        self.log(f"🧱 新建监控表 {name}（{template}，{made['columns']} 列）→ "
+                 f"{made['app_token'][-6:]}/{made['table_id']}")
         return made
 
     def preview_thresholds(self, record_id: str, values: dict) -> dict:
@@ -1038,7 +1153,44 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._send_json(200, self._projects_payload())
+        if path == "/api/chats":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._chats_payload()
+        if path == "/api/share":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._share_payload()
         return self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _share_payload(self):
+        """新建表给谁开权限：环境变量里的 + 面板上点出来的。只读。"""
+        projects = self.deps.projects
+        if projects is None or not projects.enabled:
+            return self._send_json(400, {
+                "error": projects.why_disabled() if projects else "面板没配 FEISHU_APP_ID"})
+        try:
+            return self._send_json(200, {"share": projects.share_state()})
+        except feishu.FeishuError as exc:
+            return self._send_json(400, {"error": exc.msg, "hint": exc.hint})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _chats_payload(self):
+        """应用所在的群和 chat_id。只读；是给填 FEISHU_TABLE_EDITOR_CHATS 找值用的。"""
+        projects = self.deps.projects
+        if projects is None or not self.deps.config.app_id:
+            return self._send_json(400, {"error": "面板没配 FEISHU_APP_ID"})
+        try:
+            chats = projects.list_chats()
+        except feishu.FeishuError as exc:
+            return self._send_json(400, {
+                "error": f"列群失败：{exc.msg}",
+                "hint": "多半是应用没开 im:chat:readonly（读群信息）权限：开放平台 → "
+                        "权限管理 → 搜 im:chat → 开通，然后发布一个新版本。"})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        return self._send_json(200, {"chats": chats})
 
     def do_POST(self):                                          # noqa: N802
         path = urlparse(self.path).path
@@ -1382,6 +1534,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 400, {"error": exc.msg, "hint": exc.hint, "code": exc.code})
         except registry.RegistryError as exc:
             return self._send_json(400, {"error": str(exc)})
+        except ValueError as exc:
+            # _run_action 里对请求内容的校验（空项目名、不认识的模板、阈值不是
+            # 整数）都抛 ValueError——那是请求的错，不是服务器的错，给 400。
+            return self._send_json(400, {"error": str(exc)})
         except NotImplementedError:
             return self._send_json(404, {"error": f"没有这个动作：{action}"})
         except Exception as exc:                                # noqa: BLE001
@@ -1409,7 +1565,21 @@ class PanelHandler(BaseHTTPRequestHandler):
             name = text("name")
             if not name:
                 raise ValueError("要填个项目名")
-            return {"created": projects.create(name)}
+            template = text("template") or "full"
+            if template not in provision.TEMPLATES:
+                raise ValueError(f"template 只认 {'/'.join(provision.TEMPLATES)}")
+            return {"created": projects.create(name, template=template)}
+        if action == "share_chats":
+            chats = payload.get("chats")
+            if not isinstance(chats, list):
+                raise ValueError("chats 要是数组")
+            return {"ok": True, "share": projects.set_editor_chats(chats)}
+        # 刻意**没有** share_manager 这个动作：可管理的人只在后台环境变量里定
+        # （见 Projects 里那段说明），面板上不能加。
+        if action == "share_apply":
+            result = projects.apply_share(text("app_token"))
+            return {"granted": result.granted, "failures": result.failures,
+                    "ok": not result.failures}
         if action == "build":
             result = projects.build(text("app_token"), text("table_id"))
             return {"summary": result.summary(), "created": result.created,
