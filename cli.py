@@ -613,6 +613,15 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
             print("没有需要刷新的行。")
         return (1 if record_ids and not quiet_missing else 0), found, 0, 0.0, None
 
+    # queue 不看「是否巡查」（见 runner.load_rows）：没开巡查的行勾了排队照刷。
+    # 这是主动的单次取数，但它花的是同一笔钱，所以要在运行历史里看得见——
+    # 一批「结案很久的老行忽然被勾了」不该只能靠对账单发现。
+    if mode == "queue":
+        off = sum(1 for r in row_list if not r.monitoring)
+        if off:
+            print(f"🔎 这批里有 {off} 行没开「{settings.fields.monitoring}」，"
+                  "是有人主动勾了「排队刷新」要单次取数——照刷，刷完清勾。")
+
     # 首轮小闸：整张表**一个**「最近检查时间」都没有 = 要么是全新表，要么是
     # 刚把这一列建出来。两种情况下每一行都判到期，一轮就是全表付费。
     # 这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，

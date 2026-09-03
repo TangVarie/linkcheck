@@ -231,6 +231,19 @@ class TestConfigRefusesToStartUnsafe(unittest.TestCase):
         self.assertEqual((bare.table_managers, bare.table_editor_chats, bare.table_owner),
                          ((), (), ""))
 
+    def test_manager_identities_are_scrubbed_from_the_log_feed(self):
+        """运行日志是 cron 那个进程打的，送到浏览器之前要过一遍脱敏。
+        管理员的手机号不是密钥，但同样不该出现在这个共用口令的页面上。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": GOOD_PASSWORD,
+            "FEISHU_TABLE_MANAGERS": "13800008888, ziao@example.com",
+            "FEISHU_TABLE_OWNER": "ou_boss_identifier"})
+        self.assertIn("13800008888", cfg.secrets)
+        self.assertIn("ziao@example.com", cfg.secrets)
+        self.assertIn("ou_boss_identifier", cfg.secrets)
+        scrubbed = railway.redact("给 13800008888 开可管理失败", cfg.secrets)
+        self.assertNotIn("13800008888", scrubbed)
+
     def test_a_formatted_phone_number_stays_one_manager(self):
         """「+86 138-0000-0000」按空白切会变成两个人，谁都对不上。"""
         cfg = panel.PanelConfig.from_env({
@@ -1236,8 +1249,7 @@ class TestShareSettings(unittest.TestCase):
         projects, _ = self._projects(store, table_managers=("13800008888",),
                                      table_editor_chats=("oc_env",), table_owner="")
         state = projects.share_state()
-        self.assertEqual([(m["id"], m["source"]) for m in state["managers"]],
-                         [("13800008888", "env")])
+        self.assertEqual(state["managers_count"], 1)
         self.assertEqual([(c["chat_id"], c["name"], c["source"]) for c in state["editor_chats"]],
                          [("oc_env", "", "env"), ("oc_1", "运营群", "panel")])
         plan = projects.share_plan()
@@ -1246,12 +1258,35 @@ class TestShareSettings(unittest.TestCase):
         self.assertEqual(plan.label("oc_1"), "运营群")
         self.assertEqual(plan.label("oc_env"), "oc_env")
 
+    def test_the_browser_never_learns_who_the_managers_are(self):
+        """手机号 / 邮箱是个人信息，面板口令又是运营共用的。share_state 是原样
+        送进浏览器的 JSON——里面只能有数量，不能有号码、邮箱、open_id。"""
+        projects, _ = self._projects(table_managers=("13800008888", "ziao@x.com"),
+                                     table_owner="ou_boss")
+        state = projects.share_state()
+        dumped = json.dumps(state, ensure_ascii=False)
+        for secret in ("13800008888", "ziao@x.com", "ou_boss"):
+            self.assertNotIn(secret, dumped, f"{secret} 被送到了浏览器")
+        self.assertEqual(state["managers_count"], 2)
+        self.assertTrue(state["owner_configured"])
+        self.assertNotIn("managers", state)
+        self.assertNotIn("owner", state)
+
+    def test_the_count_is_deduplicated_like_the_plan(self):
+        """同一个人写了两遍时，面板说「已配 2 人」而实际只开一个——
+        数数和真正开权限必须用同一份清单。"""
+        projects, _ = self._projects(
+            table_managers=("13800008888", "13800008888", "ziao@x.com"))
+        self.assertEqual(projects.share_state()["managers_count"], 2)
+        self.assertEqual(projects.share_plan().managers,
+                         ("13800008888", "ziao@x.com"))
+
     def test_managers_come_only_from_the_backend(self):
         """面板口令是运营共用的：面板上要是能加可管理的人，谁拿到口令谁就能给
         自己开所有新表的管理权。所以设置表里就算有人塞了一份，也不认。"""
         store = FakeStore(**{"share.managers": [{"id": "ou_evil", "label": "x"}]})
         projects, _ = self._projects(store, table_managers=())
-        self.assertEqual(projects.share_state()["managers"], [])
+        self.assertEqual(projects.share_state()["managers_count"], 0)
         self.assertEqual(projects.share_plan().managers, ())
         self.assertFalse(hasattr(projects, "add_manager"))
         self.assertFalse(hasattr(projects, "remove_manager"))
@@ -1422,10 +1457,11 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
 
     def test_share_state_needs_a_session_and_is_read_only(self):
         self.assertEqual(self._call("/api/share")[0], 401)
-        self.actions.share_state.return_value = {"managers": [], "editor_chats": [], "owner": ""}
+        self.actions.share_state.return_value = {"managers_count": 1, "editor_chats": [],
+                                                 "owner_configured": False}
         status, body = self._call("/api/share", headers=self._login())
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["share"]["managers"], [])
+        self.assertEqual(json.loads(body)["share"]["managers_count"], 1)
 
     def test_share_writes_reach_the_action_layer(self):
         self.actions.set_editor_chats.return_value = {"ok": 1}

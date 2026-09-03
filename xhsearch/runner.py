@@ -1221,6 +1221,10 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         pin_status=feishu.read_text(cells.get(f.pinned_status)),
         surge_time_ms=feishu.read_timestamp_ms(cells.get(f.surge_time)),
         queued=feishu.read_bool(cells.get(f.queued)),
+        # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
+        # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
+        monitoring=(feishu.read_bool(cells.get(f.monitoring))
+                    if f.monitoring in cells else True),
     )
 
 
@@ -1259,9 +1263,21 @@ def load_rows(
 
     filter_spec: Optional[dict[str, Any]] = None
     if only_record_ids is None:
-        conditions = [{"field_name": f.monitoring, "operator": "is", "value": ["true"]}]
         if only_queued:
-            conditions.append({"field_name": f.queued, "operator": "is", "value": ["true"]})
+            # **queue 不看「是否巡查」。** 巡查是日常维护的开关；勾「排队刷新」
+            # 是人明确说「我现在就要看这一行的数据」，一次性的主动请求。
+            # 两件事不该互相否决——结案的表里想临时查一行，取消勾选之后
+            # 手动勾排队本来就该管用（Ziao 2026-09 拍板）。
+            #
+            # 旧行为是 `是否巡查=true AND 排队刷新=true`：没开巡查的行勾了
+            # 永远不会被接走，那个勾也永远不会被清掉（清勾是处理完顺带做的），
+            # 而面板还回一句「cron 五分钟内接手」——一句不成立的承诺。
+            #
+            # 花钱这一侧不靠这个条件兜底：queue 照样受 MAX_RECORDS_PER_RUN /
+            # MAX_YUAN_PER_RUN 约束，面板一次最多勾 MAX_QUEUE_ROWS 行。
+            conditions = [{"field_name": f.queued, "operator": "is", "value": ["true"]}]
+        else:
+            conditions = [{"field_name": f.monitoring, "operator": "is", "value": ["true"]}]
         filter_spec = {"conjunction": "and", "conditions": conditions}
 
     wanted_fields = f.must_read()

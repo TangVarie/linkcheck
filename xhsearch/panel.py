@@ -239,7 +239,16 @@ def _secrets(env) -> tuple:
     names = ("TIKHUB_API_KEY", "SOCIALDATAX_API_KEY", "FEISHU_APP_SECRET",
              "FEISHU_APP_ID", "RAILWAY_PROJECT_TOKEN", "RAILWAY_API_TOKEN",
              "PANEL_PASSWORD", "PANEL_SECRET")
-    return tuple(v for v in ((env.get(n) or "").strip() for n in names) if v)
+    out = [v for v in ((env.get(n) or "").strip() for n in names) if v]
+    # 管理员的手机号 / 邮箱不是密钥，但同样不该出现在这个共用口令的页面上。
+    # `provision.redact` 已经在源头抹过一遍；这里是第二道——运行日志是 cron
+    # 那个进程打的，将来某条话术回声了身份，面板这边也不会原样贴出来。
+    # 是**逐项**加进来的：整串「a,b」在日志里永远不会原样出现，抹不到任何东西。
+    out += [v for v in _list_env(env, "FEISHU_TABLE_MANAGERS")]
+    owner = (env.get("FEISHU_TABLE_OWNER") or "").strip()
+    if owner:
+        out.append(owner)
+    return tuple(out)
 
 
 # 直达链接只允许指向飞书自己。这个域名会被渲染进页面上每一个「去这一行」，
@@ -864,25 +873,37 @@ class Projects:
         raw = self._store().get_json(panel_settings.KEY_EDITOR_CHATS, [])
         return [c for c in raw if isinstance(c, dict) and c.get("chat_id")]
 
+    def _chat_entries(self) -> list:
+        return ([{"chat_id": c, "name": "", "source": "env"}
+                 for c in self.config.table_editor_chats]
+                + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
+                    "source": "panel"} for c in self._stored_chats()])
+
+    def _managers(self) -> list:
+        """去重之后的可管理清单。**数数和真正开权限必须用同一份**——
+        同一个人在环境变量里写了两遍时，面板说「已配 2 人」而实际只开一个，
+        那个数字就是错的（去重在下面 share_plan 里做过一次）。"""
+        out: list = []
+        for m in self.config.table_managers:
+            if m not in out:
+                out.append(m)
+        return out
+
     def share_state(self) -> dict:
-        """面板「协作者」那一栏要显示的东西：谁可管理（只读）、哪些群可编辑、各自从哪来。"""
-        managers = [{"id": m, "label": m, "source": "env"}
-                    for m in self.config.table_managers]
-        chats = ([{"chat_id": c, "name": "", "source": "env"}
-                  for c in self.config.table_editor_chats]
-                 + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
-                     "source": "panel"} for c in self._stored_chats()])
-        return {"managers": managers, "editor_chats": chats,
-                "owner": self.config.table_owner}
+        """面板「协作者」那一栏要显示的东西。
+
+        **可管理的人只给数量，不给是谁。** 手机号 / 邮箱是个人信息，面板口令又是
+        运营共用的——管理员是谁不该从面板上看出来。这个字典是原样送进浏览器的，
+        所以这里就不放。群名可以放：群本来就是给运营看的。
+        """
+        return {"managers_count": len(self._managers()),
+                "editor_chats": self._chat_entries(),
+                "owner_configured": bool(self.config.table_owner)}
 
     def share_plan(self) -> provision.SharePlan:
-        state = self.share_state()
-        managers, chats, labels = [], [], {}
-        for m in state["managers"]:
-            if m["id"] not in managers:
-                managers.append(m["id"])
-                labels[m["id"]] = m["label"]
-        for c in state["editor_chats"]:
+        managers = self._managers()
+        chats, labels = [], {}
+        for c in self._chat_entries():
             if c["chat_id"] not in chats:
                 chats.append(c["chat_id"])
                 if c["name"]:
