@@ -218,11 +218,11 @@ class TestConfigRefusesToStartUnsafe(unittest.TestCase):
                 panel.PanelConfig.from_env(env)
 
     def test_new_table_collaborators_come_from_the_environment(self):
-        """建完表给谁开权限：逗号 / 分号 / 空白分隔都认，空就是空元组。"""
+        """建完表给谁开权限：逗号 / 分号分隔都认，两头空白去掉，空就是空元组。"""
         cfg = panel.PanelConfig.from_env({
             "PANEL_PASSWORD": GOOD_PASSWORD,
             "FEISHU_TABLE_MANAGERS": "ziao@example.com, ou_abc；ou_def",
-            "FEISHU_TABLE_EDITOR_CHATS": "oc_1 oc_2",
+            "FEISHU_TABLE_EDITOR_CHATS": " oc_1 ; oc_2 ",
             "FEISHU_TABLE_OWNER": " ziao@example.com "})
         self.assertEqual(cfg.table_managers, ("ziao@example.com", "ou_abc", "ou_def"))
         self.assertEqual(cfg.table_editor_chats, ("oc_1", "oc_2"))
@@ -230,6 +230,16 @@ class TestConfigRefusesToStartUnsafe(unittest.TestCase):
         bare = panel.PanelConfig.from_env({"PANEL_PASSWORD": GOOD_PASSWORD})
         self.assertEqual((bare.table_managers, bare.table_editor_chats, bare.table_owner),
                          ((), (), ""))
+
+    def test_a_formatted_phone_number_stays_one_manager(self):
+        """「+86 138-0000-0000」按空白切会变成两个人，谁都对不上。"""
+        cfg = panel.PanelConfig.from_env({
+            "PANEL_PASSWORD": GOOD_PASSWORD,
+            "FEISHU_TABLE_MANAGERS": "+86 138-0000-0000, 139 0000 0000"})
+        self.assertEqual(cfg.table_managers, ("+86 138-0000-0000", "139 0000 0000"))
+        from xhsearch import provision
+        self.assertEqual([provision.member_type(m) for m in cfg.table_managers],
+                         ["mobile", "mobile"])
 
 
 class TestSessions(unittest.TestCase):
@@ -1261,9 +1271,13 @@ class TestShareSettings(unittest.TestCase):
 
     def test_apply_uses_the_merged_plan_on_an_existing_table(self):
         from xhsearch import provision as provision_mod
+        from xhsearch import registry as registry_mod
         store = FakeStore(**{"share.editor_chats": [{"chat_id": "oc_1", "name": "运营群"}]})
         projects, _ = self._projects(store, table_managers=("boss@x.com",))
-        with mock.patch.object(provision_mod, "share_table",
+        known = [registry_mod.Entry(label="旧表", target="bascnOLD:tblA",
+                                    app_token="bascnOLD", table_id="tblA")]
+        with mock.patch.object(panel.Projects, "list", return_value=known), \
+             mock.patch.object(provision_mod, "share_table",
                                return_value=provision_mod.ShareResult(granted=["x"])) as shared:
             result = projects.apply_share("bascnOLD")
         self.assertEqual(result.granted, ["x"])
@@ -1273,6 +1287,21 @@ class TestShareSettings(unittest.TestCase):
         self.assertEqual(plan.editor_chats, ("oc_1",))
         with self.assertRaises(ValueError):
             projects.apply_share("")
+
+    def test_apply_refuses_a_table_that_is_not_in_the_registry(self):
+        """面板口令是运营共用的：不查清单的话，知道任何一个应用能管的 base 的
+        app_token，就能把配好的群和人加到那个 base 上去。"""
+        from xhsearch import provision as provision_mod
+        from xhsearch import registry as registry_mod
+        projects, _ = self._projects(table_managers=("boss@x.com",))
+        known = [registry_mod.Entry(label="旧表", target="bascnOLD:tblA",
+                                    app_token="bascnOLD", table_id="tblA")]
+        with mock.patch.object(panel.Projects, "list", return_value=known), \
+             mock.patch.object(provision_mod, "share_table") as shared:
+            with self.assertRaises(ValueError) as ctx:
+                projects.apply_share("bascnSOMEONE_ELSES")
+        shared.assert_not_called()
+        self.assertIn("不在监控清单里", str(ctx.exception))
 
     def test_the_store_lives_in_the_registry_base(self):
         projects = panel.Projects(self._projects()[0].config, Settings(), log=lambda *a: None)

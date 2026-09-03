@@ -123,6 +123,31 @@ class TestSettingsStore(unittest.TestCase):
         store, *_ = self._store([{"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}], bitable)
         self.assertEqual(store.get_json("some.key", []), [])
 
+    def test_two_concurrent_first_saves_leave_exactly_one_row(self):
+        """两个运营同时第一次保存：找行 → 建行不是原子的，没有锁就会同一个键
+        两行，之后读到哪一行看飞书心情。"""
+        import threading
+        import time as time_mod
+
+        bitable = FakeBitable()
+        real_search = bitable.search
+        def slow_search(*a, **k):
+            time_mod.sleep(0.02)          # 放大「看到没有这一行」到「建行」之间的窗口
+            return real_search(*a, **k)
+        bitable.search = slow_search
+        store, *_ = self._store([{"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}],
+                                bitable)
+        threads = [threading.Thread(target=store.set_json, args=("some.key", [i]))
+                   for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(bitable.created), 1, "同一个键建了两行")
+        self.assertEqual(len(bitable.updated), 1, "第二次保存应该是改那一行")
+        keys = [r["fields"][panel_settings.COL_KEY] for r in bitable.rows]
+        self.assertEqual(keys, ["some.key"])
+
     def test_a_failed_table_creation_raises(self):
         store, workspace, *_ = self._store([], FakeBitable())
         workspace.create_table.return_value = ""

@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -56,6 +57,10 @@ class SettingsStore:
         self._table_id: str = ""
         self._rows: Optional[dict[str, tuple[str, str]]] = None   # key -> (record_id, value)
         self._read_at: float = 0.0
+        # 「找行 → 没有就 batch_create、有就 batch_update」不是原子的：两个运营
+        # 同时第一次保存，两个线程都看到没有那一行，就各建一行——同一个键两行，
+        # 之后读到哪一行看飞书心情。面板是单进程，一把锁把整段串起来就够。
+        self._lock = threading.RLock()
 
     # ---------- 找表 / 建表 ----------
 
@@ -101,7 +106,8 @@ class SettingsStore:
 
     def get_json(self, key: str, default: Any) -> Any:
         """读一个键，JSON 解开。没有、或存的不是合法 JSON → default。"""
-        row = self._load().get(key)
+        with self._lock:
+            row = self._load().get(key)
         if row is None or not row[1].strip():
             return default
         try:
@@ -112,18 +118,23 @@ class SettingsStore:
     # ---------- 写 ----------
 
     def set_json(self, key: str, value: Any) -> None:
-        """写一个键（整体覆盖）。没有那张表就先建。写完缓存失效。"""
-        table_id = self._ensure_table()
-        table = self._bitable(self.app_token, table_id)
+        """写一个键（整体覆盖）。没有那张表就先建。写完缓存失效。
+        找行和写行在同一把锁里，两个人同时保存也只会有一行。"""
         text = json.dumps(value, ensure_ascii=False)
-        existing = self._load().get(key)
-        if existing and existing[0]:
-            table.batch_update([{"record_id": existing[0],
-                                 "fields": {COL_KEY: key, COL_VALUE: text}}])
-        else:
-            # 幂等键按 键+值 算：同一个值重发（超时重试）不会多出一行。
-            table.batch_create(
-                [{"fields": {COL_KEY: key, COL_VALUE: text}}],
-                client_token=feishu.idempotency_key(f"panel-setting:{self.app_token}:{key}:{text}"))
-        self._rows = None
+        with self._lock:
+            table_id = self._ensure_table()
+            table = self._bitable(self.app_token, table_id)
+            # 强制重读：别拿缓存里的「没有这一行」去决定 create——另一个线程
+            # 刚建完的那一行缓存里还没有。
+            existing = self._load(force=True).get(key)
+            if existing and existing[0]:
+                table.batch_update([{"record_id": existing[0],
+                                     "fields": {COL_KEY: key, COL_VALUE: text}}])
+            else:
+                # 幂等键按 键+值 算：同一个值重发（超时重试）不会多出一行。
+                table.batch_create(
+                    [{"fields": {COL_KEY: key, COL_VALUE: text}}],
+                    client_token=feishu.idempotency_key(
+                        f"panel-setting:{self.app_token}:{key}:{text}"))
+            self._rows = None
         self.log(f"⚙ 面板设置 {key} = {text}")

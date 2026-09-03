@@ -205,9 +205,14 @@ def _float_env(env, name, default, minimum, maximum) -> float:
 
 
 def _list_env(env, name) -> tuple:
-    """逗号 / 分号 / 空白分隔的一组值。空 = 空元组。"""
+    """逗号 / 分号分隔的一组值，每一项两头的空白去掉。空 = 空元组。
+
+    **不按空白切**：手机号常写成「+86 138-0000-0000」，按空白切会变成两个人
+    （`+86` 和 `138-0000-0000`），谁都对不上。号码内部的空格和连字符交给
+    provision.normalize_mobile 去掉。
+    """
     raw = env.get(name) or ""
-    return tuple(v for v in re.split(r"[,;，；\s]+", raw) if v)
+    return tuple(v.strip() for v in re.split(r"[,;，；]+", raw) if v.strip())
 
 
 def _bool_env(env, name, default: bool) -> bool:
@@ -908,9 +913,17 @@ class Projects:
 
     def apply_share(self, app_token: str) -> provision.ShareResult:
         """按当前设置给一张**已经建好的**表补协作者。应用得是这张表的所有者或
-        可管理——自己建的表天然是；接管的业务表要看当初给应用的是什么权限。"""
+        可管理——自己建的表天然是；接管的业务表要看当初给应用的是什么权限。
+
+        **只认注册表里的表。** 面板口令是运营共用的；不查的话，知道任何一个
+        应用能管的 base 的 app_token，就能把配好的群（和人）加到那个 base 上去
+        ——下拉框只列清单里的表，但服务端不能指望前端。
+        """
         if not app_token:
             raise ValueError("要选一张表")
+        known = {e.app_token for e in self.list() if e.app_token}
+        if app_token not in known:
+            raise ValueError("这张表不在监控清单里——只给清单里的表补协作者")
         self.log(f"🔑 给 {app_token[-6:]} 补协作者")
         return provision.share_table(self._workspace(), app_token, self.share_plan(),
                                      log=self.log)
