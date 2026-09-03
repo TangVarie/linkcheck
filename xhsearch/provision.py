@@ -216,17 +216,24 @@ class BusinessColumn:
 
 
 def next_check_formula(settings: Settings) -> str:
-    """「下次检查时间」的公式，运营给的原文，只把列名换成配置里的：
+    """「下次检查时间」的公式。里层是运营给的原文，只把列名换成配置里的：
 
         [最近检查时间] + IF(DATEDIF([发布时间], NOW(), "D") <= 2, 8,
                          IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24
 
     发布 2 天内每 8 小时、7 天内每 24 小时、之后每 72 小时——和分层刷新的
     节奏一致，表里看得到「下一次大概什么时候来」。
+
+    外面再套一层：发布超过归档天数（全局默认 30 天）就显示空——归档后 sweep
+    不再自动刷这一行，再显示一个「下次检查」就是在报一个不会发生的时间。
+    用的是全局默认值：建表时这张表还没入册，没有逐表覆盖可看；改过「归档天数」
+    的表，去列设置里把那个数改一下就行。
     """
     f = settings.fields
     age = f'DATEDIF([{f.publish_time}], NOW(), "D")'
-    return (f"[{f.last_updated}] + IF({age} <= 2, 8, IF({age} <= 7, 24, 72)) / 24")
+    days = settings.refresh.archive_after_days
+    inner = f"[{f.last_updated}] + IF({age} <= 2, 8, IF({age} <= 7, 24, 72)) / 24"
+    return f'IF({age} > {days}, "", {inner})'
 
 
 # 字符串 = 巡查列的角色名（settings.fields 上的属性），BusinessColumn = 业务列。

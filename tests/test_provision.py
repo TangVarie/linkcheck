@@ -338,9 +338,18 @@ class TestFullTemplate(unittest.TestCase):
         self.assertEqual(body["type"], 20)
         self.assertEqual(
             body["property"]["formula_expression"],
+            'IF(DATEDIF([发布时间], NOW(), "D") > 30, "", '
             '[最近检查时间] + IF(DATEDIF([发布时间], NOW(), "D") <= 2, 8, '
-            'IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24')
+            'IF(DATEDIF([发布时间], NOW(), "D") <= 7, 24, 72)) / 24)')
         self.assertIn("下次检查时间", self.made["built"])
+
+    def test_the_archive_cutoff_in_the_formula_follows_the_setting(self):
+        """归档后 sweep 不再刷这一行，公式再给一个「下次检查」就是在报一个
+        不会发生的时间。界线用的是全局的归档天数。"""
+        settings = Settings()
+        settings.refresh.archive_after_days = 45
+        self.assertTrue(provision.next_check_formula(settings)
+                        .startswith('IF(DATEDIF([发布时间], NOW(), "D") > 45, "", '))
 
     def test_deferred_columns_are_added_in_layout_order(self):
         names = [c[0][2]["field_name"] for c in self.workspace.create_field.call_args_list]
