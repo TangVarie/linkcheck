@@ -357,6 +357,14 @@ class TestFullTemplate(unittest.TestCase):
                       formula)
         self.assertNotIn("72", formula)
 
+    def test_no_tiers_means_a_blank_column_not_a_fake_next_check(self):
+        """一档都没配 = 没有任何自动刷新（interval_hours_for_age 全返回 None）。
+        这时候公式必须整列留空：算成 `[最近检查时间] + 0 / 24` 的话，那一格会
+        把「上次检查的时刻」显示成「下次检查时间」——一个不会发生的承诺。"""
+        settings = Settings()
+        settings.refresh.tiers = []
+        self.assertEqual(provision.next_check_formula(settings), '""')
+
     def test_the_archive_cutoff_in_the_formula_follows_the_setting(self):
         """归档后 sweep 不再刷这一行，公式再给一个「下次检查」就是在报一个
         不会发生的时间。界线用的是全局的归档天数。"""

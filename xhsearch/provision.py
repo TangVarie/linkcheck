@@ -217,9 +217,13 @@ class BusinessColumn:
 
 def _tier_expr(age_expr: str, tiers) -> str:
     """把分层配置写成嵌套 IF。档位直接来自 settings.refresh.tiers——
-    公式和代码用同一份配置，改了刷新节奏不会只改一半。"""
+    公式和代码用同一份配置，改了刷新节奏不会只改一半。
+
+    一档都没配的情况由调用方先挡掉（见 next_check_formula）：那种配置下
+    根本没有「下次检查」，这里返回什么都是错的。
+    """
     if not tiers:
-        return "0"
+        return ""
     expr = str(tiers[-1][1])
     for max_age_days, interval_hours in reversed(tiers[:-1]):
         expr = f"IF({age_expr} <= {max_age_days}, {interval_hours}, {expr})"
@@ -248,6 +252,11 @@ def next_check_formula(settings: Settings) -> str:
     改过「归档天数」的表，去列设置里把那个数改一下就行。
     """
     f = settings.fields
+    if not settings.refresh.tiers:
+        # 一档都没配 = 没有任何自动刷新（`interval_hours_for_age` 对每个帖龄
+        # 都返回 None）。这时候还给一个「下次检查」就是在报一个不会发生的
+        # 时间——整列留空，和归档行的处理一致。
+        return '""'
     age_now = f'DATEDIF([{f.publish_time}], NOW(), "D")'
     age_at_check = f'DATEDIF([{f.publish_time}], [{f.last_updated}], "D")'
     days = settings.refresh.archive_after_days
