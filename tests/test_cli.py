@@ -995,6 +995,19 @@ class TestFirstRunCap(unittest.TestCase):
         self.assertIn("if (first_run_cap and", source,
                       "0 要能关掉这个闸，否则没法一次刷完")
 
+    def test_the_default_is_fifty_and_the_docs_agree(self):
+        """默认值是运营看得见的行为（新表勾一批只刷这么多就「停」了），
+        改了却忘了改文档，下次排查就得从代码里翻。"""
+        import inspect
+        import pathlib
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn('"FIRST_RUN_MAX_RECORDS", int, 50', source)
+        root = pathlib.Path(__file__).resolve().parent.parent
+        for name in (".env.example", "docs/部署.md", "docs/面板.md"):
+            text = (root / name).read_text(encoding="utf-8")
+            self.assertNotIn("FIRST_RUN_MAX_RECORDS=20", text, name)
+            self.assertNotIn("默认 20", text, f"{name} 还写着旧的默认值")
+
 
 class TestEstimateSaysUnknownNotZero(unittest.TestCase):
     """缺「最近检查时间」列时 load_rows 直接 return []，

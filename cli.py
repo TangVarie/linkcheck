@@ -626,7 +626,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     # 刚把这一列建出来。两种情况下每一行都判到期，一轮就是全表付费。
     # 这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，
     # 这个是**单张新表**的，防的是「一张 800 行的表刚入册就吃掉整轮预算」。
-    first_run_cap = _numeric_env("FIRST_RUN_MAX_RECORDS", int, 20, minimum=0)
+    first_run_cap = _numeric_env("FIRST_RUN_MAX_RECORDS", int, 50, minimum=0)
     if (first_run_cap and len(row_list) > first_run_cap
             and all(r.last_updated_ms is None for r in row_list)):
         print(f"🐣 这张表一个「{settings.fields.last_updated}」都没有"
