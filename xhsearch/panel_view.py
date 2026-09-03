@@ -812,17 +812,15 @@ _SCRIPT = r"""
   });
   // ---- 新建表给谁开权限 ----
   // 群可编辑：面板上从应用所在的群里勾选，存在注册表 base 里，不用碰部署。
-  // 可管理：**只显示**。它来自后台环境变量 FEISHU_TABLE_MANAGERS——面板口令是
-  // 运营共用的，管理权限不能是面板上点一下就给自己的东西。
+  // 可管理：**只显示数量**。它来自后台环境变量 FEISHU_TABLE_MANAGERS——面板口令
+  // 是运营共用的，管理权限不能是面板上点一下就给自己的东西，管理员是谁也不该
+  // 从面板上看出来（服务端根本不把手机号 / 邮箱送到浏览器）。
   var shareBox = document.getElementById("share");
   var shareState = null;
   function getJson(url){
     return fetch(url).then(function(r){ return r.json().then(function(j){
       if (!r.ok) throw new Error((j.error || ("HTTP " + r.status)) + (j.hint ? "\n" + j.hint : ""));
       return j; }); });
-  }
-  function personChip(m){
-    return "<span class=chip>" + esc(m.label || m.id) + "</span>";
   }
   function chatChip(c){
     var tail = c.source === "env" ? " <span class=muted>环境变量</span>" : "";
@@ -831,9 +829,9 @@ _SCRIPT = r"""
   function renderShare(){
     if (!shareBox || !shareState) return;
     var s = shareState;
-    var people = s.managers.length
-      ? s.managers.map(personChip).join(" ") + " <span class=muted>在后台定（面板服务的环境变量 <code>FEISHU_TABLE_MANAGERS</code>），面板上改不了</span>"
-      : "<span class='chip r'>没配</span> <span class=muted>建出来的表没人能管——去 Railway 给面板服务配 <code>FEISHU_TABLE_MANAGERS=你的手机号</code>（也认邮箱），重启生效</span>";
+    var people = s.managers_count
+      ? "<span class=chip>后台已配 " + s.managers_count + " 人</span> <span class=muted>面板服务的环境变量 <code>FEISHU_TABLE_MANAGERS</code>；是谁只有后台知道，面板上不显示、也改不了</span>"
+      : "<span class='chip r'>没配</span> <span class=muted>建出来的表没人能管——去 Railway 给面板服务配 <code>FEISHU_TABLE_MANAGERS</code>（手机号或邮箱），重启生效</span>";
     var groups = s.editor_chats.map(chatChip).join(" ") || "<span class=muted>还没选群</span>";
     var opts = entriesCache.filter(function(e){ return e.app_token; }).map(function(e){
       return "<option value='" + esc(e.app_token) + "'>" + esc(e.label) + "</option>"; }).join("");
@@ -845,7 +843,7 @@ _SCRIPT = r"""
       "<div id=chatPick class=pick hidden></div>" +
       (opts ? "<div class=srow><span class=lbl>给已建的表补权限</span><select id=shareApply>" + opts + "</select> " +
         "<button type=button class=sm data-share=apply>按上面的设置补</button> <span class=muted>应用得是那张表的所有者或可管理</span></div>" : "") +
-      (s.owner ? "<div class=muted style='margin-top:6px'>所有权转给：" + esc(s.owner) + "（环境变量）</div>" : "") +
+      (s.owner_configured ? "<div class=muted style='margin-top:6px'>建完会把所有权转给后台配置的人（<code>FEISHU_TABLE_OWNER</code>），应用保留可管理</div>" : "") +
       "<div id=shareOut class=out></div>";
   }
   function shareSay(html, cls){

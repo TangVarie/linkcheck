@@ -864,25 +864,30 @@ class Projects:
         raw = self._store().get_json(panel_settings.KEY_EDITOR_CHATS, [])
         return [c for c in raw if isinstance(c, dict) and c.get("chat_id")]
 
+    def _chat_entries(self) -> list:
+        return ([{"chat_id": c, "name": "", "source": "env"}
+                 for c in self.config.table_editor_chats]
+                + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
+                    "source": "panel"} for c in self._stored_chats()])
+
     def share_state(self) -> dict:
-        """面板「协作者」那一栏要显示的东西：谁可管理（只读）、哪些群可编辑、各自从哪来。"""
-        managers = [{"id": m, "label": m, "source": "env"}
-                    for m in self.config.table_managers]
-        chats = ([{"chat_id": c, "name": "", "source": "env"}
-                  for c in self.config.table_editor_chats]
-                 + [{"chat_id": c["chat_id"], "name": c.get("name") or "",
-                     "source": "panel"} for c in self._stored_chats()])
-        return {"managers": managers, "editor_chats": chats,
-                "owner": self.config.table_owner}
+        """面板「协作者」那一栏要显示的东西。
+
+        **可管理的人只给数量，不给是谁。** 手机号 / 邮箱是个人信息，面板口令又是
+        运营共用的——管理员是谁不该从面板上看出来。这个字典是原样送进浏览器的，
+        所以这里就不放。群名可以放：群本来就是给运营看的。
+        """
+        return {"managers_count": len(self.config.table_managers),
+                "editor_chats": self._chat_entries(),
+                "owner_configured": bool(self.config.table_owner)}
 
     def share_plan(self) -> provision.SharePlan:
-        state = self.share_state()
-        managers, chats, labels = [], [], {}
-        for m in state["managers"]:
-            if m["id"] not in managers:
-                managers.append(m["id"])
-                labels[m["id"]] = m["label"]
-        for c in state["editor_chats"]:
+        managers = []
+        for m in self.config.table_managers:
+            if m not in managers:
+                managers.append(m)
+        chats, labels = [], {}
+        for c in self._chat_entries():
             if c["chat_id"] not in chats:
                 chats.append(c["chat_id"])
                 if c["name"]:

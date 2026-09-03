@@ -415,9 +415,11 @@ class TestShareTable(unittest.TestCase):
             mock.call("bascnNEW", "openchat", "oc_group1", "edit"),
         ])
         self.assertEqual(result.failures, [])
-        self.assertEqual(len(result.granted), 3)
-        self.assertIn("可管理", result.granted[0])
-        self.assertIn("可编辑", result.granted[2])
+        # 人合成一条、不写是谁；群一条一个、写群名
+        self.assertEqual(result.granted,
+                         ["可管理 2 人（后台配置，面板上不显示是谁）", "群 oc_group1 可编辑"])
+        self.assertNotIn("ziao@example.com", " ".join(result.granted))
+        self.assertNotIn("ou_abc", " ".join(result.granted))
 
     def test_the_owner_is_transferred_last_and_the_app_keeps_full_access(self):
         workspace = fake_workspace()
@@ -430,20 +432,26 @@ class TestShareTable(unittest.TestCase):
             "bascnNEW", "email", "a@x.com", "full_access")),
             workspace.mock_calls.index(mock.call.transfer_owner(
                 "bascnNEW", "email", "ziao@example.com")))
-        self.assertIn("所有者", result.granted[-1])
+        self.assertIn("所有权已转给后台配置的人", result.granted[-1])
         self.assertIn("应用保留可管理", result.granted[-1])
+        self.assertNotIn("ziao@example.com", " ".join(result.granted))
 
     def test_an_unrecognised_id_is_refused_not_guessed(self):
-        """宁可拒掉让人改配置，也别猜一种类型送给飞书。"""
+        """宁可拒掉让人改配置，也别猜一种类型送给飞书。失败信息按「第 N 项」
+        指路，不把填的东西原样写出来。"""
         workspace = fake_workspace()
         plan = self._plan(managers=("张三",), editor_chats=("运营群",), owner="123")
         result = provision.share_table(workspace, "bascnNEW", plan, log=lambda *a: None)
         workspace.add_member.assert_not_called()
         workspace.transfer_owner.assert_not_called()
         self.assertEqual(len(result.failures), 3)
+        self.assertIn("FEISHU_TABLE_MANAGERS 第 1 项", result.failures[0])
         self.assertIn("邮箱", result.failures[0])
+        self.assertNotIn("张三", result.failures[0])
         self.assertIn("oc_", result.failures[1])
         self.assertIn("cli.py chats", result.failures[1])
+        self.assertIn("FEISHU_TABLE_OWNER", result.failures[2])
+        self.assertNotIn("123", result.failures[2])
 
     def test_one_failure_does_not_stop_the_rest_nor_the_table(self):
         workspace = fake_workspace()
@@ -466,8 +474,10 @@ class TestShareTable(unittest.TestCase):
                               self._plan(managers=("a@x.com",), editor_chats=("oc_1",)),
                               log=lines.append)
         self.assertEqual(len(lines), 2)
-        self.assertIn("a@x.com", lines[0])
+        # 人按「第 N 项」记，不记是谁；群记 chat_id / 群名
+        self.assertIn("FEISHU_TABLE_MANAGERS 第 1 项", lines[0])
         self.assertIn("可管理", lines[0])
+        self.assertNotIn("a@x.com", lines[0])
         self.assertIn("oc_1", lines[1])
         self.assertIn("可编辑", lines[1])
 
@@ -492,7 +502,7 @@ class TestShareTable(unittest.TestCase):
         workspace.resolve_open_id.assert_called_once_with(mobile="13800000000")
         workspace.add_member.assert_called_once_with("bascnNEW", "openid", "ou_ziao", "full_access")
         self.assertEqual(result.failures, [])
-        self.assertEqual(result.granted, ["138 0000 0000 可管理"])
+        self.assertEqual(result.granted, ["可管理 1 人（后台配置，面板上不显示是谁）"])
 
     def test_an_unknown_mobile_is_a_failure_with_the_scope_hint(self):
         workspace = fake_workspace()
@@ -502,25 +512,32 @@ class TestShareTable(unittest.TestCase):
                                        log=lambda *a: None)
         workspace.add_member.assert_not_called()
         self.assertEqual(len(result.failures), 1)
-        self.assertIn("13800000000", result.failures[0])
+        self.assertIn("FEISHU_TABLE_MANAGERS 第 1 项", result.failures[0])
+        self.assertNotIn("13800000000", result.failures[0], "失败信息也不许写手机号")
         workspace.resolve_open_id.side_effect = RuntimeError("99991672 no scope")
         result = provision.share_table(workspace, "bascnNEW",
                                        self._plan(owner="13800000000"),
                                        log=lambda *a: None)
         workspace.transfer_owner.assert_not_called()
         self.assertIn("contact:user.id:readonly", result.failures[0])
+        self.assertNotIn("13800000000", result.failures[0])
 
-    def test_labels_are_what_people_see_not_the_ids(self):
-        """open_id 是一串乱码，面板和日志里显示的得是人认得出的名字。"""
+    def test_people_never_appear_in_results_or_logs_but_group_names_do(self):
+        """手机号 / 邮箱 / open_id 是个人信息，面板口令又是运营共用的：
+        管理员是谁不进结果、不进日志。群名可以——群本来就是给运营看的。"""
         lines = []
         workspace = fake_workspace()
-        plan = self._plan(managers=("ou_ziao",), editor_chats=("oc_1",),
-                          labels={"ou_ziao": "138****8888", "oc_1": "梨响运营群"})
+        workspace.resolve_open_id.return_value = "ou_ziao"
+        plan = self._plan(managers=("13800008888", "ziao@example.com"), editor_chats=("oc_1",),
+                          owner="ou_boss", labels={"oc_1": "梨响运营群"})
         result = provision.share_table(workspace, "bascnNEW", plan, log=lines.append)
-        self.assertEqual(result.granted, ["138****8888 可管理", "群 梨响运营群 可编辑"])
-        self.assertIn("138****8888", lines[0])
-        self.assertIn("梨响运营群", lines[1])
-        workspace.add_member.assert_any_call("bascnNEW", "openid", "ou_ziao", "full_access")
+        everything = " ".join(result.granted + result.failures + lines)
+        for secret in ("13800008888", "ziao@example.com", "ou_ziao", "ou_boss"):
+            self.assertNotIn(secret, everything, f"{secret} 泄露到了结果或日志里")
+        self.assertIn("梨响运营群", everything)
+        self.assertEqual(result.granted[0], "可管理 2 人（后台配置，面板上不显示是谁）")
+        self.assertIn("第 1 项", lines[0])
+        self.assertIn("第 2 项", lines[1])
 
 
 if __name__ == "__main__":

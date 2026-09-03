@@ -347,8 +347,9 @@ class SharePlan:
     managers: tuple = ()       # 可管理（full_access）：手机号 / 邮箱 / ou_ 开头的 open_id
     editor_chats: tuple = ()   # 可编辑（edit）：oc_ 开头的 chat_id。应用得先在群里
     owner: str = ""            # 把所有权转给这个人（应用保留可管理）。可选
-    # 给人看的名字：open_id 是一串乱码，面板上和日志里要显示的是「138****」
-    # 或「梨响运营群」。键是上面三项里的 ID，缺就显示 ID 本身。
+    # 给人看的名字，**只给群用**（chat_id → 「梨响运营群」）。人不在这里：
+    # 可管理的人是后台配的，面板上、结果里、日志里都不写是谁——手机号 / 邮箱
+    # 是个人信息，面板口令又是运营共用的。人只按「FEISHU_TABLE_MANAGERS 第 N 项」称呼。
     labels: dict = field(default_factory=dict)
 
     def __bool__(self) -> bool:
@@ -389,10 +390,14 @@ def member_type(member_id: str) -> str:
     return ""
 
 
-def resolve_person(workspace: feishu.Workspace, who: str, role: str,
+def resolve_person(workspace: feishu.Workspace, who: str, shown: str,
                    failures: list) -> Optional[tuple[str, str]]:
     """把一个「人」的写法变成协作者接口认的 (member_type, member_id)。
-    认不出 / 找不到 → 记一条失败，返回 None。"""
+    认不出 / 找不到 → 记一条失败，返回 None。
+
+    `shown` 是这个人在失败信息里的称呼（「FEISHU_TABLE_MANAGERS 第 2 项」），
+    **不是** `who` 本身：手机号 / 邮箱不进任何会显示给运营的文字。
+    """
     kind = member_type(who)
     if kind in ("email", "openid"):
         return kind, who.strip()
@@ -402,16 +407,16 @@ def resolve_person(workspace: feishu.Workspace, who: str, role: str,
             open_id = workspace.resolve_open_id(mobile=mobile)
         except Exception as exc:                                # noqa: BLE001
             failures.append(
-                f"按手机号 {who} 找用户失败：{exc}。要给应用开 "
+                f"按{shown}的手机号找用户失败：{exc}。要给应用开 "
                 "contact:user.id:readonly（通过手机号或邮箱获取用户 ID）权限，开完发布新版本")
             return None
         if not open_id:
             failures.append(
-                f"飞书里没有手机号 {who} 对应的用户——号码要和飞书账号绑定的一致，"
+                f"飞书里没有{shown}那个手机号对应的用户——号码要和飞书账号绑定的一致，"
                 "非大陆号码带 + 区号")
             return None
         return "openid", open_id
-    failures.append(f"「{who}」认不出是谁：{role}只认手机号、邮箱，或 ou_ 开头的 open_id")
+    failures.append(f"{shown}认不出是谁：只认手机号、邮箱，或 ou_ 开头的 open_id")
     return None
 
 
@@ -425,20 +430,25 @@ def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
     """
     result = ShareResult()
     tag = app_token[-6:]
-    for who in plan.managers:
-        shown = plan.label(who)
-        person = resolve_person(workspace, who, "可管理的人", result.failures)
+    # 人：只按「第 N 项」称呼，成功的合成一条「可管理 N 人」。手机号 / 邮箱
+    # 不进结果、不进日志——面板口令是运营共用的，管理员是谁不该从面板上看出来。
+    managers_ok = 0
+    for index, who in enumerate(plan.managers, 1):
+        shown = f"FEISHU_TABLE_MANAGERS 第 {index} 项"
+        person = resolve_person(workspace, who, shown, result.failures)
         if person is None:
             continue
         kind, member_id = person
         try:
             workspace.add_member(app_token, kind, member_id, "full_access")
         except Exception as exc:                                # noqa: BLE001
-            result.failures.append(f"给「{shown}」开可管理失败：{exc}")
-            log(f"🔑 [{tag}] 开可管理失败 {shown}：{exc}")
+            result.failures.append(f"给{shown}开可管理失败：{exc}")
+            log(f"🔑 [{tag}] 开可管理失败（{shown}）：{exc}")
             continue
-        result.granted.append(f"{shown} 可管理")
-        log(f"🔑 [{tag}] 协作者 {shown} 可管理")
+        managers_ok += 1
+        log(f"🔑 [{tag}] 可管理 +1（{shown}）")
+    if managers_ok:
+        result.granted.append(f"可管理 {managers_ok} 人（后台配置，面板上不显示是谁）")
     for chat in plan.editor_chats:
         shown = plan.label(chat)
         if member_type(chat) != "openchat":
@@ -457,18 +467,18 @@ def share_table(workspace: feishu.Workspace, app_token: str, plan: SharePlan,
         result.granted.append(f"群 {shown} 可编辑")
         log(f"🔑 [{tag}] 协作者 群 {shown} 可编辑")
     if plan.owner:
-        shown = plan.label(plan.owner)
-        person = resolve_person(workspace, plan.owner, "所有者", result.failures)
+        shown = "FEISHU_TABLE_OWNER"
+        person = resolve_person(workspace, plan.owner, shown, result.failures)
         if person is not None:
             kind, member_id = person
             try:
                 workspace.transfer_owner(app_token, kind, member_id)
             except Exception as exc:                            # noqa: BLE001
-                result.failures.append(f"把所有权转给「{shown}」失败：{exc}")
-                log(f"🔑 [{tag}] 转移所有权失败 {shown}：{exc}")
+                result.failures.append(f"把所有权转给 {shown} 配的人失败：{exc}")
+                log(f"🔑 [{tag}] 转移所有权失败（{shown}）：{exc}")
             else:
-                result.granted.append(f"{shown} 所有者（应用保留可管理）")
-                log(f"🔑 [{tag}] 所有权 → {shown}（应用保留可管理）")
+                result.granted.append("所有权已转给后台配置的人（应用保留可管理）")
+                log(f"🔑 [{tag}] 所有权 → {shown} 配的人（应用保留可管理）")
     return result
 
 
