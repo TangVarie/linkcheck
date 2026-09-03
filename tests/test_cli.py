@@ -4,6 +4,7 @@
 这里钉住：代码要读的每一列、要写的每个选择值，都在 doctor 的清单里。
 """
 
+import contextlib
 import io
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -994,6 +995,76 @@ class TestFirstRunCap(unittest.TestCase):
         source = inspect.getsource(cli._refresh_table)
         self.assertIn("if (first_run_cap and", source,
                       "0 要能关掉这个闸，否则没法一次刷完")
+
+    def test_the_default_is_fifty_and_the_docs_agree(self):
+        """默认值是运营看得见的行为（新表勾一批只刷这么多就「停」了），
+        改了却忘了改文档，下次排查就得从代码里翻。"""
+        import inspect
+        import pathlib
+        source = inspect.getsource(cli._refresh_table)
+        self.assertIn('"FIRST_RUN_MAX_RECORDS", int, 50', source)
+        root = pathlib.Path(__file__).resolve().parent.parent
+        for name in (".env.example", "docs/部署.md", "docs/面板.md"):
+            text = (root / name).read_text(encoding="utf-8")
+            self.assertNotIn("FIRST_RUN_MAX_RECORDS=20", text, name)
+            self.assertNotIn("默认 20", text, f"{name} 还写着旧的默认值")
+
+
+class TestBlindRowsAreCounted(unittest.TestCase):
+    """帖龄未知的行按最快档刷、而且永远不会归档——这笔账在表里一点痕迹
+    都没有，只有把它数出来才有人去补那一格。
+
+    （以前更糟：`is_due` 对这种行无条件返回 True，每一轮 cron 都重刷一次。）
+    """
+
+    NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+
+    class _Table:
+        def __init__(self, meta, records):
+            self._meta, self._records = meta, records
+
+        def fields_meta(self):
+            return self._meta
+
+        def search(self, field_names, *, filter_spec=None, max_records=None):
+            return self._records
+
+    def _meta(self, settings, *, drop=()):
+        return {name: {"type": next(iter(allowed)), "options": []}
+                for name, allowed, _label, _opts, _note in cli._expected_schema(settings)
+                if name not in drop}
+
+    def _run(self, *, drop=(), publish=True):
+        from xhsearch.config import Settings
+        settings = Settings()
+        f = settings.fields
+        cells = {f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24}
+        if publish:
+            cells[f.publish_time] = int(
+                (self.NOW - timedelta(days=1)).timestamp() * 1000)
+        table = self._Table(self._meta(settings, drop=drop),
+                            [{"record_id": "rec1", "fields": cells}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli._refresh_table("estimate", None, settings, {}, table, self.NOW)
+        return out.getvalue()
+
+    def test_a_row_without_a_publish_time_is_reported(self):
+        said = self._run(publish=False)
+        self.assertIn("有 1 行的「发布时间」是空的", said)
+        self.assertIn("8 小时", said, "要说清楚它现在按哪一档在刷")
+        self.assertIn("永远不会归档", said)
+
+    def test_a_normal_row_says_nothing(self):
+        self.assertNotIn("是空的", self._run())
+
+    def test_a_missing_publish_column_is_reported_before_anything_else(self):
+        """整列不存在 = 全表帖龄未知。不拒跑（那等于整张表停止监控），
+        但这笔账要在日志里说清楚。"""
+        from xhsearch.config import Settings
+        said = self._run(drop=(Settings().fields.publish_time,))
+        self.assertIn("表里没有「发布时间」列", said)
+        self.assertIn("永远不会归档", said)
 
 
 class TestEstimateSaysUnknownNotZero(unittest.TestCase):

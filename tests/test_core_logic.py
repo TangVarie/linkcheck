@@ -894,6 +894,125 @@ class TestRefreshTiering(unittest.TestCase):
         self.assertTrue(rows.Row(record_id="r", link_cell="x").is_due(self.settings, self.now))
 
 
+class TestUnknownAgeIsNotAFreeForAll(unittest.TestCase):
+    """发布时间那一格是空的 ≠ 每一轮都重刷。
+
+    旧 `is_due` 在看「最近检查时间」**之前**就 `return True`，于是这种行
+    每一轮 cron（5 分钟）都重刷一次：一条小红书 288 轮/天 × ¥0.072 ≈ ¥20/天，
+    而且每一轮都占掉 MAX_RECORDS_PER_RUN 的名额，把真正到期的行顶到下一轮。
+    现在按最快的那一档兜底——「宁可多刷也别让它永远不更新」的初衷保留，
+    但有了上界。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+        self.now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+
+    def _blind(self, checked_hours_ago):
+        updated = self.now - timedelta(hours=checked_hours_ago)
+        return rows.Row(record_id="r", link_cell="x",
+                        last_updated_ms=int(updated.timestamp() * 1000))
+
+    def test_just_checked_is_not_due_again_five_minutes_later(self):
+        self.assertFalse(self._blind(5 / 60).is_due(self.settings, self.now))
+
+    def test_still_not_due_after_seven_hours(self):
+        self.assertFalse(self._blind(7).is_due(self.settings, self.now))
+
+    def test_due_again_after_the_fastest_tier(self):
+        self.assertTrue(self._blind(9).is_due(self.settings, self.now))
+
+    def test_never_checked_is_still_due(self):
+        """从没刷过的行照样立刻刷——兜底的是「刷完之后多久再刷」。"""
+        self.assertTrue(rows.Row(record_id="r", link_cell="x")
+                        .is_due(self.settings, self.now))
+
+    def test_the_fallback_is_the_fastest_tier_not_a_hardcoded_eight(self):
+        self.settings.refresh.tiers = [(1, 4), (5, 12)]
+        self.assertEqual(self.settings.refresh.fastest_interval_hours(), 4)
+        self.assertFalse(self._blind(3).is_due(self.settings, self.now))
+        self.assertTrue(self._blind(5).is_due(self.settings, self.now))
+
+    def test_no_tiers_at_all_means_no_automatic_refresh(self):
+        """一档都没配 = 没有任何刷新节奏可言，不能退化成「每轮都刷」。"""
+        self.settings.refresh.tiers = []
+        self.assertIsNone(self.settings.refresh.fastest_interval_hours())
+        self.assertFalse(self._blind(9999).is_due(self.settings, self.now))
+
+    def test_unknown_age_never_archives_so_it_keeps_costing(self):
+        """帖龄未知 = 归档也判不了。这就是 cli 要把这种行数出来的原因。"""
+        self.assertIsNotNone(
+            self._blind(9999).refresh_interval_hours(self.settings, self.now))
+
+
+class TestTierIsPinnedAtTheLastCheck(unittest.TestCase):
+    """档位按**上次检查那一刻**的帖龄定，不是按此刻的帖龄定。
+
+    按此刻算的话，中午显示「下次 14:00」的行，下午一跨过 2 天线就自己变成
+    「次日 06:00」——14:00 什么也没发生，运营完全看不出为什么。
+    钉死这条，「下次检查时间」那一列才是一个定值、才能当成承诺看。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+        self.now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+
+    def _row(self, age_days_now, checked_hours_ago):
+        published = self.now - timedelta(days=age_days_now)
+        updated = self.now - timedelta(hours=checked_hours_ago)
+        return rows.Row(record_id="r", link_cell="x",
+                        publish_time_ms=int(published.timestamp() * 1000),
+                        last_updated_ms=int(updated.timestamp() * 1000))
+
+    def test_crossing_the_two_day_line_does_not_postpone_the_next_check(self):
+        # 上次检查时才 1.6 天（8 小时档），现在已经 2.6 天。
+        # 按此刻定档会变成 24 小时档、这一行还要再等 15 小时；
+        # 按上次检查定档，9 小时就该刷了——和表里那一格写的一致。
+        row = self._row(age_days_now=2.6, checked_hours_ago=9)
+        self.assertEqual(row.refresh_interval_hours(self.settings, self.now), 8)
+        self.assertTrue(row.is_due(self.settings, self.now))
+
+    def test_the_next_check_time_is_exactly_last_check_plus_interval(self):
+        """表里那一格算的就是这个时刻：早一秒不刷，到点就刷。"""
+        for age_days_now in (0.5, 2.6, 6.9, 12.0):
+            with self.subTest(age_days_now):
+                row = self._row(age_days_now, checked_hours_ago=0)
+                interval = row.refresh_interval_hours(self.settings, self.now)
+                updated = self.now
+                self.assertFalse(row.is_due(
+                    self.settings, updated + timedelta(hours=interval, seconds=-1)))
+                self.assertTrue(row.is_due(
+                    self.settings, updated + timedelta(hours=interval)))
+
+    def test_archiving_still_follows_the_age_right_now(self):
+        """归档看当下：上次检查发生在归档线之前，也不该再多刷一轮。"""
+        row = self._row(age_days_now=31.5, checked_hours_ago=9999)
+        self.assertIsNone(row.refresh_interval_hours(self.settings, self.now))
+        self.assertFalse(row.is_due(self.settings, self.now))
+
+
+class TestWholeDayTiers(unittest.TestCase):
+    """档位按完整天数判，和飞书公式里的 DATEDIF(…, "D") 同口径。
+
+    以前这里比的是浮点天数：「发布 2.5 天」在代码里已经进了 24 小时档，
+    而表里那列公式（DATEDIF 得 2）还显示 8 小时档——运营看到的下次检查
+    时间和机器真正的判断差一整天，而且没有任何地方能看出这个差别。
+    """
+
+    def setUp(self):
+        self.refresh = Settings().refresh
+
+    def test_the_boundaries_land_on_whole_days(self):
+        for age, expected in ((0.0, 8), (2.0, 8), (2.9, 8), (3.0, 24),
+                              (7.9, 24), (8.0, 72), (30.9, 72)):
+            with self.subTest(age=age):
+                self.assertEqual(self.refresh.interval_hours_for_age(age), expected)
+
+    def test_archiving_also_waits_for_the_whole_day(self):
+        self.assertEqual(self.refresh.interval_hours_for_age(30.99), 72)
+        self.assertIsNone(self.refresh.interval_hours_for_age(31.0))
+
+
 class TestProtocol(unittest.TestCase):
     """错误码取自 SocialDataX 公开 OpenAPI 规范的 x-socialdatax-error-contract。
 

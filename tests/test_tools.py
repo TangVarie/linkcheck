@@ -72,7 +72,10 @@ def _simulate_calls_per_day(per_day, xhs_share, settings, step=0.02):
     """
     xhs_calls = dy_calls = 0.0
     age = 0.0
-    archive = settings.refresh.archive_after_days
+    # +1：档位和归档都按**完整天数**判（interval_hours_for_age 里的 floor，
+    # 和飞书 DATEDIF 同口径），所以 archive=30 的帖子在第 30 天当天照样在刷，
+    # 满 31 天才停。仿真的上界要跟着走，否则它自己就少数了一天。
+    archive = settings.refresh.archive_after_days + 1
     while age < archive:
         interval = settings.refresh.interval_hours_for_age(age)
         if interval is None:
@@ -128,18 +131,21 @@ class TestCostModelMatchesTheRealCallPlan(unittest.TestCase):
                                     f"（模型 {model:.1f} vs 仿真 {sim:.1f}）")
 
     def test_archive_shorter_than_tiers_actually_shrinks_the_population(self):
-        """旧模型会把整个 8–30 天档算进来，成本凭空多算一倍多。"""
+        """旧模型会把整个 8–30 天档算进来，成本凭空多算一倍多。
+
+        端点是 15 而不是 14：归档按完整天数判，第 14 天当天还在刷，满 15 天才停。
+        """
         settings = Settings()
         settings.refresh.archive_after_days = 14
         segments = estimate_cost.tier_segments(settings)
-        self.assertTrue(all(end <= 14 for _, end, _ in segments))
-        self.assertEqual(max(end for _, end, _ in segments), 14)
+        self.assertTrue(all(end <= 15 for _, end, _ in segments))
+        self.assertEqual(max(end for _, end, _ in segments), 15)
 
     def test_archive_longer_than_tiers_extends_with_the_last_interval(self):
         settings = Settings()
         settings.refresh.archive_after_days = 45
         segments = estimate_cost.tier_segments(settings)
-        self.assertEqual(max(end for _, end, _ in segments), 45)
+        self.assertEqual(max(end for _, end, _ in segments), 46)
         # 末段沿用最后一档的间隔，和 RefreshTiers.interval_hours_for_age 口径一致
         self.assertEqual(segments[-1][2], settings.refresh.tiers[-1][1])
 

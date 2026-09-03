@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -354,16 +355,37 @@ class RefreshTiers:
     def interval_hours_for_age(self, age_days: float) -> int | None:
         """返回该年龄的帖子应有的刷新间隔；None 表示已归档。
 
+        **档位按「完整天数」算**（29.7 天算 29 天），和飞书公式里的
+        `DATEDIF(…, "D")` 是同一个口径。以前这里拿浮点天数直接比，于是
+        「发布 2.5 天」在代码里已经进了 24 小时档、而表里那列公式
+        （DATEDIF 得 2）还显示 8 小时档——运营看到的下次检查时间和机器
+        真正的判断差一整天，而且没有任何地方能看出这个差别。
+        代价是每篇笔记一生多刷三四次（跨档那天多刷几轮），换的是
+        「表里写的时间就是真的」。
+
         归档界线由 archive_after_days 决定；tiers 只决定归档前的刷新节奏，
         超出最后一档年龄但还没到归档线的，沿用最后一档的间隔。
         （默认两者都是 30 天，行为不变；把 archive_after_days 调大才有差别。）
         """
-        if age_days > self.archive_after_days:
+        whole_days = math.floor(age_days)
+        if whole_days > self.archive_after_days:
             return None
         for max_age_days, interval_hours in self.tiers:
-            if age_days <= max_age_days:
+            if whole_days <= max_age_days:
                 return interval_hours
         return self.tiers[-1][1] if self.tiers else None
+
+    def fastest_interval_hours(self) -> int | None:
+        """最快的那一档间隔。帖龄未知时用它兜底。
+
+        「发布时间那一格是空的」以前等于**无条件到期**——`is_due` 在看
+        「最近检查时间」之前就返回 True，于是这一行每一轮 cron（5 分钟）
+        都重刷一次，一条小红书一天能烧掉二十块，而且每轮都占掉
+        MAX_RECORDS_PER_RUN 的名额，把真正到期的行顶到下一轮。
+        兜底成最快的那一档，既保留「宁可多刷也别让它永远不更新」的初衷，
+        又给了它一个上界。
+        """
+        return min((hours for _days, hours in self.tiers), default=None)
 
 
 @dataclass

@@ -7,6 +7,7 @@
 
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from xhsearch import feishu, transport
@@ -464,6 +465,86 @@ class TestLoadRowsFieldFiltering(unittest.TestCase):
                                 known_fields={f.link, f.monitoring, f.queued})
         self.assertEqual(rows, [])
         self.assertIsNone(table.requested_fields)   # 连 search 都没发
+
+
+class TestDispatchOrderIsFair(unittest.TestCase):
+    """派发顺序 = 等得最久的先走，不是飞书返回的表顺序。
+
+    `refresh` 就按 load_rows 给的顺序派发，而单轮预算（MAX_RECORDS_PER_RUN /
+    MAX_YUAN_PER_RUN / 软截止）是从前往后花的。不排序的话，到期行数长期
+    超过单轮容量时，排在表上面的那批每轮都先花掉预算、表尾那批永远轮不到
+    ——运营看到的就是「有些行像被遗忘了一样」。
+    """
+
+    NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+
+    def _table(self, spec):
+        """spec: [(record_id, 帖龄天, 上次检查几小时前 或 None)]，按表顺序给。"""
+        from xhsearch.config import Settings
+        f = Settings().fields
+        items = []
+        for record_id, age_days, checked_hours_ago in spec:
+            cells = {
+                f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24,
+                f.publish_time: int(
+                    (self.NOW - timedelta(days=age_days)).timestamp() * 1000),
+                f.queued: True,
+            }
+            if checked_hours_ago is not None:
+                cells[f.last_updated] = int(
+                    (self.NOW - timedelta(hours=checked_hours_ago)).timestamp() * 1000)
+            items.append({"record_id": record_id, "fields": cells})
+
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                return items
+        return _Table()
+
+    def _ids(self, **kwargs):
+        from xhsearch import runner
+        from xhsearch.config import Settings
+        table = kwargs.pop("table")
+        return [r.record_id for r in runner.load_rows(
+            table, Settings(), now=self.NOW, **kwargs)]
+
+    def test_the_most_overdue_row_goes_first(self):
+        # 表顺序：刚到期的在最前，逾期最久的在最后。
+        table = self._table([("just", 1, 9),      # 8h 档，逾期 1 小时
+                             ("never", 1, None),  # 从没刷过
+                             ("worst", 1, 40)])   # 8h 档，逾期 32 小时
+        self.assertEqual(self._ids(table=table, only_due=True),
+                         ["never", "worst", "just"])
+
+    def test_rows_that_wait_the_same_keep_their_table_order(self):
+        """并列时保持表内顺序：排序是稳定的，不该把表搅乱。"""
+        table = self._table([("a", 1, 9), ("b", 1, 9), ("c", 1, 9)])
+        self.assertEqual(self._ids(table=table, only_due=True), ["a", "b", "c"])
+
+    def test_a_hot_row_outranks_a_cold_one_that_waited_longer_in_absolute_terms(self):
+        """比的是「逾期多久」，不是「距上次多久」——老帖本来就该刷得慢。"""
+        table = self._table([("cold", 20, 80),   # 72h 档，逾期 8 小时
+                             ("hot", 1, 30)])    # 8h 档，逾期 22 小时
+        self.assertEqual(self._ids(table=table, only_due=True), ["hot", "cold"])
+
+    def test_queue_mode_serves_the_stalest_data_first(self):
+        """排队刷新没有「到期」可言（勾了就是要看），按数据最旧的先看。
+        已归档的老行也能排在前面——那正是「结案的表里想临时查一行」。"""
+        table = self._table([("fresh", 1, 1), ("ancient", 40, 900)])
+        self.assertEqual(self._ids(table=table, only_queued=True, only_due=False),
+                         ["ancient", "fresh"])
+
+    def test_named_rows_keep_the_callers_order(self):
+        """人点名的几行按调用方给的顺序，别重排。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+
+        class _Table:
+            def batch_get(self, record_ids):
+                return [{"record_id": rid, "fields": {}} for rid in record_ids]
+
+        got = runner.load_rows(_Table(), Settings(), now=self.NOW,
+                               only_record_ids=["z", "a", "m"])
+        self.assertEqual([r.record_id for r in got], ["z", "a", "m"])
 
 
 class TestFieldsMeta(unittest.TestCase):

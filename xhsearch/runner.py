@@ -1301,6 +1301,30 @@ def load_rows(
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。
         if wanted or row.queued or not only_due or row.is_due(settings, now):
             result.append(row)
+
+    # —— 派发顺序：等得最久的先走 ——
+    # `refresh` 就按这个顺序派发，而单轮预算（MAX_RECORDS_PER_RUN /
+    # MAX_YUAN_PER_RUN / 软截止）是从前往后花的。以前这里不排序，顺序就是
+    # 飞书返回的表顺序，于是到期行数长期超过单轮容量时，排在表上面的那批
+    # 每轮都先花掉预算、表尾那批永远轮不到——运营看到的就是「有些行像被
+    # 遗忘了一样」。排序是稳定的，同样等待时长的行保持表内顺序。
+    #
+    # ⚠️ 这个顺序**不是逐行精确**的：`refresh` 用 ThreadPoolExecutor 派发，
+    # 线程按提交顺序取活，但每个线程要先解析链接、算调用计划，才走到
+    # `budget.reserve()`。所以在预算刚好卡住的那个位置上，同时在飞的
+    # 几行（≤ MAX_CONCURRENCY，默认 2）谁先预留是时序决定的。
+    # 保证的是「拿到预算的是排在前面的那一批」，边界上最多差几行；
+    # 而差掉的那几行逾期只会更久、下一轮排得更前，不会重新变成饿死。
+    # 想要逐行精确就得把预留搬到派发前串行做，那要把 disabled/降级这套
+    # 运行期状态一起搬走——为了边界上的一两行不值得。
+    if wanted:
+        # 人点名的几行：按调用方给的顺序，别重排。
+        return result
+    if only_queued:
+        # 排队刷新没有「到期」可言（勾了就是要看），按「数据最旧的先看」排。
+        result.sort(key=lambda r: r.hours_since_check(now), reverse=True)
+    else:
+        result.sort(key=lambda r: r.overdue_hours(settings, now), reverse=True)
     return result
 
 

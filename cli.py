@@ -577,6 +577,13 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         print("⚠ 调度地基列的类型不对，这几行刷完不会被记成「已检查」：")
         for problem in blockers:
             print(f"  {problem}")
+    if mode in ("sweep", "estimate") and settings.fields.publish_time not in known_fields:
+        # 帖龄是分层刷新的全部依据。这一列不存在 = 全表帖龄未知 = 全表都按
+        # 最快的那一档刷、而且**永远不会归档**（归档也是按帖龄判的）。
+        # 不拒跑（拒跑等于整张表停止监控），但这笔账要在日志里说清楚。
+        print(f"⚠ 表里没有「{settings.fields.publish_time}」列：全表都算不出帖龄，"
+              f"于是每一行都按最快的一档（{_fastest_tier(settings)}）刷，"
+              "而且永远不会归档——三年前的老帖也会一直刷下去。先去建这一列。")
     row_list = runner.load_rows(
         table,
         settings,
@@ -622,11 +629,20 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
             print(f"🔎 这批里有 {off} 行没开「{settings.fields.monitoring}」，"
                   "是有人主动勾了「排队刷新」要单次取数——照刷，刷完清勾。")
 
+    # 帖龄未知的行：按最快档刷、而且不会归档。数量一多就是在持续多花钱，
+    # 而这件事在表里一点痕迹都没有——只有把它数出来，才有人去补那一格。
+    if mode in ("sweep", "estimate"):
+        blind = sum(1 for r in row_list if r.publish_time_ms is None)
+        if blind:
+            print(f"⚠ 这批里有 {blind} 行的「{settings.fields.publish_time}」是空的："
+                  f"算不出帖龄，只能按最快的一档（{_fastest_tier(settings)}）刷，"
+                  "而且永远不会归档。把发布时间补上，它们就会自动降频。")
+
     # 首轮小闸：整张表**一个**「最近检查时间」都没有 = 要么是全新表，要么是
     # 刚把这一列建出来。两种情况下每一行都判到期，一轮就是全表付费。
     # 这个闸和 MAX_RECORDS_PER_RUN 不是一回事：那个是整次运行共享的，
     # 这个是**单张新表**的，防的是「一张 800 行的表刚入册就吃掉整轮预算」。
-    first_run_cap = _numeric_env("FIRST_RUN_MAX_RECORDS", int, 20, minimum=0)
+    first_run_cap = _numeric_env("FIRST_RUN_MAX_RECORDS", int, 50, minimum=0)
     if (first_run_cap and len(row_list) > first_run_cap
             and all(r.last_updated_ms is None for r in row_list)):
         print(f"🐣 这张表一个「{settings.fields.last_updated}」都没有"
@@ -672,6 +688,13 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         stop=stop,
     )
     return 0, found, len(row_list), yuan, (report, fields_meta)
+
+
+def _fastest_tier(settings: Settings) -> str:
+    """帖龄未知时兜底用的那一档，写成人话。一档都没配时说清楚是「不刷」，
+    别在提示里冒出一个 None。"""
+    hours = settings.refresh.fastest_interval_hours()
+    return "没有配任何档位，这些行不会自动刷" if hours is None else f"{hours} 小时"
 
 
 def _scheduling_blockers(settings: Settings, fields_meta: dict) -> list[str]:
