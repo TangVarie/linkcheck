@@ -251,12 +251,15 @@ class TestPanelFields(unittest.TestCase):
         self.assertIn(settings.fields.negative_digest, with_digest)
 
     def test_includes_the_columns_the_verdict_path_does_not_need(self):
-        """面板要靠这几列回答「这行怎么了」，而 must_read() 里没有它们。"""
+        """面板要靠这几列回答「这行怎么了」。诊断信息和负面状态判定链路不读；
+        巡查状态现在选行要认（熔断记过失败的行提前复查），已进 must_read，
+        面板照样要拿到它。"""
         settings = Settings()
         fields = summary.panel_fields(settings)
         for column in (settings.fields.refresh_status, settings.fields.failure_reason,
                        settings.fields.negative_status):
             self.assertIn(column, fields)
+        for column in (settings.fields.failure_reason, settings.fields.negative_status):
             self.assertNotIn(column, settings.fields.must_read())
 
     def test_no_duplicates(self):

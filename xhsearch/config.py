@@ -91,6 +91,7 @@ class FieldNames:
             self.comment_count,           # 判定掉量必须知道上一次的数
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
+            self.refresh_status,          # 熔断记过失败的行要提前复查（rows.Row.breaker_strike_pending）
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
             self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
         ]
@@ -406,6 +407,17 @@ class Safety:
     # 错误码**，那是上游 schema 漂移的典型形态（比如所有笔记都被译成
     # empty_shell），不是这三五条内容恰好同时被删。达到这个行数就熔断。
     breaker_uniform_min_sample: int = 3
+
+    # 熔断**不是**作废重来，是「记一次失败，过这么久再看一次」。
+    # 熔断轮照常盖「最近检查时间」、连续失败次数 +1、不改流量状态、不清排队勾；
+    # 这段时间内这些行谁都不接（排队勾也不接），到点复查一次——还取不到
+    # 就按两击定罪判「已失效」往下走。
+    #
+    # 以前熔断轮什么都不写、下一轮原样重刷，cron 每 5 分钟一轮，同一批行
+    # 每轮重刷、每轮再熔断，一天烧两百多块，而且没有任何东西让它停下来
+    # （2026-09「雷诺考特复查」表，50 行 × ¥0.81 × 每 5 分钟）。
+    # 1 小时够 TikHub 这种通道级抖动恢复；真是内容集体没了，1 小时后照样判得出来。
+    breaker_recheck_hours: float = 1.0
 
     # 同一行在这个时间窗内刚成功刷过就跳过，不花积分。
     # 有人连点 200 次按钮 = 1 次真实调用。
