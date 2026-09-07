@@ -199,6 +199,10 @@ def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -
     解析分享链接是另外的端点。把 v.douyin.com 短链塞进 aweme_id 必然失败，
     还会被归一化成 GONE 嫌疑：两轮之后一条活着的内容就被标成「已失效」，钱照扣。
     所以这种行让 TikHub 直接让位给吃链接的 SocialDataX。
+
+    开跑时 runner 会先用 shortlink.py 把短链免费展开成 aweme_id（跟一次 302），
+    展开成功的行到这里已经是 ID 形态、照走 TikHub；这个判据管的是**展不开**的
+    那些（短链过期、落地页改版、网络抖动）。
     小红书不受影响：share_text 参数长链短链分享文案都吃（实测）。
     """
     if platform == "douyin" and not arguments.get("aweme_id"):

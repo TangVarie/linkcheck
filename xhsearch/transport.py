@@ -66,6 +66,13 @@ class Response:
     # 预算闸门要按真实请求数记账：一个「计划中的调用」在传输层可能变成 3 个请求，
     # 按计划数记账会让 MAX_CALLS_PER_RUN 名不副实。
     attempts: int = 1
+    # 3xx 响应的 Location 头（原样，可能是相对路径）。只有 get_no_redirect()
+    # 会填它：付费接口从不重定向，短链展开则只要这一个头、不要落地页正文。
+    location: str = ""
+
+    @property
+    def redirected(self) -> bool:
+        return 300 <= self.status < 400 and bool(self.location)
 
     @property
     def ok(self) -> bool:
@@ -101,7 +108,33 @@ def get(url: str, headers: dict[str, str], timeout: float = 30.0) -> Response:
     return _perform(request, timeout)
 
 
-def _perform(request: urllib.request.Request, timeout: float) -> Response:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """让 urlopen 把 3xx 当成一个普通响应交回来，而不是自己跟过去。
+
+    返回 None 时 urllib 会把 3xx 包成 HTTPError 抛出，_perform 已经接住了
+    这条路（读 body、读响应头），Location 就在那份响应头里。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def get_no_redirect(url: str, headers: dict[str, str], timeout: float = 10.0) -> Response:
+    """发一个 GET 但**不跟随重定向**：3xx 原样返回，Location 头放在 Response.location。
+
+    给短链展开用。跟着 302 跳过去会把整个落地页（抖音的是一个几百 KB 的
+    SPA 壳）下载回来，而我们要的只是 Location 里那串数字 ID。
+    语义与 get() 一致：非 2xx 也返回 Response 而不是抛异常。
+    """
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    return _perform(request, timeout, opener=_NO_REDIRECT_OPENER)
+
+
+def _perform(request: urllib.request.Request, timeout: float,
+             opener: Optional[urllib.request.OpenerDirector] = None) -> Response:
     """「永远返回 Response」的承诺在这里兑现。
 
     urllib 只把**建连阶段**的 OSError 包成 URLError；状态行前被断开
@@ -110,8 +143,9 @@ def _perform(request: urllib.request.Request, timeout: float) -> Response:
     漏掉任何一个，一次网络毛刺就会炸穿整批：write_back 执行不到，
     本轮已经花钱刷完的行一条都不写回。所以最后必须有 Exception 兜底。
     """
+    open_ = opener.open if opener is not None else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with open_(request, timeout=timeout) as resp:
             return _read(resp)
     except urllib.error.HTTPError as exc:
         try:
@@ -243,6 +277,7 @@ def _read(resp: Any) -> Response:
         body=body,
         request_id=resp.headers.get("x-request-id", "") or "",
         retry_after=_retry_after(resp.headers),
+        location=(resp.headers.get("Location") or "").strip(),
     )
 
 

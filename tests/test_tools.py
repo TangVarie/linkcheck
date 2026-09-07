@@ -36,19 +36,45 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
             result = probe_channel.probe(*args, **kwargs)
         return result, captured.getvalue()
 
+    @staticmethod
+    def _expand(response):
+        """顶掉短链展开那一跳（transport.get_no_redirect），别让测试真去敲抖音。"""
+        return mock.patch.object(transport, "get_no_redirect", return_value=response)
+
+    UNREACHABLE = transport.Response(0, "", "网络错误：test")
+    REDIRECT = transport.Response(
+        302, "", "", location="https://www.iesdouyin.com/share/video/7123456789012345678/")
+
     def test_douyin_short_link_on_tikhub_sends_no_request(self):
-        with mock.patch.object(transport, "request") as sent:
+        """短链展不开时，和从前一样：TikHub 不吃链接，不发请求。"""
+        with self._expand(self.UNREACHABLE), mock.patch.object(transport, "request") as sent:
             ok, output = self._probe(providers.TIKHUB, "t-key",
                                      "https://v.douyin.com/iRxYzAb/", Settings())
         sent.assert_not_called()
         self.assertTrue(ok, "跳过一条这家吃不了的链接不算「通道不可用」")
         self.assertIn("不发请求、不扣费", output)
+        self.assertIn("短链展不开", output)
+
+    def test_douyin_short_link_expands_and_then_probes_tikhub(self):
+        """线上开跑会先免费展开短链再挑通道，探针必须走同一条路——
+        否则它会对一条线上明明能走 TikHub 的链接报「TikHub 不吃」。"""
+        response = transport.Response(401, "application/json",
+                                      '{"detail": {"code": 401, "message": "no"}}', "r")
+        with self._expand(self.REDIRECT), \
+             mock.patch.object(transport, "request", return_value=response) as sent:
+            ok, output = self._probe(providers.TIKHUB, "t-key",
+                                     "https://v.douyin.com/iRxYzAb/", Settings())
+        self.assertTrue(sent.called)
+        self.assertIn("aweme_id=7123456789012345678", sent.call_args.args[1])
+        self.assertIn("短链已展开", output)
+        self.assertFalse(ok)   # 401 是真失败，照实报
 
     def test_force_actually_sends_the_request(self):
         """--force 是给「我就是要验一次」准备的，行为要如实。"""
         response = transport.Response(401, "application/json",
                                       '{"detail": {"code": 401, "message": "no"}}', "r")
-        with mock.patch.object(transport, "request", return_value=response) as sent:
+        with self._expand(self.UNREACHABLE), \
+             mock.patch.object(transport, "request", return_value=response) as sent:
             self._probe(providers.TIKHUB, "t-key",
                         "https://v.douyin.com/iRxYzAb/", Settings(), force=True)
         self.assertTrue(sent.called)

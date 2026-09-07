@@ -33,11 +33,11 @@ import cli  # noqa: E402  —— 复用同一份 .env 加载（看不懂的行�
 
 cli.load_env_or_exit()   # 本地跑时补上 .env 里的 Key；已存在的环境变量优先
 
-from xhsearch import analyze, providers, transport  # noqa: E402
+from xhsearch import analyze, providers, shortlink, transport  # noqa: E402
 from xhsearch.config import Settings  # noqa: E402
 from xhsearch.links import parse  # noqa: E402
 from xhsearch.protocol import Err  # noqa: E402
-from xhsearch.rows import Row, plan_calls  # noqa: E402
+from xhsearch.rows import Row, ToolCall, id_form, plan_calls  # noqa: E402
 
 ENV = {
     providers.TIKHUB: "TIKHUB_API_KEY",
@@ -61,6 +61,18 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     # 而 TikHub 对失败的业务查询照样计费——探针会白扣一次费，
     # 然后报「这条通道不可用」，而线上其实会自动让给吃短链的 SocialDataX。
     unsupported = [c for c in calls if not provider.can_handle(c.platform, c.purpose, c.arguments)]
+    if unsupported and calls[0].platform == "douyin" and calls[0].arguments.get("url"):
+        # 线上开跑时会先把抖音短链免费展开成 aweme_id 再挑通道（shortlink.py），
+        # 探针照做——否则「TikHub 不吃这种链接」这个结论只对展不开的短链成立。
+        expansion = shortlink.expand_douyin(calls[0].arguments["url"])
+        if expansion.ok:
+            print(f"  🔗 短链已展开（免费，{expansion.requests} 跳）：aweme_id={expansion.aweme_id}")
+            calls = [ToolCall(c.platform, c.purpose, id_form(c.arguments, expansion.aweme_id))
+                     for c in calls]
+            unsupported = [c for c in calls
+                           if not provider.can_handle(c.platform, c.purpose, c.arguments)]
+        else:
+            print(f"  ⚠ 短链展不开：{expansion.reason}")
     if unsupported and not force:
         print(f"  ⏭ 跳过（不发请求、不扣费）：{provider.label} 不吃这种参数形态——"
               f"{row.parsed.platform} 的 {'、'.join(sorted({c.purpose for c in unsupported}))} "

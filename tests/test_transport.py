@@ -113,6 +113,55 @@ class TestExceptionEnvelope(unittest.TestCase):
         self.assertIn("读取错误响应失败", resp.body)
 
 
+class TestGetNoRedirect(unittest.TestCase):
+    """短链展开只要 302 的 Location 头，不要落地页。"""
+
+    def _http_error(self, code, headers):
+        import urllib.error
+
+        message = Message()
+        for key, value in headers.items():
+            message[key] = value
+        return urllib.error.HTTPError("https://v.douyin.com/x", code, "Found", message,
+                                      io.BytesIO(b""))
+
+    def test_302_comes_back_as_a_response_with_location(self):
+        """urllib 在不跟随重定向时把 3xx 包成 HTTPError 抛出；这里要接住并把
+        Location 交出去，而不是当成一次失败。"""
+        error = self._http_error(302, {"Location": "https://www.iesdouyin.com/share/video/1/"})
+        with mock.patch.object(transport._NO_REDIRECT_OPENER, "open", side_effect=error):
+            resp = transport.get_no_redirect("https://v.douyin.com/x", {})
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.location, "https://www.iesdouyin.com/share/video/1/")
+        self.assertTrue(resp.redirected)
+
+    def test_200_is_not_a_redirect(self):
+        with mock.patch.object(transport._NO_REDIRECT_OPENER, "open",
+                               return_value=_FakeResp(b"<html>", status=200)):
+            resp = transport.get_no_redirect("https://v.douyin.com/x", {})
+        self.assertEqual(resp.status, 200)
+        self.assertFalse(resp.redirected)
+        self.assertEqual(resp.location, "")
+
+    def test_network_failure_keeps_the_never_raise_contract(self):
+        with mock.patch.object(transport._NO_REDIRECT_OPENER, "open",
+                               side_effect=http.client.RemoteDisconnected("closed")):
+            resp = transport.get_no_redirect("https://v.douyin.com/x", {})
+        self.assertEqual(resp.status, 0)
+        self.assertFalse(resp.redirected)
+
+    def test_the_opener_really_refuses_to_follow(self):
+        """护栏本身：redirect_request 返回 None 才是「不跟」。"""
+        handler = transport._NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://x"))
+
+    def test_plain_get_does_not_pick_up_location(self):
+        """付费接口的 get() 不该受影响：它照旧跟随重定向，也不填 location。"""
+        with _urlopen_returning(_FakeResp(b"ok", status=200)):
+            resp = transport.get("https://x", {})
+        self.assertFalse(resp.redirected)
+
+
 class TestResponseSizeLimits(unittest.TestCase):
     """ROB-006：响应体没有上限时，一个超大 body 或 gzip 炸弹会把进程 OOM 掉——
     而 OOM 会把本轮已经付费刷完、还没写回的结果**全部**丢掉，
