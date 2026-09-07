@@ -22,6 +22,19 @@ from .links import ParsedLink, parse
 # 直接导名字并写成一行（理由同 providers.py 顶部的历史说明）。
 from .providers import get_provider  # noqa: F401
 
+# 「巡查状态」那一列的取值。放在这里而不是 runner 里，是因为**选行**也要认它
+# （熔断记过失败的行要提前复查），而 rows 不能反过来依赖 runner。
+# runner 原样再导出一遍，调用方照旧写 runner.STATUS_OK。
+STATUS_OK = "正常"
+STATUS_SUSPECT = "疑似受限"
+STATUS_GONE = "已失效"
+STATUS_FAILED = "刷新失败"
+STATUS_SKIPPED = "跳过"
+STATUS_COOLDOWN = "冷却跳过"
+# 到软截止（或整批中止）没轮到的行：**完全不写回**，最后更新时间保持原样，
+# 下一轮自然重新捞起——这才是 refresh() docstring 承诺的断点续跑。
+STATUS_DEFERRED = "留待下一轮"
+
 
 @dataclass
 class ToolCall:
@@ -72,6 +85,10 @@ class Row:
     # 要不要维护」是两件事（见 load_rows）。读回来只为了在日志里说清
     # 「这一批里有 N 行没开巡查」，让这种主动取数在运行历史里看得见。
     monitoring: bool = True
+    # 「巡查状态」的现值。选行只用它认一种情况：熔断记过一次失败的行
+    # （刷新失败 + 连续失败次数 ≥ 1），要在 breaker_recheck_hours 之后提前复查，
+    # 而不是等分层间隔、也不是排队勾一在就每 5 分钟重刷。
+    refresh_status: str = ""
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)
 
@@ -116,6 +133,32 @@ class Row:
         now = now or datetime.now(timezone.utc)
         return (now - updated).total_seconds() / 3600
 
+    @property
+    def breaker_strike_pending(self) -> bool:
+        """上一轮的失效判定被熔断挡下、只记了一次失败：等着第二次看。
+
+        判据是「巡查状态=刷新失败 且 连续失败次数 ≥ 1」。刷新失败本身不涨计数
+        （网络抖动对「内容还在不在」没有证据力），所以这个组合几乎只有熔断轮
+        会写出来。唯一的旁路是「上一轮疑似受限、这一轮网络失败」的行——它也会
+        被提前复查一次，一行的钱，可以接受。
+        """
+        return self.refresh_status == STATUS_FAILED and (self.consecutive_failures or 0) >= 1
+
+    def in_breaker_hold(self, settings: Settings, now: Optional[datetime] = None) -> bool:
+        """熔断记过失败之后的等待期内：**排队勾也不接**。
+
+        这是死循环的那一刀。熔断轮以前不推进「最近检查时间」也不清排队勾，
+        本意是「这一行没有结论，下一轮接着来」；可 cron 每 5 分钟一轮，
+        同一批行每轮重刷、每轮再熔断，一天烧两百多块，没有任何东西让它停。
+        现在熔断轮照常盖时间戳、记一次失败，这里按时间戳把它挡 breaker_recheck_hours，
+        到点复查一次，还取不到就按两击定罪判失效往下走（Ziao 2026-09 拍板：
+        「最多两次，两次还不行就算失效」）。
+        """
+        if not self.breaker_strike_pending:
+            return False
+        since = self.hours_since_check(now)
+        return 0 <= since < settings.safety.breaker_recheck_hours
+
     def refresh_interval_hours(self, settings: Settings,
                                now: Optional[datetime] = None) -> Optional[float]:
         """这一行现在按几小时的间隔刷；None = 已归档，不再自动刷。
@@ -155,6 +198,10 @@ class Row:
         updated = _utc(self.last_updated_ms)
         if updated is None:
             return True   # 在管、没归档、从来没刷过
+        if self.breaker_strike_pending:
+            # 熔断只记了一次失败的行：不等分层间隔（老帖是 72 小时），
+            # 等待期一过就复查，给「两次」一个明确的第二次。归档线照旧。
+            interval = min(interval, settings.safety.breaker_recheck_hours)
         now = now or datetime.now(timezone.utc)
         elapsed_hours = (now - updated).total_seconds() / 3600
         # 未来的更新时间同样按「该刷」处理：否则一个填错的日期能让这一行

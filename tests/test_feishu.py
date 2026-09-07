@@ -547,6 +547,97 @@ class TestDispatchOrderIsFair(unittest.TestCase):
         self.assertEqual([r.record_id for r in got], ["z", "a", "m"])
 
 
+class TestBreakerHoldInSelection(unittest.TestCase):
+    """熔断记过一次失败的行：等待期内谁都不接（排队勾也不接），到点复查一次。
+
+    这是「同一批行每 5 分钟重刷一次、每次再熔断」那个死循环的出口。
+    熔断轮现在照常盖「最近检查时间」、连续失败次数 +1、巡查状态=刷新失败，
+    选行就按这三样认出它们。
+    """
+
+    NOW = datetime(2026, 9, 7, 14, 20, tzinfo=timezone.utc)
+
+    def _table(self, spec):
+        """spec: [(record_id, 帖龄天, 上次检查几小时前, 巡查状态, 连续失败次数, 排队勾)]"""
+        from xhsearch.config import Settings
+        f = Settings().fields
+        items = []
+        for record_id, age_days, checked_hours_ago, status, strikes, queued in spec:
+            cells = {
+                f.link: "https://www.xiaohongshu.com/explore/" + "a" * 24,
+                f.publish_time: int(
+                    (self.NOW - timedelta(days=age_days)).timestamp() * 1000),
+                f.queued: queued,
+                f.refresh_status: status,
+                f.consecutive_failures: strikes,
+            }
+            if checked_hours_ago is not None:
+                cells[f.last_updated] = int(
+                    (self.NOW - timedelta(hours=checked_hours_ago)).timestamp() * 1000)
+            items.append({"record_id": record_id, "fields": cells})
+
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                return items
+        return _Table()
+
+    def _ids(self, table, **kwargs):
+        from xhsearch import runner
+        from xhsearch.config import Settings
+        return [r.record_id for r in runner.load_rows(table, Settings(), now=self.NOW, **kwargs)]
+
+    def test_queued_rows_in_the_hold_window_are_not_served(self):
+        """现场复现：熔断轮 5 分钟前刚记过失败、排队勾还在 → 这一轮不接。"""
+        table = self._table([("held", 1, 5 / 60, "刷新失败", 1, True)])
+        self.assertEqual(self._ids(table, only_queued=True, only_due=False), [])
+
+    def test_queued_rows_are_served_again_once_the_hold_has_passed(self):
+        table = self._table([("due", 1, 2, "刷新失败", 1, True)])
+        self.assertEqual(self._ids(table, only_queued=True, only_due=False), ["due"])
+
+    def test_sweep_rechecks_after_the_hold_instead_of_the_tier_interval(self):
+        """老帖是 72 小时一档；熔断记过失败的要按等待期提前复查，给「两次」一个明确的第二次。"""
+        table = self._table([("old", 20, 2, "刷新失败", 1, False)])
+        self.assertEqual(self._ids(table, only_due=True), ["old"])
+
+    def test_sweep_does_not_recheck_inside_the_hold(self):
+        table = self._table([("old", 1, 0.5, "刷新失败", 1, False)])
+        self.assertEqual(self._ids(table, only_due=True), [])
+
+    def test_archived_rows_stay_archived(self):
+        """归档线照旧：熔断记过失败也不把已归档的行拉回 sweep。排队勾另算。"""
+        table = self._table([("archived", 40, 2, "刷新失败", 1, False)])
+        self.assertEqual(self._ids(table, only_due=True), [])
+
+    def test_plain_failures_are_not_held(self):
+        """普通的刷新失败（网络抖动，计数为 0）不是熔断记的，不该被挡。"""
+        table = self._table([("net", 1, 5 / 60, "刷新失败", 0, True)])
+        self.assertEqual(self._ids(table, only_queued=True, only_due=False), ["net"])
+
+    def test_suspect_rows_are_not_held(self):
+        """疑似受限是正常的第一击（没被熔断），照旧按排队勾/分层间隔走。"""
+        table = self._table([("suspect", 1, 5 / 60, "疑似受限", 1, True)])
+        self.assertEqual(self._ids(table, only_queued=True, only_due=False), ["suspect"])
+
+    def test_named_rows_ignore_the_hold(self):
+        """人点名刷一行（cli.py row）：无视一切节流，包括这个等待期。"""
+        from xhsearch import runner
+        from xhsearch.config import Settings
+        f = Settings().fields
+        five_minutes_ago = int((self.NOW - timedelta(minutes=5)).timestamp() * 1000)
+
+        class _Table:
+            def batch_get(self, record_ids):
+                return [{"record_id": rid, "fields": {
+                    f.link: "https://www.xiaohongshu.com/explore/" + "b" * 24,
+                    f.refresh_status: "刷新失败", f.consecutive_failures: 1,
+                    f.last_updated: five_minutes_ago,
+                }} for rid in record_ids]
+
+        got = runner.load_rows(_Table(), Settings(), now=self.NOW, only_record_ids=["x"])
+        self.assertEqual([r.record_id for r in got], ["x"])
+
+
 class TestFieldsMeta(unittest.TestCase):
     """fields_meta 是 doctor 全量体检的地基：类型、选项都得原样带回来。"""
 

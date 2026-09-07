@@ -24,16 +24,11 @@ from typing import Any, Callable, Iterable, Optional
 from . import analyze, feishu, protocol, providers, shortlink, tags, transport
 from .config import Budget, Display, Settings
 from .rows import Row, ToolCall, plan_calls, estimate_yuan, id_form
-
-STATUS_OK = "正常"
-STATUS_SUSPECT = "疑似受限"
-STATUS_GONE = "已失效"
-STATUS_FAILED = "刷新失败"
-STATUS_SKIPPED = "跳过"
-STATUS_COOLDOWN = "冷却跳过"
-# 到软截止（或整批中止）没轮到的行：**完全不写回**，最后更新时间保持原样，
-# 下一轮自然重新捞起——这才是 docstring 承诺的断点续跑。
-STATUS_DEFERRED = "留待下一轮"
+# 状态常量定义在 rows.py（选行也要认它），这里原样再导出，调用方照旧写 runner.STATUS_*。
+from .rows import (  # noqa: F401
+    STATUS_OK, STATUS_SUSPECT, STATUS_GONE, STATUS_FAILED,
+    STATUS_SKIPPED, STATUS_COOLDOWN, STATUS_DEFERRED,
+)
 
 # 这些状态没有真正打过上游接口，不该参与熔断的失效比例计算。
 _NOT_ATTEMPTED = frozenset({STATUS_COOLDOWN, STATUS_SKIPPED, STATUS_DEFERRED})
@@ -167,7 +162,8 @@ class RunReport:
         if self.points_balance is not None:
             line += f"，SocialDataX 余额 {self.points_balance} 积分 ≈ ¥{self.points_balance / 100:.2f}"
         if self.breaker_tripped:
-            line += "\n🛑 已熔断：本批失效比例异常偏高，所有流量状态写入已作废"
+            line += ("\n🛑 已熔断：本批失效比例异常偏高，流量状态写入已作废；"
+                     "这批行已记 1 次失败，等待期过后复查一次，再取不到即判失效")
         if self.budget_stopped:
             line += f"\n💰 预算触顶：{self.budget_stopped}"
         if self.short_links_expanded or self.short_links_failed:
@@ -1120,15 +1116,41 @@ def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]],
         })
 
 
+def _is_second_look(outcome: Outcome, settings: Settings) -> bool:
+    """这一行的失效判定是不是**第二次**看到取不到内容。
+
+    熔断最多拦一次：第一次整批取不到，当上游故障处理、只记一次失败；
+    等待期过后再看一次仍然取不到，就按两击定罪判失效往下走，熔断不再拦
+    （Ziao 2026-09 拍板：「最多两次，两次还不行就算失效」）。
+    否则上游真出了一次长故障、或者一张本来就全是死链的复查表，
+    会让同一批行每轮重刷、每轮再熔断，永远得不到结论。
+
+    判据是这一轮写出去的「连续失败次数」已达定罪线：那个数 = 上一轮的
+    计数 + 1，所以 ≥ strikes_before_gone 就意味着上一轮已经记过至少一次。
+    权威死讯（1008、抖音 filter_list）第一次看到时计数也只是 1，
+    同样会被熔断拦一次——熔断存在的理由之一就是「权威信号本身漂移了」。
+    """
+    if outcome.status not in (STATUS_GONE, STATUS_SUSPECT):
+        return False
+    strikes = outcome.fields.get(settings.fields.consecutive_failures) or 0
+    return strikes >= settings.safety.strikes_before_gone
+
+
 def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
     """一批里失效比例异常偏高 → 判定为上游故障，撤销所有标签写入。
 
     几百条笔记不可能在同一小时里被集体删除。真发生这种事，一定是上游挂了或者
-    错误话术改版了，而不是内容真出事。宁可这一轮什么都不写，也不能把整张表刷红。
+    错误话术改版了，而不是内容真出事。宁可这一轮不打标签，也不能把整张表刷红。
+
+    但熔断**只拦第一次**：被拦下的行照常盖时间戳、记一次失败，等待期
+    （Safety.breaker_recheck_hours）过后复查一次，第二次仍取不到就判失效，
+    不再进熔断的样本（见 _is_second_look）。
     """
     # 分母只算真正打过上游的行：冷却/坏链接/软截止顺延的行没有产生任何
     # 「取不到内容」的观测，混进分母会稀释失效比例，让该熔的批熔不了。
-    attempted = [o for o in report.outcomes if o.status not in _NOT_ATTEMPTED]
+    # 第二次看到失效的行也不算：它们的结论已经定了，熔断管不着。
+    attempted = [o for o in report.outcomes
+                 if o.status not in _NOT_ATTEMPTED and not _is_second_look(o, settings)]
     total = len(attempted)
     suspects = [o for o in attempted if o.status in (STATUS_GONE, STATUS_SUSPECT)]
     gone = len(suspects)
@@ -1207,41 +1229,44 @@ def apply_cross_run_breaker(reports: list[RunReport], settings: Settings) -> boo
 
 def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: int,
                       *, extra: str = "") -> None:
-    """熔断的执行动作：撤销这份 report 里所有失效判定的写入。
+    """熔断的执行动作：把这份 report 里**第一次**看到的失效判定降级成「记一次失败」。
 
     gone/total 是触发熔断的样本（单表熔断是本表的，跨表熔断是全局合计的），
     只用于诊断文案，让运营看到判定被作废的依据。
 
-    ⚠️ 「作废」必须**彻底**：被保护的行不能只撤掉标签，却仍然带着
-    「最近检查时间=现在」和「排队刷新=False」落表——那等于告诉调度器
-    「这一行本轮处理完了」，运营的手动请求被吞掉，sweep 还要再等 8–72 小时
-    才会复查。承诺的是「宁可这一轮什么都不写」，就要真的什么都不写：
-    只留状态和诊断两列。
+    作废的是**结论**，不是**这一轮**：不改流量状态、不摘「已确认存活」的勾，
+    但照常盖「最近检查时间」、连续失败次数 +1、排队勾保留。这样下一轮
+    不会把同一批行原样重刷（首轮小闸和「从没刷过」都认时间戳），选行时
+    按 Safety.breaker_recheck_hours 挡一段，到点复查一次；第二次还取不到
+    就是两击定罪，熔断不再拦（_is_second_look）。
+
+    以前这里连时间戳和计数都撤掉，承诺「宁可这一轮什么都不写」——结果是
+    cron 每 5 分钟把同一批 50 行重刷一遍、每遍再熔断，一天烧两百多块，
+    没有任何东西让它停（2026-09「雷诺考特复查」）。
     """
     report.breaker_tripped = True
     f = settings.fields
     for outcome in report.outcomes:
+        if _is_second_look(outcome, settings):
+            # 第二次了：结论照写，标签照打。熔断只拦第一次。
+            continue
         outcome.fields.pop(f.traffic_status, None)
         if outcome.status in (STATUS_GONE, STATUS_SUSPECT):
             outcome.status = STATUS_FAILED
-            # 判定作废，计数增量也要一并撤销——否则熔断轮照样给每行 +1，
-            # 上游故障一恢复，下一次单个非权威 GONE 就能一击定罪。
-            outcome.fields.pop(f.consecutive_failures, None)
-            # 「已确认存活=取消」同理作废：上游故障轮不能把一批活帖的勾全摘掉。
+            # 「已确认存活=取消」作废：上游故障轮不能把一批活帖的勾全摘掉。
             outcome.fields.pop(f.alive_confirmed, None)
-            # 不推进最近检查时间、不清排队勾：这一行**没有**得到有效结论。
-            outcome.fields.pop(f.last_updated, None)
+            # 排队勾保留：运营的请求还没得到答案，等待期过后自动再看一次。
+            # 时间戳和计数**保留**：它们就是「已经看过一次」的跨轮记忆。
             outcome.fields.pop(f.queued, None)
-            # 时间戳撤了，报告里也不能再声称盖过章——收尾那行打印的
-            # 「巡查时间 x ~ y」区间必须只包含真正落表的那些行。
-            outcome.checked_at = None
-            # 标签重算材料也要撤销：这一行本轮不碰标签列了。
+            # 标签重算材料撤销：这一行本轮不碰标签列。
             outcome.tag_plan = None
             # 追加而不是覆盖：原始错误文案里带着 request_id，是找厂商排查的唯一凭据。
             original = str(outcome.fields.get(f.failure_reason) or "")
+            hold = settings.safety.breaker_recheck_hours
+            hold_text = f"{hold:g} 小时" if hold != int(hold) else f"{int(hold)} 小时"
             note = (
                 f"本批 {gone}/{total} 行都取不到内容{extra}，疑似上游故障而非内容失效，"
-                "本轮不改流量状态、不推进检查时间，请稍后复查"
+                f"本轮不改流量状态；已记第 1 次失败，{hold_text}后自动复查，再取不到即判失效"
             )
             outcome.fields[f.refresh_status] = STATUS_FAILED
             outcome.fields[f.failure_reason] = (
@@ -1276,6 +1301,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         pin_status=feishu.read_text(cells.get(f.pinned_status)),
         surge_time_ms=feishu.read_timestamp_ms(cells.get(f.surge_time)),
         queued=feishu.read_bool(cells.get(f.queued)),
+        refresh_status=feishu.read_text(cells.get(f.refresh_status)),
         # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))
@@ -1354,7 +1380,14 @@ def load_rows(
             continue
         row = row_from_record(record, settings)
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。
-        if wanted or row.queued or not only_due or row.is_due(settings, now):
+        if wanted:
+            result.append(row)
+            continue
+        if row.in_breaker_hold(settings, now):
+            # 熔断记过一次失败、还在等待期：排队勾也不接。这是「同一批行每
+            # 5 分钟重刷一次、每次再熔断」那个死循环的出口，见 Row.in_breaker_hold。
+            continue
+        if row.queued or not only_due or row.is_due(settings, now):
             result.append(row)
 
     # —— 派发顺序：等得最久的先走 ——

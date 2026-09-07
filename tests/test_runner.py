@@ -283,15 +283,16 @@ class TestCheckedAtIsPerRow(RunnerTest):
         # 一行都没写进去 → 什么都不报，别编一个时刻出来
         self.assertEqual(report.checked_span(display, skip=["rec1", "rec2", "rec3"]), "")
 
-    def test_breaker_voided_rows_drop_out_of_the_span(self):
-        """熔断作废了时间戳，报告里就不能再声称这些行盖过章。"""
+    def test_breaker_rows_stay_in_the_span(self):
+        """熔断轮照常盖「最近检查时间」（那是「已经看过一次」的跨轮记忆），
+        报告里的巡查时间跨度就要把它们算进去——表里那一格确实写了。"""
         rows = [xhs_row(f"rec{i}", tags=["已复盘"]) for i in range(3)]
         report = self.run_with([err(200, 1003, "未找到对应内容")] * 3, rows)
         self.assertTrue(report.breaker_tripped)
-        self.assertEqual(report.checked_span(self.settings.display), "")
+        self.assertNotEqual(report.checked_span(self.settings.display), "")
         for outcome in report.outcomes:
-            self.assertIsNone(outcome.checked_at)
-            self.assertNotIn(self.settings.fields.last_updated, outcome.fields)
+            self.assertIsNotNone(outcome.checked_at)
+            self.assertIn(self.settings.fields.last_updated, outcome.fields)
 
 
 class TestDeadPostDetection(RunnerTest):
@@ -356,11 +357,8 @@ class TestCircuitBreaker(RunnerTest):
     一定是上游挂了或错误话术改版了，宁可这轮什么都不写。"""
 
     def test_mass_failure_voids_all_tag_writes(self):
-        rows = []
-        for i in range(12):
-            row = xhs_row(f"rec{i}")
-            row.consecutive_failures = 1      # 都已经是第二击了，本该全部判死
-            rows.append(row)
+        """第一次整批取不到：当上游故障，不打标签、只记一次失败。"""
+        rows = [xhs_row(f"rec{i}", tags=["已复盘"]) for i in range(12)]
         report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
 
         self.assertTrue(report.breaker_tripped)
@@ -368,6 +366,44 @@ class TestCircuitBreaker(RunnerTest):
             self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
             self.assertEqual(outcome.status, runner.STATUS_FAILED)
             self.assertIn("疑似上游故障", outcome.fields[self.settings.fields.failure_reason])
+
+    def test_second_look_is_convicted_even_when_the_whole_batch_is_dead(self):
+        """熔断只拦一次。这批行上一轮已经记过一次失败，这一轮仍然取不到，
+        就按两击定罪判失效往下走——不管这批的失效比例多高。
+        否则一张本来就全是死链的复查表永远得不到结论、每轮重刷（Ziao 2026-09）。"""
+        rows = []
+        for i in range(12):
+            row = xhs_row(f"rec{i}", tags=["已复盘"])
+            row.consecutive_failures = 1
+            row.refresh_status = runner.STATUS_FAILED   # 上一轮就是被熔断记的
+            rows.append(row)
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
+
+        self.assertFalse(report.breaker_tripped)
+        self.assertEqual(report.breaker_attempted, 0, "第二次看的行不进熔断样本")
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_GONE)
+            self.assertIn("风控中", outcome.fields[self.settings.fields.traffic_status])
+            self.assertEqual(outcome.fields[self.settings.fields.consecutive_failures], 2)
+
+    def test_first_look_rows_are_still_protected_when_mixed_with_second_looks(self):
+        """同一批里混着第一次看的和第二次看的：第二次的判死，第一次的照样被拦。"""
+        rows = []
+        for i in range(12):
+            row = xhs_row(f"second{i}")
+            row.consecutive_failures = 1
+            rows.append(row)
+        rows += [xhs_row(f"first{i}") for i in range(12)]
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
+
+        self.assertTrue(report.breaker_tripped)
+        self.assertEqual(report.breaker_attempted, 12)
+        for outcome in report.outcomes:
+            if outcome.record_id.startswith("second"):
+                self.assertEqual(outcome.status, runner.STATUS_GONE)
+            else:
+                self.assertEqual(outcome.status, runner.STATUS_FAILED)
+                self.assertEqual(outcome.fields[self.settings.fields.consecutive_failures], 1)
 
     def test_small_batch_does_not_trip_breaker(self):
         row = xhs_row()
@@ -1110,12 +1146,8 @@ class TestNegativeColumns(RunnerTest):
 
 class TestBreakerAccounting(RunnerTest):
     def _gone_rows(self, n):
-        rows = []
-        for i in range(n):
-            row = xhs_row(f"gone{i}")
-            row.consecutive_failures = 1
-            rows.append(row)
-        return rows
+        """第一次看的行（没有记过失败）。熔断只拦第一次，样本只算这种行。"""
+        return [xhs_row(f"gone{i}") for i in range(n)]
 
     def _cooldown_rows(self, n):
         rows = []
@@ -1161,19 +1193,20 @@ class TestBreakerAccounting(RunnerTest):
                                self._gone_rows(2))
         self.assertFalse(report.breaker_tripped)
 
-    def test_breaker_voids_strike_increment_and_keeps_diagnostics(self):
+    def test_breaker_keeps_the_strike_and_the_diagnostics(self):
         report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
                                self._gone_rows(12))
         self.assertTrue(report.breaker_tripped)
         for outcome in report.outcomes:
-            # 判定作废，这一轮的计数增量也要一并撤销
-            self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
-            # 「已确认存活=False」也是这轮 GONE 判定的产物，同样要撤销——
+            # 计数**保留**：它就是「已经看过一次」的跨轮记忆，下一次取不到就定罪
+            self.assertEqual(outcome.fields[self.settings.fields.consecutive_failures], 1)
+            # 「已确认存活=False」是这轮 GONE 判定的产物，要撤销——
             # 留着它，熔断就只救了状态列，没救勾选框。
             self.assertNotIn(self.settings.fields.alive_confirmed, outcome.fields)
             reason = outcome.fields[self.settings.fields.failure_reason]
             self.assertIn("未找到对应内容", reason)     # 原始错误（含 request_id 线索）还在
             self.assertIn("疑似上游故障", reason)       # 熔断说明是追加的，不是覆盖
+            self.assertIn("1 小时后自动复查", reason)   # 运营知道下一步是什么
 
 
 class TestCrossRunBreaker(RunnerTest):
@@ -1181,11 +1214,7 @@ class TestCrossRunBreaker(RunnerTest):
     但上游故障是通道级的，跟行分在哪张表没关系，样本要全局算。"""
 
     def _gone_report(self, n, prefix, responder=None):
-        rows = []
-        for i in range(n):
-            row = xhs_row(f"{prefix}{i}")
-            row.consecutive_failures = 1
-            rows.append(row)
+        rows = [xhs_row(f"{prefix}{i}") for i in range(n)]   # 第一次看的行
         # 默认让错误码有分歧：这一组测的是**比例**闸门跨表加总，
         # 不掺分歧的话小样本一致性闸门会先在单表里触发。
         return self.run_with(responder or mixed_gone({"n": 0}), rows)
@@ -1201,7 +1230,7 @@ class TestCrossRunBreaker(RunnerTest):
             for outcome in report.outcomes:
                 self.assertEqual(outcome.status, runner.STATUS_FAILED)
                 self.assertNotIn(self.settings.fields.traffic_status, outcome.fields)
-                self.assertNotIn(self.settings.fields.consecutive_failures, outcome.fields)
+                self.assertEqual(outcome.fields[self.settings.fields.consecutive_failures], 1)
                 self.assertIn("疑似上游故障",
                               outcome.fields[self.settings.fields.failure_reason])
 
@@ -1209,7 +1238,20 @@ class TestCrossRunBreaker(RunnerTest):
         r1 = self._gone_report(2, "a")
         r2 = self._gone_report(2, "b")
         self.assertFalse(runner.apply_cross_run_breaker([r1, r2], self.settings))
-        self.assertEqual(r1.outcomes[0].status, runner.STATUS_GONE)
+        self.assertEqual(r1.outcomes[0].status, runner.STATUS_SUSPECT)
+
+    def test_second_looks_do_not_count_toward_the_global_sample(self):
+        """跨表加总也只算第一次看的行：第二次的结论已经定了。"""
+        rows = []
+        for i in range(12):
+            row = xhs_row(f"s{i}")
+            row.consecutive_failures = 1
+            rows.append(row)
+        r1 = self.run_with(mixed_gone({"n": 0}), rows)
+        r2 = self._gone_report(2, "b")
+        self.assertFalse(runner.apply_cross_run_breaker([r1, r2], self.settings))
+        for outcome in r1.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_GONE)
 
     def test_already_tripped_table_is_not_voided_twice(self):
         """大表自己熔断过：全局熔断不能给它的诊断信息再追加一遍，
@@ -1251,39 +1293,75 @@ class TestSharedRunBudget(RunnerTest):
         self.assertIn("socialdatax", shared)
 
 
-class TestBreakerLeavesSchedulingUntouched(RunnerTest):
-    """COR-003：熔断承诺的是「宁可这一轮什么都不写」，那就要真的什么都不写。
+class TestBreakerLeavesAFootprint(RunnerTest):
+    """熔断轮必须留下「已经看过一次」的痕迹，否则下一轮原样重刷。
 
-    只撤销标签、却仍然带着「最近检查时间=现在」和「排队刷新=False」落表，
-    等于告诉调度器这一行本轮处理完了：运营的手动请求被吞掉，
-    sweep 下一次还要等 8–72 小时才复查。"""
+    以前熔断行不推进「最近检查时间」也不清排队勾，承诺「宁可这一轮什么都不写」。
+    结果是 cron 每 5 分钟把同一批 50 行重刷一遍、每遍再熔断，一天烧两百多块，
+    没有任何东西让它停（2026-09「雷诺考特复查」）。现在：盖时间戳、记一次失败、
+    排队勾保留；选行时按 breaker_recheck_hours 挡一段，到点复查，第二次仍取不到
+    就判失效往下走。"""
 
-    def _queued_gone_rows(self, n):
+    def _queued_rows(self, n):
         rows = []
         for i in range(n):
             row = xhs_row(f"q{i}")
-            row.consecutive_failures = 1
             row.queued = True
             rows.append(row)
         return rows
 
-    def test_tripped_rows_do_not_advance_time_or_clear_the_queue_flag(self):
+    def test_tripped_rows_advance_time_and_record_a_strike_but_keep_the_queue_flag(self):
         report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
-                               self._queued_gone_rows(12))
+                               self._queued_rows(12))
         self.assertTrue(report.breaker_tripped)
         f = self.settings.fields
         for outcome in report.outcomes:
-            self.assertNotIn(f.last_updated, outcome.fields,
-                             "熔断行不该推进最近检查时间")
+            self.assertIn(f.last_updated, outcome.fields,
+                          "熔断行要盖时间戳，否则首轮小闸和「从没刷过」下一轮又把它捞起来")
+            self.assertEqual(outcome.fields[f.consecutive_failures], 1)
             self.assertNotIn(f.queued, outcome.fields,
-                             "熔断行不该清掉排队刷新的勾")
+                             "排队勾保留：运营的请求还没得到答案，等待期后自动再看一次")
+            self.assertNotIn(f.traffic_status, outcome.fields)
             # 状态和诊断仍要写：运营得看得见发生了什么
             self.assertEqual(outcome.fields[f.refresh_status], runner.STATUS_FAILED)
             self.assertIn("疑似上游故障", outcome.fields[f.failure_reason])
 
+    def test_the_second_look_after_a_breaker_round_settles_the_rows(self):
+        """第二轮：上一轮被熔断记过失败的行再次取不到 → 判失效、清排队勾，
+        往下走。这就是「最多两次」。"""
+        rows = []
+        for i in range(12):
+            row = xhs_row(f"q{i}")
+            row.queued = True
+            row.consecutive_failures = 1
+            row.refresh_status = runner.STATUS_FAILED
+            row.last_updated_ms = int((NOW - timedelta(hours=2)).timestamp() * 1000)
+            rows.append(row)
+        report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"), rows)
+        self.assertFalse(report.breaker_tripped)
+        f = self.settings.fields
+        for outcome in report.outcomes:
+            self.assertEqual(outcome.status, runner.STATUS_GONE)
+            self.assertIs(outcome.fields[f.queued], False)
+            self.assertIn("风控中", outcome.fields[f.traffic_status])
+
+    def test_recovery_on_the_second_look_clears_the_strike(self):
+        """上游真只是抖了一下：第二次取到了，计数清零，排队勾清掉，一切照常。"""
+        row = xhs_row("q0")
+        row.queued = True
+        row.consecutive_failures = 1
+        row.refresh_status = runner.STATUS_FAILED
+        report = self.run_with(
+            [sse(comment_page(count=150)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})], [row])
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_OK)
+        self.assertEqual(outcome.fields[self.settings.fields.consecutive_failures], 0)
+        self.assertIs(outcome.fields[self.settings.fields.queued], False)
+
     def test_healthy_rows_in_the_same_batch_still_advance_time(self):
         """熔断只作废失效判定，同一批里正常完成的行照常落表。"""
-        rows = self._queued_gone_rows(11) + [xhs_row("ok1")]
+        rows = self._queued_rows(11) + [xhs_row("ok1")]
         responses = {"n": 0}
 
         def responder(url, headers, body, timeout=30.0):
@@ -1491,12 +1569,7 @@ class TestStructuredEventsSeeTheFinalStatus(RunnerTest):
     """
 
     def _gone_rows(self, n):
-        rows = []
-        for i in range(n):
-            row = xhs_row(f"g{i}")
-            row.consecutive_failures = 1
-            rows.append(row)
-        return rows
+        return [xhs_row(f"g{i}") for i in range(n)]   # 第一次看的行，熔断会拦
 
     def test_events_report_the_post_breaker_status(self):
         report = self.run_with(lambda *a, **k: err(200, 1003, "未找到对应内容"),
