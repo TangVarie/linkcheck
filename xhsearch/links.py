@@ -1,12 +1,14 @@
 """识别多维表格单元格里的链接属于哪个平台，并尽量抽出稳定 ID。
 
-设计取舍：SocialDataX 的 *_by_url 接口本身就吃短链和完整分享文案，所以这里
-不做短链展开、不发任何网络请求。我们只需要回答两个问题：
+设计取舍：这里是纯函数，**不发任何网络请求**。我们只需要回答两个问题：
 
 1. 这一格是小红书还是抖音（决定调哪个平台的端点）
 2. 能不能直接拿到 ID（能拿到就走 by_id 入口，少一次链接解析，也更稳）
 
-拿不到 ID 时把原始文本整个透传给 by_url 入口即可。
+拿不到 ID 时把原始文本整个透传给 by_url 入口即可——SocialDataX 的 *_by_url
+接口吃短链和完整分享文案。TikHub 的抖音端点**只吃数字 ID**，所以抖音短链
+在开跑时会由 shortlink.py 跟一次 302 换成 aweme_id（免费），那一步刻意
+不放在这里：解析一格文本不该有网络副作用。
 """
 
 from __future__ import annotations
@@ -61,7 +63,9 @@ _DOUYIN_ID_PATTERNS = [
     re.compile(r"douyin\.com/video/(\d{6,})", re.I),
     re.compile(r"douyin\.com/note/(\d{6,})", re.I),
     re.compile(r"[?&]modal_id=(\d{6,})", re.I),
-    re.compile(r"/share/video/(\d{6,})", re.I),
+    # v.douyin.com 短链 302 到的落地页：视频是 /share/video/<id>，
+    # 图文是 /share/note/<id>（老版本叫 /share/slides/<id>）。
+    re.compile(r"/share/(?:video|note|slides)/(\d{6,})", re.I),
 ]
 
 # 从一段分享文案里把 URL 抠出来。中文分享文案常把链接和文字、标点黏在一起，
@@ -170,6 +174,23 @@ def _host_matches(url: str, domains: tuple[str, ...]) -> bool:
     except ValueError:
         return False
     return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def is_douyin_url(url: str) -> bool:
+    """这个 URL 的 hostname 是不是抖音自家域名（或其子域）。
+
+    给短链展开用：跟着 302 走的时候，每一跳都要验一次——只对抖音自己的
+    域名发请求，永远不拿运营贴的链接去敲陌生主机。
+    """
+    return _host_matches(url, DOUYIN_DOMAINS)
+
+
+def douyin_id_in_url(url: str) -> Optional[str]:
+    """从一条抖音 URL 里抠 aweme_id；抠不出返回 None。
+
+    和 parse() 用同一组正则，短链落地页的形态改了只需要改一处。
+    """
+    return _match_id(url or "", _DOUYIN_ID_PATTERNS)
 
 
 def _first_url(text: str, domains: tuple[str, ...]) -> Optional[str]:

@@ -21,9 +21,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
-from . import analyze, feishu, protocol, providers, tags, transport
+from . import analyze, feishu, protocol, providers, shortlink, tags, transport
 from .config import Budget, Display, Settings
-from .rows import Row, ToolCall, plan_calls, estimate_yuan
+from .rows import Row, ToolCall, plan_calls, estimate_yuan, id_form
 
 STATUS_OK = "正常"
 STATUS_SUSPECT = "疑似受限"
@@ -113,6 +113,11 @@ class RunReport:
     dead_platforms: dict[str, str] = field(default_factory=dict)
     # 预算触顶的原因（SUP-001）。非空 = 还有行没轮到，但它们完全没被写过。
     budget_stopped: str = ""
+    # 抖音短链展开（免费的那一步）：成功换到 aweme_id 的条数 / 展不开的条数。
+    # 写进日志是为了让「抖音这轮怎么还在走 SocialDataX」有处可查：
+    # 失败数一高，多半是短链落地页形态变了，该去看 shortlink.py 的正则。
+    short_links_expanded: int = 0
+    short_links_failed: int = 0
 
     @property
     def credits(self) -> int:
@@ -165,6 +170,9 @@ class RunReport:
             line += "\n🛑 已熔断：本批失效比例异常偏高，所有流量状态写入已作废"
         if self.budget_stopped:
             line += f"\n💰 预算触顶：{self.budget_stopped}"
+        if self.short_links_expanded or self.short_links_failed:
+            line += (f"\n🔗 抖音短链展开：成功 {self.short_links_expanded}，"
+                     f"失败 {self.short_links_failed}（失败的行按原链接走备胎）")
         for platform, reason in sorted(self.dead_platforms.items()):
             line += f"\n⚠ {platform} 平台本轮无可用通道：{reason[:150]}"
         if self.aborted_reason:
@@ -430,6 +438,25 @@ def _call(
     return last
 
 
+def _expansion_changes_routing(call: ToolCall, keys: dict[str, str], settings: Settings,
+                               disabled: set[str]) -> bool:
+    """把这条链接换成 ID，会不会让某家**此刻可用**的通道从「不能接」变成「能接」。
+
+    这是「要不要花时间展开短链」的唯一判据。展开本身不花钱，但每一行都是
+    一次真实的网络往返；只配 SocialDataX 的部署（它直接吃短链）做这一步
+    等于每行白等几百毫秒，还多一个可能出错的环节。
+    """
+    if call.platform != "douyin" or call.arguments.get("aweme_id") or not call.arguments.get("url"):
+        return False
+    as_id = id_form(call.arguments, "0")
+    for name in providers.usable_order(settings.channels, call.platform, keys, disabled):
+        provider = providers.get_provider(name)
+        if (not provider.can_handle(call.platform, call.purpose, call.arguments)
+                and provider.can_handle(call.platform, call.purpose, as_id)):
+            return True
+    return False
+
+
 def _fetch_one(
     row: Row,
     keys: dict[str, str],
@@ -441,6 +468,7 @@ def _fetch_one(
     disabled: set[str],
     tally: dict[str, int],
     lock: Optional[threading.Lock] = None,
+    resolver: Optional[shortlink.Resolver] = None,
 ) -> tuple[Optional[analyze.Snapshot], Optional[protocol.Err], int, float, int, int]:
     """跑完一行需要的全部调用。
 
@@ -459,6 +487,20 @@ def _fetch_one(
     failovers = 0
     requests = 0
     guard = lock or threading.Lock()
+
+    # —— 抖音短链 → aweme_id（免费）——
+    # 只在「换成 ID 会改变走哪家」时才做：有一家可用通道吃 ID 不吃链接
+    # （TikHub）。只配 SocialDataX 的部署它本来就吃短链，多发一次请求
+    # 纯属浪费；TikHub 本轮已被判死时同理。
+    expand_failure = ""
+    if resolver is not None and _expansion_changes_routing(calls[0], keys, settings, disabled):
+        expansion = resolver.resolve(calls[0].arguments.get("url", ""))
+        requests += expansion.requests
+        if expansion.ok:
+            calls = [ToolCall(c.platform, c.purpose, id_form(c.arguments, expansion.aweme_id))
+                     for c in calls]
+        else:
+            expand_failure = expansion.reason
 
     def attempt(c: ToolCall) -> protocol.Result:
         nonlocal credits, yuan, failovers, requests
@@ -541,6 +583,11 @@ def _fetch_one(
                 # detail 却说笔记不存在，那是上游自相矛盾，这时候信 detail
                 # 就是拿一次上游抖动去杀一条好帖子。
                 return None, result, credits, yuan, failovers, requests
+            if result.code == "unsupported_link" and expand_failure:
+                # 只配 TikHub、短链又展不开：把展开失败的原因带给运营——
+                # 「不支持这种链接形态」本身没说清为什么这一次连免费的
+                # 那一步都没走通（短链过期？落地页改版？网络？）。
+                result.message += f"；曾尝试展开短链但失败：{expand_failure}"
             # 评论接口失败 = 这一行的结论；detail 失败只是少几个数字，
             # 已经拿到的评论数据仍然有效，不该整行判死。
             if call.purpose == "comments":
@@ -658,6 +705,10 @@ def refresh(
     dead_platforms: dict[str, str] = {}
     if budget is None:
         budget = RunBudget(settings.budget)
+    # 抖音短链 → aweme_id 的缓存，一轮一份（跨表共享没有意义：同一条短链
+    # 出现在两张表里的概率可以忽略，而 Resolver 的统计是按表报的）。
+    resolver = shortlink.Resolver(timeout=min(timeout, shortlink.TIMEOUT_SECONDS),
+                                  deadline=deadline)
 
     def finish(
         row: Row,
@@ -826,7 +877,7 @@ def refresh(
         try:
             snapshot, error, credits, cost_yuan, failovers, made_requests = _fetch_one(
                 row, keys, settings, now=now, deadline=deadline, timeout=timeout,
-                disabled=disabled, tally=tally, lock=lock,
+                disabled=disabled, tally=tally, lock=lock, resolver=resolver,
             )
         except _Abort as exc:
             # 中止的行也可能已经花过钱：按实际花销校正账面再走。
@@ -988,6 +1039,8 @@ def refresh(
             report.aborted_reason = f"{deferred} 行未处理（{cause}），留给下一轮"
 
     report.used_providers = dict(tally)
+    report.short_links_expanded = resolver.expanded
+    report.short_links_failed = resolver.failed
     _apply_circuit_breaker(report, settings)
     return report
 
@@ -1041,6 +1094,8 @@ def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]],
         "credits": report.credits,
         "used_providers": dict(report.used_providers),
         "failovers": report.failovers,
+        "short_links_expanded": report.short_links_expanded,
+        "short_links_failed": report.short_links_failed,
         "breaker_tripped": report.breaker_tripped,
         "breaker_attempted": report.breaker_attempted,
         "breaker_gone": report.breaker_gone,

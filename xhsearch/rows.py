@@ -217,6 +217,30 @@ def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> 
     return calls
 
 
+def id_form(arguments: dict[str, Any], aweme_id: str) -> dict[str, Any]:
+    """把一条抖音调用的参数从「链接形态」改写成「ID 形态」。
+
+    短链展开成功后用它改写整行的调用计划：去掉 url、放进 aweme_id，
+    其余参数（sort 等）原样保留。两家 provider 的 build 都先看 aweme_id。
+    """
+    args = {k: v for k, v in arguments.items() if k != "url"}
+    args["aweme_id"] = aweme_id
+    return args
+
+
+def _argument_forms(call: ToolCall) -> list[dict[str, Any]]:
+    """这条调用在开跑时可能呈现的参数形态。
+
+    抖音短链在开跑时会先被免费展开成 aweme_id（shortlink.py），展开成功
+    就走吃 ID 的通道。所以估算要把两种形态都考虑进去：链接形态是它现在
+    的样子，ID 形态是展开之后的样子。小红书和已带 ID 的抖音只有一种形态。
+    """
+    args = call.arguments
+    if call.platform == "douyin" and args.get("url") and not args.get("aweme_id"):
+        return [args, id_form(args, "0")]
+    return [args]
+
+
 def estimate_credits(rows: list[Row], settings: Settings, now: Optional[datetime] = None) -> int:
     """预估这一批要花多少积分（按 SocialDataX 计价：10 积分/次，1 积分 = 0.01 元）。
 
@@ -251,6 +275,10 @@ def estimate_yuan(
     会把 SocialDataX 的账按 TikHub 的单价报——抖音差 14 倍，一个天天报错账的
     估算没人会信。keys 不传时退回按「第一家能接的」算。
 
+    抖音短链算两种形态（见 _argument_forms）：乐观口径假定展开成功、走吃 ID 的
+    TikHub；悲观口径把展不开、退回 SocialDataX 的那条路也算上——预算闸门
+    预留时展开还没发生，不能假定它一定成功。
+
     disabled 一定要传：主通道在本轮早些时候已经被判死之后，后面每一行**实际**
     走的是备胎。漏传它的后果不只是报表难看——预算闸门就是拿这个数去预留的。
     """
@@ -268,7 +296,8 @@ def estimate_yuan(
                     provider = get_provider(name)
                 except ValueError:
                     continue
-                if provider.can_handle(call.platform, call.purpose, call.arguments):
+                if any(provider.can_handle(call.platform, call.purpose, form)
+                       for form in _argument_forms(call)):
                     prices.append(provider.yuan_per_call(call.platform, call.purpose))
                     if not worst_case:
                         break

@@ -1369,21 +1369,45 @@ class TestEstimateByActualChannel(unittest.TestCase):
         yuan = rows.estimate_yuan([row], settings, now, keys={"socialdatax": "s"})
         self.assertAlmostEqual(yuan, 0.10)
 
-    def test_douyin_short_link_is_priced_at_socialdatax(self):
-        """抖音短链行 TikHub 接不了，实际会走 SDX——估算要跟着能力路由走。"""
+    def _short_link_row(self):
         now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
-        row = rows.Row(record_id="r", link_cell="https://v.douyin.com/iRxYzAb/",
-                       publish_time_ms=int((now - timedelta(days=1)).timestamp() * 1000))
-        settings = Settings()
-        yuan = rows.estimate_yuan([row], settings, now,
+        return rows.Row(record_id="r", link_cell="https://v.douyin.com/iRxYzAb/",
+                        publish_time_ms=int((now - timedelta(days=1)).timestamp() * 1000)), now
+
+    def test_douyin_short_link_is_priced_at_tikhub_optimistically(self):
+        """抖音短链开跑时会先免费展开成 aweme_id、走 TikHub。乐观口径
+        （报给人看的「预计花费」）就按 TikHub 算——按 SDX 报是 14 倍的虚高。"""
+        row, now = self._short_link_row()
+        yuan = rows.estimate_yuan([row], Settings(), now,
                                   keys={"tikhub": "t", "socialdatax": "s"})
+        self.assertAlmostEqual(yuan, 2 * 0.001 * 7.2)   # 评论 + detail 各 $0.001
+
+    def test_douyin_short_link_reserves_at_socialdatax_in_worst_case(self):
+        """预算闸门预留时展开还没发生：展不开就退回 SDX，悲观口径必须把它算上。"""
+        row, now = self._short_link_row()
+        yuan = rows.estimate_yuan([row], Settings(), now,
+                                  keys={"tikhub": "t", "socialdatax": "s"}, worst_case=True)
         self.assertAlmostEqual(yuan, 0.20)   # 评论 + detail 各 ¥0.10
 
-    def test_row_no_channel_can_handle_costs_nothing(self):
-        now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
-        row = rows.Row(record_id="r", link_cell="https://v.douyin.com/iRxYzAb/",
-                       publish_time_ms=int((now - timedelta(days=1)).timestamp() * 1000))
+    def test_short_link_is_priced_at_socialdatax_when_tikhub_is_dead(self):
+        """TikHub 本轮已判死：展开不会发生（换成 ID 也没通道接），按 SDX 算。"""
+        row, now = self._short_link_row()
+        yuan = rows.estimate_yuan([row], Settings(), now,
+                                  keys={"tikhub": "t", "socialdatax": "s"},
+                                  disabled={"tikhub"})
+        self.assertAlmostEqual(yuan, 0.20)
+
+    def test_tikhub_only_short_link_is_priced_at_tikhub(self):
+        """只配 TikHub 的部署：这行能不能跑取决于短链展不展得开。
+        估算按「能」算——展不开时实际花 0，估高一点点比估 0 然后花了钱强。"""
+        row, now = self._short_link_row()
         yuan = rows.estimate_yuan([row], Settings(), now, keys={"tikhub": "t"})
+        self.assertAlmostEqual(yuan, 2 * 0.001 * 7.2)
+
+    def test_row_no_channel_can_handle_costs_nothing(self):
+        """一家能接的通道都没有（key 都没配）：不产生费用。"""
+        row, now = self._short_link_row()
+        yuan = rows.estimate_yuan([row], Settings(), now, keys={})
         self.assertEqual(yuan, 0.0)
 
 

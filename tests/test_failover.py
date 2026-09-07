@@ -83,8 +83,22 @@ def xhs_row(record_id="rec1", *, age_days=1.0) -> Row:
     )
 
 
+def no_redirect_unreachable(url, headers, timeout=10.0) -> transport.Response:
+    """短链展开那一跳的默认替身：网络不通。
+
+    展开是免费的辅助步骤，失败必须退回原路径——所以默认让它失败，
+    这样每一个既有用例验的都是「展不开时的行为」，和改造前完全一致。
+    要验展开成功的路径，用 on_expand 显式给一个 302。
+    """
+    return transport.Response(0, "", "网络错误：test harness")
+
+
 class FailoverTest(unittest.TestCase):
-    """把两家的传输层分开顶掉：GET 一定是 TikHub，POST 一定是 SocialDataX。"""
+    """把两家的传输层分开顶掉：GET 一定是 TikHub，POST 一定是 SocialDataX。
+
+    短链展开走的是第三个入口 transport.get_no_redirect，也一并顶掉，
+    免得测试里一条 v.douyin.com 真的去敲抖音。
+    """
 
     def setUp(self):
         self.settings = Settings()
@@ -95,8 +109,10 @@ class FailoverTest(unittest.TestCase):
         self.settings.detail_within_days = 7
         self.get_calls: list[str] = []
         self.post_calls: list[str] = []
+        self.expand_calls: list[str] = []
 
-    def run_with(self, *, on_get, on_post, rows=None, keys=None, **kwargs):
+    def run_with(self, *, on_get, on_post, rows=None, keys=None,
+                 on_expand=no_redirect_unreachable, **kwargs):
         def _get(url, headers, timeout=30.0):
             self.get_calls.append(url)
             return on_get(len(self.get_calls) - 1)
@@ -105,8 +121,13 @@ class FailoverTest(unittest.TestCase):
             self.post_calls.append(url)
             return on_post(len(self.post_calls) - 1)
 
+        def _no_redirect(url, headers, timeout=10.0):
+            self.expand_calls.append(url)
+            return on_expand(url, headers, timeout)
+
         with mock.patch.object(transport, "get", side_effect=_get), \
              mock.patch.object(transport, "post", side_effect=_post), \
+             mock.patch.object(transport, "get_no_redirect", side_effect=_no_redirect), \
              mock.patch("time.sleep"):
             return runner.refresh(rows or [xhs_row()], keys or KEYS,
                                   self.settings, now=NOW, **kwargs)
@@ -396,6 +417,197 @@ class TestDouyinLinkOnlyRows(FailoverTest):
         )
         self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
         self.assertEqual(report.used_providers, {"tikhub": 2})
+
+
+LANDING = "https://www.iesdouyin.com/share/video/7123456789012345678/?region=CN"
+
+
+def expand_ok(url, headers, timeout=10.0) -> transport.Response:
+    return transport.Response(302, "text/html", "", location=LANDING)
+
+
+def tikhub_douyin(i) -> transport.Response:
+    if i % 2 == 0:
+        return transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"comments": [], "total": 5}}), "th-dy")
+    return transport.Response(200, "application/json", json.dumps({
+        "code": 200, "data": {"aweme_detail": {
+            "statistics": {"digg_count": 10, "comment_count": 5}}}}), "th-dy2")
+
+
+class TestDouyinShortLinkExpansion(FailoverTest):
+    """抖音短链开跑时先免费展开成 aweme_id，再挑通道。
+
+    这是让抖音真正走上 TikHub 的那一步。没有它，表里的抖音行实际上是
+    SocialDataX 单通道：SocialDataX 积分一空整个抖音平台停摆——
+    2026-09 那次「douyin 平台本轮无可用通道：[quota/1004]」就是这么来的。
+    """
+
+    def _short_link_row(self, record_id="dy-url"):
+        return Row(
+            record_id=record_id,
+            link_cell="7.86 复制打开抖音，看看作品 https://v.douyin.com/iRxYzAb/",
+            publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000),
+        )
+
+    def test_expanded_short_link_goes_to_tikhub(self):
+        report = self.run_with(
+            on_get=tikhub_douyin,
+            on_post=lambda i: self.fail("展开成功就该走 TikHub，不该碰 SocialDataX"),
+            on_expand=expand_ok,
+            rows=[self._short_link_row()],
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.used_providers, {"tikhub": 2})
+        self.assertEqual(self.expand_calls, ["https://v.douyin.com/iRxYzAb/"])
+        # 两个付费请求都带上了展开出来的 ID，而不是把短链塞进 aweme_id
+        for url in self.get_calls:
+            self.assertIn("aweme_id=7123456789012345678", url)
+        self.assertEqual(report.failovers, 0)
+        self.assertEqual(report.short_links_expanded, 1)
+        self.assertEqual(report.short_links_failed, 0)
+        # 单价跟着 TikHub 走：¥0.0072 × 2，不是 SocialDataX 的 ¥0.10 × 2
+        self.assertAlmostEqual(report.cost_yuan, 2 * 0.001 * 7.2)
+
+    def test_the_quota_incident_no_longer_kills_douyin(self):
+        """现场复现：SocialDataX 积分为 0（1004），TikHub 健康。
+        改造前抖音短链行只能走 SocialDataX → 平台判死、整批抖音顺延。
+        改造后它根本不需要 SocialDataX。"""
+        report = self.run_with(
+            on_get=tikhub_douyin,
+            on_post=lambda i: sdx_err(200, 1004, "当前 API Key 积分不足"),
+            on_expand=expand_ok,
+            rows=[self._short_link_row("a"), self._short_link_row("b")],
+        )
+        self.assertFalse(report.fatal)
+        self.assertEqual(report.dead_platforms, {})
+        self.assertEqual([o.status for o in report.outcomes],
+                         [runner.STATUS_OK, runner.STATUS_OK])
+        self.assertEqual(self.post_calls, [])
+
+    def test_failed_expansion_falls_back_to_socialdatax_as_before(self):
+        """展不开（默认替身就是网络不通）：行为和改造前逐字相同——
+        短链原样交给吃链接的 SocialDataX，不算降级。"""
+        report = self.run_with(
+            on_get=lambda i: self.fail("展不开就不该打 TikHub"),
+            on_post=TestDouyinLinkOnlyRows._sdx_douyin.__get__(self),
+            rows=[self._short_link_row()],
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.used_providers, {"socialdatax": 2})
+        self.assertEqual(report.failovers, 0)
+        self.assertEqual(report.short_links_failed, 1)
+        self.assertIn("失败 1", report.summary())
+
+    def test_tikhub_only_deployment_now_works_when_the_link_expands(self):
+        report = self.run_with(
+            on_get=tikhub_douyin,
+            on_post=lambda i: self.fail("没配 SDX 的 key"),
+            on_expand=expand_ok,
+            rows=[self._short_link_row()],
+            keys={"tikhub": "t-key"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.used_providers, {"tikhub": 2})
+
+    def test_tikhub_only_deployment_explains_why_when_it_cannot_expand(self):
+        """只配 TikHub 又展不开：还是「跳过」，但诊断信息要说清免费那一步
+        也试过了、为什么失败——运营才知道该补链接还是等一等。"""
+        report = self.run_with(
+            on_get=lambda i: self.fail("不该发出任何付费请求"),
+            on_post=lambda i: self.fail("没配 SDX 的 key"),
+            rows=[self._short_link_row()],
+            keys={"tikhub": "t-key"},
+        )
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.status, runner.STATUS_SKIPPED)
+        reason = outcome.fields[self.settings.fields.failure_reason]
+        self.assertIn("不支持这种链接形态", reason)
+        self.assertIn("曾尝试展开短链但失败", reason)
+        self.assertEqual(report.cost_yuan, 0.0)
+
+    def test_socialdatax_only_deployment_never_expands(self):
+        """SocialDataX 本来就吃短链：换成 ID 不改变路由，就别多发那一跳。"""
+        report = self.run_with(
+            on_get=lambda i: self.fail("没配 TikHub 的 key"),
+            on_post=TestDouyinLinkOnlyRows._sdx_douyin.__get__(self),
+            on_expand=lambda *a: self.fail("只配 SDX 时不该展开短链"),
+            rows=[self._short_link_row()],
+            keys={"socialdatax": "s-key"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(self.expand_calls, [])
+
+    def test_dead_tikhub_this_round_skips_expansion(self):
+        """TikHub 本轮已判死：换成 ID 也没通道接，同样不多发那一跳。"""
+        report = self.run_with(
+            on_get=lambda i: self.fail("TikHub 已判死"),
+            on_post=TestDouyinLinkOnlyRows._sdx_douyin.__get__(self),
+            on_expand=lambda *a: self.fail("TikHub 已判死时不该展开短链"),
+            rows=[self._short_link_row()],
+            disabled={"tikhub"},
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(self.expand_calls, [])
+
+    def test_full_video_link_is_not_expanded(self):
+        row = Row(record_id="dy-id",
+                  link_cell="https://www.douyin.com/video/7123456789012345678",
+                  publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+        report = self.run_with(
+            on_get=tikhub_douyin,
+            on_post=lambda i: self.fail("不该降级"),
+            on_expand=lambda *a: self.fail("已带 ID 的链接不该展开"),
+            rows=[row],
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(self.expand_calls, [])
+
+    def test_same_short_link_twice_expands_once(self):
+        from xhsearch.config import Budget
+
+        budget = runner.RunBudget(Budget(max_calls_per_run=100))
+        report = self.run_with(
+            on_get=tikhub_douyin,
+            on_post=lambda i: self.fail("不该碰 SocialDataX"),
+            on_expand=expand_ok,
+            rows=[self._short_link_row("a"), self._short_link_row("b")],
+            budget=budget,
+        )
+        self.assertEqual([o.status for o in report.outcomes],
+                         [runner.STATUS_OK, runner.STATUS_OK])
+        self.assertEqual(len(self.expand_calls), 1)
+        self.assertEqual(report.short_links_expanded, 1)
+        # 1 跳展开（第二行命中缓存，不再记账）+ 每行 2 个付费请求
+        self.assertEqual(budget.calls, 5)
+
+    def test_expansion_hop_counts_against_the_call_budget(self):
+        """展开免费，但它是一个真实请求：MAX_CALLS_PER_RUN 记的是请求数。"""
+        from xhsearch.config import Budget
+
+        budget = runner.RunBudget(Budget(max_calls_per_run=100))
+        self.run_with(
+            on_get=tikhub_douyin,
+            on_post=lambda i: self.fail("不该碰 SocialDataX"),
+            on_expand=expand_ok,
+            rows=[self._short_link_row()],
+            budget=budget,
+        )
+        self.assertEqual(budget.calls, 3)   # 1 跳展开 + 评论 + detail
+
+    def test_expansion_failure_never_raises_into_the_row(self):
+        """展开里抛了异常也不能让这一行变成「内部错误」——它只是个免费辅助步骤。"""
+        def boom(*a):
+            raise RuntimeError("DNS exploded")
+
+        report = self.run_with(
+            on_get=lambda i: self.fail("展不开就不该打 TikHub"),
+            on_post=TestDouyinLinkOnlyRows._sdx_douyin.__get__(self),
+            on_expand=boom,
+            rows=[self._short_link_row()],
+        )
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(report.used_providers, {"socialdatax": 2})
 
 
 class TestFailoverMetricHonesty(FailoverTest):
