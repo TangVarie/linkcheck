@@ -223,6 +223,39 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat,
     return "\n".join(lines)
 
 
+# 小红书评论正文里的「蓝词」标记：被平台变成搜索超链接的词，原文长这样
+#     是我理解的这个 #快充小片[搜索高亮]# 吗
+# 这是小红书自己的富文本格式（话题是 `#xx[话题]#`），TikHub 原样透传（2026-09
+# 实测能稳定看到）。只认「搜索高亮」：话题标签也是蓝色链接，但那是发评论的人
+# 自己打的，不是平台判定出来的搜索词，运营要的是后者。
+HIGHLIGHT_RE = re.compile(r"#([^#\[\]]+?)\[搜索高亮\]#")
+
+
+def highlighted_words(snapshot: Snapshot) -> list[str]:
+    """这一页评论里所有被标成搜索高亮的词，按出现顺序、去重（大小写和标点不计）。
+
+    只看第一页——和关键词、负面词一样，不为它多花一次请求。
+    """
+    seen: set[str] = set()
+    words: list[str] = []
+    for comment in snapshot.comments:
+        for raw in HIGHLIGHT_RE.findall(comment.content or ""):
+            word = raw.strip()
+            key = _normalize(word)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            words.append(word)
+    return words
+
+
+def new_blue_words(found: list[str], current: list[str]) -> list[str]:
+    """found 里哪些是「蓝词字段」还没有的。比对不计大小写、空白和标点：
+    表里人工填的「gt33」和评论里高亮的「GT33」是同一个词，不该再提醒一次。"""
+    known = {_normalize(w) for w in current}
+    return [w for w in found if _normalize(w) not in known]
+
+
 def _normalize(text: str) -> str:
     """比对文本用的归一化：去空白、去标点、统一大小写。
 
@@ -245,7 +278,7 @@ def match_seed_keywords(snapshot: Snapshot, keywords: list[str]) -> Optional[See
     """评论关键词组 × 第一页评论的包含匹配。
 
     这查的是**我们自己的种子评论有没有显示出来**（和「蓝词」无关——
-    蓝词指评论里变成超链接的词，那是人工在手机端自查的）。
+    蓝词指评论里被平台变成搜索超链接的词，由 highlighted_words 另行抠出）。
     规则刻意简单：任一关键词（归一化后）出现在任一条评论里就算命中，
     按关键词在表里的顺序取第一个命中的。没有长度门槛、没有辨识度要求——
     「西地那非口溶膜」这类词本身就有辨识度。
@@ -418,6 +451,9 @@ class Verdict:
     # 它不是标签：热度档位说的是「现在有多热」，这个说的是「这一轮涨得猛」，
     # 两件事。写不写进表由调用方决定——「起量时间」只记第一次。
     surged: bool = False
+    # 第一页评论里被平台标成搜索高亮的词（蓝词），按出现顺序去重。
+    # 只在看到了评论页时填；空壳轮是空列表，调用方据此不碰蓝词三件套。
+    blue_words: list[str] = field(default_factory=list)
 
 
 def decide(
@@ -607,6 +643,12 @@ def decide(
             )
     elif negative_keywords:
         verdict.notes.append("本轮未取到评论页内容，负面词判定保持原样")
+
+    # —— 蓝词：评论正文里的 `#词[搜索高亮]#` 标记，同一份第一页评论 ——
+    # 哪些是新词、要不要翻「是否截图」由调用方对着表里的现值决定；
+    # 这里只负责把词抠出来。
+    if saw_comment_page(snapshot):
+        verdict.blue_words = highlighted_words(snapshot)
 
     return verdict
 

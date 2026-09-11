@@ -620,6 +620,80 @@ class TestPinnedTracking(RunnerTest):
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
 
+class TestBlueWordBackfill(RunnerTest):
+    """蓝词回填：评论里出现「蓝词字段」还没有的高亮词 → 追加进去、翻「是否截图」。
+
+    只在**有新词**时动这两列。同一个蓝词每轮都在，每轮都翻「未截图」等于把
+    运营刚截完的图撤销掉。
+    """
+
+    def _page(self, *contents, count=30):
+        return sse({
+            "items": [{"content": c, "like_count": 5, "is_pinned": False,
+                       "is_author_comment": False, "ip_location": "上海",
+                       "author": {"name": "路人"}} for c in contents],
+            "comment_count": count, "top_level_comment_count": count,
+            "points": {"cost": 10, "balance": 900},
+        })
+
+    def _detail(self):
+        return sse({"like_count": 100, "collect_count": 20,
+                    "points": {"cost": 10, "balance": 890}})
+
+    def _run(self, row, *contents, **kwargs):
+        return self.run_with([self._page(*contents), self._detail()], [row], **kwargs)
+
+    def test_new_word_is_appended_and_the_shot_flag_flips(self):
+        row = xhs_row()
+        row.blue_words = ["西屋GT33"]
+        report = self._run(row, "#西屋按摩椅[搜索高亮]# 真不错", "普通评论")
+        fields = report.outcomes[0].fields
+        f = self.settings.fields
+        self.assertEqual(fields[f.blue_words], ["西屋GT33", "西屋按摩椅"])   # 只加不减
+        self.assertEqual(fields[f.blue_word_shot], "未截图")
+        self.assertIn("新蓝词：西屋按摩椅", fields[f.failure_reason])
+        self.assertNotIn(f.blue_word_images, fields)                       # 附件列机器不碰
+
+    def test_known_word_touches_nothing(self):
+        """表里已经有这个词（大小写不同也算同一个）：两列都不动，运营截过的图不被撤销。"""
+        row = xhs_row()
+        row.blue_words = ["gt33"]
+        report = self._run(row, "买了 #GT33[搜索高亮]#")
+        fields = report.outcomes[0].fields
+        self.assertNotIn(self.settings.fields.blue_words, fields)
+        self.assertNotIn(self.settings.fields.blue_word_shot, fields)
+        self.assertNotIn("新蓝词", fields[self.settings.fields.failure_reason])
+
+    def test_no_highlight_touches_nothing(self):
+        report = self._run(xhs_row(), "好用！", "回购了")
+        fields = report.outcomes[0].fields
+        self.assertNotIn(self.settings.fields.blue_words, fields)
+        self.assertNotIn(self.settings.fields.blue_word_shot, fields)
+
+    def test_first_word_ever_on_an_empty_column(self):
+        report = self._run(xhs_row(), "#快充小片是什么[搜索高亮]#")
+        fields = report.outcomes[0].fields
+        self.assertEqual(fields[self.settings.fields.blue_words], ["快充小片是什么"])
+        self.assertEqual(fields[self.settings.fields.blue_word_shot], "未截图")
+
+    def test_missing_shot_option_still_appends_the_word(self):
+        """「是否截图」还没建「未截图」选项：词照样回填，翻转跳过并在诊断里提示，
+        别让一个缺选项拖垮整行写回。"""
+        report = self._run(xhs_row(), "#西屋按摩椅[搜索高亮]#", blue_word_shot_options=["已截图"])
+        fields = report.outcomes[0].fields
+        self.assertEqual(fields[self.settings.fields.blue_words], ["西屋按摩椅"])
+        self.assertNotIn(self.settings.fields.blue_word_shot, fields)
+        self.assertIn("还没建选项「未截图」", fields[self.settings.fields.failure_reason])
+
+    def test_failed_round_never_touches_the_blue_word_columns(self):
+        row = xhs_row()
+        row.blue_words = []
+        report = self.run_with(lambda *a, **k: err(500, 1005, "服务暂时不可用"), [row])
+        fields = report.outcomes[0].fields
+        self.assertNotIn(self.settings.fields.blue_words, fields)
+        self.assertNotIn(self.settings.fields.blue_word_shot, fields)
+
+
 class TestFailurePathsLeaveStatusColumnsAlone(RunnerTest):
     """失败/存疑路径对「评论状态」「置顶状态」零发言权。
 

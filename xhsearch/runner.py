@@ -628,6 +628,7 @@ def refresh(
     comment_status_options: Optional[list[str]] = None,
     negative_status_options: Optional[list[str]] = None,
     pin_status_options: Optional[list[str]] = None,
+    blue_word_shot_options: Optional[list[str]] = None,
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
@@ -826,6 +827,28 @@ def refresh(
         if touch_tags and verdict.negative_checked:
             fields[f.negative_digest] = analyze.format_negative_digest(
                 verdict.negative_hits, settings.digest)
+
+        # —— 蓝词回填：只在出现**表里还没有**的词时动这两列 ——
+        # 「蓝词字段」只追加不删除：人工填的、机器此前回填的都原样保留，
+        # 蓝词掉了是要人去看的事，不是机器撤掉的事。
+        # 「是否截图」只在有新词时翻成「未截图」：同一个蓝词每轮都在，
+        # 每轮都翻等于把运营刚截完的图撤销掉；没有新词就一个字都不碰。
+        if touch_tags and verdict.blue_words:
+            fresh = analyze.new_blue_words(verdict.blue_words, row.blue_words)
+            if fresh:
+                fields[f.blue_words] = list(row.blue_words) + fresh
+                pending = settings.blue_word_shot.pending
+                if blue_word_shot_options is not None and pending not in blue_word_shot_options:
+                    fields[f.failure_reason] = (
+                        fields[f.failure_reason]
+                        + f"；「{f.blue_word_shot}」里还没建选项「{pending}」，已跳过"
+                    )[:500]
+                else:
+                    fields[f.blue_word_shot] = pending
+                fields[f.failure_reason] = (
+                    fields[f.failure_reason]
+                    + f"；🔵 评论里出现新蓝词：{'、'.join(fresh)}（已加进「{f.blue_words}」，请截图）"
+                )[:500]
 
         return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at)
@@ -1302,6 +1325,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         surge_time_ms=feishu.read_timestamp_ms(cells.get(f.surge_time)),
         queued=feishu.read_bool(cells.get(f.queued)),
         refresh_status=feishu.read_text(cells.get(f.refresh_status)),
+        blue_words=feishu.read_multi_select(cells.get(f.blue_words)),
         # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))

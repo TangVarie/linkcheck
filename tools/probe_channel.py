@@ -11,6 +11,11 @@
     # 明知这家不吃这种参数形态，仍然强行发一次请求（会计费）
     python3 tools/probe_channel.py <链接> --only tikhub --force
 
+    # 顺带打印第一条评论的**原始**字段（不经过归一化）。验「这家通道的评论
+    # 条目里有没有蓝词/高亮一类的字段」用：小红书的蓝词是正文里的
+    # `#词[搜索高亮]#` 标记，抖音还没验过
+    python3 tools/probe_channel.py <抖音链接> --only tikhub --raw
+
 和 `cli.py doctor` 的分工：doctor 不花钱，只查飞书那边的权限和列名；
 这个脚本**会真的发请求、真的扣费**，验的是「数据通道能不能用、字段全不全」。
 一次小红书调用 ≈ ¥0.07（TikHub）或 ¥0.10（SocialDataX），抖音便宜十倍。
@@ -23,6 +28,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import sys
@@ -45,10 +51,37 @@ ENV = {
 }
 
 
-def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = False) -> bool:
+def _first_raw_comment(body: str):
+    """从评论接口的**原始**响应里挖出第一条评论条目，不经过归一化。
+
+    两家的信封不一样：SocialDataX 是顶层 items[]；TikHub 是 data.data.comments[]
+    （小红书）或 data.comments[]（抖音）。都找不到就返回 None。
+    """
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    candidates = []
+    node = payload
+    for _ in range(3):
+        if not isinstance(node, dict):
+            break
+        for key in ("items", "comments"):
+            if isinstance(node.get(key), list):
+                candidates.append(node[key])
+        node = node.get("data")
+    for items in candidates:
+        if items and isinstance(items[0], dict):
+            return items[0]
+    return None
+
+
+def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = False,
+          raw: bool = False) -> bool:
     provider = providers.get_provider(name)
     row = Row(record_id="probe", link_cell=link)
     calls = plan_calls(row, settings)
+    raw_comment = None
 
     print(f"\n{'=' * 68}\n{provider.label}\n{'=' * 68}")
     if not calls:
@@ -114,6 +147,8 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
         print(f"  {label}：✅ {request.method} {response.status}")
         if call.purpose == "comments":
             snapshot = analyze.read_comment_page(call.platform, result.data)
+            if raw:
+                raw_comment = _first_raw_comment(response.body)
         elif snapshot is not None:
             analyze.merge_detail(snapshot, result.data)
 
@@ -136,6 +171,14 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     print("  评论区快照：")
     for line in analyze.format_digest(snapshot, settings.digest).splitlines():
         print(f"    {line}")
+    blue = analyze.highlighted_words(snapshot)
+    print(f"  蓝词（#词[搜索高亮]# 标记）  {'、'.join(blue) if blue else '（这一页没有）'}")
+    if raw_comment is not None:
+        # 验「这家通道的评论条目里到底有哪些字段」用的：蓝词在小红书是正文里的
+        # 标记，在抖音还没验过（原始条目里可能是 text_extra 之类的富文本结构）。
+        # 打印第一条**未归一化**的评论条目，人工看一眼哪个字段像。
+        print("  第一条评论的原始字段（--raw）：")
+        print("    " + json.dumps(raw_comment, ensure_ascii=False)[:2500])
 
     if snapshot.supports_pinned and snapshot.pinned is None:
         print("\n  ⚠ 没识别到置顶评论。如果这条笔记**确实有**置顶，说明上游改字段了，"
@@ -178,6 +221,7 @@ def main() -> int:
             print(f"--only 的值 {only!r} 不认识，可选：{' / '.join(ENV)}", file=sys.stderr)
             return 2
     force = "--force" in sys.argv
+    raw = "--raw" in sys.argv
 
     unsafe = os.environ.get("ALLOW_UNSAFE_ENDPOINT_OVERRIDE", "").strip() in ("1", "true", "yes")
     try:
@@ -200,7 +244,7 @@ def main() -> int:
             print(f"\n（跳过 {name}：没有 {env_name}）")
             continue
         ran = True
-        all_ok = probe(name, key, link, settings, force=force) and all_ok
+        all_ok = probe(name, key, link, settings, force=force, raw=raw) and all_ok
 
     if not ran:
         print("一个 Key 都没配。至少设一个：", " / ".join(ENV.values()), file=sys.stderr)

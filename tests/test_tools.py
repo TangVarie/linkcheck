@@ -7,6 +7,7 @@ probe_channel 决定「这条通道能不能上线」，estimate_cost 决定「�
 
 import contextlib
 import io
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -68,6 +69,23 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertIn("aweme_id=7123456789012345678", sent.call_args.args[1])
         self.assertIn("短链已展开", output)
         self.assertFalse(ok)   # 401 是真失败，照实报
+
+    def test_raw_dumps_the_first_unnormalised_comment(self):
+        """--raw 打印第一条评论的原始字段：验抖音有没有蓝词字段全靠它。"""
+        body = json.dumps({"code": 200, "data": {"comments": [
+            {"text": "好看", "text_extra": [{"hashtag_name": "露营"}], "digg_count": 3},
+        ], "total": 1}})
+        comments = transport.Response(200, "application/json", body, "r1")
+        detail = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"aweme_detail": {"statistics": {"digg_count": 1,
+                                                                  "comment_count": 1}}}}), "r2")
+        with mock.patch.object(transport, "request", side_effect=[comments, detail]):
+            _ok, output = self._probe(providers.TIKHUB, "t-key",
+                                      "https://www.douyin.com/video/7123456789012345678",
+                                      Settings(), raw=True)
+        self.assertIn("原始字段", output)
+        self.assertIn("text_extra", output)
+        self.assertIn("蓝词", output)
 
     def test_force_actually_sends_the_request(self):
         """--force 是给「我就是要验一次」准备的，行为要如实。"""

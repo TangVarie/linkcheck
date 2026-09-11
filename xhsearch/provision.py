@@ -197,7 +197,7 @@ TEXT, NUMBER, SINGLE, MULTI, DATE, CHECKBOX, ATTACHMENT, LINK, FORMULA = (
 @dataclass(frozen=True)
 class BusinessColumn:
     """一列机器**完全不读不写**的业务列。选项为空 = 建成空的选择列，运营
-    往里填的时候飞书会自动加选项（蓝词、作者这类每个项目都不一样的词）。"""
+    往里填的时候飞书会自动加选项（作者这类每个项目都不一样的词）。"""
 
     name: str
     type_code: int
@@ -285,10 +285,11 @@ FULL_LAYOUT: tuple = (
     "comment_status",
     BusinessColumn("发布截图", ATTACHMENT),
     BusinessColumn("相关截图", ATTACHMENT),
-    # 蓝词是人工在手机端自查的，机器不碰（docs/表结构.md §〇）；每个项目的词
-    # 都不一样，所以建成空多选，填的时候自动加选项。
-    BusinessColumn("蓝词字段", MULTI),
-    BusinessColumn("蓝词图片", ATTACHMENT),
+    # 蓝词三件套现在是巡查列（机器回填新蓝词、翻「是否截图」），类型和选项
+    # 以 schema.expected_schema 为准；位置沿用西屋表，「是否截图」插在中间。
+    "blue_words",
+    "blue_word_shot",
+    "blue_word_images",
     BusinessColumn("作者", SINGLE),
     BusinessColumn("父记录", LINK, self_link=True),
     "negative_keywords",
