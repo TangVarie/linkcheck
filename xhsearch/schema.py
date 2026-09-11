@@ -74,6 +74,14 @@ def expected_schema(settings: Settings) -> list[tuple]:
         (f.traffic_status, (4,), "多选", settings.tags.machine_written(),
          "机器按多选合并写入——建成单选会让写回整批失败"),
         (f.refresh_status, (3, 1), "单选或文本", statuses, None),
+        # —— 蓝词三件套（人机共用）——
+        (f.blue_words, (4,), "多选", None,
+         "机器扫到评论里的新蓝词就追加进来（只加不减），选项跟着词自动出现；"
+         "人工也能填"),
+        (f.blue_word_shot, (3,), "单选", settings.blue_word_shot.all_options(),
+         "有新蓝词时机器翻成「未截图」；运营截完图放进「蓝词图片」后手动改回「已截图」"),
+        (f.blue_word_images, (17,), "附件", None,
+         "机器不写，运营放蓝词截图"),
         (f.failure_reason, (1,), "文本", None, None),
         (f.last_updated, (5,), "日期", None,
          "必须是普通「日期」字段——建成系统的「最后更新时间」类型机器写不进去，"
@@ -103,7 +111,7 @@ def schema_problems(settings: Settings, meta: dict) -> list[str]:
     # （平台/巡查状态）是直写字符串，没有写侧守卫，缺选项的后果是
     # 写回可能失败——两种情况的文案必须如实区分。
     filtered_columns = {f.traffic_status, f.comment_status, f.negative_status,
-                        f.pinned_status}
+                        f.pinned_status, f.blue_word_shot}
     for name, allowed, type_label, required_options, note in expected_schema(settings):
         info = meta.get(name)
         if info is None:

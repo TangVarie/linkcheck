@@ -24,10 +24,10 @@ class FieldNames:
     表里还没有的列（评论关键词、置顶状态、上次点赞数等）要先在飞书里建好——
     doctor 会列出缺哪些；没建的列会被自动跳过并在日志里提示，不会写坏表。
 
-    ⚠️ 「蓝词字段」机器**完全不读不写**：蓝词（评论里变成超链接的词）
-    是人工在手机端自查的，和「评论关键词」（查我们自己的种子评论有没有
-    显示出来）是两回事。接口数据里目前拿不到「这个词有没有变成超链接」，
-    所以两者没有任何关联（见 docs/待验证清单.md）。
+    「蓝词字段」（评论里变成搜索超链接的词）现在**机器会回填**：小红书评论
+    正文里蓝词带着 `#词[搜索高亮]#` 的原始标记（TikHub 透传，2026-09 实测），
+    扫到表里还没有的词就追加进去，并把「是否截图」翻成「未截图」提醒人去截图。
+    它和「评论关键词」（查我们自己的种子评论有没有显示出来）仍是两回事。
     """
 
     # —— 人工维护 ——
@@ -75,6 +75,16 @@ class FieldNames:
     last_updated: str = "最近检查时间"
     alive_confirmed: str = "已确认存活"       # 复选框：本轮真的量到数字（哪怕是0）=勾上，确认失效=取消
 
+    # —— 蓝词三件套（人机共用）——
+    # 蓝词 = 评论里被平台变成搜索超链接的词。小红书评论正文里它带着
+    # `#词[搜索高亮]#` 标记（上游原始格式，TikHub 原样透传），机器扫到
+    # 表里还没有的词就**追加**进「蓝词字段」（只加不减，人工填的原样保留），
+    # 同时把「是否截图」翻成「未截图」——运营去手机上截图放进「蓝词图片」，
+    # 再手动改回「已截图」。没有新词的轮次这三列一个都不碰。
+    blue_words: str = "蓝词字段"              # 多选：机器追加新词，人工可编辑
+    blue_word_shot: str = "是否截图"          # 单选：机器只写「未截图」，「已截图」由人改
+    blue_word_images: str = "蓝词图片"        # 附件：机器不写，人工放截图
+
     # —— 机器写入 · 系统列（建议在运营视图里隐藏）——
     consecutive_failures: str = "连续失败次数"   # 两击定罪的计数器
 
@@ -92,6 +102,7 @@ class FieldNames:
             self.last_updated,            # 分层刷新靠它判断到期
             self.consecutive_failures,    # 两击定罪
             self.refresh_status,          # 熔断记过失败的行要提前复查（rows.Row.breaker_strike_pending）
+            self.blue_words,              # 回填蓝词要先知道表里已有哪些（只提醒新词）
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
             self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
         ]
@@ -204,6 +215,31 @@ class NegativeStatus:
 
     def machine_written(self) -> list[str]:
         return [self.found, self.clean]
+
+
+@dataclass
+class BlueWordShot:
+    """「是否截图」单选列的取值：新出现的蓝词有没有人去截过图。
+
+    这一列是**人机共用**的提醒开关，方向和别的状态列不一样——机器只会
+    把它翻成「未截图」，从不写「已截图」：
+
+        未截图  —— 本轮在评论里扫到了「蓝词字段」里还没有的词（机器写）
+        已截图  —— 运营截完图放进「蓝词图片」后手动改回（人写）
+
+    没有新词的轮次机器完全不碰这一列：同一个蓝词每轮都在，
+    每轮都翻成「未截图」等于把运营刚做完的事撤销掉。
+    """
+
+    pending: str = "未截图"
+    done: str = "已截图"
+
+    def machine_written(self) -> list[str]:
+        return [self.pending]
+
+    def all_options(self) -> list[str]:
+        """建列时两个选项都要有：「已截图」虽然机器不写，但人得选得到。"""
+        return [self.pending, self.done]
 
 
 @dataclass
@@ -553,6 +589,7 @@ class Settings:
     comment_status: CommentStatus = field(default_factory=CommentStatus)
     negative_status: NegativeStatus = field(default_factory=NegativeStatus)
     pin_status: PinStatus = field(default_factory=PinStatus)
+    blue_word_shot: BlueWordShot = field(default_factory=BlueWordShot)
     thresholds: Thresholds = field(default_factory=Thresholds)
     digest: DigestFormat = field(default_factory=DigestFormat)
     refresh: RefreshTiers = field(default_factory=RefreshTiers)

@@ -241,7 +241,7 @@ class TestCreateMonitoredTable(unittest.TestCase):
 XIWU_COLUMNS = [
     "素人编号", "发布时间", "反馈链接", "已删除评论留底", "流量状态", "起量时间",
     "笔记状态", "方向", "找人备注", "内容配图", "文案", "随贴评论", "评论的素人编号",
-    "评论配图", "评论状态", "发布截图", "相关截图", "蓝词字段", "蓝词图片", "作者",
+    "评论配图", "评论状态", "发布截图", "相关截图", "蓝词字段", "是否截图", "蓝词图片", "作者",
     "父记录", "负面词", "评论关键词", "是否巡查", "排队刷新", "诊断信息", "置顶状态",
     "已确认存活", "巡查状态", "负面状态", "负面评论快照", "评论区快照",
     "实时数据.评论数", "最近检查时间", "下次检查时间", "连续失败次数", "平台",
@@ -292,9 +292,13 @@ class TestFullTemplate(unittest.TestCase):
                          ["流量贴", "产品贴"])
         self.assertEqual(by_name["笔记状态"]["type"], 4)
         self.assertIn("已发布", [o["name"] for o in by_name["笔记状态"]["property"]["options"]])
-        # 每个项目的词都不一样：建成空的选择列，填的时候飞书自动加选项
+        # 每个项目的词都不一样：建成空的多选，机器回填新蓝词时选项跟着出现
         self.assertEqual(by_name["蓝词字段"]["type"], 4)
         self.assertNotIn("property", by_name["蓝词字段"])
+        # 「是否截图」两个选项都要建：「已截图」机器不写，但人得选得到
+        self.assertEqual(by_name["是否截图"]["type"], 3)
+        self.assertEqual([o["name"] for o in by_name["是否截图"]["property"]["options"]],
+                         ["未截图", "已截图"])
         self.assertEqual(by_name["作者"]["type"], 3)
         self.assertNotIn("property", by_name["作者"])
 

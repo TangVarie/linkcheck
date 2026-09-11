@@ -170,6 +170,62 @@ class TestCommentAnalysis(unittest.TestCase):
         self.assertEqual(analyze.format_digest(snap, Settings().digest), "（暂无评论）")
 
 
+class TestBlueWords(unittest.TestCase):
+    """蓝词：小红书评论正文里 `#词[搜索高亮]#` 的原始标记（TikHub 透传）。
+
+    2026-09 实测能稳定看到：
+        1. [1赞] MOMO: #快充小片是什么[搜索高亮]#
+        3. [2赞] 点兵点将能咋办: 是我理解的这个 #快充小片[搜索高亮]# 吗，笑死
+    """
+
+    def _snap(self, *contents, platform="xhs"):
+        items = [{"content": c, "like_count": 0, "is_pinned": False,
+                  "is_author_comment": False, "ip_location": "", "author": {"name": "x"}}
+                 for c in contents]
+        return analyze.read_comment_page(platform, {"items": items, "comment_count": len(items)})
+
+    def test_extracts_highlighted_words_in_order(self):
+        snap = self._snap("#快充小片是什么[搜索高亮]#",
+                          "比起这个还是关注你老公吧",
+                          "是我理解的这个 #快充小片[搜索高亮]# 吗，笑死")
+        self.assertEqual(analyze.highlighted_words(snap), ["快充小片是什么", "快充小片"])
+
+    def test_same_word_twice_is_listed_once(self):
+        snap = self._snap("#GT33[搜索高亮]# 好用", "买了 #gt33[搜索高亮]#", "# GT33 [搜索高亮]#")
+        self.assertEqual(analyze.highlighted_words(snap), ["GT33"])
+
+    def test_topic_tags_are_not_blue_words(self):
+        """话题也是蓝色链接，但那是发评论的人自己打的，不是平台判定的搜索词。"""
+        snap = self._snap("#露营装备[话题]# 推荐", "普通评论 #没有标记")
+        self.assertEqual(analyze.highlighted_words(snap), [])
+
+    def test_two_words_in_one_comment(self):
+        snap = self._snap("#西屋按摩椅[搜索高亮]# 和 #GT33白色款[搜索高亮]# 都不错")
+        self.assertEqual(analyze.highlighted_words(snap), ["西屋按摩椅", "GT33白色款"])
+
+    def test_new_words_ignore_case_and_spacing(self):
+        """表里人工填的「gt33」和评论里高亮的「GT33」是同一个词，不该再提醒。"""
+        self.assertEqual(analyze.new_blue_words(["GT33", "西屋按摩椅"], ["gt33", "西屋GT33"]),
+                         ["西屋按摩椅"])
+        self.assertEqual(analyze.new_blue_words(["西屋按摩椅"], []), ["西屋按摩椅"])
+        self.assertEqual(analyze.new_blue_words([], ["gt33"]), [])
+
+    def test_decide_carries_the_words_only_when_the_page_was_seen(self):
+        settings = Settings()
+        snap = self._snap("#快充小片[搜索高亮]#")
+        verdict = analyze.decide(snap, settings, previous_comment_count=None, age_hours=30)
+        self.assertEqual(verdict.blue_words, ["快充小片"])
+        # 空壳轮：一条评论都没看到、评论数也没拿到 → 不下任何结论
+        empty = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        verdict = analyze.decide(empty, settings, previous_comment_count=None, age_hours=30)
+        self.assertEqual(verdict.blue_words, [])
+
+    def test_digest_keeps_the_raw_marker_so_operators_can_see_it(self):
+        """快照里保留原始标记：运营正是靠它一眼看出哪个词变蓝了。"""
+        snap = self._snap("是我理解的这个 #快充小片[搜索高亮]# 吗")
+        self.assertIn("#快充小片[搜索高亮]#", analyze.format_digest(snap, Settings().digest))
+
+
 class TestPinnedState(unittest.TestCase):
     """置顶判定。帖子是我们自己发的，置顶评论必然是我方置顶的——
     所以只需要回答「置顶还在不在」，不做任何内容比对。"""

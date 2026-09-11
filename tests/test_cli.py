@@ -768,6 +768,7 @@ class TestMistypedWarning(unittest.TestCase):
 
         class _Outcome:
             tag_plan = None
+            blue_word_plan = None
             record_id = "rec1"
             checked_at = None
             fields = {f.refresh_status: "正常", f.last_updated: 1787313600000,

@@ -57,6 +57,29 @@ class TagPlan:
 
 
 @dataclass
+class BlueWordPlan:
+    """写回前回填蓝词的材料：这一轮在评论里扫到的、开跑时表里还没有的词。
+
+    和 TagPlan 同一个理由：「蓝词字段」是人机共用的多选列，飞书多选没有原子
+    append，写入是整列覆盖。开跑时读到的现值到收尾时可能已经被运营改过
+    （手工补了一个词、删了一个错词），拿旧快照拼出来整列写回去就把那次
+    编辑抹掉了。所以真正要写的值在 write_back 里**重读一次现值**再算。
+
+    同时它把「翻『是否截图』」和「记新词」绑在一起：只有新词真的能落进
+    「蓝词字段」（列存在、类型对、重读成功）时才翻那个开关、才在诊断里说
+    「已加进」——否则运营会被叫去截一个表里根本没记下来的词。
+    """
+
+    field_name: str            # 「蓝词字段」
+    shot_field: str            # 「是否截图」
+    reason_field: str          # 「诊断信息」：回填成功时追加一句
+    new_words: list[str]
+    snapshot_words: list[str]  # 开跑时的现值，用来判断「这中间有没有人动过」
+    # 「是否截图」要翻成的值；None = 选项还没建，只记词不翻开关。
+    shot_value: Optional[str] = None
+
+
+@dataclass
 class Outcome:
     record_id: str
     status: str
@@ -68,6 +91,8 @@ class Outcome:
     cost_yuan: float = 0.0
     # 写回前重算标签的材料；None = 这一行本轮不碰标签列。
     tag_plan: Optional[TagPlan] = None
+    # 写回前回填蓝词的材料；None = 这一轮没有新蓝词，三件套一列都不碰。
+    blue_word_plan: Optional[BlueWordPlan] = None
     # 这一行失败的错误码（GONE 路径才填）。小样本熔断靠它识别
     # 「所有行都栽在同一个错误上」这种上游漂移形态。
     failure_code: str = ""
@@ -628,6 +653,7 @@ def refresh(
     comment_status_options: Optional[list[str]] = None,
     negative_status_options: Optional[list[str]] = None,
     pin_status_options: Optional[list[str]] = None,
+    blue_word_shot_options: Optional[list[str]] = None,
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
@@ -827,8 +853,36 @@ def refresh(
             fields[f.negative_digest] = analyze.format_negative_digest(
                 verdict.negative_hits, settings.digest)
 
-        return Outcome(row.record_id, status, fields, "；".join(verdict.notes)[:200],
-                       credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at)
+        # —— 蓝词回填：只在出现**表里还没有**的词时动这两列 ——
+        # 「蓝词字段」只追加不删除：人工填的、机器此前回填的都原样保留，
+        # 蓝词掉了是要人去看的事，不是机器撤掉的事。
+        # 「是否截图」只在有新词时翻成「未截图」：同一个蓝词每轮都在，
+        # 每轮都翻等于把运营刚截完的图撤销掉；没有新词就一个字都不碰。
+        #
+        # 这里只登记材料，不直接写列：真正的值在 write_back 里重读现值之后
+        # 再拼（人机共用的多选列，整列覆盖），而且「翻开关」必须等「记词」
+        # 确认能落表才做——见 BlueWordPlan / _reconcile_blue_words。
+        blue_word_plan: Optional[BlueWordPlan] = None
+        log_notes = list(verdict.notes)
+        if touch_tags and verdict.blue_words:
+            fresh = analyze.new_blue_words(verdict.blue_words, row.blue_words)
+            if fresh:
+                pending: Optional[str] = settings.blue_word_shot.pending
+                if blue_word_shot_options is not None and pending not in blue_word_shot_options:
+                    fields[f.failure_reason] = (
+                        fields[f.failure_reason]
+                        + f"；「{f.blue_word_shot}」里还没建选项「{pending}」，已跳过"
+                    )[:500]
+                    pending = None
+                blue_word_plan = BlueWordPlan(
+                    field_name=f.blue_words, shot_field=f.blue_word_shot,
+                    reason_field=f.failure_reason, new_words=fresh,
+                    snapshot_words=list(row.blue_words), shot_value=pending)
+                log_notes.append(f"🔵 评论里出现新蓝词：{'、'.join(fresh)}")
+
+        return Outcome(row.record_id, status, fields, "；".join(log_notes)[:200],
+                       credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at,
+                       blue_word_plan=blue_word_plan)
 
     def work(row: Row) -> Outcome:
         platform = row.parsed.platform or ""
@@ -1302,6 +1356,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         surge_time_ms=feishu.read_timestamp_ms(cells.get(f.surge_time)),
         queued=feishu.read_bool(cells.get(f.queued)),
         refresh_status=feishu.read_text(cells.get(f.refresh_status)),
+        blue_words=feishu.read_multi_select(cells.get(f.blue_words)),
         # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))
@@ -1477,6 +1532,84 @@ def _reconcile_tags(
             "已按最新现值重算标签（人工标签原样保留）")
 
 
+def _append_note(fields: dict[str, Any], column: str, note: str) -> None:
+    current = str(fields.get(column) or "")
+    fields[column] = (f"{current}；{note}" if current else note)[:500]
+
+
+def _reconcile_blue_words(
+    table: feishu.Bitable,
+    report: RunReport,
+    *,
+    known_fields: Optional[set[str]],
+    field_types: Optional[dict[str, Any]],
+    dropped_fields: Optional[set[str]],
+    mistyped_fields: Optional[set[str]],
+    say: Callable[[str], None] = lambda _: None,
+) -> None:
+    """写回**之前**把蓝词回填算成真正要写的列。
+
+    两件事必须在这里、而不是在 finish 里做：
+
+    1. **重读现值再拼**。「蓝词字段」是人机共用的多选列，写入是整列覆盖。
+       开跑到收尾隔着几分钟付费调用，运营这几分钟里手工加的词会被按旧快照
+       拼出来的值抹掉（和 _reconcile_tags 同一个坑）。重读失败就这一轮不写：
+       词没记下来，下一轮照样会当新词再扫到，什么都不丢。
+    2. **记词和翻开关绑定**。只有词真的能落进「蓝词字段」（列存在、类型对）
+       才翻「是否截图」、才在诊断里说「已加进」。列没建/建错时 write_back 会
+       把这一列挡掉，若开关和那句话照写，运营就会被叫去截一个表里根本
+       没记下来的词，而下一轮又把它当新词再叫一次。
+    """
+    targets = [o for o in report.outcomes if o.blue_word_plan is not None]
+    if not targets:
+        return
+
+    column = targets[0].blue_word_plan.field_name
+    unwritable = ""
+    if known_fields is not None and column not in known_fields:
+        unwritable = f"表里还没建「{column}」"
+        if dropped_fields is not None:
+            dropped_fields.add(column)
+    elif field_types is not None and column in field_types \
+            and feishu.parse_code(field_types[column]) != 4:
+        unwritable = f"「{column}」不是多选列"
+        if mistyped_fields is not None:
+            mistyped_fields.add(column)
+    if unwritable:
+        for outcome in targets:
+            plan = outcome.blue_word_plan
+            _append_note(outcome.fields, plan.reason_field,
+                         f"🔵 评论里出现新蓝词：{'、'.join(plan.new_words)}，"
+                         f"但{unwritable}，未能记录")
+        return
+
+    try:
+        fresh = {r.get("record_id"): (r.get("fields") or {})
+                 for r in table.batch_get([o.record_id for o in targets])}
+    except Exception as exc:  # noqa: BLE001 —— 重读失败不该炸穿写回
+        say(f"⚠ 写回前重读「{column}」失败（{type(exc).__name__}: {exc}）："
+            "本轮不回填蓝词，避免覆盖运营刚填的词；下一轮会再扫到")
+        return
+
+    for outcome in targets:
+        plan = outcome.blue_word_plan
+        cells = fresh.get(outcome.record_id)
+        if cells is None:
+            continue   # 行被删了：交给 batch_update 报 1254043 并隔离
+        current = feishu.read_multi_select(cells.get(plan.field_name))
+        still_new = analyze.new_blue_words(plan.new_words, current)
+        if not still_new:
+            # 运营在这几分钟里自己把词填上了：那就什么都不写、也不翻开关——
+            # 人已经看到了，再翻成「未截图」是在撤销人的动作。
+            continue
+        outcome.fields[plan.field_name] = list(current) + still_new
+        if plan.shot_value is not None:
+            outcome.fields[plan.shot_field] = plan.shot_value
+        _append_note(outcome.fields, plan.reason_field,
+                     f"🔵 评论里出现新蓝词：{'、'.join(still_new)}"
+                     f"（已加进「{plan.field_name}」，请截图）")
+
+
 def write_back(
     table: feishu.Bitable,
     report: RunReport,
@@ -1504,6 +1637,9 @@ def write_back(
     None = 不过滤（旧行为）。
     """
     _reconcile_tags(table, report, say=say)
+    _reconcile_blue_words(table, report, known_fields=known_fields, field_types=field_types,
+                          dropped_fields=dropped_fields, mistyped_fields=mistyped_fields,
+                          say=say)
     updates = []
     for o in report.outcomes:
         fields = o.fields
