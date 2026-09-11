@@ -76,7 +76,10 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         评论两千多字符，真正要看的字段全被挤出屏幕。"""
         body = json.dumps({"code": 200, "data": {"comments": [
             {"text": "好看", "text_extra": [], "label_type": -1, "digg_count": 3,
-             "user": {"nickname": "甲", "avatar_thumb": {"url_list": ["https://x/a.heic"]}}},
+             "user": {"nickname": "甲", "avatar_thumb": {"url_list": ["https://x/a.heic"]}},
+             "reply_comment": [{"text": "谢谢", "label_text": "作者", "text_extra": [],
+                                "user": {"nickname": "作者本人", "sec_uid": "MS4w",
+                                         "avatar_thumb": {"url_list": ["https://x/b.heic"]}}}]},
             {"text": "买了 协春堂", "text_extra": [{"hashtag_name": "协春堂", "type": 1}],
              "digg_count": 0, "user": {"nickname": "乙", "sec_uid": "MS4w"}},
         ], "total": 2, "cursor": 20, "has_more": 0, "extra": {"now": 0, "fatal_item_ids": []},
@@ -96,6 +99,9 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertNotIn("sec_uid", output)
         self.assertNotIn('"label_type"', output)           # -1 这种占位去掉
         self.assertIn('"nickname": "乙"', output)          # 昵称留着，好对照手机
+        # 二级回复（作者回复）也是评论条目，里面的 user 同样只留昵称
+        self.assertIn('"nickname": "作者本人"', output)
+        self.assertIn('"label_text": "作者"', output)
         self.assertIn("蓝词", output)
         # 页级字段：评论列表换成占位，其余保留，空值去掉——抖音的蓝词若不在
         # 每条评论上，就只可能在这里。

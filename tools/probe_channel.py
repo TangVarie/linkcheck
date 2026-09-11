@@ -124,6 +124,10 @@ def _trim_raw(item: dict) -> dict:
                 if name:
                     out[key] = {"nickname": name}
             continue
+        if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            # 二级回复（reply_comment）也是评论条目，同样压一遍——作者回复里的
+            # user 一样带两千字头像杂项。
+            value = [_trim_raw(v) for v in value]
         if value in (None, "", [], {}, 0, False, -1):
             continue
         out[key] = value
