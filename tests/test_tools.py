@@ -70,11 +70,16 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertIn("短链已展开", output)
         self.assertFalse(ok)   # 401 是真失败，照实报
 
-    def test_raw_dumps_the_first_unnormalised_comment(self):
-        """--raw 打印第一条评论的原始字段：验抖音有没有蓝词字段全靠它。"""
+    def test_raw_dumps_every_unnormalised_comment_without_the_noise(self):
+        """--raw 打印整页评论的原始字段：验抖音有没有蓝词字段全靠它。
+        蓝词往往不在第一条，所以要整页；头像等杂项和空值要去掉，否则一条
+        评论两千多字符，真正要看的字段全被挤出屏幕。"""
         body = json.dumps({"code": 200, "data": {"comments": [
-            {"text": "好看", "text_extra": [{"hashtag_name": "露营"}], "digg_count": 3},
-        ], "total": 1}})
+            {"text": "好看", "text_extra": [], "label_type": -1, "digg_count": 3,
+             "user": {"nickname": "甲", "avatar_thumb": {"url_list": ["https://x/a.heic"]}}},
+            {"text": "买了 协春堂", "text_extra": [{"hashtag_name": "协春堂", "type": 1}],
+             "digg_count": 0, "user": {"nickname": "乙", "sec_uid": "MS4w"}},
+        ], "total": 2}})
         comments = transport.Response(200, "application/json", body, "r1")
         detail = transport.Response(200, "application/json", json.dumps({
             "code": 200, "data": {"aweme_detail": {"statistics": {"digg_count": 1,
@@ -83,8 +88,13 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
             _ok, output = self._probe(providers.TIKHUB, "t-key",
                                       "https://www.douyin.com/video/7123456789012345678",
                                       Settings(), raw=True)
-        self.assertIn("原始字段", output)
-        self.assertIn("text_extra", output)
+        self.assertIn("共 2 条", output)
+        self.assertIn("#2 ", output)                       # 第二条也打了
+        self.assertIn('"hashtag_name": "协春堂"', output)   # 有值的富文本结构保留
+        self.assertNotIn("avatar_thumb", output)           # 头像杂项去掉
+        self.assertNotIn("sec_uid", output)
+        self.assertNotIn('"label_type"', output)           # -1 这种占位去掉
+        self.assertIn('"nickname": "乙"', output)          # 昵称留着，好对照手机
         self.assertIn("蓝词", output)
 
     def test_force_actually_sends_the_request(self):
