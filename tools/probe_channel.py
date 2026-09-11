@@ -73,6 +73,38 @@ def _raw_comments(body: str) -> list:
     return []
 
 
+def _raw_envelope(body: str) -> dict:
+    """原始响应去掉评论条目之后**剩下的**部分：页级字段。
+
+    抖音的蓝词若不挂在每条评论上（--raw 已验：带蓝词的评论 text_extra 为空），
+    就只可能挂在整页响应的顶层或 data 层。这里把评论列表本身换成一句占位，
+    其余层层去掉空值后原样返回，人工看一眼哪个键像搜索词列表。
+    """
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    def strip(node):
+        if not isinstance(node, dict):
+            return node
+        out = {}
+        for key, value in node.items():
+            if key in ("items", "comments") and isinstance(value, list) \
+                    and value and isinstance(value[0], dict):
+                out[key] = f"（{len(value)} 条评论，见上）"
+                continue
+            value = strip(value)
+            if value in (None, "", [], {}, 0, False, -1):
+                continue
+            out[key] = value
+        return out
+
+    return strip(payload)
+
+
 # 原始条目里这些键是头像/主页/账号杂项，一条评论里能占两千多字符，把真正要看的
 # 字段（text_extra / label_* / is_hot …）全挤出屏幕。打印时只留昵称。
 _NOISY_KEYS = {"user", "author", "avatar_thumb", "avatar", "image_list", "sticker"}
@@ -104,6 +136,7 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     row = Row(record_id="probe", link_cell=link)
     calls = plan_calls(row, settings)
     raw_comments: list = []
+    raw_envelope: dict = {}
 
     print(f"\n{'=' * 68}\n{provider.label}\n{'=' * 68}")
     if not calls:
@@ -171,6 +204,7 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
             snapshot = analyze.read_comment_page(call.platform, result.data)
             if raw:
                 raw_comments = _raw_comments(response.body)
+                raw_envelope = _raw_envelope(response.body)
         elif snapshot is not None:
             analyze.merge_detail(snapshot, result.data)
 
@@ -204,6 +238,10 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
             print(f"    #{index} " + json.dumps(_trim_raw(item), ensure_ascii=False))
         if not raw_comments:
             print("    （原始响应里没找到评论列表）")
+        # 抖音已验：带蓝词的评论条目里没有任何字段标出蓝词（text_extra 只装 @ 和话题）。
+        # 那蓝词只可能在页级字段里——把评论列表之外的整个信封也打出来。
+        print("  评论条目之外的页级字段（--raw，已去掉空值）：")
+        print("    " + json.dumps(raw_envelope, ensure_ascii=False))
 
     if snapshot.supports_pinned and snapshot.pinned is None:
         print("\n  ⚠ 没识别到置顶评论。如果这条笔记**确实有**置顶，说明上游改字段了，"
