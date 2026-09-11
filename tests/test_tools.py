@@ -79,7 +79,8 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
              "user": {"nickname": "甲", "avatar_thumb": {"url_list": ["https://x/a.heic"]}}},
             {"text": "买了 协春堂", "text_extra": [{"hashtag_name": "协春堂", "type": 1}],
              "digg_count": 0, "user": {"nickname": "乙", "sec_uid": "MS4w"}},
-        ], "total": 2}})
+        ], "total": 2, "cursor": 20, "has_more": 0, "extra": {"now": 0, "fatal_item_ids": []},
+            "comment_search_words": [{"word": "协春堂", "cid": "1"}]}})
         comments = transport.Response(200, "application/json", body, "r1")
         detail = transport.Response(200, "application/json", json.dumps({
             "code": 200, "data": {"aweme_detail": {"statistics": {"digg_count": 1,
@@ -96,6 +97,14 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertNotIn('"label_type"', output)           # -1 这种占位去掉
         self.assertIn('"nickname": "乙"', output)          # 昵称留着，好对照手机
         self.assertIn("蓝词", output)
+        # 页级字段：评论列表换成占位，其余保留，空值去掉——抖音的蓝词若不在
+        # 每条评论上，就只可能在这里。
+        self.assertIn("页级字段", output)
+        self.assertIn('"comments": "（2 条评论，见上）"', output)
+        self.assertIn('"comment_search_words": [{"word": "协春堂"', output)
+        self.assertIn('"total": 2', output)
+        self.assertNotIn('"has_more"', output)              # 0 这种占位去掉
+        self.assertNotIn('"extra"', output)                 # 全空的子对象整个去掉
 
     def test_force_actually_sends_the_request(self):
         """--force 是给「我就是要验一次」准备的，行为要如实。"""
