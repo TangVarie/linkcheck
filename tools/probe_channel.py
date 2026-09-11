@@ -108,6 +108,8 @@ def _raw_envelope(body: str) -> dict:
 # 原始条目里这些键是头像/主页/账号杂项，一条评论里能占两千多字符，把真正要看的
 # 字段（text_extra / label_* / is_hot …）全挤出屏幕。打印时只留昵称。
 _NOISY_KEYS = {"user", "author", "avatar_thumb", "avatar", "image_list", "sticker"}
+# 条目里装着**另一层评论**的键：抖音把作者回复塞在 reply_comment 里。
+_NESTED_COMMENT_KEYS = {"reply_comment", "sub_comments", "replies"}
 
 
 def _trim_raw(item: dict) -> dict:
@@ -124,6 +126,12 @@ def _trim_raw(item: dict) -> dict:
                 if name:
                     out[key] = {"nickname": name}
             continue
+        if key in _NESTED_COMMENT_KEYS and isinstance(value, list):
+            # 二级回复也是评论条目，同样压一遍——作者回复里的 user 一样带两千字
+            # 头像杂项。**只对已知的嵌套评论键递归**：text_extra 这类元数据里
+            # `type: 0` / `start: 0` 的零是有信息的（0 = @ 提及、从第 0 个字开始），
+            # 而 --raw 正是用来看这些未归一化结构的，不能拿评论级的去空值规则去压它。
+            value = [_trim_raw(v) if isinstance(v, dict) else v for v in value]
         if value in (None, "", [], {}, 0, False, -1):
             continue
         out[key] = value
