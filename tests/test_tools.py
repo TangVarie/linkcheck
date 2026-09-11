@@ -82,6 +82,9 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
                                          "avatar_thumb": {"url_list": ["https://x/b.heic"]}}}]},
             {"text": "买了 协春堂", "text_extra": [{"hashtag_name": "协春堂", "type": 1}],
              "digg_count": 0, "user": {"nickname": "乙", "sec_uid": "MS4w"}},
+            {"text": "@丙 看", "digg_count": 0, "user": {"nickname": "丁"},
+             "text_extra": [{"start": 0, "end": 2, "user_id": "9", "type": 0,
+                             "hashtag_name": "", "hashtag_id": ""}]},
         ], "total": 2, "cursor": 20, "has_more": 0, "extra": {"now": 0, "fatal_item_ids": []},
             "comment_search_words": [{"word": "协春堂", "cid": "1"}]}})
         comments = transport.Response(200, "application/json", body, "r1")
@@ -92,8 +95,8 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
             _ok, output = self._probe(providers.TIKHUB, "t-key",
                                       "https://www.douyin.com/video/7123456789012345678",
                                       Settings(), raw=True)
-        self.assertIn("共 2 条", output)
-        self.assertIn("#2 ", output)                       # 第二条也打了
+        self.assertIn("共 3 条", output)
+        self.assertIn("#3 ", output)                       # 后面的条目也打了
         self.assertIn('"hashtag_name": "协春堂"', output)   # 有值的富文本结构保留
         self.assertNotIn("avatar_thumb", output)           # 头像杂项去掉
         self.assertNotIn("sec_uid", output)
@@ -102,11 +105,14 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         # 二级回复（作者回复）也是评论条目，里面的 user 同样只留昵称
         self.assertIn('"nickname": "作者本人"', output)
         self.assertIn('"label_text": "作者"', output)
+        # 但 text_extra 这类元数据**不**递归去空值：`type: 0`（@ 提及）、
+        # `start: 0`（从第 0 个字开始）的零是有信息的，--raw 正是要看它们。
+        self.assertIn('"start": 0, "end": 2, "user_id": "9", "type": 0', output)
         self.assertIn("蓝词", output)
         # 页级字段：评论列表换成占位，其余保留，空值去掉——抖音的蓝词若不在
         # 每条评论上，就只可能在这里。
         self.assertIn("页级字段", output)
-        self.assertIn('"comments": "（2 条评论，见上）"', output)
+        self.assertIn('"comments": "（3 条评论，见上）"', output)
         self.assertIn('"comment_search_words": [{"word": "协春堂"', output)
         self.assertIn('"total": 2', output)
         self.assertNotIn('"has_more"', output)              # 0 这种占位去掉
