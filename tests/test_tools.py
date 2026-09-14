@@ -118,6 +118,54 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertNotIn('"has_more"', output)              # 0 这种占位去掉
         self.assertNotIn('"extra"', output)                 # 全空的子对象整个去掉
 
+    XHS_LINK = "https://www.xiaohongshu.com/explore/" + "a" * 24
+    XHS_COMMENTS = transport.Response(200, "application/json", json.dumps({
+        "code": 200, "data": {"data": {
+            "user_id": "u1", "all_sort_strategies": ["default"],
+            "comment_count": 3, "comment_count_l1": 2,
+            "comments": [{"content": "好看", "user": {"nickname": "甲"}}]}}}), "r1")
+
+    def test_detail_flag_calls_the_detail_endpoint_and_dumps_the_note(self):
+        """--detail：线上默认不调小红书详情，探针显式要了才调，并把笔记本体的
+        原始字段打出来——验「分享链接打不开、评论接口却正常」的笔记详情接口
+        怎么说，全靠它。"""
+        detail = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"data": [{"note_list": [{
+                "id": "n1", "in_censor": True, "liked_count": 12, "comments_count": 3,
+                "note_status": 2, "images_list": [{"url": "https://x/big.jpg"}],
+                "user": {"nickname": "作者", "userid": "u1"}}]}]}}), "r2")
+        settings = Settings()
+        settings.detail_within_days = 3650
+        with mock.patch.object(transport, "request",
+                               side_effect=[self.XHS_COMMENTS, detail]) as sent:
+            _ok, output = self._probe(providers.TIKHUB, "t-key", self.XHS_LINK,
+                                      settings, raw=True)
+        self.assertEqual(sent.call_count, 2)
+        self.assertIn("详情：✅", output)
+        self.assertIn("上游审核标记 True", output)
+        self.assertIn('"in_censor": true', output)          # 状态字段原样保留
+        self.assertIn('"note_status": 2', output)
+        self.assertNotIn("images_list", output)              # 媒体杂项去掉
+        self.assertNotIn('"userid"', output)                 # 作者只留昵称
+
+    def test_without_detail_flag_xhs_probe_sends_one_request(self):
+        with mock.patch.object(transport, "request", return_value=self.XHS_COMMENTS) as sent:
+            self._probe(providers.TIKHUB, "t-key", self.XHS_LINK, Settings(), raw=True)
+        self.assertEqual(sent.call_count, 1)
+
+    def test_detail_gone_still_shows_the_raw_envelope(self):
+        """笔记「仅作者可见」时详情接口可能直接回空（GONE）——那时候信封里的
+        code / msg 才是要看的东西，失败也要打出来。"""
+        detail = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "msg": "note not found", "data": {"data": []}}), "r2")
+        settings = Settings()
+        settings.detail_within_days = 3650
+        with mock.patch.object(transport, "request", side_effect=[self.XHS_COMMENTS, detail]):
+            _ok, output = self._probe(providers.TIKHUB, "t-key", self.XHS_LINK,
+                                      settings, raw=True)
+        self.assertIn("详情：❌ [gone]", output)
+        self.assertIn('"msg": "note not found"', output)
+
     def test_force_actually_sends_the_request(self):
         """--force 是给「我就是要验一次」准备的，行为要如实。"""
         response = transport.Response(401, "application/json",
