@@ -16,6 +16,11 @@
     # 正文里的 `#词[搜索高亮]#` 标记，抖音还没验过
     python3 tools/probe_channel.py <抖音链接> --only tikhub --raw
 
+    # 小红书额外调一次详情接口（线上默认不调，DETAIL_WITHIN_DAYS=0），并连
+    # 原始的笔记级字段一起打出来。验「分享链接打开是『笔记不存在』、评论接口
+    # 却照常返回」这种**仅作者可见**的笔记，详情接口到底怎么说
+    python3 tools/probe_channel.py <小红书链接> --only tikhub --detail --raw
+
 和 `cli.py doctor` 的分工：doctor 不花钱，只查飞书那边的权限和列名；
 这个脚本**会真的发请求、真的扣费**，验的是「数据通道能不能用、字段全不全」。
 一次小红书调用 ≈ ¥0.07（TikHub）或 ¥0.10（SocialDataX），抖音便宜十倍。
@@ -105,22 +110,55 @@ def _raw_envelope(body: str) -> dict:
     return strip(payload)
 
 
+def _raw_detail(body: str) -> dict:
+    """详情接口原始响应里的**笔记 / 视频本体**，不经过归一化。
+
+    小红书是 data.data[0].note_list[0]，抖音是 data.aweme_detail。找不到本体
+    （比如笔记没了时 data 直接是 []）就返回整个信封去空值——那时候信封里的
+    code / msg 才是要看的东西。
+    """
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    inner = payload.get("data")
+    if isinstance(inner, dict):
+        aweme = inner.get("aweme_detail")
+        if isinstance(aweme, dict):
+            return _trim_raw(aweme, noisy=_DETAIL_NOISY_KEYS)
+        core = inner.get("data")
+        if isinstance(core, list) and core and isinstance(core[0], dict):
+            notes = core[0].get("note_list")
+            if isinstance(notes, list) and notes and isinstance(notes[0], dict):
+                return _trim_raw(notes[0], noisy=_DETAIL_NOISY_KEYS)
+    return _raw_envelope(body)
+
+
 # 原始条目里这些键是头像/主页/账号杂项，一条评论里能占两千多字符，把真正要看的
 # 字段（text_extra / label_* / is_hot …）全挤出屏幕。打印时只留昵称。
 _NOISY_KEYS = {"user", "author", "avatar_thumb", "avatar", "image_list", "sticker"}
 # 条目里装着**另一层评论**的键：抖音把作者回复塞在 reply_comment 里。
 _NESTED_COMMENT_KEYS = {"reply_comment", "sub_comments", "replies"}
+# 详情本体里的媒体/作者杂项：一条视频的 video / music 对象几千字符，
+# 而要看的是 in_censor / status / risk 这类几十字节的状态字段。
+_DETAIL_NOISY_KEYS = _NOISY_KEYS | {
+    "images_list", "image_info_list", "video", "video_info", "music", "cover",
+    "dynamic_cover", "origin_cover", "share_info", "video_tag", "text_extra",
+}
 
 
-def _trim_raw(item: dict) -> dict:
+def _trim_raw(item: dict, *, noisy: set | None = None) -> dict:
     """把一条原始评论压成能读的样子：去掉杂项对象，去掉空值，其余原样。
 
     「空值」= None / "" / [] / {} / 0 / False / -1。抖音的原始条目一半以上是这种
     占位，留着只会淹没那几个真正有信息的字段。要看全貌就去掉这个过滤。
     """
+    noisy = _NOISY_KEYS if noisy is None else noisy
     out = {}
     for key, value in item.items():
-        if key in _NOISY_KEYS:
+        if key in noisy:
             if isinstance(value, dict):
                 name = value.get("nickname") or value.get("name")
                 if name:
@@ -145,6 +183,7 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     calls = plan_calls(row, settings)
     raw_comments: list = []
     raw_envelope: dict = {}
+    raw_detail: dict | None = None
 
     print(f"\n{'=' * 68}\n{provider.label}\n{'=' * 68}")
     if not calls:
@@ -195,6 +234,10 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
                                 response.request_id, key)
 
         label = "评论" if call.purpose == "comments" else "详情"
+        if raw and call.purpose == "detail":
+            # 成功失败都留着：笔记「仅作者可见」时详情接口可能直接回空（GONE），
+            # 那时候信封里的 code / msg 正是要看的。
+            raw_detail = _raw_detail(response.body)
         if isinstance(result, Err):
             print(f"  {label}：❌ [{result.kind.value}] {result.operator_text()[:150]}")
             if result.kind.value == "auth":
@@ -250,6 +293,12 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
         # 那蓝词只可能在页级字段里——把评论列表之外的整个信封也打出来。
         print("  评论条目之外的页级字段（--raw，已去掉空值）：")
         print("    " + json.dumps(raw_envelope, ensure_ascii=False))
+    if raw_detail is not None:
+        # 「分享链接打开是『笔记不存在』、评论接口却照常返回」的笔记，评论接口
+        # 看不出任何异常（它量的是笔记在不在后台，不是公众看不看得见）。
+        # 能看出来的话只可能在详情本体的状态字段里——整个打出来人工看。
+        print("  详情接口的原始笔记/视频字段（--raw，已去掉媒体和作者杂项）：")
+        print("    " + json.dumps(raw_detail, ensure_ascii=False))
 
     if snapshot.supports_pinned and snapshot.pinned is None:
         print("\n  ⚠ 没识别到置顶评论。如果这条笔记**确实有**置顶，说明上游改字段了，"
@@ -293,6 +342,7 @@ def main() -> int:
             return 2
     force = "--force" in sys.argv
     raw = "--raw" in sys.argv
+    detail = "--detail" in sys.argv
 
     unsafe = os.environ.get("ALLOW_UNSAFE_ENDPOINT_OVERRIDE", "").strip() in ("1", "true", "yes")
     try:
@@ -301,6 +351,10 @@ def main() -> int:
         print(f"TIKHUB_BASE 被拒绝：{exc}", file=sys.stderr)
         return 2
     settings = Settings()
+    if detail:
+        # 线上默认不调小红书详情（占月成本 39%，见 config.Settings.detail_within_days）。
+        # 探针上显式要了才调，而且不看帖龄——探针的行没有发布时间。
+        settings.detail_within_days = 3650
     if not parse(link).usable:
         print(f"链接识别不了：{parse(link).describe_failure()}", file=sys.stderr)
         return 2
