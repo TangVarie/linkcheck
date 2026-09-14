@@ -182,6 +182,26 @@ class TestTikhubXhsDetail(unittest.TestCase):
         self.assertEqual(snap.comment_count, 193)
         self.assertIs(snap.censored, False)
 
+    def test_error_placeholder_means_hidden_from_public(self):
+        """实测（2026-09-14）：笔记被限制成仅作者可见时，评论接口照常返回，
+        detail 给的却是一个错误占位（model_type=error / Note is not available）。
+        译成审核/受限标记而不是 GONE：runner 在评论接口有活证据时会把 detail
+        的死讯当上游自相矛盾丢掉，而这里两个接口都没说错。"""
+        res = self.parse(wrap({"code": 0, "success": True, "data": [{"note_list": [{
+            "id": "6a8538d6000000003300c037", "text": "Note is not available",
+            "image": "https://picasso-static.xiaohongshu.com/x.png",
+            "countdown": 3, "model_type": "error",
+            "user_id": "6936454000000000320164b4",
+        }]}]}))
+        self.assertIsInstance(res, Ok)
+        snap = analyze.Snapshot(platform="xhs", comment_count=1)
+        analyze.merge_detail(snap, res.data)
+        self.assertIs(snap.censored, True)
+        self.assertIn("Note is not available", snap.censor_reason)
+        self.assertIn("对外不可见", snap.censor_reason)
+        self.assertIsNone(snap.like_count)          # 占位里没有互动数，别读成 0
+        self.assertEqual(snap.comment_count, 1)     # 评论接口量到的数不被覆盖
+
     def test_empty_data_list_is_a_definitive_death(self):
         """实测：笔记不存在时 detail 的 data 直接是 []。这个信号是干净的。"""
         res = self.parse(wrap({"code": 0, "success": True, "data": []}))

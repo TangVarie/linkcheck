@@ -658,6 +658,17 @@ class TestRiskDetection(unittest.TestCase):
         self.assertIn("风控中", v.tags)
         self.assertTrue(any("审核中/受限" in n for n in v.notes))
 
+    def test_censor_reason_is_spelled_out_in_the_note(self):
+        """上游给了具体原因（仅作者可见那种）时，诊断信息说具体的那句，
+        而不是通用的「审核中/受限」——运营要知道去平台上看什么。"""
+        snap = self._snap(30)
+        snap.censored = True
+        snap.censor_reason = "详情接口不给笔记本体，只回「Note is not available」——笔记对外不可见"
+        v = analyze.decide(snap, self.settings, previous_comment_count=None, age_hours=10)
+        self.assertIn("风控中", v.tags)
+        self.assertTrue(any("Note is not available" in n and "风控中" in n for n in v.notes))
+        self.assertFalse(any("审核中/受限" in n for n in v.notes))
+
     def test_throttled_is_volatile_and_clears_on_recovery(self):
         """恢复正常要能自动摘掉，否则表会越来越红，最后没人看。"""
         v = self.decide(80, previous_comment_count=75,
