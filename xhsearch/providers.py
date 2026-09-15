@@ -531,7 +531,8 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
             # 不译成 GONE：runner 在评论接口有活证据时会把 detail 的死讯当
             # 上游自相矛盾丢掉（_looks_alive），而这里恰恰是「在，但别人看不见」，
             # 两个接口都没说错。译成审核/受限标记 → analyze.decide 打「风控中」，
-            # 巡查状态仍是「正常」（数据确实量到了），恢复可见后标签自动摘掉。
+            # 巡查状态仍是「正常」（数据确实量到了）。「风控中」机器只加不减，
+            # 恢复可见后也留着，由运营去摘（见 config.Tags.sticky）。
             return Ok({
                 "like_count": None, "collect_count": None, "share_count": None,
                 "comment_count": None,

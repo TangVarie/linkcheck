@@ -101,6 +101,25 @@ class TestTagMerge(unittest.TestCase):
     def test_none_current(self):
         self.assertEqual(tags.merge(None, {"风控中"}, self.NS).final, ["风控中"])
 
+    def test_sticky_tags_are_never_removed(self):
+        """机器只加不减（2026-09-15）：行上的「风控中」不管谁打的，本轮没算出来
+        也照单保留；热度档位照常换档。"""
+        result = tags.merge(["风控中", "爆贴", "已复盘"], {"大爆"}, self.NS,
+                            sticky=["风控中"])
+        self.assertEqual(result.final, ["风控中", "已复盘", "大爆"])
+        self.assertEqual(result.removed, ["爆贴"])
+        self.assertEqual(result.added, ["大爆"])
+
+    def test_sticky_tag_added_counts_as_a_change(self):
+        result = tags.merge(["评估中"], {"评估中", "风控中"}, self.NS, sticky=["风控中"])
+        self.assertEqual(result.added, ["风控中"])
+        self.assertTrue(result.changed)
+
+    def test_sticky_tag_already_present_is_idempotent(self):
+        result = tags.merge(["风控中", "评估中"], {"评估中"}, self.NS, sticky=["风控中"])
+        self.assertFalse(result.changed)
+        self.assertEqual(result.final, ["风控中", "评估中"])
+
 
 class TestCommentAnalysis(unittest.TestCase):
     def _xhs_page(self, count=42, with_pinned=True):
@@ -669,8 +688,10 @@ class TestRiskDetection(unittest.TestCase):
         self.assertTrue(any("Note is not available" in n and "风控中" in n for n in v.notes))
         self.assertFalse(any("审核中/受限" in n for n in v.notes))
 
-    def test_throttled_is_volatile_and_clears_on_recovery(self):
-        """恢复正常要能自动摘掉，否则表会越来越红，最后没人看。"""
+    def test_throttled_is_not_reasserted_on_recovery(self):
+        """decide 只产出**本轮**成立的标签：数字回升了就不再算出疑似限流/风控中。
+        行上已有的这两个留不留，由 tags.merge 的 sticky 决定（2026-09-15 起
+        一律保留，人来摘），这里只管本轮有没有新证据。"""
         v = self.decide(80, previous_comment_count=75,
                         current_tags=["疑似限流", "风控中"])
         self.assertNotIn("疑似限流", v.tags)

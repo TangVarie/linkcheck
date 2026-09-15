@@ -129,8 +129,12 @@ class Tags:
     （两击定罪之后）。评论数的异常都不进风控——腰斩是 疑似限流，
     起不来是 无水花，口径分开，运营才知道每个标签背后是什么证据。
 
-    风控中 / 疑似限流反映**当前状态**，每轮重算，恢复正常要能自动摘掉，
-    否则表会越来越红，最后没人看。
+    **机器只加不减（2026-09-15，Ziao 拍板）**：风控中 / 疑似限流 一旦在行上，
+    机器永远不摘——运营人工判定的风控（比如「仅作者可见」这种机器抓不到的），
+    不能被下一轮的「无水花」覆盖掉。摘标签是人的事。
+    可撤回的只剩热度档位（含退役的旧档位名）：「观察中」升成「无水花」、
+    「爆贴」升成「大爆」时低档让位，那是同一把尺子上的刻度往上走，不是撤回
+    一个结论。见 sticky() / retractable()。
     """
 
     observing: str = "观察中"
@@ -156,8 +160,24 @@ class Tags:
                             self.hot, self.super_hot) if t]
 
     def namespace(self) -> list[str]:
-        """机器管辖的全部标签（含退役标签）。merge 的可撤回范围。"""
+        """机器管辖的全部标签（含退役标签）——机器**会写**的范围。
+
+        可撤回的只是其中的热度档位（见 retractable / sticky）。
+        """
         return [*self.heat_tiers(), self.risk, self.throttled, *self.retired]
+
+    def retractable(self) -> list[str]:
+        """机器可以摘掉的标签：热度档位（升档时低档让位）和退役的旧名字
+        （比如改名 / 关掉「观察中」之后残留的旧值、早期的「已失效」）。"""
+        return [t for t in self.namespace() if t not in self.sticky()]
+
+    def sticky(self) -> list[str]:
+        """机器会写、但**永远不摘**的标签：风控中 / 疑似限流。
+
+        行上已有的这两个，不管是机器打的还是人打的，每轮原样保留；
+        机器只在自己判定成立时**加**上去。摘掉它们是运营的事。
+        """
+        return [self.risk, self.throttled]
 
     def machine_written(self) -> list[str]:
         """机器仍会写的标签。doctor 只要求表里建这些选项，退役的不用建。"""
