@@ -54,6 +54,8 @@ class TagPlan:
     exclusive: tuple[tuple[str, ...], ...] = ()
     # 读表那一刻的现值，用来判断「这中间有没有人动过」。
     snapshot_tags: list[str] = field(default_factory=list)
+    # 永远不摘的机器标签（风控中 / 疑似限流），见 config.Tags.sticky。
+    sticky: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -761,6 +763,7 @@ def refresh(
                 settings.tags.namespace(),
                 known_options=known_options,
                 exclusive=(settings.tags.heat_tiers(),),
+                sticky=settings.tags.sticky(),
             )
             # 记下重算所需的材料：写回前会拿**那一刻**的现值再 merge 一次，
             # 这样运行期间运营新加的人工标签不会被旧快照算出的整列值覆盖。
@@ -771,6 +774,7 @@ def refresh(
                 known_options=None if known_options is None else list(known_options),
                 exclusive=(tuple(settings.tags.heat_tiers()),),
                 snapshot_tags=list(row.current_tags or []),
+                sticky=list(settings.tags.sticky()),
             )
             if merged.dropped_unknown:
                 fields[f.failure_reason] = (
@@ -1520,6 +1524,7 @@ def _reconcile_tags(
             plan.namespace,
             known_options=plan.known_options,
             exclusive=plan.exclusive,
+            sticky=plan.sticky,
         )
         changed_rows += 1
         if merged.changed:

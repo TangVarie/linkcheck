@@ -108,6 +108,8 @@ class TestHappyPath(RunnerTest):
 
 class TestHumanTagsAreNeverClobbered(RunnerTest):
     def test_manual_tags_survive_machine_write(self):
+        """人工标签原样保留；行上已有的「风控中」**也**保留（机器只加不减，
+        2026-09-15 起）——运营人工判定的风控不能被这一轮的热度档覆盖掉。"""
         report = self.run_with(
             [sse(comment_page(count=150)), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
             [xhs_row(tags=["已复盘", "客户确认", "风控中"])],
@@ -116,7 +118,29 @@ class TestHumanTagsAreNeverClobbered(RunnerTest):
         self.assertIn("已复盘", final)
         self.assertIn("客户确认", final)
         self.assertIn("大爆", final)
-        self.assertNotIn("风控中", final)   # 机器标签可撤回
+        self.assertIn("风控中", final)      # sticky：机器不摘，人来摘
+
+    def test_human_risk_tag_is_not_overwritten_by_flop(self):
+        """现场：运营人工把一条帖标成「风控中」（比如仅作者可见那种机器抓不到的），
+        下一轮机器算出「无水花」——以前会把「风控中」摘掉换成「无水花」，
+        现在两个并存：无水花是机器的结论，风控中是人的结论，互不覆盖。"""
+        report = self.run_with(
+            [sse(comment_page(count=3)), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(tags=["风控中"], age_days=5)],
+        )
+        final = report.outcomes[0].fields[self.settings.fields.traffic_status]
+        self.assertIn("风控中", final)
+        self.assertIn("无水花", final)
+
+    def test_throttled_stays_until_a_human_removes_it(self):
+        """「疑似限流」同样 sticky：评论数回升了机器也不摘，运营看过再清。"""
+        report = self.run_with(
+            [sse(comment_page(count=80)), sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [xhs_row(tags=["疑似限流", "爆贴"], prev_count=75)],
+        )
+        fields = report.outcomes[0].fields
+        if self.settings.fields.traffic_status in fields:
+            self.assertIn("疑似限流", fields[self.settings.fields.traffic_status])
 
     def test_unknown_option_is_filtered_out(self):
         report = self.run_with(

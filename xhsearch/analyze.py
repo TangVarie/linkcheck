@@ -75,6 +75,9 @@ class Snapshot:
     # 字段语义还没在真实被封的帖子上验过（只见过 false），所以打标签的同时
     # 仍在诊断信息里请人工确认，见 docs/待验证清单.md。
     censored: Optional[bool] = None
+    # 上游给审核/受限标记时附带的一句人话（比如「详情接口不给笔记本体，只回
+    # Note is not available」）。有它诊断信息就说具体的，没有就说通用的那句。
+    censor_reason: str = ""
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -185,6 +188,9 @@ def merge_detail(snapshot: Snapshot, data: dict[str, Any]) -> Snapshot:
         snapshot.comment_count = _int_or_none(data.get("comment_count"))
     if isinstance(data.get("_censored"), bool):
         snapshot.censored = data["_censored"]
+        reason = data.get("_censor_reason")
+        if isinstance(reason, str) and reason:
+            snapshot.censor_reason = reason
     points = data.get("points") if isinstance(data.get("points"), dict) else {}
     if points.get("balance") is not None:
         snapshot.points_balance = points["balance"]
@@ -594,7 +600,10 @@ def decide(
     # —— 审查标记：上游明确说这条在审核/受限，才打「风控中」——
     if snapshot.censored:
         verdict.tags.add(t.risk)
-        verdict.notes.append("⚠ 上游把这条标成了审核中/受限 → 风控中，请人工确认")
+        if snapshot.censor_reason:
+            verdict.notes.append(f"⚠ {snapshot.censor_reason} → 风控中，请人工确认")
+        else:
+            verdict.notes.append("⚠ 上游把这条标成了审核中/受限 → 风控中，请人工确认")
 
     # —— 置顶 ——
     verdict.pin = decide_pin(snapshot)

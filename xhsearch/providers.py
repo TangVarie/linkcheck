@@ -521,6 +521,25 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
             return Err(Failure.GONE, "no_note", "详情接口没有返回任何笔记，笔记已不存在或不可见",
                        http_status=http_status, request_id=request_id, definitive=True)
         note = note_list[0] if isinstance(note_list[0], dict) else {}
+        if note.get("model_type") == "error":
+            # 实测（2026-09-14）：笔记被限制成**仅作者可见**时，笔记没删、评论接口
+            # 照常返回（评论、作者 id、排序策略都在），detail 却不给笔记本体，
+            # 而是给一个错误占位：`model_type: "error"`、`text: "Note is not
+            # available"`、`countdown: 3`——正是别人点开分享链接看到的那个
+            # 「笔记不存在」页面的数据形态。
+            #
+            # 不译成 GONE：runner 在评论接口有活证据时会把 detail 的死讯当
+            # 上游自相矛盾丢掉（_looks_alive），而这里恰恰是「在，但别人看不见」，
+            # 两个接口都没说错。译成审核/受限标记 → analyze.decide 打「风控中」，
+            # 巡查状态仍是「正常」（数据确实量到了）。「风控中」机器只加不减，
+            # 恢复可见后也留着，由运营去摘（见 config.Tags.sticky）。
+            return Ok({
+                "like_count": None, "collect_count": None, "share_count": None,
+                "comment_count": None,
+                "_censored": True,
+                "_censor_reason": f"详情接口不给笔记本体，只回「{note.get('text') or 'error'}」"
+                                  "——笔记对外不可见（作者自己可能仍看得到）",
+            }, request_id=request_id)
         return Ok({
             "like_count": note.get("liked_count"),
             "collect_count": note.get("collected_count"),
