@@ -1685,6 +1685,7 @@ def _project_json(p: summary.ProjectSnapshot) -> dict:
         "due_rows": p.due_rows, "due_yuan": round(p.due_yuan, 2),
         "estimate_blocked": p.estimate_blocked,
         "stale_rows": p.stale_rows, "never_checked_rows": p.never_checked_rows,
+        "missing_publish_time_rows": p.missing_publish_time_rows,
         "oldest_checked_ms": p.oldest_checked_ms,
         "refresh_status_counts": p.refresh_status_counts,
         "traffic_tag_counts": p.traffic_tag_counts,

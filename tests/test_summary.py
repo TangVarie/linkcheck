@@ -24,7 +24,7 @@ def record(record_id="rec1", *, settings=None, link=XHS, published_hours_ago=10,
            checked_hours_ago=1, tags=(), refresh_status="", negative_status="",
            pin_status="", queued=False, seed=None, negative=None,
            comment_count=None, diagnosis="", digest="", negative_digest="",
-           extra=None):
+           monitoring=None, extra=None):
     """造一条飞书 record。只填给到的列——飞书对空单元格根本不返回键，
     测试里也照这个来，否则测不到「这一格没值」的路径。"""
     f = (settings or Settings()).fields
@@ -45,6 +45,8 @@ def record(record_id="rec1", *, settings=None, link=XHS, published_hours_ago=10,
         cells[f.pinned_status] = pin_status
     if queued:
         cells[f.queued] = True
+    if monitoring is not None:
+        cells[f.monitoring] = monitoring
     if seed:
         cells[f.seed_keywords] = list(seed)
     if negative:
@@ -154,7 +156,7 @@ class TestFreshness(unittest.TestCase):
 
     def test_missing_publish_time_is_not_reported_as_stale(self):
         """发布时间读不出来是「那一格有问题」，诊断信息里已经在报了，
-        不该在面板上占第二个位置。"""
+        不该在面板上占第二个位置。它有自己的计数，见 TestMissingPublishTime。"""
         snap = snapshot([record("r1", published_hours_ago=None,
                                 checked_hours_ago=24 * 30)])
         self.assertEqual(snap.stale_rows, 0)
@@ -166,6 +168,56 @@ class TestFreshness(unittest.TestCase):
             record("r3", checked_hours_ago=10),
         ])
         self.assertEqual(snap.oldest_checked_ms, ms(NOW - timedelta(hours=50)))
+
+
+class TestMissingPublishTime(unittest.TestCase):
+    """「发布时间」空着的在管行要被单独数出来。
+
+    它不报出来就完全没有声音：不算「卡住了」、不进待办，而 analyze 那句 ⚠
+    只在评论数够不上任何热度档时才写。代价是这些行**永远不归档**，
+    按最快的一档一直刷到有人发现为止。
+    """
+
+    def test_managed_row_without_publish_time_is_counted(self):
+        snap = snapshot([
+            record("r1", published_hours_ago=None),
+            record("r2", published_hours_ago=10),
+        ])
+        self.assertEqual(snap.missing_publish_time_rows, 1)
+        self.assertEqual(snap.rows_without_publish_time, ["r1"])
+
+    def test_unmonitored_rows_do_not_count(self):
+        """没勾「是否巡查」的多半是还没发的草稿：它本来就不刷，
+        报出来只是噪声（Ziao 2026-09 拍板）。"""
+        snap = snapshot([
+            record("draft", published_hours_ago=None, monitoring=False),
+            record("live", published_hours_ago=None, monitoring=True),
+        ])
+        self.assertEqual(snap.missing_publish_time_rows, 1)
+        self.assertEqual(snap.rows_without_publish_time, ["live"])
+
+    def test_no_monitoring_column_counts_everything(self):
+        """表里没有那一列时 row.monitoring 默认 True，这个数就和卡上
+        别的数一个口径——那种表另有一条体检提示在说这件事。"""
+        snap = snapshot([record("r1", published_hours_ago=None)])
+        self.assertEqual(snap.missing_publish_time_rows, 1)
+
+    def test_it_is_not_a_todo(self):
+        """没填发布时间不是「出事了」，是「那一格没填」。
+        混进待办会把真正的风控行往下挤。"""
+        snap = snapshot([record("r1", published_hours_ago=None)])
+        self.assertEqual(snap.todos, [])
+
+    def test_the_id_list_is_capped_but_the_count_is_not(self):
+        records = [record(f"r{i}", published_hours_ago=None) for i in range(5)]
+        snap = snapshot(records, max_todos=2)
+        self.assertEqual(snap.missing_publish_time_rows, 5)
+        self.assertEqual(len(snap.rows_without_publish_time), 2)
+
+    def test_a_filled_publish_time_counts_nothing(self):
+        snap = snapshot([record("r1", published_hours_ago=10)])
+        self.assertEqual(snap.missing_publish_time_rows, 0)
+        self.assertEqual(snap.rows_without_publish_time, [])
 
 
 class TestKeywordCoverage(unittest.TestCase):

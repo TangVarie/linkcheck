@@ -104,6 +104,18 @@ class ProjectSnapshot:
     oldest_checked_ms: Optional[int] = None
     never_checked_rows: int = 0
 
+    # 「发布时间」那一格空着（或读不出来）的在管行。**这是个会安静烧钱的洞**：
+    # 帖龄算不出来 → 永远跨不过归档线 → 按最快的一档
+    # （`RefreshTiers.fastest_interval_hours`）一直刷下去，永远不停。
+    # 而这件事原来在面板上一点声音都没有：`_is_stale` 故意不把它算成
+    # 「卡住了」，`_todo_reasons` 只收机器下过结论的事，`analyze` 那句
+    # ⚠ 也只在**评论数够不上任何热度档**时才写进「诊断信息」——
+    # 一条有热度、发布时间空着的行，三道口全部躲过去。所以单独数一个。
+    # 只数勾着「是否巡查」的行：没勾的多半是还没发的草稿，
+    # 那种行本来就不刷，报出来只是噪声（Ziao 2026-09 拍板）。
+    missing_publish_time_rows: int = 0
+    rows_without_publish_time: list[str] = field(default_factory=list)
+
     refresh_status_counts: dict[str, int] = field(default_factory=dict)
     traffic_tag_counts: dict[str, int] = field(default_factory=dict)
     negative_rows: int = 0
@@ -306,6 +318,13 @@ def build_snapshot(
         archived = age is not None and settings.refresh.interval_hours_for_age(age) is None
         if archived:
             snap.archived_rows += 1
+        # 帖龄算不出来 = 那一格是空的或者是脏的，两种都永远不归档。
+        # `row.monitoring` 在表里没有「是否巡查」列时默认 True，于是这个数
+        # 和这张卡上别的数一个口径（那种表另有一条体检提示在说这件事）。
+        if age is None and row.monitoring:
+            snap.missing_publish_time_rows += 1
+            if len(snap.rows_without_publish_time) < max_todos:
+                snap.rows_without_publish_time.append(row.record_id)
         if row.queued:
             snap.queued_rows += 1
         if row.last_updated_ms is None:

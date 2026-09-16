@@ -1158,6 +1158,30 @@ class TestUnknownEstimateIsNotZero(unittest.TestCase):
         self.assertIn("算不出", page)
 
 
+class TestMissingPublishTimeOnTheCard(unittest.TestCase):
+    """「没填发布时间」这一行有就说、没有就一个字都不占。
+
+    它不是覆盖度（「还没配」），是「这些行在空转」——帖龄算不出来就
+    永远跨不过归档线，会按最快的一档一直刷下去。
+    """
+
+    def _page(self, count: int) -> str:
+        snap = summary.ProjectSnapshot(label="A", app_token="t", table_id="tb",
+                                       total_rows=9, missing_publish_time_rows=count)
+        return panel_view.overview_page(
+            overview=summary.Overview(projects=[snap], generated_at=NOW),
+            error="", fetched_at=NOW.timestamp(), config=config(), csrf="t")
+
+    def test_the_card_shows_the_count_and_why_it_matters(self):
+        page = self._page(3)
+        self.assertIn("没填发布时间", page)
+        self.assertIn("3 行", page)
+        self.assertIn("永不归档", page)
+
+    def test_zero_takes_no_space_at_all(self):
+        self.assertNotIn("没填发布时间", self._page(0))
+
+
 class TestProjectRoutes(unittest.TestCase):
     """项目页的写路径。它们改的是**注册表**（这套东西自己的配置存储），
     以及业务表的**结构**（只追加）——业务表的数据一个字都不碰。

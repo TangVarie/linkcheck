@@ -1253,6 +1253,13 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     due_text = (f"<span class=num>{p.due_rows} 行 ≈ ¥{p.due_yuan:.2f}</span>"
                 if not p.estimate_blocked
                 else "<b style='color:var(--danger-deep)'>无法估算</b>")
+    # 有就说，没有就一个字都不占。这一行不是覆盖度（「还没配」），
+    # 是「这些行在空转」：帖龄算不出来 → 永远不归档 → 按最快的一档一直刷。
+    no_publish = (
+        f"<div><span class=lbl>没填发布时间</span>"
+        f"<span>{p.missing_publish_time_rows} 行 <span class=muted>"
+        f"（算不出帖龄，永不归档，一直按最快一档刷）</span></span></div>"
+        if p.missing_publish_time_rows else "")
     seed_gap = p.total_rows - p.seed_keyword_rows
     neg_gap = p.total_rows - p.negative_keyword_rows
     coverage = (
@@ -1280,6 +1287,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     <div><span class=lbl>卡住了</span><span>{p.stale_rows} 行
       {f'<span class=muted>（{p.never_checked_rows} 从没刷过）</span>' if p.never_checked_rows else ''}</span></div>
     <div><span class=lbl>最旧检查</span><span>{_e(_stamp(p.oldest_checked_ms, offset_hours))}</span></div>
+    {no_publish}
     {coverage}
   </div>
   <div style='margin-top:9px'>{_counts_chips(p.traffic_tag_counts)}</div>
