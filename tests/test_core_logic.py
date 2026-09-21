@@ -1085,6 +1085,44 @@ class TestAuthorBlindChannel(unittest.TestCase):
         self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.clean)
         self.assertFalse(any("自家账号的回复没有被排除" in n for n in v.notes))
 
+    def test_untrusted_author_flags_never_exclude_anything(self):
+        """**不可信的标记不许拿来排除任何东西**——排除就是信了它。
+
+        Codex 在 PR #39 上逮到的那个洞：原来不管可不可信都 skip_author=True，
+        于是一条**真负面**被上游错标成作者，就会被静默丢掉——命中数归零，
+        负面告警和「自家回复没被排除」那句提醒**一个都不发**。
+        坏在最要命的方向上，正好是「漏掉真负面比误报一条糟得多」的反面。
+        """
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                # 路人写的真负面，却被这家不可信的通道标成了「作者」
+                {"content": "用了过敏，踩雷", "like_count": 30,
+                 "is_author_comment": True, "author": {"name": "路人"}},
+            ],
+            "comment_count": 12,
+            "_capabilities": {"pinned": False, "author": False},
+        })
+        self.assertFalse(snap.author_reported)
+        v = self._decide(snap)
+        self.assertTrue(v.negative_hits, "真负面被不可信的作者标记吞掉了")
+        self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.found)
+        self.assertTrue(any("自家账号的回复没有被排除" in n for n in v.notes))
+
+    def test_trusted_author_flags_still_exclude(self):
+        """对照组：标记可信时照旧排除，这道改动不能把正常链路一起放开。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "温和配方，不会过敏的哦", "like_count": 2,
+                 "is_author_comment": True, "author": {"name": "官号"}},
+            ],
+            "comment_count": 12,
+            "_capabilities": {"pinned": True, "author": True},
+        })
+        self.assertTrue(snap.author_reported)
+        v = self._decide(snap)
+        self.assertFalse(v.negative_hits)
+        self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.clean)
+
     def test_one_marked_item_is_enough_to_prove_the_channel_reports(self):
         """能力判据是「整页有没有一条写过这个键」，不是「每条都写了」。"""
         snap = self._page([

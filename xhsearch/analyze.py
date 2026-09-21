@@ -391,9 +391,10 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
 
     只有小红书的评论条目带作者标记（`is_author_comment`），抖音一律
     False，所以抖音行上这个开关等于没开——这是上游能力的边界，不是
-    这里可以补的。**通道也是一道边界**：降级到不报作者标记的备胎时，
-    这个开关同样会静默失效，由 `Snapshot.author_reported` 认出来，
-    decide() 负责在诊断信息里说一声（这里照常匹配，不改行为）。
+    这里可以补的。**通道也是一道边界**：降级到作者标记不可信的备胎时，
+    调用方（decide）会把 `skip_author` 直接关掉——不可信的标记不该拿来
+    排除任何东西，排除就是信了它，而错标成作者的那条真负面会被静默丢掉。
+    关掉之后自家回复也会算进命中，由诊断信息里那句提醒交给人工核一眼。
 
     一条评论同时命中多个词时只记第一个命中的词（按关键词在表里的顺序），
     免得同一条评论在快照里出现好几遍。
@@ -717,8 +718,14 @@ def decide(
     # 假的安全感，比不判还糟。
     if negative_keywords and saw_comment_page(snapshot):
         verdict.negative_checked = True
+        # 作者标记不可信时**不拿它排除任何东西**——排除就是信了它。
+        # 一边声明「这家的作者标记不可信」、一边还照着它把评论丢掉，是自相
+        # 矛盾的，而且坏在最要命的方向上：一条真负面被错标成作者就会被静默
+        # 丢掉，命中数归零，于是负面告警和下面那句提醒**一个都不发**。
+        # 宁可把自家回复也算进来（下面那句提醒会让人去核一眼），
+        # 也不能漏掉真负面。
         verdict.negative_hits = match_all_keywords(
-            snapshot, negative_keywords, skip_author=True)
+            snapshot, negative_keywords, skip_author=snapshot.author_reported)
         if verdict.negative_hits:
             words = "、".join(dict.fromkeys(h.keyword for h in verdict.negative_hits))
             verdict.notes.append(
