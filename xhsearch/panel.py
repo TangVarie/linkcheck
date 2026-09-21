@@ -45,8 +45,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
-from . import (feishu, panel_settings, provision, railway, registry, schema,
-               summary, tablespec)
+from . import (channels as channels_mod, feishu, panel_settings, provision,
+               railway, registry, schema, summary, tablespec)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -1122,6 +1122,9 @@ class _Deps:
 
     config: PanelConfig
     cache: Cache
+    # 算「哪条通道下线了」要用 channels.order（CHANNEL_ORDER 可以改它），
+    # 所以这一层得拿得到 settings。留 None 是给只测渲染的用例兜底。
+    settings: Optional[Settings] = None
     logs: Optional["LogFeed"] = None
     balances: Optional["BalanceFeed"] = None
     projects: Optional["Projects"] = None
@@ -1384,7 +1387,18 @@ class PanelHandler(BaseHTTPRequestHandler):
             config=self.deps.config, runs=runs, log_error=log_error,
             balances=balances, balance_error=balance_error,
             runway=runway_from_runs(balances, runs),
+            outages=self._outages(balances),
             csrf=csrf_token(self.deps.config, self._session_token()))
+
+    def _outages(self, balances) -> list:
+        """哪条通道此刻发不出请求了。算不出就当没有——**绝不猜**。
+
+        这一步不花钱：余额是 BalanceFeed 早取好的，其余全是本地常量。
+        """
+        settings = self.deps.settings
+        if settings is None:
+            return []
+        return channels_mod.outages(balances, settings, self.deps.config.api_keys)
 
     def _balances(self):
         if self.deps.balances is None:
@@ -1723,12 +1737,13 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
                  balances: Optional["BalanceFeed"] = None,
                  projects: Optional[Projects] = None,
                  queueing: Optional[Queueing] = None,
+                 settings: Optional[Settings] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
-        config=config, cache=cache, logs=logs, balances=balances,
-        projects=projects, queueing=queueing,
+        config=config, cache=cache, settings=settings, logs=logs,
+        balances=balances, projects=projects, queueing=queueing,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -1745,7 +1760,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     projects = Projects(config, resolved)
     queueing = Queueing(config, resolved) if config.app_id else None
     server = build_server(config, cache, logs=logs, balances=balances,
-                          projects=projects, queueing=queueing)
+                          projects=projects, queueing=queueing,
+                          settings=resolved)
     cache.start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"

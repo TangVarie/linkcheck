@@ -1387,7 +1387,66 @@ def _projects_section(config) -> str:
 </div>"""
 
 
-def _balance_section(balances, balance_error: str, runway, config) -> str:
+def _outage_note(outages) -> str:
+    """「有通道发不出请求了」那条告警带。**放在最上面**，在别的提示之前。
+
+    它要回答的不是「余额还剩多少」（那是下面余额区的事），而是运营此刻真正
+    需要知道的两件事：**现在哪些判定停了**、**去做什么能让它恢复**。
+
+    这条带子是 2026-09 那次事故直接催生的：TikHub 余额见底 → 整轮降到备胎
+    → 一整表的「置顶成功」被刷成「置顶掉了」，而面板上从头到尾一个字都没报，
+    因为「余额还够跑 N 天」是两家加起来算的，备胎充裕时它照样是绿的。
+    """
+    if not outages:
+        return ""
+    blocks = []
+    for o in outages:
+        where = "、".join(_e(p) for p in o.platforms) or "所有平台"
+        money = (f"只剩 <span class=num>¥{o.yuan_left:.2f}</span>，"
+                 f"而发一次要 <span class=num>¥{o.one_call_yuan:.3f}</span>")
+        if o.role == "shape_only":
+            # 首选还健康，但它接不了某种链接形态，只有这家能接。面板看不到
+            # 具体的行，所以说的是「哪一类行」，不是「多少行」。
+            what = (f"{where}的首选通道还好好的，但它<b>接不了某些链接形态</b>"
+                    "（比如展不开的抖音短链），那种行只能走这一家——"
+                    "现在走不了了，会一直刷不到。")
+        elif o.stopped:
+            # 确认没有备胎：丢的不是几项能力，是整条链路。话术必须分开——
+            # 「少了置顶监控」和「这个平台完全没在巡查」是两件事。
+            what = (f"<b>{where}没有任何可用通道了，巡查已经停了。</b>"
+                    "这不是少几项能力的问题——这些行现在一条都刷不到。")
+        elif o.fallback_unknown:
+            # 后面只剩读不到余额的通道。**两个方向都不许编**：说成功降级
+            # 是编（它的 Key 可能就是坏的，付费端点照样会拒），说彻底停摆
+            # 也是编（它可能好好的）。就说说不准，并指路去查。
+            what = (f"<b>{where}现在靠不靠得住，说不准</b>——后面配着的通道"
+                    "余额<b>读不到</b>，可能顶上了，也可能它的 Key 本来就是坏的。"
+                    "先看下面余额区那一家报的是什么错。")
+        elif o.lost:
+            # 这几项的后果其实不一样：置顶是整列不碰、作者标记是排除不生效
+            # （两者都会在诊断信息里逐行留痕），蓝词是压根扫不到——它一个字
+            # 都不写，所以**行级上没有任何痕迹**。不能笼统承诺「逐行点名」，
+            # 那会把人支去找一个不存在的东西。
+            what = (f"{where}已经整轮降到 <b>{_e(o.fallback_label)}</b>。"
+                    f"期间<b>受影响的判定</b>："
+                    f"{'、'.join(_e(x) for x in o.lost)}。"
+                    "机器不会拿不可信的值写错表，但这几项这段时间等于没在查。"
+                    "置顶和作者标记会在「诊断信息」里逐行点名；"
+                    "蓝词不写任何东西，恢复后下一轮自然补上。")
+        else:
+            what = (f"{where}已经整轮降到 <b>{_e(o.fallback_label)}</b>，"
+                    "两家能力相同，判定不受影响——只是换了一家在花钱。")
+        blocks.append(
+            f"<div><b>{_e(o.label)} 发不出请求了</b>（{money}）。{what}</div>")
+    fix = ("<div class=muted style='margin-top:6px'>"
+           "去对应后台充值即可恢复；充值后受影响的行会按各自节奏自动刷回来，"
+           "但<b>发布超过 30 天的行已归档、不再自动刷</b>，要手动勾「排队刷新」。"
+           "</div>")
+    return (f"<div class=problem>{_icon('alert-triangle')}"
+            f"<span>{''.join(blocks)}{fix}</span></div>")
+
+
+def _balance_section(balances, balance_error: str, runway, config, outages=()) -> str:
     """余额那一块。
 
     ⚠️ **读不到就说读不到，绝不显示 ¥0。** 真的余额为 0 和读不到余额，
@@ -1402,8 +1461,24 @@ def _balance_section(balances, balance_error: str, runway, config) -> str:
 
     warn_days = getattr(config, "runway_warn_days", 14.0)
     alert_days = getattr(config, "runway_alert_days", 5.0)
+    down = {o.channel: o for o in (outages or [])}
     cards = []
     for b in balances:
+        # 已经发不出请求的那一家：卡片就得是红的。余额是正数（剩 ¥0.04）
+        # 但不够发一次（要 ¥0.07）时，一张普通白卡上的 "$0.01" 看着完全正常，
+        # 而它其实已经下线了——这正是要在这里说破的那个落差。
+        out = down.get(b.channel)
+        if out is not None and not b.error:
+            main = (f"${b.amount:.2f}" if b.unit == "USD"
+                    else f"{b.amount:.0f} 积分")
+            cards.append(
+                f"<div class='card bad'><h3>{_e(b.label)}</h3>"
+                f"<div class='big num'>{_e(main)}</div>"
+                f"<div class=problem>{_icon('alert-circle')}"
+                f"<span>发不出请求了：发一次要 ¥{out.one_call_yuan:.3f}，"
+                f"只剩 ¥{out.yuan_left:.2f}</span></div>"
+                "<div class=muted>详情见页面顶部那条告警</div></div>")
+            continue
         if b.error:
             cards.append(
                 f"<div class='card bad'><h3>{_e(b.label)}</h3>"
@@ -1455,7 +1530,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                   fetched_at: float, config, csrf: str = "",
                   runs=None, log_error: str = "",
                   balances=None, balance_error: str = "", runway=None,
-                  offset_hours: float = 8.0) -> str:
+                  outages=None, offset_hours: float = 8.0) -> str:
     if overview is None:
         # 四态里的「骨架加载」。给骨架而不是一句「正在取数」，是因为这一屏
         # 要读完整张表，第一次可能要好几秒——一个空盒子看着像坏了。
@@ -1546,7 +1621,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                   "要人管", lead_sub),
         _kpi_box(cost + ("+" if overview.unestimatable else ""),
                  "下一轮预计花费", cost_sub),
-        *_runway_box(runway, config),
+        *_runway_box(runway, config, outages or []),
         _kpi_box(overview.stale_rows, "卡住了",
                  "早该刷到却一直没轮到" if overview.stale_rows
                  else "没有积压", warn=bool(overview.stale_rows)),
@@ -1597,7 +1672,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
   <div class=content>
     <h1>内容监控面板</h1>
     <p class=lede>{lede}</p>
-    {stale_note}{domain_note}
+    {_outage_note(outages or [])}{stale_note}{domain_note}
     <div class='kpi stagger-in'>{bar}</div>
 
     <h2 id=s-todo>要人管的行 <span class=n>{len(todos)}{'+' if todos_hidden else ''}</span></h2>
@@ -1613,7 +1688,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
     {_projects_section(config)}
 
-    {_balance_section(balances or [], balance_error, runway, config)}
+    {_balance_section(balances or [], balance_error, runway, config, outages or [])}
 
     {_runs_section(runs or [], log_error, offset_hours)}
   </div>
@@ -1676,14 +1751,24 @@ def _kpi_box(value, key: str, sub: str = "", *, warn: bool = False,
             f"<div class='{sub_cls}'>{_e(sub)}</div></div>")
 
 
-def _runway_box(runway, config) -> list:
+def _runway_box(runway, config, outages=()) -> list:
     """「还够跑几天」那一格。算不出就**整格不显示**——
     放一个「—」只会占掉主块旁边三个位置里的一个，还让人以为是 0。
+
+    ⚠️ 这个数是**两家加起来**算的，所以主通道见底、备胎充裕时它照样很大。
+    那正是 2026-09 那次事故里它没能报警的原因。有通道下线时这一格必须变红
+    并改口——顶上四个数是大多数人唯一会看的地方，在这里显示一个绿油油的
+    「还够跑 40 天」，等于把最该被看见的事藏起来。
     """
     if runway is None or not runway.known:
         return []
     alert_days = getattr(config, "runway_alert_days", 5.0)
     warn_days = getattr(config, "runway_warn_days", 14.0)
+    if outages:
+        names = "、".join(o.label for o in outages)
+        return [_kpi_box(f"{runway.days:.0f}", "余额还够跑",
+                         f"但 {names} 已经发不出请求，见上面的告警",
+                         unit="天", warn=True)]
     sub = f"按 ¥{runway.yuan_per_day:.2f}/天 的实际花速"
     if runway.partial:
         sub += "，有一家读不到，这是下界"

@@ -89,9 +89,15 @@ TIKHUB = "tikhub"
 # 全 false，但作者的回复全在楼中楼（sub_comments）里、第一页一条都没有，所以
 # 这一轮分不出对错。同一家已经在另一个字段上给过错值，在拿到反证之前按不可信
 # 算——代价只是负面判定多一句「自家回复没被排除」的提醒，比静默误报便宜得多。
+# blue_words：评论正文里的蓝词标记 `#词[搜索高亮]#` 还在不在。同一次实测
+# （2026-09-21）里，同一条评论 TikHub 给 `#sportsix[搜索高亮]#`、SocialDataX
+# 给光秃秃的 `sportsix` —— 它把上游的富文本标记归一化掉了。
+# 这一维**不进判定**（蓝词回填只追加、空列表不碰任何一列，所以抹平了
+# 也不会写坏数据），登记它是为了让面板能说清「降到备胎之后到底丢了什么」，
+# 而不是在面板那边再硬编一份清单。
 XHS_COMMENT_CAPABILITIES: dict[str, dict[str, bool]] = {
-    TIKHUB: {"pinned": True, "author": True},
-    SOCIALDATAX: {"pinned": False, "author": False},
+    TIKHUB: {"pinned": True, "author": True, "blue_words": True},
+    SOCIALDATAX: {"pinned": False, "author": False, "blue_words": False},
 }
 
 # TikHub 有两个同功能的域名，**按你的服务器在哪选**（对方文档要求「请勿跨区使用」）：
