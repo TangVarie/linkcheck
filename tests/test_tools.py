@@ -118,6 +118,83 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertNotIn('"has_more"', output)              # 0 这种占位去掉
         self.assertNotIn('"extra"', output)                 # 全空的子对象整个去掉
 
+    def _sdx_page(self, items):
+        """SocialDataX 的成功响应：顶层就是归一化后的形状，**不带 code 字段**
+        （规范原文：「成功响应不会返回该字段」）。"""
+        return transport.Response(200, "application/json", json.dumps({
+            "items": items, "comment_count": 3, "top_level_comment_count": 2,
+            "points": {"cost": 10, "balance": 990},
+        }), "r1")
+
+    SDX_XHS_LINK = "https://www.xiaohongshu.com/explore/" + "b" * 24
+
+    def test_probe_prints_the_declaration_not_just_the_observed_keys(self):
+        """探针必须按**线上的判据**给结论，而线上按通道声明判。
+
+        SocialDataX 照常返回 is_pinned（所以「键在不在」看着一切正常），
+        只是对真正置顶的那条也给 false。只打实测的话，探针会对它印出
+        「✅ 这家报置顶」——正好是错的那个结论，然后有人照着它上线。
+        """
+        present_but_false = [
+            {"content": "戳主页领券", "is_pinned": False, "is_author_comment": False,
+             "like_count": 9, "author": {"name": "官号"}},
+        ]
+        with mock.patch.object(transport, "request",
+                               return_value=self._sdx_page(present_but_false)):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings())
+        # 声明：不可信
+        self.assertIn("通道声明：❌ 不可信，线上不拿这家的值判置顶", output)
+        self.assertNotIn("✅ 可信，线上照常判置顶", output)
+        # 实测：键确实在，值是 false——证据照样要打出来
+        self.assertIn("响应实测：is_pinned 1/1 条带这个键（其中 True 0 条）", output)
+        # 结论那一段要说清「不可信」和「不报」是两种原因
+        self.assertIn("字段在、值是错的", output)
+
+    def test_probe_falls_back_to_observed_keys_without_a_declaration(self):
+        """没有声明时退回看键在不在（老行为，给还没登记的通道兜底）。"""
+        no_flags = [
+            {"content": "戳主页领券", "like_count": 9, "author": {"name": "官号"}},
+            {"content": "路过", "like_count": 0, "author": {"name": "路人"}},
+        ]
+        page = self._sdx_page(no_flags)
+        with mock.patch.dict(providers.XHS_COMMENT_CAPABILITIES, clear=True), \
+             mock.patch.object(transport, "request", return_value=page):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings())
+        self.assertIn("❌ 这家不报置顶", output)
+        self.assertIn("0/2 条带这个键", output)
+        # 「置顶评论」那一行也要说清这不等于「没置顶」
+        self.assertIn("不等于没置顶", output)
+
+    def test_probe_confirms_a_trusted_channel(self):
+        """对照组：声明可信的通道照常印 ✅，别把正常链路也吓成红的。"""
+        items = [{"content": "戳主页领券", "is_pinned": True, "is_author_comment": True,
+                  "like_count": 9, "author": {"name": "官号"}}]
+        page = self._sdx_page(items)
+        with mock.patch.dict(
+                providers.XHS_COMMENT_CAPABILITIES,
+                {providers.SOCIALDATAX: {"pinned": True, "author": True}}), \
+             mock.patch.object(transport, "request", return_value=page):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings())
+        self.assertIn("✅ 可信，线上照常判置顶", output)
+        self.assertIn("响应实测：is_pinned 1/1 条带这个键（其中 True 1 条）", output)
+
+    def test_raw_keeps_these_two_keys_even_when_false(self):
+        """去空值那一步**不能**吃掉这两个键的 false——吃掉之后，
+        「没返回」和「返回了 false」在屏幕上长得一模一样，
+        而分清这两件事正是这个脚本存在的一大半理由。"""
+        items = [{"content": "路过", "is_pinned": False, "is_author_comment": False,
+                  "like_count": 0, "reply_count": 0, "author": {"name": "路人"}}]
+        with mock.patch.object(transport, "request", return_value=self._sdx_page(items)):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings(), raw=True)
+        self.assertIn('"is_pinned": false', output)
+        self.assertIn('"is_author_comment": false', output)
+        # 其余的 0 照旧去掉——只有这两个键的 false 是有信息的
+        self.assertNotIn('"reply_count"', output)
+
     XHS_LINK = "https://www.xiaohongshu.com/explore/" + "a" * 24
     XHS_COMMENTS = transport.Response(200, "application/json", json.dumps({
         "code": 200, "data": {"data": {

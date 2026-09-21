@@ -12,6 +12,26 @@
     评论页  {"items": [{content, like_count, is_pinned, is_author_comment,
                         ip_location, author}],
              "comment_count": int|None, "top_level_comment_count": int|None}
+
+    ⚠️ **通道能力由 `_capabilities` 声明**（见 XHS_COMMENT_CAPABILITIES）：小红书
+    评论页的响应里要带上它，说清这一家的 `is_pinned` / `is_author_comment`
+    值可不可信。这件事**不能**留给 analyze 从响应里推断——推断只认得出
+    「这家不说话」，认不出「这家说了假话」，而后者是实测到的真实形态。
+
+    `is_pinned` 和 `is_author_comment` 这两个键的有无仍然是个兜底信号：会报的
+    通道对**每一条**评论都写上（True / False 都写，照 _xhs_comment_items 的
+    写法），一条都不写 = 这家不报。没有 `_capabilities` 时 analyze 退回看它。
+    两个维度的处置不同、都在 analyze 那边：
+
+    * 置顶不报 → 「置顶状态」那一列**完全不碰**（和抖音一个待遇）
+    * 作者不报 → 负面判定**照常出结论**（漏掉真负面更糟），但诊断信息里
+      说明「自家账号的回复这一轮没被排除」
+
+    SocialDataX 走的是原样透传，所以它报不报由它的**真实**响应说了算——
+    而那一侧至今一次真实调用都没发过（见 docs/供应商对比.md 开头的警告）。
+    新接一家通道时，要么保证这两个键恒定写，要么就让它缺着——
+    **唯独不能补一个假的 False**，那等于让一家看不见的通道去证明
+    「置顶没了」「这条不是自家回的」。
     详情    {"like_count", "collect_count", "share_count", "comment_count",
              "_censored": bool|None}
 
@@ -50,6 +70,29 @@ from .protocol import Err, Failure, Ok, Result, build_body, endpoint, headers, p
 
 SOCIALDATAX = "socialdatax"
 TIKHUB = "tikhub"
+
+# 每家通道在**小红书评论页**上，哪几个维度的值可信。
+#
+# ⚠️ 这不是「响应里有没有这个字段」。能力必须由通道**声明**，不能从响应里推断，
+# 因为推断只认得出「这家不说话」，认不出「这家说了假话」——而后者正是实测到的：
+#
+#   2026-09-21，同一条笔记、同一条 comment_id `6aa74952000000000a0256a3`：
+#     TikHub       show_tags_v2: [{"type": "user_top", "text": "Pinned"}]   ← 置顶
+#     SocialDataX  "is_pinned": false                                        ← 说没置顶
+#   整页 10 条，SocialDataX 的 is_pinned 全是 false。字段在、值是错的。
+#
+# 后果不是少一列数据，是**假告警**：那一轮「置顶状态」会从「置顶成功」被刷成
+# 「置顶掉了」，运营对着一屋子好好的置顶去补置顶。所以 SocialDataX 在验收通过
+# 之前一律不获准对置顶下结论（和抖音一个待遇：那一列完全不碰）。
+#
+# author 那一格是**未验**，不是已证错：这次实测里两家的 is_author_comment 都是
+# 全 false，但作者的回复全在楼中楼（sub_comments）里、第一页一条都没有，所以
+# 这一轮分不出对错。同一家已经在另一个字段上给过错值，在拿到反证之前按不可信
+# 算——代价只是负面判定多一句「自家回复没被排除」的提醒，比静默误报便宜得多。
+XHS_COMMENT_CAPABILITIES: dict[str, dict[str, bool]] = {
+    TIKHUB: {"pinned": True, "author": True},
+    SOCIALDATAX: {"pinned": False, "author": False},
+}
 
 # TikHub 有两个同功能的域名，**按你的服务器在哪选**（对方文档要求「请勿跨区使用」）：
 #   api.tikhub.dev   境内可直连（api.tikhub.io 在大陆被防火墙拦截）
@@ -284,6 +327,14 @@ def _sdx_parse(platform: str, purpose: str, http_status: int, content_type: str,
         return result
     problem = _sdx_shape_error(platform, purpose, result.data)
     if problem is None:
+        # 声明这家在这一页上哪些维度可信。**必须在这里注入**，不能等 analyze
+        # 去看字段在不在——它的 is_pinned 字段一直在，只是值是错的（见
+        # XHS_COMMENT_CAPABILITIES 上面那段实测记录）。
+        # 没登记就不注入，analyze 退回看键在不在：一家还没验过的新通道应该
+        # 走兜底判据，而不是让整行解析炸在一个 KeyError 上。
+        caps = XHS_COMMENT_CAPABILITIES.get(SOCIALDATAX)
+        if platform == "xhs" and purpose == "comments" and caps is not None:
+            result.data["_capabilities"] = caps
         return result
     # 形状不符：记成行级失败并把脱敏后的片段带上，方便对着 request_id 找厂商。
     #
@@ -504,6 +555,10 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
             # comment_count 是含楼中楼的总数，和 detail 的 comments_count 一致（实测）；
             # comment_count_l1 只算一级评论。阈值用总数，跟 App 里显示的口径对齐。
             "top_level_comment_count": core.get("comment_count_l1"),
+            # 没登记就不带这个键（同 _sdx_parse：analyze 退回看键在不在，
+            # 而不是让整行炸在 KeyError 上）。
+            **({"_capabilities": XHS_COMMENT_CAPABILITIES[TIKHUB]}
+               if TIKHUB in XHS_COMMENT_CAPABILITIES else {}),
         }, request_id=request_id)
 
     if platform == "xhs" and purpose == "detail":

@@ -898,6 +898,269 @@ class TestPinStatusColumn(unittest.TestCase):
         self.assertFalse(any("置顶已不在" in n for n in v.notes))
 
 
+class TestPinBlindChannel(unittest.TestCase):
+    """通道不报置顶的那种轮次：**一列都不碰**，绝不写「置顶掉了」。
+
+    真实事故：TikHub 余额见底 → runner 把它判死 → 整轮小红书全部降到备胎，
+    而备胎的响应里没有置顶这个维度。评论照常抓到、诊断信息一个字不报，
+    「置顶状态」却被整表刷成「置顶掉了」——运营对着一屋子假告警去补置顶，
+    而置顶一直好好的。平台能看见置顶 ≠ 这一轮的通道会报置顶。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+        self.ps = self.settings.pin_status
+
+    def _blind_page(self, count=12):
+        """备胎通道的形状：评论齐全，就是没有 is_pinned 这个键。"""
+        return analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "戳主页领券", "like_count": 3, "ip_location": "上海",
+                 "author": {"name": "官号"}},
+                {"content": "求链接", "like_count": 1, "ip_location": "浙江",
+                 "author": {"name": "路人"}},
+            ],
+            "comment_count": count,
+        })
+
+    def test_blind_channel_is_not_qualified_to_judge(self):
+        snap = self._blind_page()
+        self.assertFalse(snap.pin_reported)
+        self.assertFalse(snap.supports_pinned)
+        self.assertIs(analyze.decide_pin(snap), analyze.Pin.UNSUPPORTED)
+
+    def test_blind_channel_never_writes_pin_lost(self):
+        """这就是那个假告警的正解：保持原样，不是写「掉了」。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertFalse(v.pin_checked)
+        self.assertIsNone(
+            analyze.pin_status_value(v, self.ps.pinned_ok, self.settings))
+
+    def test_blind_channel_never_writes_never_pinned_either(self):
+        """没历史的行同样不能写「无置顶」——那也是一个它没资格下的结论。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status="")
+        self.assertIsNone(analyze.pin_status_value(v, "", self.settings))
+
+    def test_blind_round_says_so_in_the_notes(self):
+        """不碰那一列的结果和「什么都没发生」长得一样——必须在诊断信息里出声，
+        否则运营看到的是一个再也不更新的旧状态，还以为机器在正常巡查。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertTrue(any("没查过，不是没置顶" in n for n in v.notes))
+        # 而且绝不能同时再报一句「置顶已不在」——那正是要消灭的假告警。
+        self.assertFalse(any("置顶已不在" in n for n in v.notes))
+
+    def test_reporting_channel_still_judges_normally(self):
+        """会报置顶的通道一行行为都不变：False 也是结论，照样判「掉了」。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [{"content": "路过", "is_pinned": False,
+                       "is_author_comment": False, "like_count": 0,
+                       "ip_location": "", "author": {"name": "路人"}}],
+            "comment_count": 12,
+        })
+        self.assertTrue(snap.pin_reported)
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertEqual(
+            analyze.pin_status_value(v, self.ps.pinned_ok, self.settings),
+            self.ps.pinned_lost)
+
+    def test_one_marked_item_is_enough_to_prove_the_channel_reports(self):
+        """能力判据是「整页有没有一条写过这个键」，不是「每条都写了」——
+        只在置顶那条上写标记的通道照样算会报置顶。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "路过", "like_count": 0, "author": {"name": "路人"}},
+                {"content": "戳主页领券", "is_pinned": True, "like_count": 9,
+                 "author": {"name": "官号"}},
+            ],
+            "comment_count": 12,
+        })
+        self.assertTrue(snap.pin_reported)
+        self.assertIsNotNone(snap.pinned)
+
+    def test_zero_comments_is_still_a_conclusion(self):
+        """一条评论都没有的笔记不可能有置顶，哪家通道都得出同一个结论——
+        这种轮次照常判，不要被能力闸误伤。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 0})
+        self.assertTrue(snap.supports_pinned)
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertEqual(
+            analyze.pin_status_value(v, self.ps.pinned_ok, self.settings),
+            self.ps.pinned_lost)
+
+    def test_blind_channel_does_not_disturb_the_other_columns(self):
+        """只掐置顶这一件事。评论状态/负面状态匹配的是评论正文，
+        和置顶字段无关，不能被这道闸连坐。"""
+        snap = self._blind_page()
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, seed_keywords=["戳主页"],
+                           negative_keywords=["踩雷"])
+        self.assertTrue(v.seed_checked)
+        self.assertIsNotNone(v.seed_hit)
+        self.assertTrue(v.negative_checked)
+        self.assertEqual(
+            analyze.comment_status_value(v, self.settings),
+            self.settings.comment_status.displayed)
+
+
+class TestAuthorBlindChannel(unittest.TestCase):
+    """通道不报作者标记的那种轮次：负面**照常判**，但要说清自家回复没被排除。
+
+    和置顶同源（同一个 show_tags_v2、同一条降级路径），后果却落在另一列上、
+    方向也相反：置顶是无中生有报一个「掉了」，这里是把品牌号自己回的
+    「温和配方，不会过敏」算成负面，一条干净的帖子被写成「有负面」。
+
+    所以处置**故意和置顶不一样**：置顶判不了就整列不碰，负面判不了却不能
+    不判——漏掉真负面比误报一条糟得多。照常出结论 + 诊断信息里点名。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+        self.ns = self.settings.negative_status
+
+    def _page(self, items, count=12):
+        return analyze.read_comment_page("xhs", {"items": items, "comment_count": count})
+
+    def _blind_page(self):
+        """备胎形状：评论齐全，就是没有 is_author_comment 这个键。
+        自家回复和路人的负面话混在一页里——正是会出事的那种局面。"""
+        return self._page([
+            {"content": "温和配方，不会过敏的哦", "like_count": 2,
+             "ip_location": "上海", "author": {"name": "官号"}},
+            {"content": "路过看看", "like_count": 1,
+             "ip_location": "浙江", "author": {"name": "路人"}},
+        ])
+
+    def _reporting_page(self):
+        """会报作者标记的通道：同样两条评论，自家那条带着标记。"""
+        return self._page([
+            {"content": "温和配方，不会过敏的哦", "is_pinned": False,
+             "is_author_comment": True, "like_count": 2,
+             "ip_location": "上海", "author": {"name": "官号"}},
+            {"content": "路过看看", "is_pinned": False,
+             "is_author_comment": False, "like_count": 1,
+             "ip_location": "浙江", "author": {"name": "路人"}},
+        ])
+
+    def _decide(self, snap):
+        return analyze.decide(snap, self.settings, previous_comment_count=None,
+                              age_hours=10, negative_keywords=["过敏"])
+
+    def test_blind_channel_is_detected(self):
+        self.assertFalse(self._blind_page().author_reported)
+
+    def test_negative_verdict_is_still_produced(self):
+        """**和置顶的处置不同**：不能因为排除失效就不判负面——
+        漏掉真的负面比误报一条糟得多。"""
+        v = self._decide(self._blind_page())
+        self.assertTrue(v.negative_checked)
+        self.assertTrue(v.negative_hits)
+        self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.found)
+
+    def test_blind_round_says_own_replies_were_not_excluded(self):
+        """不说的话，运营看到的是一条和真负面一模一样的「有负面」，
+        照着它去走公关流程，而命中的是自己昨天回的那一句。"""
+        v = self._decide(self._blind_page())
+        self.assertTrue(any("自家账号的回复没有被排除" in n for n in v.notes))
+
+    def test_no_warning_when_nothing_hit(self):
+        """没命中就不存在「排除没生效」这回事。每轮都挂一句只会把真正
+        要看的那几条淹掉。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, negative_keywords=["踩雷"])
+        self.assertTrue(v.negative_checked)
+        self.assertFalse(v.negative_hits)
+        self.assertFalse(any("自家账号的回复没有被排除" in n for n in v.notes))
+
+    def test_reporting_channel_still_excludes_the_author(self):
+        """会报作者标记的通道行为一行不变：自家那条照旧被排除，
+        这一页就只剩「路过看看」，一条负面都不该命中。"""
+        v = self._decide(self._reporting_page())
+        self.assertTrue(v.negative_checked)
+        self.assertFalse(v.negative_hits)
+        self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.clean)
+        self.assertFalse(any("自家账号的回复没有被排除" in n for n in v.notes))
+
+    def test_untrusted_author_flags_never_exclude_anything(self):
+        """**不可信的标记不许拿来排除任何东西**——排除就是信了它。
+
+        Codex 在 PR #39 上逮到的那个洞：原来不管可不可信都 skip_author=True，
+        于是一条**真负面**被上游错标成作者，就会被静默丢掉——命中数归零，
+        负面告警和「自家回复没被排除」那句提醒**一个都不发**。
+        坏在最要命的方向上，正好是「漏掉真负面比误报一条糟得多」的反面。
+        """
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                # 路人写的真负面，却被这家不可信的通道标成了「作者」
+                {"content": "用了过敏，踩雷", "like_count": 30,
+                 "is_author_comment": True, "author": {"name": "路人"}},
+            ],
+            "comment_count": 12,
+            "_capabilities": {"pinned": False, "author": False},
+        })
+        self.assertFalse(snap.author_reported)
+        v = self._decide(snap)
+        self.assertTrue(v.negative_hits, "真负面被不可信的作者标记吞掉了")
+        self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.found)
+        self.assertTrue(any("自家账号的回复没有被排除" in n for n in v.notes))
+
+    def test_trusted_author_flags_still_exclude(self):
+        """对照组：标记可信时照旧排除，这道改动不能把正常链路一起放开。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "温和配方，不会过敏的哦", "like_count": 2,
+                 "is_author_comment": True, "author": {"name": "官号"}},
+            ],
+            "comment_count": 12,
+            "_capabilities": {"pinned": True, "author": True},
+        })
+        self.assertTrue(snap.author_reported)
+        v = self._decide(snap)
+        self.assertFalse(v.negative_hits)
+        self.assertEqual(analyze.negative_status_value(v, self.settings), self.ns.clean)
+
+    def test_one_marked_item_is_enough_to_prove_the_channel_reports(self):
+        """能力判据是「整页有没有一条写过这个键」，不是「每条都写了」。"""
+        snap = self._page([
+            {"content": "路过看看", "like_count": 0, "author": {"name": "路人"}},
+            {"content": "温和配方，不会过敏的哦", "is_author_comment": True,
+             "like_count": 2, "author": {"name": "官号"}},
+        ])
+        self.assertTrue(snap.author_reported)
+
+    def test_douyin_does_not_get_the_warning(self):
+        """抖音两家通道都恒定写这个键（值恒为 False），所以标志为真、不报。
+        抖音看不见作者是**平台**边界，docs/表结构.md 已经写明「这个排除等于
+        没开」——每一行再报一次只是固定噪音，不是新信息。"""
+        snap = analyze.read_comment_page("douyin", {"items": [
+            {"content": "温和配方，不会过敏的哦", "is_pinned": False,
+             "is_author_comment": False, "like_count": 2,
+             "ip_location": "上海", "author": {"name": "官号"}},
+        ], "comment_count": 12})
+        self.assertTrue(snap.author_reported)
+        v = self._decide(snap)
+        self.assertTrue(v.negative_hits)          # 排除没生效，照样命中
+        self.assertFalse(any("自家账号的回复没有被排除" in n for n in v.notes))
+
+    def test_zero_comments_needs_no_warning(self):
+        """一条评论都没有，就不存在「自家回复被算成负面」这件事。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 0})
+        self.assertTrue(snap.author_reported)
+
+    def test_the_two_capabilities_are_independent(self):
+        """置顶和作者是两个维度，各认各的键——一家只报其中一个完全可能。"""
+        snap = self._page([
+            {"content": "戳主页领券", "is_pinned": True, "like_count": 9,
+             "author": {"name": "官号"}},
+        ])
+        self.assertTrue(snap.pin_reported)
+        self.assertFalse(snap.author_reported)
+
+
 class TestCallPlanning(unittest.TestCase):
     def setUp(self):
         self.settings = Settings()

@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import protocol, runner, transport
+from xhsearch import protocol, providers, runner, transport
 from xhsearch.config import Settings
 from xhsearch.rows import Row
 
@@ -65,6 +65,22 @@ class RunnerTest(unittest.TestCase):
         # 新默认值由 TestDetailIsOffByDefault 单独钉。
         self.settings.detail_within_days = 7
 
+    @staticmethod
+    def trusted_channel():
+        """把这一组固件所走的通道临时标成「置顶/作者值可信」。
+
+        这些固件是 **SocialDataX** 形状的（裸字符串 key 只登记给它），而实测
+        它会对真正置顶的评论返回 `is_pinned: false`，所以线上不拿它的值判置顶
+        （见 providers.XHS_COMMENT_CAPABILITIES 里的实测记录）。
+
+        下面用到它的那几个用例测的是**三值阶梯本身**（置顶成功 / 置顶掉了 /
+        无置顶）和写回形状，不是「哪家通道可不可信」——后者由
+        TestChannelPinCapability 单独钉，两件事分开测才看得出是哪一个坏了。
+        """
+        return mock.patch.dict(
+            providers.XHS_COMMENT_CAPABILITIES,
+            {providers.SOCIALDATAX: {"pinned": True, "author": True}})
+
     def run_with(self, responses, rows, **kwargs):
         """responses: 按调用顺序返回的响应列表，或一个 callable(url, headers, body)。"""
         if callable(responses):
@@ -80,11 +96,14 @@ class RunnerTest(unittest.TestCase):
 
 class TestHappyPath(RunnerTest):
     def test_writes_all_expected_columns(self):
-        report = self.run_with(
-            [sse(comment_page(count=150)), sse({"like_count": 8000, "collect_count": 900,
-                                                "comment_count": 150, "points": {"cost": 10, "balance": 8990}})],
-            [xhs_row()],
-        )
+        # 置顶那一列只在通道的置顶值可信时才写，所以这里显式标成可信——
+        # 这个用例问的是「该写的列都写了吗」，不是「这家通道可不可信」。
+        with self.trusted_channel():
+            report = self.run_with(
+                [sse(comment_page(count=150)), sse({"like_count": 8000, "collect_count": 900,
+                                                    "comment_count": 150, "points": {"cost": 10, "balance": 8990}})],
+                [xhs_row()],
+            )
         self.assertEqual(report.counts(), {runner.STATUS_OK: 1})
         fields = report.outcomes[0].fields
         f = self.settings.fields
@@ -588,11 +607,12 @@ class TestPinnedTracking(RunnerTest):
         return row
 
     def _run(self, pinned, row, **kwargs):
-        return self.run_with(
-            [sse(comment_page(pinned=pinned)),
-             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [row], **kwargs,
-        )
+        with self.trusted_channel():
+            return self.run_with(
+                [sse(comment_page(pinned=pinned)),
+                 sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+                [row], **kwargs,
+            )
 
     def test_hit_writes_displayed(self):
         fields = self._run(True, self._row(keywords=["好用"])).outcomes[0].fields
@@ -633,6 +653,7 @@ class TestPinnedTracking(RunnerTest):
         fields = self._run(False, self._row(pin_status=ps.pinned_lost)).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.pinned_status], ps.pinned_lost)
 
+
     def test_unknown_option_is_skipped_with_note(self):
         """选项还没建：跳过这一列并在诊断里提示，别拖垮整行写回。"""
         report = self._run(True, self._row(keywords=["好用"]),
@@ -643,6 +664,69 @@ class TestPinnedTracking(RunnerTest):
         self.assertNotIn(self.settings.fields.pinned_status, fields)
         self.assertIn("还没建选项", fields[self.settings.fields.failure_reason])
 
+
+class TestChannelPinCapability(RunnerTest):
+    """端到端钉住那次真实事故：**置顶值不可信的通道一格都不许写**。
+
+    2026-09-21 实测，同一条笔记的同一条 comment_id：
+        TikHub       show_tags_v2: [{"type": "user_top"}]   ← 置顶
+        SocialDataX  "is_pinned": false                      ← 说没置顶
+    当时 TikHub 余额耗尽、整轮降到 SocialDataX，于是一整表的「置顶成功」
+    被刷成「置顶掉了」，运营对着一屋子好好的置顶去补置顶。
+
+    注意这里**不加 trusted_channel()**——测的就是默认那家（SocialDataX）
+    在默认声明下的行为。上面那组阶梯用例才需要把它标成可信。
+    """
+
+    def _run(self, *, pin_status=""):
+        row = xhs_row()
+        row.pin_status = pin_status
+        return self.run_with(
+            [sse(comment_page(pinned=False)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [row],
+        ).outcomes[0].fields
+
+    def test_untrusted_channel_never_writes_pin_lost(self):
+        """这就是那个假告警的正解：那一格保持原样，不是写「掉了」。"""
+        fields = self._run(pin_status=self.settings.pin_status.pinned_ok)
+        self.assertNotIn(self.settings.fields.pinned_status, fields)
+
+    def test_untrusted_channel_never_writes_never_pinned_either(self):
+        """没历史的行同样不写「无置顶」——那也是它没资格下的结论。"""
+        self.assertNotIn(self.settings.fields.pinned_status, self._run())
+
+    def test_untrusted_round_says_so_in_the_diagnosis(self):
+        """不碰那一列和「什么都没发生」长得一样，必须在诊断信息里出声，
+        否则运营盯着一个再也不更新的旧状态还以为机器在正常巡查。"""
+        fields = self._run(pin_status=self.settings.pin_status.pinned_ok)
+        note = fields[self.settings.fields.failure_reason]
+        self.assertIn("没查过，不是没置顶", note)
+        # 而且绝不能同时再报一句「置顶已不在」——那正是要消灭的假告警。
+        self.assertNotIn("置顶已不在", note)
+
+    def test_the_other_columns_still_get_written(self):
+        """只掐置顶这一件事。评论数、快照、平台这些照常落表——
+        否则一次降级会变成整行不更新，那是另一种坏。"""
+        fields = self._run()
+        f = self.settings.fields
+        self.assertEqual(fields[f.comment_count], 50)
+        self.assertEqual(fields[f.platform], "小红书")
+        self.assertIn("好用！", fields[f.comment_digest])
+
+    def test_trusted_channel_is_unaffected(self):
+        """对照组：同样的响应，通道可信时照常判「掉了」——
+        这道闸只在通道不可信时收紧，别把正常链路一起掐了。"""
+        with self.trusted_channel():
+            row = xhs_row()
+            row.pin_status = self.settings.pin_status.pinned_ok
+            fields = self.run_with(
+                [sse(comment_page(pinned=False)),
+                 sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+                [row],
+            ).outcomes[0].fields
+        self.assertEqual(fields[self.settings.fields.pinned_status],
+                         self.settings.pin_status.pinned_lost)
 
 class TestBlueWordBackfill(RunnerTest):
     """蓝词回填：评论里出现「蓝词字段」还没有的高亮词 → 追加进去、翻「是否截图」。
@@ -1873,10 +1957,13 @@ class TestOneMistypedColumnCannotKillTheTable(RunnerTest):
             return len(updates)
 
     def _report(self):
-        return self.run_with(
-            [sse(comment_page(count=150)),
-             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
-            [xhs_row()])
+        # 这一组测的是写回时的类型错配处置，拿「置顶状态」当样本——
+        # 要有这一列才测得了，所以把通道标成置顶值可信。
+        with self.trusted_channel():
+            return self.run_with(
+                [sse(comment_page(count=150)),
+                 sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+                [xhs_row()])
 
     def _types(self, **overrides):
         """一张类型全对的表，再按需要把某几列改错。"""
