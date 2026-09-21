@@ -12,7 +12,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import feishu, panel, panel_view, railway, summary
+from xhsearch import balance as balance_mod
+from xhsearch import (channels, feishu, panel, panel_view, providers,
+                      railway, summary, transport)
 from xhsearch.config import Settings
 
 UTC = timezone.utc
@@ -2179,3 +2181,189 @@ class TestTodosAreSplitByProject(unittest.TestCase):
         page = self._page([self._snap("甲", "ta", [["有负面"]])])
         self.assertIn("每个项目一个标签", page)
         self.assertIn("aria-label='按项目分开看'", page)
+
+
+class TestChannelOutage(unittest.TestCase):
+    """「有通道发不出请求了」这条告警。
+
+    它是 2026-09 那次事故直接催生的：TikHub 余额见底 → runner 把它判死 →
+    整轮小红书降到备胎 → 一整表的「置顶成功」被刷成「置顶掉了」，
+    而面板上**从头到尾一个字都没报**——因为「余额还够跑 N 天」是两家加
+    起来算的，备胎充裕时它照样是绿的。
+    """
+
+    KEYS = {"tikhub": "k1", "socialdatax": "k2"}
+
+    def setUp(self):
+        self.settings = Settings()
+
+    @staticmethod
+    def _bal(channel, label, yuan, *, error=""):
+        return balance_mod.Balance(
+            channel=channel, label=label, unit="USD",
+            amount=None if error else (yuan or 0.0) / 7.2,
+            yuan=None if error else yuan, error=error)
+
+    def _healthy_standby(self):
+        return self._bal("socialdatax", "SocialDataX", 85.2)
+
+    def _outages(self, *balances):
+        return channels.outages(list(balances), self.settings, self.KEYS)
+
+    def test_primary_that_cannot_afford_one_call_is_an_outage(self):
+        """判据是「**还发得出一次请求吗**」，不是「余额是不是 0」。
+
+        TikHub 剩 ¥0.03、一次小红书调用要 ¥0.072：它对我们来说已经下线了，
+        而余额还是正数——按「余额 > 0」判会整段漏掉。
+        """
+        outs = self._outages(self._bal("tikhub", "TikHub", 0.03),
+                             self._healthy_standby())
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(outs[0].channel, "tikhub")
+        self.assertEqual(outs[0].platforms, ["小红书"])
+        self.assertEqual(outs[0].fallback_label, "SocialDataX")
+        self.assertFalse(outs[0].stopped)
+
+    def test_lost_capabilities_come_from_the_measured_table(self):
+        """丢了什么照 providers 那张实测登记表生成，不在这里写死——
+        哪天备胎验收通过、表里那一格翻成 True，这句话要自己变短。"""
+        outs = self._outages(self._bal("tikhub", "TikHub", 0.03),
+                             self._healthy_standby())
+        self.assertIn("置顶监控", outs[0].lost)
+        self.assertIn("蓝词回填", outs[0].lost)
+        with mock.patch.dict(
+                providers.XHS_COMMENT_CAPABILITIES,
+                {"socialdatax": {"pinned": True, "author": True,
+                                 "blue_words": True}}):
+            same = self._outages(self._bal("tikhub", "TikHub", 0.03),
+                                 self._healthy_standby())
+        self.assertEqual(same[0].lost, [], "备胎补齐能力后不该还报「丢了」")
+
+    def test_a_cheaper_platform_the_same_channel_still_serves_is_not_listed(self):
+        """同一家可能对一个平台下线、对另一个还能用：抖音一次才 ¥0.0072，
+        剩 ¥0.03 还发得起。报「抖音也停了」是吓唬人。"""
+        outs = self._outages(self._bal("tikhub", "TikHub", 0.03),
+                             self._healthy_standby())
+        self.assertEqual(outs[0].platforms, ["小红书"])
+
+    def test_one_outage_per_channel_even_across_platforms(self):
+        """两个平台的主通道是同一家时，那是一条告警、两个受影响平台，
+        不是两条一模一样的告警。"""
+        outs = self._outages(self._bal("tikhub", "TikHub", 0.0),
+                             self._bal("socialdatax", "SocialDataX", 0.0))
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(outs[0].platforms, ["小红书", "抖音"])
+
+    def test_no_standby_left_is_a_different_and_worse_story(self):
+        """两家都付不起：丢的不是几项能力，是整条链路。话术必须分开。"""
+        outs = self._outages(self._bal("tikhub", "TikHub", 0.0),
+                             self._bal("socialdatax", "SocialDataX", 0.0))
+        self.assertTrue(outs[0].stopped)
+        self.assertEqual(outs[0].lost, [], "停摆的时候不该还在列「少了哪几项」")
+
+    def test_unreadable_balance_never_becomes_an_outage(self):
+        """读不到余额和余额见底，要人做的事完全相反（一个查 Key、一个充值）。
+        把「读不到」算成「下线了」会在 Key 过期时报「置顶监控停摆」，
+        把人引向错误的那一边。和 balance.py 那条「不报 ¥0」同一个道理。"""
+        self.assertEqual(
+            self._outages(self._bal("tikhub", "TikHub", 0, error="HTTP 401"),
+                          self._healthy_standby()),
+            [])
+
+    def test_unreadable_standby_is_not_called_no_standby_left(self):
+        """备胎余额读不到时它仍算候选——「没有备胎了」是更吓人的一句话，
+        不能靠猜说出口。"""
+        outs = self._outages(
+            self._bal("tikhub", "TikHub", 0.0),
+            self._bal("socialdatax", "SocialDataX", 0, error="读不到"))
+        self.assertFalse(outs[0].stopped)
+
+    def test_healthy_channels_report_nothing(self):
+        self.assertEqual(
+            self._outages(self._bal("tikhub", "TikHub", 86.4),
+                          self._healthy_standby()),
+            [])
+
+    def test_computing_outages_sends_no_request(self):
+        """这条告警**不花一分钱**：余额是 BalanceFeed 早取好的（那两个端点
+        官方标明零费用），其余全是本地常量。面板那条不变量一点没动。"""
+        with mock.patch.object(transport, "request") as sent, \
+             mock.patch.object(transport, "post") as posted:
+            self._outages(self._bal("tikhub", "TikHub", 0.0),
+                          self._healthy_standby())
+        sent.assert_not_called()
+        posted.assert_not_called()
+
+
+class TestChannelOutageOnThePage(unittest.TestCase):
+    """告警在页面上要出现在三个地方——只报一处等于没报。"""
+
+    class _Outage:
+        channel = "tikhub"
+        label = "TikHub"
+        yuan_left = 0.03
+        one_call_yuan = 0.072
+        platforms = ["小红书"]
+        fallback_label = "SocialDataX"
+        lost = ["置顶监控", "蓝词回填"]
+        stopped = False
+
+    class _Stopped(_Outage):
+        fallback_label = ""
+        lost = []
+        stopped = True
+
+    class _Runway:
+        known = True
+        days = 41.0
+        yuan_per_day = 2.1
+        partial = False
+        runs_used = 6
+        hours_covered = 18.0
+        reason = ""
+
+    def test_the_band_names_what_stopped_and_what_to_do(self):
+        html = panel_view._outage_note([self._Outage()])
+        self.assertIn("TikHub 发不出请求了", html)
+        self.assertIn("置顶监控", html)
+        self.assertIn("SocialDataX", html)
+        self.assertIn("充值", html)
+        # 归档的老帖不会自己刷回来，这一点必须在同一条告警里说清楚
+        self.assertIn("排队刷新", html)
+
+    def test_no_standby_reads_differently(self):
+        html = panel_view._outage_note([self._Stopped()])
+        self.assertIn("巡查已经停了", html)
+        self.assertNotIn("降到", html)
+
+    def test_no_outage_renders_nothing(self):
+        self.assertEqual(panel_view._outage_note([]), "")
+
+    def test_runway_kpi_stops_looking_green(self):
+        """顶上四个数是大多数人唯一会看的地方。主通道下线时这一格还显示
+        绿油油的「还够跑 41 天」，等于把最该被看见的事藏起来。"""
+        boxes = panel_view._runway_box(self._Runway(), config(), [self._Outage()])
+        self.assertIn("warn", boxes[0])
+        self.assertIn("TikHub", boxes[0])
+        self.assertIn("发不出请求", boxes[0])
+
+    def test_runway_kpi_unchanged_when_everything_is_fine(self):
+        boxes = panel_view._runway_box(self._Runway(), config(), [])
+        self.assertNotIn("warn", boxes[0])
+        self.assertIn("实际花速", boxes[0])
+
+    def test_balance_card_turns_red_for_the_dead_channel(self):
+        """余额是正数但不够发一次时，一张普通白卡上的 "$0.00" 看着完全正常
+        ——这正是要在卡片上说破的那个落差。"""
+        balances = [
+            balance_mod.Balance(channel="tikhub", label="TikHub",
+                                amount=0.004, unit="USD", yuan=0.03),
+            balance_mod.Balance(channel="socialdatax", label="SocialDataX",
+                                amount=8520, unit="POINT", yuan=85.2),
+        ]
+        html = panel_view._balance_section(balances, "", self._Runway(),
+                                           config(), [self._Outage()])
+        self.assertIn("card bad", html)
+        self.assertIn("发不出请求了", html)
+        # 另一家照常是白卡
+        self.assertIn("8520 积分", html)
