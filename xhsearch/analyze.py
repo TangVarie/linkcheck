@@ -91,12 +91,12 @@ class Snapshot:
     # 是「这家通道会不会报置顶」。两件事必须分开：平台能力（抖音没有置顶字段）
     # 和通道能力（同一个平台，换一家供应商就可能不报）都会让置顶判不了，
     # 而后者是运行期才会发生的——主通道余额一见底，整轮都降到备胎上去了。
-    # 判据见 read_comment_page：归一化层对**能报置顶的通道**恒定写 is_pinned
-    # 这个键（True/False 都写），所以「整页一条都没写过这个键」= 这家不报。
-    # ⚠️ 这个判据只认得出「这家不说话」，认不出「这家说了假话」：一家照常返回
-    # is_pinned、但对置顶那条也给 false 的通道，这里一样判成「会报」，判定照跑。
-    # 挡住那一种要把能力改成按通道声明（未验的通道不获准下结论），
-    # 而那要先有一次真实调用的证据——见 docs/待验证清单.md 第 2 条。
+    # 判据见 read_comment_page，两层：通道**声明**的能力优先（providers 注入的
+    # `_capabilities`），没有声明才退回看 is_pinned 这个键在不在。
+    # 声明必须排在前面，因为看键只认得出「这家不说话」，认不出「这家说了假话」
+    # ——而后者是实测到的真实形态：SocialDataX 的 is_pinned 一直在，只是对真正
+    # 置顶的那条也给 false（2026-09-21 同一条 comment_id 两家对打，见
+    # providers.XHS_COMMENT_CAPABILITIES）。
     pin_reported: bool = True
     # 有没有**作者标记**这个维度，语义和 pin_reported 完全对称：问的是
     # 「这家通道会不会报作者」，不是「有没有作者评论」。它撑着的是负面判定
@@ -181,11 +181,11 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     """
     items = data.get("items")
     comments: list[CommentView] = []
-    # 这一页里只要有**一条**带着 is_pinned 这个键，就说明这条通道会报置顶；
-    # is_author_comment 同理。靠的是归一化层的契约（见 providers 顶部）：
-    # 能报的通道对每一条评论恒定写这个键，True 和 False 都写。所以整页一个
-    # 都没有 = 这家根本不报，而不是「这一页恰好没有置顶 / 没有作者评论」——
-    # 两者写进表里的后果天差地别。
+    # 兜底判据（`_capabilities` 缺席时才用）：这一页里只要有**一条**带着
+    # is_pinned 这个键，就说明这条通道会报置顶；is_author_comment 同理。
+    # 靠的是归一化层的契约（见 providers 顶部）：能报的通道对每一条评论恒定写
+    # 这个键，True 和 False 都写。所以整页一个都没有 = 这家根本不报，而不是
+    # 「这一页恰好没有置顶 / 没有作者评论」——两者写进表里的后果天差地别。
     pin_reported = False
     author_reported = False
     if isinstance(items, list):
@@ -215,13 +215,29 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
         top_level_comment_count=_int_or_none(data.get("top_level_comment_count")),
         comments=comments,
         points_balance=points.get("balance"),
-        # 一条评论都没有时无从看出这家报不报置顶——也不需要看：没有评论就
-        # 不可能有置顶，哪家通道都得出同一个结论。空壳轮（连评论数都没拿到）
-        # 另有 saw_comment_page 那道闸挡着，不会走到下结论这一步。
-        pin_reported=pin_reported or not comments,
-        # 同理：没有评论就不存在「自家回复被算成负面」这件事，没什么要提醒的。
-        author_reported=author_reported or not comments,
+        pin_reported=_trusted(data, "pinned", pin_reported, comments),
+        author_reported=_trusted(data, "author", author_reported, comments),
     )
+
+
+def _trusted(data: dict[str, Any], dimension: str,
+             saw_the_key: bool, comments: list[CommentView]) -> bool:
+    """这一轮的响应在某个维度上可不可信。三层，由强到弱：
+
+    1. **一条评论都没有** → 可信。不是因为看得出这家报不报，而是这个问题
+       此刻不存在：没有评论就不可能有置顶，也不存在「自家回复被算成负面」。
+       （空壳轮另有 saw_comment_page 那道闸挡着，走不到下结论这一步。）
+    2. **通道声明了**（providers 注入的 `_capabilities`）→ 以声明为准。
+       声明是唯一认得出「这家说了假话」的办法：SocialDataX 的 is_pinned
+       一直在、值却是错的，从响应里怎么看都看不出来。
+    3. 都没有 → 退回看键在不在（老行为，给直接构造字典的调用方和测试兜底）。
+    """
+    if not comments:
+        return True
+    caps = data.get("_capabilities")
+    if isinstance(caps, dict) and dimension in caps:
+        return bool(caps[dimension])
+    return saw_the_key
 
 
 def merge_detail(snapshot: Snapshot, data: dict[str, Any]) -> Snapshot:
@@ -669,7 +685,7 @@ def decide(
     if (snapshot.platform == "xhs" and not snapshot.pin_reported
             and saw_comment_page(snapshot)):
         verdict.notes.append(
-            "本轮这条数据通道的评论里没有置顶标记（多半是主通道余额/故障降到了"
+            "本轮这条数据通道不提供可信的置顶标记（多半是主通道余额/故障降到了"
             "备胎），「置顶状态」保持原样——是没查过，不是没置顶")
     # 掉落的那一轮在诊断信息里额外报一声——自家帖子的置顶掉了，
     # 最该被立刻发现；之后每轮的状态由「置顶状态」列自己持续表达。

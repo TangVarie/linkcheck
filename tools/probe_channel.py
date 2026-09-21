@@ -243,6 +243,7 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
 
     snapshot = None
     norm_items: list = []
+    norm_caps = None
     ok = True
     for call in calls:
         request = provider.build(key, call.platform, call.purpose, call.arguments)
@@ -274,6 +275,7 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
             # 归一化之后的条目——线上的 analyze 吃的就是这个形状，
             # 所以能力判定必须对着它数，不能对着原始响应数。
             norm_items = result.data.get("items") or []
+            norm_caps = result.data.get("_capabilities")
             snapshot = analyze.read_comment_page(call.platform, result.data)
             if raw:
                 raw_comments = _raw_comments(response.body)
@@ -299,29 +301,37 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
         # 「这家不报置顶」和「这条没置顶」是两回事，探针必须分得清——
         # 混成一句的话，拿一条**有**置顶的笔记来验反而会验出「（无）」，
         # 然后按这个结论上线。
-        print("  置顶评论   —（这家通道的评论条目里没有置顶标记这个字段，"
+        print("  置顶评论   —（这家通道的置顶标记不可信或没提供，"
               "「置顶状态」列不写，**不等于没置顶**）")
     else:
         print("  置顶评论   —（抖音接口没有置顶字段，「置顶状态」列不写）")
-    # —— 能力字段：这整个脚本最该回答的一行 ——
-    # 「这家没返回这个字段」和「返回了 false」要人做的事完全相反：
-    # 前者线上会自动不下结论（置顶列不碰 / 负面加一句提醒），后者线上会照着
-    # 错的值判，安安静静地写出假告警。光看「置顶评论（无）」分不出这两种，
-    # 所以这里把键的**有无**单独数出来。
-    print("  能力字段（决定线上判不判的是键在不在，不是值）：")
-    for field_key, what in (("is_pinned", "置顶"), ("is_author_comment", "作者标记")):
+    # —— 能力：这整个脚本最该回答的几行 ——
+    # 三种状态要分清，它们在线上的后果完全不同：
+    #   声明不可信 → 线上不拿这家的值下结论（置顶列不碰 / 负面加一句提醒）
+    #   字段整页都没有 → 同上，但原因是「这家不说话」
+    #   字段在、值可信 → 线上照常判
+    # 光看「置顶评论（无）」这一行分不出任何一种，所以声明和实测都单独打出来。
+    # **声明排在前面**：线上就是按它判的，而实测那一列只是证据。
+    print("  能力（线上按通道声明判；实测那一列是证据，不是判据）：")
+    for field_key, dim, what in (("is_pinned", "pinned", "置顶"),
+                                 ("is_author_comment", "author", "作者标记")):
         have, yes, total = _capability(norm_items, field_key)
-        if not total:
-            verdict = "这一页没有评论，看不出来——换一条有评论的笔记"
+        if isinstance(norm_caps, dict) and dim in norm_caps:
+            declared = (f"✅ 可信，线上照常判{what}" if norm_caps[dim]
+                        else f"❌ 不可信，线上不拿这家的值判{what}"
+                             "（见 providers.XHS_COMMENT_CAPABILITIES 里的实测记录）")
+        elif not total:
+            declared = "这一页没有评论，看不出来——换一条有评论的笔记"
         elif have == 0:
-            verdict = f"❌ 这家不报{what} → 线上会跳过{what}判定，不会误报"
+            declared = f"❌ 这家不报{what} → 线上会跳过{what}判定，不会误报"
         elif have < total:
-            verdict = (f"⚠ 只有部分条目带这个键（{have}/{total}）——归一化契约要求"
-                       "每条都写，这种半带不带的形状要去 providers 那边看一眼")
+            declared = (f"⚠ 只有部分条目带这个键（{have}/{total}）——归一化契约要求"
+                        "每条都写，这种半带不带的形状要去 providers 那边看一眼")
         else:
-            verdict = f"✅ 这家报{what}"
-        print(f"    {field_key:18} {have}/{total} 条带这个键"
-              f"（其中 True {yes} 条） —— {verdict}")
+            declared = f"✅ 这家报{what}"
+        print(f"    {what:8} 通道声明：{declared}")
+        print(f"    {'':8} 响应实测：{field_key} {have}/{total} 条带这个键"
+              f"（其中 True {yes} 条）")
 
     print("  评论区快照：")
     for line in analyze.format_digest(snapshot, settings.digest).splitlines():
@@ -353,10 +363,17 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
               "\n    去 providers.py 的 _tag_types() 看一眼。"
               "\n    如果这条本来就没置顶，那是正常的——换一条有置顶的再验一次。")
     elif snapshot.platform == "xhs" and not snapshot.pin_reported:
-        print("\n  ⚠ 这家通道整页评论里一个 is_pinned 都没有 = 它不报置顶。"
-              "\n    线上遇到这种轮次会**完全不碰「置顶状态」列**（和抖音一个待遇），"
-              "\n    不会误写「置顶掉了」。想让这家也能判置顶，就去归一化层把它"
-              "\n    真实响应里的置顶字段翻成 is_pinned（--raw 能看到原始字段）。")
+        print("\n  ⚠ 这家通道的置顶值不被信任，线上**完全不碰「置顶状态」列**"
+              "（和抖音一个待遇），不会误写「置顶掉了」。")
+        if isinstance(norm_caps, dict) and norm_caps.get("pinned") is False:
+            print("    原因是通道声明（providers.XHS_COMMENT_CAPABILITIES）——"
+                  "实测它对真正置顶的那条"
+                  "\n    也返回 is_pinned=false，字段在、值是错的。要解除这个限制，"
+                  "\n    得先拿一条**确实有置顶**的笔记证明它这一项修好了。")
+        else:
+            print("    原因是整页一个 is_pinned 都没有 = 这家不报。想让它也能判置顶，"
+                  "\n    就去归一化层把它真实响应里的置顶字段翻成 is_pinned"
+                  "（--raw 能看到原始字段）。")
 
     # 把线上真正会写进表的判定也打出来：探针的价值是「验线上那条路」，
     # 只打原始字段的话，判定口径出问题它一个字都不会说。

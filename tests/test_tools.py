@@ -128,12 +128,12 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
 
     SDX_XHS_LINK = "https://www.xiaohongshu.com/explore/" + "b" * 24
 
-    def test_probe_tells_field_missing_apart_from_field_false(self):
-        """探针最该回答的那一个问题：这家**没返回**这个字段，还是**返回了 false**？
+    def test_probe_prints_the_declaration_not_just_the_observed_keys(self):
+        """探针必须按**线上的判据**给结论，而线上按通道声明判。
 
-        两者要人做的事完全相反——没返回 = 这家不报（线上会自动不下结论），
-        返回了 false = 这家报错了（线上会照着错的值判，安静地写出假告警）。
-        而「置顶评论（无）」这一行对两者印的是同一句话，所以必须单独数键。
+        SocialDataX 照常返回 is_pinned（所以「键在不在」看着一切正常），
+        只是对真正置顶的那条也给 false。只打实测的话，探针会对它印出
+        「✅ 这家报置顶」——正好是错的那个结论，然后有人照着它上线。
         """
         present_but_false = [
             {"content": "戳主页领券", "is_pinned": False, "is_author_comment": False,
@@ -143,27 +143,43 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
                                return_value=self._sdx_page(present_but_false)):
             _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
                                       self.SDX_XHS_LINK, Settings())
-        self.assertIn("能力字段", output)
-        self.assertIn("1/1 条带这个键", output)
-        self.assertIn("✅ 这家报置顶", output)
-        self.assertIn("✅ 这家报作者标记", output)
-        self.assertNotIn("这家不报置顶", output)
+        # 声明：不可信
+        self.assertIn("通道声明：❌ 不可信，线上不拿这家的值判置顶", output)
+        self.assertNotIn("✅ 可信，线上照常判置顶", output)
+        # 实测：键确实在，值是 false——证据照样要打出来
+        self.assertIn("响应实测：is_pinned 1/1 条带这个键（其中 True 0 条）", output)
+        # 结论那一段要说清「不可信」和「不报」是两种原因
+        self.assertIn("字段在、值是错的", output)
 
-    def test_probe_calls_out_a_channel_that_reports_nothing(self):
-        """键整页都不在 = 这家不报。线上据此完全不碰「置顶状态」列，
-        探针要把这个结论说出来，别让人以为「（无）」= 没置顶。"""
+    def test_probe_falls_back_to_observed_keys_without_a_declaration(self):
+        """没有声明时退回看键在不在（老行为，给还没登记的通道兜底）。"""
         no_flags = [
             {"content": "戳主页领券", "like_count": 9, "author": {"name": "官号"}},
             {"content": "路过", "like_count": 0, "author": {"name": "路人"}},
         ]
-        with mock.patch.object(transport, "request", return_value=self._sdx_page(no_flags)):
+        page = self._sdx_page(no_flags)
+        with mock.patch.dict(providers.XHS_COMMENT_CAPABILITIES, clear=True), \
+             mock.patch.object(transport, "request", return_value=page):
             _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
                                       self.SDX_XHS_LINK, Settings())
-        self.assertIn("0/2 条带这个键", output)
         self.assertIn("❌ 这家不报置顶", output)
-        self.assertIn("❌ 这家不报作者标记", output)
+        self.assertIn("0/2 条带这个键", output)
         # 「置顶评论」那一行也要说清这不等于「没置顶」
         self.assertIn("不等于没置顶", output)
+
+    def test_probe_confirms_a_trusted_channel(self):
+        """对照组：声明可信的通道照常印 ✅，别把正常链路也吓成红的。"""
+        items = [{"content": "戳主页领券", "is_pinned": True, "is_author_comment": True,
+                  "like_count": 9, "author": {"name": "官号"}}]
+        page = self._sdx_page(items)
+        with mock.patch.dict(
+                providers.XHS_COMMENT_CAPABILITIES,
+                {providers.SOCIALDATAX: {"pinned": True, "author": True}}), \
+             mock.patch.object(transport, "request", return_value=page):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings())
+        self.assertIn("✅ 可信，线上照常判置顶", output)
+        self.assertIn("响应实测：is_pinned 1/1 条带这个键（其中 True 1 条）", output)
 
     def test_raw_keeps_these_two_keys_even_when_false(self):
         """去空值那一步**不能**吃掉这两个键的 false——吃掉之后，
