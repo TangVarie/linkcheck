@@ -273,6 +273,12 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     if snapshot.supports_pinned:
         pinned = snapshot.pinned
         print(f"  置顶评论   {pinned.content if pinned else '（无）'}")
+    elif snapshot.platform == "xhs":
+        # 「这家不报置顶」和「这条没置顶」是两回事，探针必须分得清——
+        # 混成一句的话，拿一条**有**置顶的笔记来验反而会验出「（无）」，
+        # 然后按这个结论上线。
+        print("  置顶评论   —（这家通道的评论条目里没有置顶标记这个字段，"
+              "「置顶状态」列不写，**不等于没置顶**）")
     else:
         print("  置顶评论   —（抖音接口没有置顶字段，「置顶状态」列不写）")
     print("  评论区快照：")
@@ -304,6 +310,11 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
         print("\n  ⚠ 没识别到置顶评论。如果这条笔记**确实有**置顶，说明上游改字段了，"
               "\n    去 providers.py 的 _tag_types() 看一眼。"
               "\n    如果这条本来就没置顶，那是正常的——换一条有置顶的再验一次。")
+    elif snapshot.platform == "xhs" and not snapshot.pin_reported:
+        print("\n  ⚠ 这家通道整页评论里一个 is_pinned 都没有 = 它不报置顶。"
+              "\n    线上遇到这种轮次会**完全不碰「置顶状态」列**（和抖音一个待遇），"
+              "\n    不会误写「置顶掉了」。想让这家也能判置顶，就去归一化层把它"
+              "\n    真实响应里的置顶字段翻成 is_pinned（--raw 能看到原始字段）。")
 
     # 把线上真正会写进表的判定也打出来：探针的价值是「验线上那条路」，
     # 只打原始字段的话，判定口径出问题它一个字都不会说。

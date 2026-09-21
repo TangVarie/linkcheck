@@ -12,6 +12,15 @@
     评论页  {"items": [{content, like_count, is_pinned, is_author_comment,
                         ip_location, author}],
              "comment_count": int|None, "top_level_comment_count": int|None}
+
+    ⚠️ `is_pinned` **这个键的有无本身就是信号**，不只是它的值：会报置顶的
+    通道必须对**每一条**评论都写上它（True / False 都写，照 _xhs_comment_items
+    的写法），一条都不写 = 「这家不报置顶」，analyze 会据此完全不碰
+    「置顶状态」那一列（和抖音一个待遇）。SocialDataX 走的是原样透传，
+    所以它报不报置顶由它的**真实**响应说了算——而那一侧至今一次真实调用
+    都没发过（见 docs/供应商对比.md 开头的警告）。新接一家通道时，
+    要么保证这个键恒定写，要么就让它缺着——**唯独不能补一个假的 False**，
+    那等于让这家通道去证明「置顶没了」。
     详情    {"like_count", "collect_count", "share_count", "comment_count",
              "_censored": bool|None}
 

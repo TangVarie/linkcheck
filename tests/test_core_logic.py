@@ -898,6 +898,115 @@ class TestPinStatusColumn(unittest.TestCase):
         self.assertFalse(any("置顶已不在" in n for n in v.notes))
 
 
+class TestPinBlindChannel(unittest.TestCase):
+    """通道不报置顶的那种轮次：**一列都不碰**，绝不写「置顶掉了」。
+
+    真实事故：TikHub 余额见底 → runner 把它判死 → 整轮小红书全部降到备胎，
+    而备胎的响应里没有置顶这个维度。评论照常抓到、诊断信息一个字不报，
+    「置顶状态」却被整表刷成「置顶掉了」——运营对着一屋子假告警去补置顶，
+    而置顶一直好好的。平台能看见置顶 ≠ 这一轮的通道会报置顶。
+    """
+
+    def setUp(self):
+        self.settings = Settings()
+        self.ps = self.settings.pin_status
+
+    def _blind_page(self, count=12):
+        """备胎通道的形状：评论齐全，就是没有 is_pinned 这个键。"""
+        return analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "戳主页领券", "like_count": 3, "ip_location": "上海",
+                 "author": {"name": "官号"}},
+                {"content": "求链接", "like_count": 1, "ip_location": "浙江",
+                 "author": {"name": "路人"}},
+            ],
+            "comment_count": count,
+        })
+
+    def test_blind_channel_is_not_qualified_to_judge(self):
+        snap = self._blind_page()
+        self.assertFalse(snap.pin_reported)
+        self.assertFalse(snap.supports_pinned)
+        self.assertIs(analyze.decide_pin(snap), analyze.Pin.UNSUPPORTED)
+
+    def test_blind_channel_never_writes_pin_lost(self):
+        """这就是那个假告警的正解：保持原样，不是写「掉了」。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertFalse(v.pin_checked)
+        self.assertIsNone(
+            analyze.pin_status_value(v, self.ps.pinned_ok, self.settings))
+
+    def test_blind_channel_never_writes_never_pinned_either(self):
+        """没历史的行同样不能写「无置顶」——那也是一个它没资格下的结论。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status="")
+        self.assertIsNone(analyze.pin_status_value(v, "", self.settings))
+
+    def test_blind_round_says_so_in_the_notes(self):
+        """不碰那一列的结果和「什么都没发生」长得一样——必须在诊断信息里出声，
+        否则运营看到的是一个再也不更新的旧状态，还以为机器在正常巡查。"""
+        v = analyze.decide(self._blind_page(), self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertTrue(any("没查过，不是没置顶" in n for n in v.notes))
+        # 而且绝不能同时再报一句「置顶已不在」——那正是要消灭的假告警。
+        self.assertFalse(any("置顶已不在" in n for n in v.notes))
+
+    def test_reporting_channel_still_judges_normally(self):
+        """会报置顶的通道一行行为都不变：False 也是结论，照样判「掉了」。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [{"content": "路过", "is_pinned": False,
+                       "is_author_comment": False, "like_count": 0,
+                       "ip_location": "", "author": {"name": "路人"}}],
+            "comment_count": 12,
+        })
+        self.assertTrue(snap.pin_reported)
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertEqual(
+            analyze.pin_status_value(v, self.ps.pinned_ok, self.settings),
+            self.ps.pinned_lost)
+
+    def test_one_marked_item_is_enough_to_prove_the_channel_reports(self):
+        """能力判据是「整页有没有一条写过这个键」，不是「每条都写了」——
+        只在置顶那条上写标记的通道照样算会报置顶。"""
+        snap = analyze.read_comment_page("xhs", {
+            "items": [
+                {"content": "路过", "like_count": 0, "author": {"name": "路人"}},
+                {"content": "戳主页领券", "is_pinned": True, "like_count": 9,
+                 "author": {"name": "官号"}},
+            ],
+            "comment_count": 12,
+        })
+        self.assertTrue(snap.pin_reported)
+        self.assertIsNotNone(snap.pinned)
+
+    def test_zero_comments_is_still_a_conclusion(self):
+        """一条评论都没有的笔记不可能有置顶，哪家通道都得出同一个结论——
+        这种轮次照常判，不要被能力闸误伤。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 0})
+        self.assertTrue(snap.supports_pinned)
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, current_pin_status=self.ps.pinned_ok)
+        self.assertEqual(
+            analyze.pin_status_value(v, self.ps.pinned_ok, self.settings),
+            self.ps.pinned_lost)
+
+    def test_blind_channel_does_not_disturb_the_other_columns(self):
+        """只掐置顶这一件事。评论状态/负面状态匹配的是评论正文，
+        和置顶字段无关，不能被这道闸连坐。"""
+        snap = self._blind_page()
+        v = analyze.decide(snap, self.settings, previous_comment_count=None,
+                           age_hours=10, seed_keywords=["戳主页"],
+                           negative_keywords=["踩雷"])
+        self.assertTrue(v.seed_checked)
+        self.assertIsNotNone(v.seed_hit)
+        self.assertTrue(v.negative_checked)
+        self.assertEqual(
+            analyze.comment_status_value(v, self.settings),
+            self.settings.comment_status.displayed)
+
+
 class TestCallPlanning(unittest.TestCase):
     def setUp(self):
         self.settings = Settings()

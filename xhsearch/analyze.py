@@ -10,6 +10,14 @@
 所以「置顶状态」在抖音侧判不了。这里不静默写「无置顶」——
 那会被运营读成「没置顶」，而真相是「这个接口根本看不到置顶」，
 抖音行的置顶状态列完全不碰。
+
+**同一件事在通道之间也成立，而且更阴险。** 平台能看见置顶，不等于这一轮
+用的那家供应商会报置顶：主通道余额见底后整轮都会静默降到备胎（runner._call
+把 QUOTA 通道判死，之后每一行直接走下一家），如果备胎的响应里压根没有
+置顶这个维度，「没有任何一条带置顶标记」就会被当成「置顶掉了」写进表——
+评论照常有、诊断信息一个字不报，运营只看到一屋子假告警。
+所以下面的资格判断是**平台 × 通道**两个条件（见 Snapshot.pin_reported），
+缺哪一个都按抖音那个待遇办：这一列完全不碰。
 """
 
 from __future__ import annotations
@@ -79,13 +87,22 @@ class Snapshot:
     # Note is not available」）。有它诊断信息就说具体的，没有就说通用的那句。
     censor_reason: str = ""
 
+    # 这一轮的响应里**到底有没有置顶这个维度**——注意这问的不是「有没有置顶」，
+    # 是「这家通道会不会报置顶」。两件事必须分开：平台能力（抖音没有置顶字段）
+    # 和通道能力（同一个平台，换一家供应商就可能不报）都会让置顶判不了，
+    # 而后者是运行期才会发生的——主通道余额一见底，整轮都降到备胎上去了。
+    # 判据见 read_comment_page：归一化层对**能报置顶的通道**恒定写 is_pinned
+    # 这个键（True/False 都写），所以「整页一条都没写过这个键」= 这家不报。
+    pin_reported: bool = True
+
     @property
     def pinned(self) -> Optional[CommentView]:
         return next((c for c in self.comments if c.is_pinned), None)
 
     @property
     def supports_pinned(self) -> bool:
-        return self.platform == "xhs"
+        """这一轮有没有**资格**对置顶下结论。平台和通道缺一不可。"""
+        return self.platform == "xhs" and self.pin_reported
 
 
 # 互动数字的上界。真实世界里没有 10 亿条评论的笔记；出现这种数字一定是
@@ -147,10 +164,16 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     """
     items = data.get("items")
     comments: list[CommentView] = []
+    # 这一页里只要有**一条**带着 is_pinned 这个键，就说明这条通道会报置顶。
+    # 靠的是归一化层的契约（见 providers 顶部）：能报置顶的通道对每一条评论
+    # 恒定写这个键，True 和 False 都写。所以整页一个都没有 = 这家根本不报，
+    # 而不是「这一页恰好没有置顶」——两者写进表里的后果天差地别。
+    pin_reported = False
     if isinstance(items, list):
         for item in items:
             if not isinstance(item, dict):
                 continue
+            pin_reported = pin_reported or "is_pinned" in item
             comments.append(
                 CommentView(
                     content=str(item.get("content") or ""),
@@ -172,6 +195,10 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
         top_level_comment_count=_int_or_none(data.get("top_level_comment_count")),
         comments=comments,
         points_balance=points.get("balance"),
+        # 一条评论都没有时无从看出这家报不报置顶——也不需要看：没有评论就
+        # 不可能有置顶，哪家通道都得出同一个结论。空壳轮（连评论数都没拿到）
+        # 另有 saw_comment_page 那道闸挡着，不会走到下结论这一步。
+        pin_reported=pin_reported or not comments,
     )
 
 
@@ -375,7 +402,7 @@ class Pin(Enum):
     置顶那条的内容在「评论区快照」里照常能看到（置顶排前）。
     """
 
-    UNSUPPORTED = "unsupported"   # 抖音：接口没有 is_pinned，判不了
+    UNSUPPORTED = "unsupported"   # 判不了：抖音没有这个字段，或这一轮的通道不报置顶
     PINNED = "pinned"             # 有置顶
     NONE_PINNED = "none_pinned"   # 没有置顶
 
@@ -425,9 +452,9 @@ def pin_status_value(verdict: "Verdict", current: str, settings: Settings) -> Op
     有置顶 → 置顶成功；没置顶时看这一列自己的历史：此前是 成功/掉了
     → 置顶掉了（曾经置顶过这件事不抹掉），否则 → 无置顶。
 
-    返回 None 表示不碰这一列：抖音（接口没有置顶字段，pin_checked
-    恒为 False）和没看到评论页内容的空壳轮都保持原样——拿上游缺数
-    当「掉了」的证据会让运营白跑一趟。
+    返回 None 表示不碰这一列，三种情况：抖音（接口没有置顶字段）、
+    这一轮的通道不报置顶（降级到备胎时会发生）、以及没看到评论页内容的
+    空壳轮——全都保持原样。拿上游缺数当「掉了」的证据会让运营白跑一趟。
     """
     if not verdict.pin_checked:
         return None
@@ -607,11 +634,19 @@ def decide(
 
     # —— 置顶 ——
     verdict.pin = decide_pin(snapshot)
-    # 只有小红书且本轮真的看到了评论页（有评论、或至少知道评论数）才有
-    # 资格对置顶下结论——空壳轮拿上游缺数当「掉了」的证据会误报；
-    # 现有通道上小红书的空壳在上游层就被译成 GONE 到不了这里，
+    # 只有小红书、这一轮的通道会报置顶、且本轮真的看到了评论页（有评论、
+    # 或至少知道评论数）才有资格对置顶下结论——空壳轮拿上游缺数当「掉了」
+    # 的证据会误报；现有通道上小红书的空壳在上游层就被译成 GONE 到不了这里，
     # 这道闸防的是上游契约漂移。
     verdict.pin_checked = snapshot.supports_pinned and saw_comment_page(snapshot)
+    # 平台有置顶、评论也拿到了，却整页没有置顶这个维度 = 这一轮走的通道不报
+    # 置顶。**必须说出来**：不碰那一列的结果和「什么都没发生」长得一模一样，
+    # 运营看到的是一个再也不更新的旧状态，而真相是这一轮压根没查过置顶。
+    if (snapshot.platform == "xhs" and not snapshot.pin_reported
+            and saw_comment_page(snapshot)):
+        verdict.notes.append(
+            "本轮这条数据通道的评论里没有置顶标记（多半是主通道余额/故障降到了"
+            "备胎），「置顶状态」保持原样——是没查过，不是没置顶")
     # 掉落的那一轮在诊断信息里额外报一声——自家帖子的置顶掉了，
     # 最该被立刻发现；之后每轮的状态由「置顶状态」列自己持续表达。
     if (
