@@ -118,6 +118,67 @@ class TestProbeUsesTheSameRoutingAsProduction(unittest.TestCase):
         self.assertNotIn('"has_more"', output)              # 0 这种占位去掉
         self.assertNotIn('"extra"', output)                 # 全空的子对象整个去掉
 
+    def _sdx_page(self, items):
+        """SocialDataX 的成功响应：顶层就是归一化后的形状，**不带 code 字段**
+        （规范原文：「成功响应不会返回该字段」）。"""
+        return transport.Response(200, "application/json", json.dumps({
+            "items": items, "comment_count": 3, "top_level_comment_count": 2,
+            "points": {"cost": 10, "balance": 990},
+        }), "r1")
+
+    SDX_XHS_LINK = "https://www.xiaohongshu.com/explore/" + "b" * 24
+
+    def test_probe_tells_field_missing_apart_from_field_false(self):
+        """探针最该回答的那一个问题：这家**没返回**这个字段，还是**返回了 false**？
+
+        两者要人做的事完全相反——没返回 = 这家不报（线上会自动不下结论），
+        返回了 false = 这家报错了（线上会照着错的值判，安静地写出假告警）。
+        而「置顶评论（无）」这一行对两者印的是同一句话，所以必须单独数键。
+        """
+        present_but_false = [
+            {"content": "戳主页领券", "is_pinned": False, "is_author_comment": False,
+             "like_count": 9, "author": {"name": "官号"}},
+        ]
+        with mock.patch.object(transport, "request",
+                               return_value=self._sdx_page(present_but_false)):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings())
+        self.assertIn("能力字段", output)
+        self.assertIn("1/1 条带这个键", output)
+        self.assertIn("✅ 这家报置顶", output)
+        self.assertIn("✅ 这家报作者标记", output)
+        self.assertNotIn("这家不报置顶", output)
+
+    def test_probe_calls_out_a_channel_that_reports_nothing(self):
+        """键整页都不在 = 这家不报。线上据此完全不碰「置顶状态」列，
+        探针要把这个结论说出来，别让人以为「（无）」= 没置顶。"""
+        no_flags = [
+            {"content": "戳主页领券", "like_count": 9, "author": {"name": "官号"}},
+            {"content": "路过", "like_count": 0, "author": {"name": "路人"}},
+        ]
+        with mock.patch.object(transport, "request", return_value=self._sdx_page(no_flags)):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings())
+        self.assertIn("0/2 条带这个键", output)
+        self.assertIn("❌ 这家不报置顶", output)
+        self.assertIn("❌ 这家不报作者标记", output)
+        # 「置顶评论」那一行也要说清这不等于「没置顶」
+        self.assertIn("不等于没置顶", output)
+
+    def test_raw_keeps_these_two_keys_even_when_false(self):
+        """去空值那一步**不能**吃掉这两个键的 false——吃掉之后，
+        「没返回」和「返回了 false」在屏幕上长得一模一样，
+        而分清这两件事正是这个脚本存在的一大半理由。"""
+        items = [{"content": "路过", "is_pinned": False, "is_author_comment": False,
+                  "like_count": 0, "reply_count": 0, "author": {"name": "路人"}}]
+        with mock.patch.object(transport, "request", return_value=self._sdx_page(items)):
+            _ok, output = self._probe(providers.SOCIALDATAX, "s-key",
+                                      self.SDX_XHS_LINK, Settings(), raw=True)
+        self.assertIn('"is_pinned": false', output)
+        self.assertIn('"is_author_comment": false', output)
+        # 其余的 0 照旧去掉——只有这两个键的 false 是有信息的
+        self.assertNotIn('"reply_count"', output)
+
     XHS_LINK = "https://www.xiaohongshu.com/explore/" + "a" * 24
     XHS_COMMENTS = transport.Response(200, "application/json", json.dumps({
         "code": 200, "data": {"data": {
