@@ -2284,6 +2284,88 @@ class TestChannelOutage(unittest.TestCase):
                           self._healthy_standby()),
             [])
 
+    # —— 以下五条钉的是 Codex 在 PR #40 上逐条指出的洞。
+    #    它们都属于同一类错误：**拿一个算不准的东西当准话说出口**。
+
+    def test_douyin_can_still_run_on_free_credit(self):
+        """TikHub 的赠送额度抖音端点认、小红书端点不认（allow_free_credit=0）。
+
+        只看现金的话，现金归零但还有赠送额度的账号会被报成「抖音也停了」
+        ——而 runner 那边照样发得出去。同一笔钱，两个平台两个口径。
+        """
+        bal = balance_mod.Balance(
+            channel="tikhub", label="TikHub", unit="USD",
+            amount=0.0, yuan=0.0, rate=7.2, free_credit=5.0)
+        outs = self._outages(bal, self._healthy_standby())
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(outs[0].platforms, ["小红书"],
+                         "抖音还能靠赠送额度跑，不该报它")
+
+    def test_unreadable_standby_is_reported_as_unknown_not_as_failover(self):
+        """备胎余额读不到时**两个方向都不许编**。
+
+        说「降到了它」是编：它的 Key 可能就是坏的，付费端点照样会拒。
+        说「巡查停了」也是编：它可能好好的。就说说不准。
+        """
+        outs = self._outages(
+            self._bal("tikhub", "TikHub", 0.0),
+            self._bal("socialdatax", "SocialDataX", 0, error="HTTP 401"))
+        self.assertTrue(outs[0].fallback_unknown)
+        self.assertEqual(outs[0].fallback_label, "")
+        self.assertFalse(outs[0].stopped, "说不准 ≠ 确认停摆")
+
+    def test_a_confirmed_standby_wins_over_an_earlier_unreadable_one(self):
+        """读不到的那家**不让搜索停下来**：后面若还有确认付得起的，那家才是答案。
+
+        直接测挑备胎那一步——注册表里只有两家，编不出「读不到的排在
+        付得起的前面」这种真实配置，而这条规则本身值得钉住。
+        """
+        by_name = {"socialdatax": self._bal("socialdatax", "SocialDataX",
+                                            0, error="读不到"),
+                   "tikhub": self._bal("tikhub", "TikHub", 86.4)}
+        name, unknown = channels._pick_standby(
+            [("socialdatax", 0.1), ("tikhub", 0.072)], by_name, "xhs")
+        self.assertEqual(name, "tikhub")
+        self.assertFalse(unknown, "找到了确认能用的，就不该再说「说不准」")
+
+    def test_platforms_with_different_fallbacks_are_separate_alerts(self):
+        """`xhs=[tikhub,socialdatax]` + `douyin=[tikhub]`：抖音根本没有备胎。
+
+        并成一条的话，那一条必然对其中一个平台说了假话——说抖音也
+        「降到了 SocialDataX」，而 runner._call 那边它压根没有下一家。
+        """
+        settings = Settings()
+        settings.channels.order = {
+            "xhs": ["tikhub", "socialdatax"], "douyin": ["tikhub"]}
+        outs = channels.outages(
+            [self._bal("tikhub", "TikHub", 0.0), self._healthy_standby()],
+            settings, self.KEYS)
+        self.assertEqual(len(outs), 2, "处境不同的平台不能并成一条")
+        by_platform = {o.platforms[0]: o for o in outs}
+        self.assertEqual(by_platform["小红书"].fallback_label, "SocialDataX")
+        self.assertTrue(by_platform["抖音"].stopped)
+
+    def test_a_depleted_channel_that_only_it_can_take_links_is_reported(self):
+        """首选健康，不等于每一行都刷得到。
+
+        `runner._call` 会拿 `can_handle` 过滤通道顺序：抖音短链展不开时
+        TikHub 直接让位，那种行只有 SocialDataX 能接。它空了，那些行就
+        刷不到，而「首选还好好的」这道闸一个字都不会报。
+        """
+        outs = self._outages(self._bal("tikhub", "TikHub", 86.4),
+                             self._bal("socialdatax", "SocialDataX", 0.0))
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(outs[0].role, "shape_only")
+        self.assertEqual(outs[0].channel, "socialdatax")
+        self.assertEqual(outs[0].platforms, ["抖音"])
+
+    def test_a_depleted_standby_is_silent_where_the_primary_takes_links(self):
+        """小红书那边 TikHub 长短链分享文案都吃，备胎空了也不影响任何一行。
+        在这里报警就是纯噪音——他们本来就可能不给备胎充值。"""
+        outs = self._outages(self._bal("tikhub", "TikHub", 86.4),
+                             self._bal("socialdatax", "SocialDataX", 0.0))
+        self.assertNotIn("小红书", outs[0].platforms)
+
     def test_computing_outages_sends_no_request(self):
         """这条告警**不花一分钱**：余额是 BalanceFeed 早取好的（那两个端点
         官方标明零费用），其余全是本地常量。面板那条不变量一点没动。"""
@@ -2305,13 +2387,32 @@ class TestChannelOutageOnThePage(unittest.TestCase):
         one_call_yuan = 0.072
         platforms = ["小红书"]
         fallback_label = "SocialDataX"
+        fallback_unknown = False
         lost = ["置顶监控", "蓝词回填"]
+        role = "primary"
         stopped = False
 
     class _Stopped(_Outage):
         fallback_label = ""
         lost = []
         stopped = True
+
+    class _Unknown(_Outage):
+        """备胎余额读不到：两个方向都不许编。"""
+        fallback_label = ""
+        fallback_unknown = True
+        lost = []
+        stopped = False
+
+    class _ShapeOnly(_Outage):
+        """首选还健康，但它接不了某种链接形态，只有这家能接。"""
+        channel = "socialdatax"
+        label = "SocialDataX"
+        platforms = ["抖音"]
+        fallback_label = ""
+        lost = []
+        role = "shape_only"
+        stopped = False
 
     class _Runway:
         known = True
@@ -2330,6 +2431,28 @@ class TestChannelOutageOnThePage(unittest.TestCase):
         self.assertIn("充值", html)
         # 归档的老帖不会自己刷回来，这一点必须在同一条告警里说清楚
         self.assertIn("排队刷新", html)
+
+    def test_the_band_does_not_promise_row_level_traces_for_blue_words(self):
+        """置顶和作者标记会在诊断信息里逐行留痕，**蓝词不会**——它一个字都不写。
+        笼统承诺「逐行点名」会把人支去找一个不存在的东西。"""
+        html = panel_view._outage_note([self._Outage()])
+        self.assertIn("置顶和作者标记会在「诊断信息」里逐行点名", html)
+        self.assertIn("蓝词不写任何东西", html)
+
+    def test_unknown_standby_claims_neither_failover_nor_stoppage(self):
+        """备胎余额读不到时，两个方向都是编：说降级成功是编（它的 Key 可能
+        就是坏的），说巡查停了也是编（它可能好好的）。"""
+        html = panel_view._outage_note([self._Unknown()])
+        self.assertIn("说不准", html)
+        self.assertNotIn("已经整轮降到", html)
+        self.assertNotIn("巡查已经停了", html)
+
+    def test_shape_only_outage_says_which_kind_of_row(self):
+        """面板看不到具体的行，所以说的是「哪一类行」，不是「多少行」。"""
+        html = panel_view._outage_note([self._ShapeOnly()])
+        self.assertIn("接不了某些链接形态", html)
+        self.assertNotIn("已经整轮降到", html)
+        self.assertNotIn("巡查已经停了", html)
 
     def test_no_standby_reads_differently(self):
         html = panel_view._outage_note([self._Stopped()])
