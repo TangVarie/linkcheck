@@ -94,6 +94,19 @@ class Snapshot:
     # 判据见 read_comment_page：归一化层对**能报置顶的通道**恒定写 is_pinned
     # 这个键（True/False 都写），所以「整页一条都没写过这个键」= 这家不报。
     pin_reported: bool = True
+    # 有没有**作者标记**这个维度，语义和 pin_reported 完全对称：问的是
+    # 「这家通道会不会报作者」，不是「有没有作者评论」。它撑着的是负面判定
+    # 里的 skip_author——靠它把品牌号自己的回复排除在负面命中之外。
+    # 静默失效的后果和置顶那个方向相反：置顶是无中生有报一个「掉了」，
+    # 这里是把自家回的「温和配方，不会过敏」算成负面，一条干净的帖子
+    # 被写成「有负面」。
+    # ⚠️ 所以处置也**不能**照抄置顶：置顶判不了就整列不碰，负面判不了却不能
+    # 不判——漏掉真负面比误报一条糟得多。照常出结论，只在诊断信息里说清
+    # 「这一轮自家回复没被排除」，让人工过一眼快照。见 decide()。
+    # 抖音两家通道都恒定写这个键（值恒为 False），所以抖音行这个标志为真：
+    # 抖音看不见作者是**平台**边界，docs/表结构.md 已经写明「这个排除等于
+    # 没开」，每一行再报一次只是固定噪音。
+    author_reported: bool = True
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -164,16 +177,19 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     """
     items = data.get("items")
     comments: list[CommentView] = []
-    # 这一页里只要有**一条**带着 is_pinned 这个键，就说明这条通道会报置顶。
-    # 靠的是归一化层的契约（见 providers 顶部）：能报置顶的通道对每一条评论
-    # 恒定写这个键，True 和 False 都写。所以整页一个都没有 = 这家根本不报，
-    # 而不是「这一页恰好没有置顶」——两者写进表里的后果天差地别。
+    # 这一页里只要有**一条**带着 is_pinned 这个键，就说明这条通道会报置顶；
+    # is_author_comment 同理。靠的是归一化层的契约（见 providers 顶部）：
+    # 能报的通道对每一条评论恒定写这个键，True 和 False 都写。所以整页一个
+    # 都没有 = 这家根本不报，而不是「这一页恰好没有置顶 / 没有作者评论」——
+    # 两者写进表里的后果天差地别。
     pin_reported = False
+    author_reported = False
     if isinstance(items, list):
         for item in items:
             if not isinstance(item, dict):
                 continue
             pin_reported = pin_reported or "is_pinned" in item
+            author_reported = author_reported or "is_author_comment" in item
             comments.append(
                 CommentView(
                     content=str(item.get("content") or ""),
@@ -199,6 +215,8 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
         # 不可能有置顶，哪家通道都得出同一个结论。空壳轮（连评论数都没拿到）
         # 另有 saw_comment_page 那道闸挡着，不会走到下结论这一步。
         pin_reported=pin_reported or not comments,
+        # 同理：没有评论就不存在「自家回复被算成负面」这件事，没什么要提醒的。
+        author_reported=author_reported or not comments,
     )
 
 
@@ -353,7 +371,9 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
 
     只有小红书的评论条目带作者标记（`is_author_comment`），抖音一律
     False，所以抖音行上这个开关等于没开——这是上游能力的边界，不是
-    这里可以补的。
+    这里可以补的。**通道也是一道边界**：降级到不报作者标记的备胎时，
+    这个开关同样会静默失效，由 `Snapshot.author_reported` 认出来，
+    decide() 负责在诊断信息里说一声（这里照常匹配，不改行为）。
 
     一条评论同时命中多个词时只记第一个命中的词（按关键词在表里的顺序），
     免得同一条评论在快照里出现好几遍。
@@ -685,6 +705,20 @@ def decide(
                 f"⚠ 第一页评论命中 {len(verdict.negative_hits)} 条负面/竞品词（{words}）"
                 f"→ {settings.negative_status.found}，详见「{settings.fields.negative_digest}」"
             )
+            # 这一轮的通道不报作者标记 → skip_author 静默失效，自家账号回的
+            # 「温和配方，不会过敏」会原样算成负面命中。**结论照出**（漏掉真
+            # 负面比误报一条糟得多），但必须说出来是谁在报警：不说的话运营
+            # 看到的是一条一模一样的「有负面」，照着它去走公关流程，
+            # 而命中的可能是自己昨天回的那一句。
+            # 只在真有命中时才报——没命中就没有「排除没生效」这回事，
+            # 每轮都挂一句只会把真正要看的那几条淹掉。
+            if not snapshot.author_reported:
+                # 措辞是给运营看的，别在这里用 markdown 记号——「诊断信息」是
+                # 飞书的纯文本格子，星号会原样显示出来（其余诊断语句也都不带）。
+                verdict.notes.append(
+                    "⚠ 本轮这条数据通道不报作者标记（多半是主通道余额/故障降到了"
+                    "备胎），自家账号的回复没有被排除在上面的命中之外"
+                    "——先过一眼快照，确认命中的不是自己回的")
     elif negative_keywords:
         verdict.notes.append("本轮未取到评论页内容，负面词判定保持原样")
 

@@ -13,14 +13,21 @@
                         ip_location, author}],
              "comment_count": int|None, "top_level_comment_count": int|None}
 
-    ⚠️ `is_pinned` **这个键的有无本身就是信号**，不只是它的值：会报置顶的
-    通道必须对**每一条**评论都写上它（True / False 都写，照 _xhs_comment_items
-    的写法），一条都不写 = 「这家不报置顶」，analyze 会据此完全不碰
-    「置顶状态」那一列（和抖音一个待遇）。SocialDataX 走的是原样透传，
-    所以它报不报置顶由它的**真实**响应说了算——而那一侧至今一次真实调用
-    都没发过（见 docs/供应商对比.md 开头的警告）。新接一家通道时，
-    要么保证这个键恒定写，要么就让它缺着——**唯独不能补一个假的 False**，
-    那等于让这家通道去证明「置顶没了」。
+    ⚠️ `is_pinned` 和 `is_author_comment` **这两个键的有无本身就是信号**，
+    不只是它们的值：会报的通道必须对**每一条**评论都写上（True / False 都写，
+    照 _xhs_comment_items 的写法），一条都不写 = 「这家不报这个维度」。
+    analyze 据此认出通道能力（Snapshot.pin_reported / author_reported），
+    两个维度的处置不同、都在 analyze 那边：
+
+    * 置顶不报 → 「置顶状态」那一列**完全不碰**（和抖音一个待遇）
+    * 作者不报 → 负面判定**照常出结论**（漏掉真负面更糟），但诊断信息里
+      说明「自家账号的回复这一轮没被排除」
+
+    SocialDataX 走的是原样透传，所以它报不报由它的**真实**响应说了算——
+    而那一侧至今一次真实调用都没发过（见 docs/供应商对比.md 开头的警告）。
+    新接一家通道时，要么保证这两个键恒定写，要么就让它缺着——
+    **唯独不能补一个假的 False**，那等于让一家看不见的通道去证明
+    「置顶没了」「这条不是自家回的」。
     详情    {"like_count", "collect_count", "share_count", "comment_count",
              "_censored": bool|None}
 
