@@ -209,6 +209,13 @@ class BusinessColumn:
     # 所以同样是建完再补。飞书的 POST fields 只会追加到末尾，这两种列
     # 在新表里会排在最后，而不是西屋表里的位置——顺序在视图里拖一下就好。
     formula: str = ""
+    # 建出来之后**还要人在飞书里补一步**才算完整的列（「数据整理」要挂 AI
+    # 字段捷径，开放接口做不到）。非空时建表结果会把这一步原样交代给人——
+    # 这一列看着和真的一样，却不会自己填，不说出来就是一个安静的坑。
+    manual_step: str = ""
+    # 那一步里要人粘进去的原文（比如 AI 指令）。跟着建表结果一起递到人手上，
+    # 不让人再去别处找。
+    manual_paste: str = ""
 
     @property
     def deferred(self) -> bool:
@@ -265,6 +272,82 @@ def next_check_formula(settings: Settings) -> str:
     return f'IF({age_now} > {days}, "", {inner})'
 
 
+# ---------- 截图读数：「数据整理」+ 三个拆数公式 ----------
+#
+# 运营把后台数据截图 / 发布页截图丢进「相关截图」，一个 AI 字段捷径（豆包
+# 「AI 图片理解」）读图，吐出一行固定格式的字：
+#
+#     曝光量：600；阅读量：43；互动量：2
+#
+# 三个公式列再把这行字拆成三个能排序、能求和的数字。认不出的项 AI 输出
+# 「/」，VALUE 转不动 → IFERROR 兜成空格子，不会冒出一个假的 0。
+#
+# ⚠️ 「数据整理」的 AI 那一半**开放接口建不了**。2026-09 核对过飞书官方 SDK
+# （lark-oapi 1.7.3，从接口定义生成）：多维表格的字段模型只有
+# field_name / type / property / description / is_primary / field_id /
+# ui_type / is_hidden，整个模块里没有任何「字段捷径 / AI / 插件 / 模型账号」
+# 的概念；而且那个捷径要绑一个**人的**豆包账号，应用身份本来就给不了。
+# 所以先建成一列普通文本（捷径本来就是挂在文本列上的——飞书里打开它，
+# 字段类型那一栏写的就是「文本」+「AI 图片理解（字段捷径）」），三个公式
+# 照常建好、照常引用它；挂捷径那一步交给人，建表结果里原样交代。
+DATA_COLUMN = "数据整理"
+
+# 你们在用的那份指令，原文照录。它是这一列唯一要人手动粘的东西，所以放在
+# 代码里当唯一的真相：建表结果直接把它递到人手上，docs/表结构.md 里那份
+# 抄本由测试盯着，两边一个字都不许漂。
+DATA_EXTRACT_PROMPT = '''# 任务
+从上传的截图中识别并提取内容数据，严格按指定格式输出。
+
+# 图片分类规则
+上传图片分为两类，先分类再提取：
+
+1. 后台数据截图：含数据看板/数据统计页面，通常带有"曝光""阅读""互动"等字段标签和对应数值。
+2. 内容发布页截图：内容详情页，右下角有三个图标（从左到右：点赞、收藏、评论），每个图标旁有数字。
+
+# 数据提取优先级
+1. 优先使用后台数据截图提取全部三项数据。
+2. 仅当无后台数据截图时，才使用内容发布页截图。
+3. 内容发布页截图仅能提取互动量（=点赞+收藏+评论三个数字之和），曝光量和阅读量输出"/"。
+
+# 多图去重规则
+若存在多张同类截图：
+- 判定标准：同一内容、同一页面的截图视为相似图。
+- 取值规则：以互动量最高的一张为准，其余不计。
+- 若互动量相同，取曝光量最高的一张。
+
+# 数据识别要求
+- 仅当在图片中识别到明确、可辨认的数值时才输出该数值。
+- 数值模糊、被遮挡、无法确认时，该项输出"/"。
+- 不得猜测、推算或补全未识别到的数据。
+
+# 输出格式（严格按此格式输出，不输出任何其他内容）
+曝光量：；阅读量：；互动量：'''
+
+# 三个拆数公式，照你们表里在用的原样。「阅读量」那条原来是多行写的，这里
+# 只是折成一行，一个字符都没改（公式里的空白不影响求值）。注意列名是
+# 「互动数」、而 AI 吐的那行字里写的是「互动量」——两边本来就不一样，照旧。
+# 公式逻辑有离线测试：拿几种真实形态的「数据整理」原文逐条求值。
+DATA_FORMULAS = (
+    ("曝光量",
+     f'IFERROR(VALUE(MID([{DATA_COLUMN}], 5, FIND("；", [{DATA_COLUMN}]) - 5)), "")'),
+    ("阅读量",
+     f'IFERROR(VALUE(MID([{DATA_COLUMN}], FIND("阅读量：", [{DATA_COLUMN}]) + 4, '
+     f'FIND("；", [{DATA_COLUMN}], FIND("阅读量：", [{DATA_COLUMN}]) + 4) '
+     f'- FIND("阅读量：", [{DATA_COLUMN}]) - 4)), "")'),
+    ("互动数",
+     f'IFERROR(VALUE(MID([{DATA_COLUMN}], FIND("互动量：", [{DATA_COLUMN}]) + 4, '
+     f'LEN([{DATA_COLUMN}]))), "")'),
+)
+
+DATA_MANUAL_STEP = (
+    f"「{DATA_COLUMN}」建出来是一列普通文本，还要在飞书里挂一次 AI 字段捷径"
+    "才会自己读图：打开这一列的设置 → 字段类型选「字段捷径 → AI 图片理解」"
+    "→「原图」选「相关截图」→ 自定义指令粘下面这段 → 关联你自己的豆包账号 → "
+    "生成范围选「整列」、打开「自动更新」。挂好之前「曝光量 / 阅读量 / 互动数」"
+    "三列会一直是空的——公式没坏，只是还没有东西可拆。"
+)
+
+
 # 字符串 = 巡查列的角色名（settings.fields 上的属性），BusinessColumn = 业务列。
 FULL_LAYOUT: tuple = (
     BusinessColumn("素人编号", TEXT),
@@ -285,6 +368,11 @@ FULL_LAYOUT: tuple = (
     "comment_status",
     BusinessColumn("发布截图", ATTACHMENT),
     BusinessColumn("相关截图", ATTACHMENT),
+    # 截图读数：紧挨着「相关截图」，因为读的就是它。三个公式列要等
+    # 「数据整理」先存在，所以和其他公式列一样建完再补、排到表尾。
+    BusinessColumn(DATA_COLUMN, TEXT, manual_step=DATA_MANUAL_STEP,
+                   manual_paste=DATA_EXTRACT_PROMPT),
+    *(BusinessColumn(name, FORMULA, formula=expr) for name, expr in DATA_FORMULAS),
     # 蓝词三件套现在是巡查列（机器回填新蓝词、翻「是否截图」），类型和选项
     # 以 schema.expected_schema 为准；位置沿用西屋表，「是否截图」插在中间。
     "blue_words",
@@ -567,6 +655,9 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
         else:
             built.append(column.name)
     shared = share_table(workspace, base["app_token"], share, log=log) if share else ShareResult()
+    steps = manual_steps(built)
+    for step in steps:
+        log(f"✋ [{base['app_token'][-6:]}/{table_id}] 「{step['column']}」还要人在飞书里补一步")
     # ⚠️ 链接必须带上**新建的这张表**的 table_id。`create_base` 会顺带建一张
     # 飞书自己的默认表，返回的 base 级 url 点进去就是那一张——运营可能直接
     # 在里面开始填数据，而注册表监控的是另一张，填的东西一行都不会被巡查。
@@ -581,7 +672,20 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
             "template": template,
             "columns": len(built), "built": built,
             "skipped_columns": skipped, "column_failures": column_failures,
+            "manual_steps": steps,
             "shared": shared.granted, "share_failures": shared.failures}
+
+
+def manual_steps(built: list) -> list:
+    """建出来之后还要人在飞书里补一步的列，按模板顺序，连要粘的原文一起。
+
+    只报**真建出来了的**：没建出来的列已经在 column_failures 里报着，这里再说
+    「去给它挂捷径」就是把人支去找一列不存在的东西。
+    """
+    names = set(built)
+    return [{"column": c.name, "step": c.manual_step, "paste": c.manual_paste}
+            for c in FULL_LAYOUT
+            if isinstance(c, BusinessColumn) and c.manual_step and c.name in names]
 
 
 def _table_url(base_url: str, app_token: str, table_id: str) -> str:

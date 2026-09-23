@@ -238,15 +238,23 @@ class TestCreateMonitoredTable(unittest.TestCase):
 
 
 # 西屋表（2026-09 导出）的列，按表里的顺序。模板照它抄，这里照它验。
+# 「数据整理」和它后面三个拆数公式是 2026-09-23 补进标准模板的（运营现在的表
+# 里都有，紧挨着「相关截图」——读的就是那一列）。
 XIWU_COLUMNS = [
     "素人编号", "发布时间", "反馈链接", "已删除评论留底", "流量状态", "起量时间",
     "笔记状态", "方向", "找人备注", "内容配图", "文案", "随贴评论", "评论的素人编号",
-    "评论配图", "评论状态", "发布截图", "相关截图", "蓝词字段", "是否截图", "蓝词图片", "作者",
+    "评论配图", "评论状态", "发布截图", "相关截图",
+    "数据整理", "曝光量", "阅读量", "互动数",
+    "蓝词字段", "是否截图", "蓝词图片", "作者",
     "父记录", "负面词", "评论关键词", "是否巡查", "排队刷新", "诊断信息", "置顶状态",
     "已确认存活", "巡查状态", "负面状态", "负面评论快照", "评论区快照",
     "实时数据.评论数", "最近检查时间", "下次检查时间", "连续失败次数", "平台",
     "上次评论数",
 ]
+
+# 建表时带不了、要建完再补的列，按补的顺序（= 模板里的先后）：三个拆数公式
+# 引用「数据整理」，「父记录」要 table_id，「下次检查时间」引用巡查列。
+DEFERRED = ("曝光量", "阅读量", "互动数", "父记录", "下次检查时间")
 
 
 class TestFullTemplate(unittest.TestCase):
@@ -265,9 +273,9 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_columns_follow_the_xiwu_table_in_order(self):
         """顺序也要一样：运营看惯了那个顺序，机器列全堆到末尾反而要重新找。
-        「父记录」和「下次检查时间」建表时带不了（一个要 table_id，一个引用
-        别的列），建完再补，落在末尾。"""
-        expected = [c for c in XIWU_COLUMNS if c not in ("父记录", "下次检查时间")]
+        「父记录」和公式列建表时带不了（一个要 table_id，公式要引用别的列），
+        建完再补，落在末尾。"""
+        expected = [c for c in XIWU_COLUMNS if c not in DEFERRED]
         self.assertEqual([f["field_name"] for f in self.fields], expected)
 
     def test_every_xiwu_column_ends_up_built(self):
@@ -379,7 +387,7 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_deferred_columns_are_added_in_layout_order(self):
         names = [c[0][2]["field_name"] for c in self.workspace.create_field.call_args_list]
-        self.assertEqual(names, ["父记录", "下次检查时间"])
+        self.assertEqual(names, list(DEFERRED))
 
     def test_the_formula_follows_renamed_columns(self):
         from dataclasses import replace
@@ -393,7 +401,12 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_a_failed_deferred_column_does_not_fail_the_created_table(self):
         workspace = fake_workspace()
-        workspace.create_field.side_effect = [RuntimeError("1254xxx"), "fldOK"]
+
+        def create_field(_app, _table, body):
+            if body["field_name"] == "父记录":
+                raise RuntimeError("1254xxx")
+            return "fldOK"
+        workspace.create_field.side_effect = create_field
         made = provision.create_monitored_table(workspace, self.settings, "甲",
                                                 log=lambda *a: None)
         self.assertEqual(made["target"], "bascnNEW:tblNEW")
@@ -608,6 +621,172 @@ class TestShareTable(unittest.TestCase):
         self.assertEqual(result.granted[0], "可管理 2 人（后台配置，面板上不显示是谁）")
         self.assertIn("第 1 项", lines[0])
         self.assertIn("第 2 项", lines[1])
+
+
+# —— 截图读数：「数据整理」+ 三个拆数公式 ——
+#
+# 运营在飞书里写好、在用的原文，逐字照录。模板里「阅读量」那条被折成了一行，
+# 下面的用例拿去掉空白之后的形态逐字比对——证明折行时一个字符都没动。
+OPERATOR_FORMULAS = {
+    "曝光量": 'IFERROR(VALUE(MID([数据整理], 5, FIND("；", [数据整理]) - 5)), "")',
+    "阅读量": '''IFERROR(
+  VALUE(MID([数据整理],
+    FIND("阅读量：", [数据整理]) + 4,
+    FIND("；", [数据整理], FIND("阅读量：", [数据整理]) + 4)
+      - FIND("阅读量：", [数据整理]) - 4)),
+  "")''',
+    "互动数": 'IFERROR(VALUE(MID([数据整理], FIND("互动量：", [数据整理]) + 4, LEN([数据整理]))), "")',
+}
+
+
+class _FormulaError(Exception):
+    """公式在飞书里会求值出错的那几种情况（找不到、转不动、越界）。"""
+
+
+def _find(needle, hay, start=1):
+    at = hay.find(needle, start - 1)
+    if at < 0:
+        raise _FormulaError(f"FIND 没找到 {needle!r}")
+    return at + 1
+
+
+def _mid(text, start, count):
+    if start < 1 or count < 0:
+        raise _FormulaError("MID 参数越界")
+    return text[start - 1:start - 1 + count]
+
+
+def _value(text):
+    try:
+        number = float(text.strip())
+    except ValueError:
+        raise _FormulaError(f"VALUE 转不动 {text!r}") from None
+    return int(number) if number.is_integer() else number
+
+
+def _evaluate(expr: str, cell: str):
+    """把拆数公式在 Python 里照飞书的语义求值一遍。
+
+    这几条公式只用到 IFERROR / VALUE / MID / FIND / LEN、字符串、整数和加减，
+    换掉列引用之后就是合法的 Python 表达式。唯一要特殊处理的是 IFERROR：
+    它的两个参数必须**惰性**求值，所以拆开外层那一个，自己 try/except。
+    """
+    assert expr.startswith("IFERROR(") and expr.endswith(")"), expr
+    body, depth, quoted = expr[len("IFERROR("):-1], 0, False
+    for at, ch in enumerate(body):
+        if ch == '"':
+            quoted = not quoted
+        elif not quoted:
+            depth += (ch == "(") - (ch == ")")
+            if ch == "," and depth == 0:
+                value, fallback = body[:at], body[at + 1:]
+                break
+    else:
+        raise AssertionError(f"IFERROR 缺第二个参数：{expr}")
+    names = {"FIND": _find, "MID": _mid, "VALUE": _value, "LEN": len, "S": cell}
+
+    def run(part):
+        return eval(part.replace(f"[{provision.DATA_COLUMN}]", "S"),  # noqa: S307
+                    {"__builtins__": {}}, names)
+    try:
+        return run(value)
+    except _FormulaError:
+        return run(fallback)
+
+
+class TestDataColumns(unittest.TestCase):
+    """「数据整理」+「曝光量 / 阅读量 / 互动数」：AI 读截图，公式拆数。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        self.workspace = fake_workspace()
+        self.made = provision.create_monitored_table(
+            self.workspace, self.settings, "新项目", log=lambda *a: None)
+        self.fields = self.workspace.create_table.call_args[0][2]
+        self.deferred = {c[0][2]["field_name"]: c[0][2]
+                         for c in self.workspace.create_field.call_args_list}
+
+    def test_the_data_column_is_plain_text_right_after_the_screenshots(self):
+        """AI 字段捷径开放接口建不了，先建成文本——捷径本来就挂在文本列上。
+        紧挨着「相关截图」，因为读的就是它。"""
+        names = [f["field_name"] for f in self.fields]
+        self.assertEqual(names[names.index("相关截图") + 1], "数据整理")
+        data = next(f for f in self.fields if f["field_name"] == "数据整理")
+        self.assertEqual(data["type"], 1)
+        self.assertNotIn("数据整理", self.deferred, "它得和表一起建：三个公式要引用它")
+
+    def test_the_three_formulas_are_the_operators_own_text(self):
+        """逐字照录。「阅读量」那条原来是多行的，折成一行后去掉空白必须一模一样
+        ——公式里的字符串字面量都不含空格，所以这个比较是严格的。"""
+        for name, original in OPERATOR_FORMULAS.items():
+            body = self.deferred[name]
+            self.assertEqual(body["type"], 20, name)
+            got = body["property"]["formula_expression"]
+            self.assertEqual("".join(got.split()), "".join(original.split()), name)
+
+    def test_the_formulas_split_what_the_prompt_asks_the_ai_to_write(self):
+        """拿 AI 按指令会吐出的几种形态，逐条公式求值。"""
+        formulas = {n: self.deferred[n]["property"]["formula_expression"]
+                    for n in OPERATOR_FORMULAS}
+        cases = [
+            # 后台数据截图：三项都有（截图 1 里的真实行）
+            ("曝光量：15；阅读量：11；互动量：1", (15, 11, 1)),
+            ("曝光量：600；阅读量：43；互动量：2", (600, 43, 2)),
+            # 只有发布页截图：只认得出互动量，其余按指令输出「/」→ 空格子，
+            # 不是一个假的 0
+            ("曝光量：/；阅读量：/；互动量：23", ("", "", 23)),
+            # 看不清的那一项也是「/」
+            ("曝光量：300；阅读量：/；互动量：1", (300, "", 1)),
+            # 捷径还没挂 / 还没跑：整列空着，三个公式都兜成空，不报错
+            ("", ("", "", "")),
+        ]
+        for cell, expected in cases:
+            got = tuple(_evaluate(formulas[n], cell) for n in ("曝光量", "阅读量", "互动数"))
+            self.assertEqual(got, expected, cell)
+
+    def test_the_manual_step_is_handed_over_with_the_exact_prompt(self):
+        """这一列看着和真的一样却不会自己填——建完这一刻必须说出来，
+        要粘的指令原文一起递上，不让人去别处找。"""
+        steps = self.made["manual_steps"]
+        self.assertEqual([s["column"] for s in steps], ["数据整理"])
+        self.assertIn("AI 图片理解", steps[0]["step"])
+        self.assertIn("相关截图", steps[0]["step"])
+        self.assertEqual(steps[0]["paste"], provision.DATA_EXTRACT_PROMPT)
+
+    def test_the_prompt_is_the_operators_text(self):
+        """几处最容易被「顺手整理」掉的地方钉死：输出格式那一行、「/」的用法、
+        以及 "曝光""阅读""互动" 和 "/" 用的是英文双引号（不是中文引号）。"""
+        prompt = provision.DATA_EXTRACT_PROMPT
+        self.assertTrue(prompt.startswith("# 任务\n从上传的截图中识别并提取内容数据"))
+        self.assertTrue(prompt.endswith("# 输出格式（严格按此格式输出，不输出任何其他内容）\n"
+                                        "曝光量：；阅读量：；互动量："))
+        self.assertIn('通常带有"曝光""阅读""互动"等字段标签', prompt)
+        self.assertIn('该项输出"/"', prompt)
+
+    def test_no_manual_step_for_a_column_that_was_not_built(self):
+        """没建出来的列已经在 column_failures 里报着；再说「去给它挂捷径」
+        就是把人支去找一列不存在的东西。"""
+        self.assertEqual(provision.manual_steps(["素人编号", "相关截图"]), [])
+
+    def test_the_monitor_template_has_none_of_this(self):
+        """只建巡查列的模板没有业务列，自然也没有要手动补的步骤。"""
+        made = provision.create_monitored_table(
+            fake_workspace(), self.settings, "只巡查", template="monitor",
+            log=lambda *a: None)
+        self.assertNotIn("数据整理", made["built"])
+        self.assertEqual(made["manual_steps"], [])
+
+    def test_the_docs_copy_of_the_prompt_matches_the_code(self):
+        """人会从 docs/表结构.md 里复制这段指令去粘——那份抄本和代码里的
+        唯一真相一个字都不许漂，否则两张表里的 AI 读出来的格式会不一样，
+        公式拆出来的数也就跟着不一样。"""
+        import pathlib
+        import re
+        doc = (pathlib.Path(__file__).resolve().parent.parent
+               / "docs" / "表结构.md").read_text(encoding="utf-8")
+        block = re.search(r"<!-- DATA_EXTRACT_PROMPT -->\n```text\n(.*?)\n```", doc, re.S)
+        self.assertIsNotNone(block, "文档里找不到那段指令原文的标记")
+        self.assertEqual(block.group(1), provision.DATA_EXTRACT_PROMPT)
 
 
 if __name__ == "__main__":

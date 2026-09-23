@@ -918,7 +918,7 @@ _SCRIPT = r"""
     if (!name) { say("先填个项目名", ""); return; }
     var fullBox = document.getElementById("addFull");
     var full = !fullBox || fullBox.checked;
-    var what = full ? "按标准业务表的结构建齐（业务列 + 巡查列，近 40 列）" : "只建巡查要用的二十来列";
+    var what = full ? "按标准业务表的结构建齐（业务列 + 巡查列，四十多列）" : "只建巡查要用的二十来列";
     if (!confirm("新建一张监控表「" + name + "」？\n\n会在应用自己的空间里建一个多维表格，" + what + "，建完按配置给人和群开权限。")) return;
     btnCreate.disabled = true;
     say("建表中…", "muted");
@@ -931,8 +931,18 @@ _SCRIPT = r"""
       var bad = (c.share_failures || []).concat(c.column_failures || []);
       if (bad.length) lines.push("没成的：\n· " + bad.map(esc).join("\n· "));
       if (c.skipped_columns && c.skipped_columns.length) lines.push("没建的列：" + c.skipped_columns.map(esc).join("；"));
+      // 建出来了、但还要人在飞书里补一步才会动的列（「数据整理」要挂 AI 捷径）。
+      // 这一列看着和真的一样却不会自己填——不在建完这一刻说出来，就是一个
+      // 安静的坑。要粘的原文一起递上，折起来免得把整段结果撑满。
+      var manual = c.manual_steps || [];
+      manual.forEach(function(m){
+        lines.push("还要你在飞书里手动做一步：" + esc(m.step));
+        if (m.paste) lines.push("<details><summary>要粘的指令原文（点开，整段复制）</summary>"
+                                + "<div>" + esc(m.paste) + "</div></details>");
+      });
       if (c.note) lines.push(esc(c.note));
-      say(lines.join("\n"), bad.length ? "" : "ok");
+      // 还有手动步骤没做时不标成「全好了」的绿色：表是建好了，但还没好用。
+      say(lines.join("\n"), (bad.length || manual.length) ? "" : "ok");
       btnCreate.disabled = false;
     }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
   });
@@ -1381,7 +1391,7 @@ def _projects_section(config) -> str:
     —— 连类型带选项一次建齐，一次飞书都不用点。
     <label style='white-space:nowrap'><input type=checkbox id=addFull checked>
     连业务列一起建</label>（素人编号、文案、配图、截图、蓝词、笔记状态……
-    照西屋表的结构和顺序，近 40 列；不勾就只建巡查要用的二十来列）。</div>
+    照西屋表的结构和顺序，四十多列；不勾就只建巡查要用的二十来列）。</div>
   <div id=addOut class=out></div>
   <div id=share class=share><div class=muted>协作者设置加载中…</div></div>
 </div>"""
