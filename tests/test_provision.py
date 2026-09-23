@@ -6,7 +6,7 @@
 import unittest
 from unittest import mock
 
-from xhsearch import feishu, provision, schema
+from xhsearch import feishu, provision, readout, schema
 from xhsearch.config import Settings
 
 
@@ -18,6 +18,13 @@ def full_meta(settings=None, drop=(), retype=None, drop_options=None):
             continue
         meta[name] = {"type": allowed[0], "ui_type": "",
                       "options": list(options) if options else None}
+    # 截图读数四列每张表都必须有：健康的表带着它们，公式也是标准的那条。
+    for column in readout.COLUMNS:
+        if column.name in drop:
+            continue
+        meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
+        if column.formula:
+            meta[column.name]["formula"] = column.formula
     for name, code in (retype or {}).items():
         meta[name]["type"] = code
     for name, keep in (drop_options or {}).items():
@@ -127,6 +134,23 @@ class TestCheckIsFree(unittest.TestCase):
         self.assertEqual(c.duplicate, "")
         self.assertTrue(c.ready)
 
+    def test_missing_screenshot_columns_are_buildable(self):
+        """截图读数四列每张表都必须有：缺了就不算「配置齐了」，面板能一键补。"""
+        c = provision.check(FakeTable(full_meta(drop=["曝光量"])), Settings())
+        self.assertFalse(c.ready)
+        self.assertEqual([col.name for col in c.buildable], ["曝光量"])
+
+    def test_a_formula_that_does_not_match_goes_to_the_manual_list(self):
+        """改公式是改一列已有的配置——面板只追加，所以只报，标准公式整段给出来。"""
+        meta = full_meta()
+        meta["阅读量"]["formula"] = 'VALUE([数据整理])'
+        c = provision.check(FakeTable(meta), Settings())
+        self.assertFalse(c.ready)
+        self.assertEqual(c.buildable, [])
+        self.assertEqual(len(c.manual), 1)
+        self.assertIn("阅读量", c.manual[0])
+        self.assertIn(dict(readout.FORMULAS)["阅读量"], c.manual[0])
+
 
 class TestBuildMissing(unittest.TestCase):
     def _diff(self, **kwargs):
@@ -195,6 +219,48 @@ class TestBuildMissing(unittest.TestCase):
         self.assertIn("tblB", lines[0])
         self.assertIn(settings.fields.negative_status, lines[0])
 
+    def test_the_screenshot_columns_are_built_data_column_first(self):
+        """截图读数四列每张表都必须有：缺了一键补上。「数据整理」先建——三个公式
+        要引用它；补完把挂 AI 捷径那一步连指令原文一起交代出来。"""
+        table = FakeTable(full_meta(drop=readout.NAMES))
+        result = provision.build_missing(table, self._diff(drop=readout.NAMES),
+                                         log=lambda *a: None)
+        self.assertTrue(result.ok)
+        self.assertEqual([b["field_name"] for b in table.created], list(readout.NAMES))
+        self.assertEqual(table.created[0], {"field_name": "数据整理", "type": 1})
+        for body in table.created[1:]:
+            self.assertEqual(body["type"], 20)
+            self.assertEqual(body["property"]["formula_expression"],
+                             dict(readout.FORMULAS)[body["field_name"]])
+        self.assertEqual([s["column"] for s in result.manual_steps], ["数据整理"])
+        self.assertEqual(result.manual_steps[0]["paste"], readout.DATA_EXTRACT_PROMPT)
+
+    def test_formulas_are_not_forced_when_the_data_column_failed(self):
+        """「数据整理」没建成，硬建公式只会再收三条看不懂的飞书错误。"""
+        class Flaky(FakeTable):
+            def create_field(self, body):
+                if body["field_name"] == "数据整理":
+                    raise feishu.FeishuError(-1, "1254xxx")
+                return super().create_field(body)
+        table = Flaky(full_meta(drop=readout.NAMES))
+        result = provision.build_missing(table, self._diff(drop=readout.NAMES),
+                                         log=lambda *a: None)
+        self.assertEqual(table.created, [])
+        self.assertEqual(len(result.failures), 4)
+        self.assertIn("1254xxx", result.failures[0])
+        for line in result.failures[1:]:
+            self.assertIn("要引用「数据整理」", line)
+        self.assertEqual(result.manual_steps, [], "没建出来的列不该支人去挂捷径")
+
+    def test_only_the_formulas_when_the_data_column_is_already_there(self):
+        names = ("曝光量", "阅读量", "互动数")
+        table = FakeTable(full_meta(drop=names))
+        result = provision.build_missing(table, self._diff(drop=names),
+                                         log=lambda *a: None)
+        self.assertEqual([b["field_name"] for b in table.created], list(names))
+        self.assertEqual(result.manual_steps, [],
+                         "「数据整理」这次没建——它挂没挂捷径，项目卡按数据另外在看")
+
 
 def fake_workspace():
     workspace = mock.Mock()
@@ -213,13 +279,16 @@ class TestCreateMonitoredTable(unittest.TestCase):
                                                template="monitor")
         self.assertEqual(got["target"], "bascnNEW:tblNEW")
         fields = workspace.create_table.call_args[0][2]
-        self.assertEqual(len(fields), len(schema.expected_schema(settings)))
-        self.assertEqual(got["columns"], len(fields))
+        # 巡查列 + 「数据整理」一次带上；三个拆数公式要引用「数据整理」，建完再补。
+        self.assertEqual(len(fields), len(schema.expected_schema(settings)) + 1)
+        self.assertEqual(fields[-1], {"field_name": "数据整理", "type": 1})
+        deferred = [c[0][2]["field_name"] for c in workspace.create_field.call_args_list]
+        self.assertEqual(deferred, ["曝光量", "阅读量", "互动数"])
+        self.assertEqual(got["columns"], len(fields) + len(deferred))
         traffic = next(f for f in fields
                        if f["field_name"] == settings.fields.traffic_status)
         self.assertEqual([o["name"] for o in traffic["property"]["options"]],
                          settings.tags.machine_written())
-        workspace.create_field.assert_not_called()
         self.assertEqual(got["skipped_columns"], [])
 
     def test_a_failed_base_creation_raises(self):
@@ -686,7 +755,7 @@ def _evaluate(expr: str, cell: str):
     names = {"FIND": _find, "MID": _mid, "VALUE": _value, "LEN": len, "S": cell}
 
     def run(part):
-        return eval(part.replace(f"[{provision.DATA_COLUMN}]", "S"),  # noqa: S307
+        return eval(part.replace(f"[{readout.DATA_COLUMN}]", "S"),  # noqa: S307
                     {"__builtins__": {}}, names)
     try:
         return run(value)
@@ -751,12 +820,12 @@ class TestDataColumns(unittest.TestCase):
         self.assertEqual([s["column"] for s in steps], ["数据整理"])
         self.assertIn("AI 图片理解", steps[0]["step"])
         self.assertIn("相关截图", steps[0]["step"])
-        self.assertEqual(steps[0]["paste"], provision.DATA_EXTRACT_PROMPT)
+        self.assertEqual(steps[0]["paste"], readout.DATA_EXTRACT_PROMPT)
 
     def test_the_prompt_is_the_operators_text(self):
         """几处最容易被「顺手整理」掉的地方钉死：输出格式那一行、「/」的用法、
         以及 "曝光""阅读""互动" 和 "/" 用的是英文双引号（不是中文引号）。"""
-        prompt = provision.DATA_EXTRACT_PROMPT
+        prompt = readout.DATA_EXTRACT_PROMPT
         self.assertTrue(prompt.startswith("# 任务\n从上传的截图中识别并提取内容数据"))
         self.assertTrue(prompt.endswith("# 输出格式（严格按此格式输出，不输出任何其他内容）\n"
                                         "曝光量：；阅读量：；互动量："))
@@ -768,13 +837,41 @@ class TestDataColumns(unittest.TestCase):
         就是把人支去找一列不存在的东西。"""
         self.assertEqual(provision.manual_steps(["素人编号", "相关截图"]), [])
 
-    def test_the_monitor_template_has_none_of_this(self):
-        """只建巡查列的模板没有业务列，自然也没有要手动补的步骤。"""
+    def test_the_monitor_template_has_them_too(self):
+        """这四列每张表都必须有。最小的模板不带的话，建出来的表第一次体检
+        就是红的——自己建的表过不了自己的体检。"""
+        workspace = fake_workspace()
         made = provision.create_monitored_table(
-            fake_workspace(), self.settings, "只巡查", template="monitor",
+            workspace, self.settings, "只巡查", template="monitor",
             log=lambda *a: None)
-        self.assertNotIn("数据整理", made["built"])
-        self.assertEqual(made["manual_steps"], [])
+        for name in readout.NAMES:
+            self.assertIn(name, made["built"])
+        self.assertEqual([s["column"] for s in made["manual_steps"]], ["数据整理"])
+        formulas = {c[0][2]["field_name"]: c[0][2]["property"]["formula_expression"]
+                    for c in workspace.create_field.call_args_list}
+        self.assertEqual(formulas, dict(readout.FORMULAS))
+
+    def test_a_table_built_from_either_template_passes_its_own_checkup(self):
+        """建出来的列喂回体检，一条问题都不该有——模板和体检用的是同一份定义。"""
+        for template in provision.TEMPLATES:
+            with self.subTest(template):
+                workspace = fake_workspace()
+                provision.create_monitored_table(
+                    workspace, self.settings, "甲", template=template,
+                    log=lambda *a: None)
+                bodies = list(workspace.create_table.call_args[0][2]) + [
+                    c[0][2] for c in workspace.create_field.call_args_list]
+                meta = {}
+                for body in bodies:
+                    prop = body.get("property") or {}
+                    meta[body["field_name"]] = {
+                        "type": body["type"], "ui_type": "",
+                        "options": ([o["name"] for o in prop["options"]]
+                                    if "options" in prop else None)}
+                    if "formula_expression" in prop:
+                        meta[body["field_name"]]["formula"] = prop["formula_expression"]
+                self.assertEqual(schema.schema_problems(self.settings, meta), [])
+                self.assertTrue(schema.diff(self.settings, meta).clean)
 
     def test_the_docs_copy_of_the_prompt_matches_the_code(self):
         """人会从 docs/表结构.md 里复制这段指令去粘——那份抄本和代码里的
@@ -786,7 +883,7 @@ class TestDataColumns(unittest.TestCase):
                / "docs" / "表结构.md").read_text(encoding="utf-8")
         block = re.search(r"<!-- DATA_EXTRACT_PROMPT -->\n```text\n(.*?)\n```", doc, re.S)
         self.assertIsNotNone(block, "文档里找不到那段指令原文的标记")
-        self.assertEqual(block.group(1), provision.DATA_EXTRACT_PROMPT)
+        self.assertEqual(block.group(1), readout.DATA_EXTRACT_PROMPT)
 
 
 if __name__ == "__main__":

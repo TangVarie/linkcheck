@@ -7,7 +7,7 @@
 
 import unittest
 
-from xhsearch import schema
+from xhsearch import readout, schema
 from xhsearch.config import Settings
 
 
@@ -17,6 +17,11 @@ def healthy_meta(settings=None, drop=(), retype=None, drop_options=None):
     for name, allowed, _label, options, _note in schema.expected_schema(settings):
         meta[name] = {"type": allowed[0], "ui_type": "",
                       "options": list(options) if options else None}
+    # 截图读数四列每张表都必须有，公式是标准的那条。
+    for column in readout.COLUMNS:
+        meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
+        if column.formula:
+            meta[column.name]["formula"] = column.formula
     for name in drop:
         meta.pop(name, None)
     for name, code in (retype or {}).items():
@@ -121,11 +126,114 @@ class TestDiff(unittest.TestCase):
         settings = Settings()
         d = schema.diff(settings, {})
         self.assertEqual(len(d.missing_columns),
-                         len(schema.expected_schema(settings)))
+                         len(schema.expected_schema(settings)) + len(readout.COLUMNS))
 
     def test_none_meta_does_not_crash(self):
         self.assertEqual(len(schema.diff(Settings(), None).missing_columns),
-                         len(schema.expected_schema(Settings())))
+                         len(schema.expected_schema(Settings())) + len(readout.COLUMNS))
+
+
+class TestScreenshotColumns(unittest.TestCase):
+    """截图读数四列每张表都必须有：缺了、类型不对、公式对不上都要报。
+    机器巡查不碰它们，所以只提醒——文案里要说清「巡查不受影响」。"""
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def _problems(self, meta):
+        return [p for p in schema.schema_problems(self.settings, meta) if "截图读数" in p]
+
+    def test_missing_ones_are_named_and_buildable_data_column_first(self):
+        meta = healthy_meta(self.settings, drop=readout.NAMES)
+        d = schema.diff(self.settings, meta)
+        self.assertEqual([c.name for c in d.missing_columns], list(readout.NAMES))
+        self.assertEqual(d.missing_columns[0].body(), {"field_name": "数据整理", "type": 1})
+        exposure = d.missing_columns[1].body()
+        self.assertEqual(exposure["type"], 20)
+        self.assertEqual(exposure["property"]["formula_expression"],
+                         dict(readout.FORMULAS)["曝光量"])
+        self.assertEqual(d.missing_columns[1].needs, ("数据整理",))
+        problems = self._problems(meta)
+        self.assertEqual(len(problems), 1, "缺几列合成一条，别刷屏")
+        for name in readout.NAMES:
+            self.assertIn(name, problems[0])
+        self.assertIn("巡查不受影响", problems[0])
+        self.assertIn("补齐缺的列", problems[0])
+        self.assertIn("AI 字段捷径", problems[0])
+
+    def test_the_ai_hint_only_when_the_data_column_is_the_one_missing(self):
+        problems = self._problems(healthy_meta(self.settings, drop=["互动数"]))
+        self.assertEqual(len(problems), 1)
+        self.assertNotIn("AI 字段捷径", problems[0])
+
+    def test_a_typed_number_instead_of_a_formula_is_reported_not_rebuilt(self):
+        """手填数字的列：改类型会动已有数据，面板不代劳——只报，并给出公式。"""
+        meta = healthy_meta(self.settings, retype={"曝光量": 2})
+        del meta["曝光量"]["formula"]
+        d = schema.diff(self.settings, meta)
+        self.assertEqual(d.missing_columns, [])
+        self.assertFalse(d.auto_fixable)
+        self.assertEqual([w.column for w in d.wrong_types], ["曝光量"])
+        problems = self._problems(meta)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("「数字」", problems[0])
+        self.assertIn("「公式」", problems[0])
+        self.assertTrue(problems[0].endswith(dict(readout.FORMULAS)["曝光量"]),
+                        "公式在句尾、后面不接句号——人会整段复制去粘")
+
+    def test_a_data_column_that_is_not_text_is_reported(self):
+        meta = healthy_meta(self.settings, retype={"数据整理": 2})
+        d = schema.diff(self.settings, meta)
+        self.assertEqual([w.column for w in d.wrong_types], ["数据整理"])
+        self.assertIn("文本", d.wrong_types[0].expected)
+
+    def test_a_formula_that_does_not_match_the_standard_is_reported(self):
+        meta = healthy_meta(self.settings)
+        meta["阅读量"]["formula"] = 'IFERROR(VALUE(MID([数据整理], 9, 3)), "")'
+        d = schema.diff(self.settings, meta)
+        self.assertEqual([g.column for g in d.wrong_formulas], ["阅读量"])
+        self.assertFalse(d.clean)
+        self.assertFalse(d.auto_fixable, "改公式是改已有配置，不归一键建齐")
+        problems = self._problems(meta)
+        self.assertEqual(len(problems), 1)
+        self.assertIn(dict(readout.FORMULAS)["阅读量"], problems[0])
+        self.assertIn("MID([数据整理], 9, 3)", problems[0], "现在是什么也要说，好对照")
+
+    def test_the_operators_multi_line_formula_counts_as_the_same(self):
+        """运营在飞书里是多行缩进写的——引号外的空白不算差别。"""
+        meta = healthy_meta(self.settings)
+        meta["阅读量"]["formula"] = '''IFERROR(
+  VALUE(MID([数据整理],
+    FIND("阅读量：", [数据整理]) + 4,
+    FIND("；", [数据整理], FIND("阅读量：", [数据整理]) + 4)
+      - FIND("阅读量：", [数据整理]) - 4)),
+  "")'''
+        self.assertEqual(self._problems(meta), [])
+
+    def test_whitespace_inside_quotes_is_a_real_difference(self):
+        """`" "` 和 `""` 是两个字符串。去空白只能去引号外的。"""
+        meta = healthy_meta(self.settings)
+        meta["曝光量"]["formula"] = dict(readout.FORMULAS)["曝光量"].replace('""', '" "')
+        self.assertEqual(len(self._problems(meta)), 1)
+
+    def test_no_claim_when_the_formula_could_not_be_read(self):
+        """读不到公式、或者还有没翻回列名的引用，都不说「对不上」：可能只是
+        写法不同，一条假提醒会教人不再信这张卡。"""
+        for unreadable in (None, 'IFERROR(VALUE(bitable::$table[tblX].$field[fldY]), "")'):
+            with self.subTest(unreadable):
+                meta = healthy_meta(self.settings)
+                if unreadable is None:
+                    del meta["互动数"]["formula"]
+                else:
+                    meta["互动数"]["formula"] = unreadable
+                self.assertEqual(self._problems(meta), [])
+                self.assertTrue(schema.diff(self.settings, meta).clean)
+
+    def test_they_never_block_the_patrol(self):
+        """四列全缺也不进「必备列」那句（那句会让 sweep 拒跑的读者慌）。"""
+        meta = healthy_meta(self.settings, drop=readout.NAMES)
+        for problem in schema.schema_problems(self.settings, meta):
+            self.assertNotIn("sweep 会拒跑", problem)
 
 
 class TestDiffAgreesWithDoctor(unittest.TestCase):
@@ -135,11 +243,16 @@ class TestDiffAgreesWithDoctor(unittest.TestCase):
     def _cases(self):
         settings = Settings()
         f = settings.fields
+        wrong_formula = healthy_meta(settings)
+        wrong_formula["互动数"]["formula"] = "LEN([数据整理])"
         return [
             ("健康", healthy_meta(settings), True),
             ("缺列", healthy_meta(settings, drop=[f.negative_digest]), False),
             ("类型错", healthy_meta(settings, retype={f.last_updated: 1002}), False),
             ("缺选项", healthy_meta(settings, drop_options={f.pinned_status: []}), False),
+            ("缺截图读数列", healthy_meta(settings, drop=["数据整理"]), False),
+            ("截图读数列类型错", healthy_meta(settings, retype={"阅读量": 2}), False),
+            ("公式对不上", wrong_formula, False),
         ]
 
     def test_clean_matches_no_problems(self):
