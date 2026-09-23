@@ -57,12 +57,15 @@ class FakeTable:
 
 
 def healthy_meta(settings=None):
-    from xhsearch import schema
+    from xhsearch import readout, schema
     settings = settings or Settings()
     meta = {}
     for name, allowed, _label, options, _note in schema.expected_schema(settings):
         meta[name] = {"type": allowed[0], "ui_type": "",
                       "options": list(options) if options else None}
+    # 截图读数四列每张表都必须有（见 xhsearch/readout.py）。
+    for column in readout.COLUMNS:
+        meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
     return meta
 
 
@@ -454,6 +457,81 @@ class TestCollect(unittest.TestCase):
         settings, table = self._with_content_column()
         overview = panel.collect([("A", table)], settings, {}, now=NOW)
         self.assertNotIn("PANEL_LABEL_COLUMN", " ".join(overview.projects[0].health))
+
+
+class TestScreenshotReadoutOnTheCard(unittest.TestCase):
+    """截图读数四列每张表都必须有：项目卡上缺了、错了要提醒。「数据整理」上的
+    AI 捷径字段接口看不见，只能按数据看——截图传了、这一格一直空着，就是捷径
+    没在干活（没挂、没开自动更新、豆包账号失效）。"""
+
+    SHOT = [{"file_token": "boxA", "name": "后台.png", "size": 1024, "type": "image/png"}]
+
+    def setUp(self):
+        self.settings = Settings()
+        self.meta = healthy_meta(self.settings)
+        self.meta["相关截图"] = {"type": 17, "ui_type": "Attachment", "options": None}
+
+    def _record(self, rid, cells=None):
+        f = self.settings.fields
+        base = {f.link: "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b"}
+        return {"record_id": rid, "fields": {**base, **(cells or {})}}
+
+    def _readout_notes(self, meta, records):
+        overview = panel.collect([("A", FakeTable(meta, records))], self.settings, {},
+                                 now=NOW)
+        return [n for n in overview.projects[0].health if "截图读数" in n]
+
+    def test_a_missing_column_is_on_the_card(self):
+        meta = dict(self.meta)
+        del meta["互动数"]
+        notes = self._readout_notes(meta, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("截图读数的列缺了：互动数", notes[0])
+
+    def test_screenshots_without_extracted_text_are_counted(self):
+        records = [
+            self._record("r1", {"相关截图": self.SHOT}),                      # 捷径没跑
+            self._record("r2", {"相关截图": self.SHOT,                        # 只剩空文本段
+                                "数据整理": [{"text": "", "type": "text"}]}),
+            self._record("r3", {"相关截图": self.SHOT,
+                                "数据整理": "曝光量：600；阅读量：43；互动量：2"}),
+            self._record("r4", {"相关截图": self.SHOT,                        # 认不出也有字
+                                "数据整理": [{"text": "曝光量：/；阅读量：/；互动量：23",
+                                              "type": "text"}]}),
+            self._record("r5"),                                              # 没传截图，不算
+        ]
+        notes = self._readout_notes(self.meta, records)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("有 2 行", notes[0])
+        self.assertIn("自动更新", notes[0])
+
+    def test_a_shape_we_do_not_recognise_counts_as_filled(self):
+        """AI 捷径写进来的值长什么样没在真机上看过：认不出的形状算「有东西」，
+        宁可少报，也别对着一格有字的说它是空的。"""
+        records = [self._record("r1", {"相关截图": self.SHOT,
+                                       "数据整理": {"value": ["x"], "type": 1}})]
+        self.assertEqual(self._readout_notes(self.meta, records), [])
+
+    def test_both_columns_ride_along_in_the_one_search(self):
+        table = FakeTable(self.meta, [])
+        with mock.patch.object(FakeTable, "search", side_effect=FakeTable.search,
+                               autospec=True) as spy:
+            panel.collect([("A", table)], self.settings, {}, now=NOW)
+        self.assertEqual(spy.call_count, 1, "不能为这件事多发一个请求")
+        self.assertIn("相关截图", table.searched_fields)
+        self.assertIn("数据整理", table.searched_fields)
+
+    def test_without_the_screenshot_column_there_is_nothing_to_judge(self):
+        """没有「相关截图」这一列：判不了，也不能按名字去请求它（整个 search 会报错）。"""
+        table = FakeTable(healthy_meta(self.settings), [self._record("r1")])
+        overview = panel.collect([("A", table)], self.settings, {}, now=NOW)
+        self.assertNotIn("相关截图", table.searched_fields)
+        self.assertFalse(any("截图读数" in n for n in overview.projects[0].health))
+
+    def test_a_working_table_says_nothing(self):
+        records = [self._record("r1", {"相关截图": self.SHOT,
+                                       "数据整理": "曝光量：1；阅读量：1；互动量：1"})]
+        self.assertEqual(self._readout_notes(self.meta, records), [])
 
 
 class TestCheckSeesDisabledEntries(unittest.TestCase):
@@ -1544,6 +1622,23 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
                                   headers=self._login(), method="POST")
         self.assertEqual(status, 400)
         self.assertIn("看不懂", body)
+
+    def test_build_hands_back_the_manual_step_and_each_failure(self):
+        """补齐把「数据整理」建出来之后，挂 AI 捷径那一步要跟着结果回到页面上；
+        没建成的也要逐条回来——光一句「N 处失败」没法修。"""
+        from xhsearch import provision as provision_mod
+        # reset_mock() 不清 side_effect：别的用例给 build 装的报错会留下来。
+        self.actions.build.side_effect = None
+        self.actions.build.return_value = provision_mod.BuildResult(
+            created=["数据整理"], failures=["「曝光量」没建：它要引用「数据整理」"],
+            manual_steps=[{"column": "数据整理", "step": "挂捷径", "paste": "指令原文"}])
+        status, body = self._call("/api/projects/build",
+                                  data=b'{"app_token":"a","table_id":"t"}',
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["manual_steps"][0]["paste"], "指令原文")
+        self.assertEqual(payload["failures"], ["「曝光量」没建：它要引用「数据整理」"])
 
     def test_a_feishu_error_carries_its_remedy(self):
         """面板要把「怎么修」摆在错误旁边，而不是让人从报错文本里自己找。"""

@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
 from . import (channels as channels_mod, feishu, panel_settings, provision,
-               railway, registry, schema, summary, tablespec)
+               railway, readout, registry, schema, summary, tablespec)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -378,8 +378,11 @@ def _collect_one(label, table, settings, api_keys, *,
     picked = summary.pick_label_column(known, label_column)
     # 只请求确实存在的列：按名字请求不存在的列会让整个 search 报 1254045，
     # 一行都读不回来（和 runner.load_rows 同一条纪律）。
-    wanted = [c for c in summary.panel_fields(settings, show_digest=show_digest,
-                                              extra=(picked,))
+    # 「相关截图」「数据整理」跟着同一次 search 读回来，只为数「截图传了、
+    # 数没出来」的行（见下面）——不多发一个请求。
+    wanted = [c for c in summary.panel_fields(
+                  settings, show_digest=show_digest,
+                  extra=(picked, readout.SCREENSHOT_COLUMN, readout.DATA_COLUMN))
               if c in known]
     filter_spec = None
     if f.monitoring in known:
@@ -397,6 +400,13 @@ def _collect_one(label, table, settings, api_keys, *,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
         scrub=scrub, route=route, label_column=picked)
+    # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
+    # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
+    # 缺列的情况体检那边已经在报，这里不重复。
+    if readout.SCREENSHOT_COLUMN in known and readout.DATA_COLUMN in known:
+        unread = readout.unread_rows(records)
+        if unread:
+            snap.health = list(snap.health) + [readout.unread_message(unread)]
     if filter_spec is None:
         snap.health = list(snap.health) + [
             f"表里没有「{f.monitoring}」列，面板无法只统计在管的行，"
@@ -1620,7 +1630,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             return {"summary": result.summary(), "created": result.created,
                     "options_added": result.options_added,
                     "skipped_options": result.skipped_options,
-                    "failures": result.failures, "ok": result.ok}
+                    "failures": result.failures, "ok": result.ok,
+                    "manual_steps": result.manual_steps}
         if action == "thresholds":
             values = payload.get("values")
             if not isinstance(values, dict):

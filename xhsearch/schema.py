@@ -6,6 +6,10 @@
 * 写回前的类型闸 —— 一列建错只摘掉它自己，不作废整表
 * 监控面板 —— 同一份定义既当体检判据，将来也当建表脚本
 
+截图读数四列（「数据整理」+ 三个拆数公式）的定义在 `readout.py`：它们不是
+巡查列（机器不读不写、写回的类型闸不管它们），但每张表都必须有，所以
+`schema_problems` 和 `diff` 在这里一起核对——缺了、错了只提醒，不拦巡查。
+
 从 `cli.py` 挪进包里，是因为面板要用它，而 `cli` 反过来 import 包——
 留在 cli 里就是循环依赖。挪动只改了位置，逻辑一行没动，
 `cli._expected_schema` 这些名字仍然指向这里（旧测试照常绿）。
@@ -15,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import runner
+from . import readout, runner
 from .config import Settings
 
 
@@ -164,6 +168,73 @@ def schema_problems(settings: Settings, meta: dict) -> list[str]:
             f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_optional)}。"
             "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
         )
+    problems.extend(_readout_problems(meta))
+    return problems
+
+
+# ---------- 截图读数四列：每张表都必须有，但只提醒、不拦巡查 ----------
+#
+# 定义在 readout.py。和上面的巡查列分开核对，因为后果不是一个量级：巡查列
+# 缺了、错了，机器读不到或写不进；这四列机器一个字都不碰，缺了只是截图里
+# 的数读不出来。所以文案里要说清「巡查不受影响」，别让人以为监控停了。
+
+
+def _readout_note(column: readout.Column) -> str:
+    # 公式列的这句话以公式本身结尾，**后面不能再接句号**——人会整段复制去粘。
+    if column.formula:
+        return ("手填的数不会跟着截图自动更新。改类型会动这一列已有的数据，"
+                f"面板不代劳——在飞书里把它改成公式：{column.formula}")
+    return ("三个拆数公式读的就是这一列的文字。改类型会动这一列已有的数据，"
+            "面板不代劳，去飞书里改。")
+
+
+def _readout_diff(meta) -> tuple[list, list, list]:
+    """四列逐列核对 → (缺的列, 类型不对的, 公式对不上的)。`diff` 和
+    `schema_problems` 都从这里取，两边对这四列的判断不会漂。"""
+    missing: list[MissingColumn] = []
+    wrong_types: list[WrongType] = []
+    wrong_formulas: list[WrongFormula] = []
+    for column in readout.COLUMNS:
+        info = (meta or {}).get(column.name)
+        if info is None:
+            missing.append(MissingColumn(
+                name=column.name, type_code=column.type_code,
+                type_label=column.type_label, formula=column.formula,
+                needs=column.needs))
+            continue
+        if info.get("type") != column.type_code:
+            wrong_types.append(WrongType(
+                column=column.name, actual=type_name(info.get("type")),
+                expected=column.type_label, note=_readout_note(column)))
+            continue
+        # 公式内容只在读得到、比得了的时候比（见 readout.formula_differs）。
+        if column.formula and readout.formula_differs(info.get("formula"),
+                                                      column.formula):
+            wrong_formulas.append(WrongFormula(
+                column=column.name, actual=info.get("formula") or "",
+                expected=column.formula))
+    return missing, wrong_types, wrong_formulas
+
+
+def _readout_problems(meta) -> list[str]:
+    missing, wrong_types, wrong_formulas = _readout_diff(meta)
+    problems: list[str] = []
+    if missing:
+        names = [c.name for c in missing]
+        tail = (f"（「{readout.DATA_COLUMN}」建完还要在飞书里挂一次 AI 字段捷径，"
+                "建完会告诉你怎么挂）" if readout.DATA_COLUMN in names else "")
+        problems.append(
+            f"截图读数的列缺了：{'、'.join(names)}。这四列每张表都要有——巡查不受影响，"
+            "但截图里的曝光 / 阅读 / 互动读不出来。在面板「项目」里点这张表的"
+            f"「补齐缺的列」就能建上{tail}。")
+    for wrong in wrong_types:
+        problems.append(
+            f"截图读数：「{wrong.column}」的字段类型是「{wrong.actual}」，"
+            f"要的是「{wrong.expected}」。{wrong.note}")
+    for gap in wrong_formulas:
+        problems.append(
+            f"截图读数：「{gap.column}」的公式和标准的对不上，拆出来的数可能不对。"
+            f"在飞书里把公式整段换成：{gap.expected}（现在是：{gap.actual}）")
     return problems
 
 
@@ -194,17 +265,23 @@ _CREATE_PROPERTY = {
 }
 
 
-def create_field_body(name: str, type_code: int, options=None) -> dict:
+def create_field_body(name: str, type_code: int, options=None, *,
+                      formula: str = "") -> dict:
     """一列 → `POST .../fields` 的请求体。
 
     选择类字段（单选 3 / 多选 4）**连选项一起建**：新建的列没有存量数据，
     带着选项一次建完是纯追加、零风险，比「先建空列再补选项」少一整类问题
     （补选项对已有列是整体覆盖，见 feishu.add_field_options）。
+
+    公式列（20）带上 `formula_expression`。公式按 `[列名]` 引用别的列，被引用
+    的列得先存在——所以公式列总是等别的列建完再建（见 provision）。
     """
     body: dict = {"field_name": name, "type": type_code}
     prop = dict(_CREATE_PROPERTY.get(type_code) or {})
     if type_code in (3, 4) and options:
         prop["options"] = [{"name": value} for value in options]
+    if type_code == 20 and formula:
+        prop["formula_expression"] = formula
     if prop:
         body["property"] = prop
     return body
@@ -217,9 +294,14 @@ class MissingColumn:
     type_label: str
     options: list = field(default_factory=list)
     note: str = ""
+    # 公式列的标准公式（截图读数那三列）。
+    formula: str = ""
+    # 建它之前得先在的列：这一批里它们没建成，这一列就不硬建（见 build_missing）。
+    needs: tuple = ()
 
     def body(self) -> dict:
-        return create_field_body(self.name, self.type_code, self.options)
+        return create_field_body(self.name, self.type_code, self.options,
+                                 formula=self.formula)
 
     def describe(self) -> str:
         tail = f"（选项：{'、'.join(self.options)}）" if self.options else ""
@@ -250,16 +332,34 @@ class WrongType:
 
 
 @dataclass
+class WrongFormula:
+    """公式列在、类型也对，但公式和标准的不一样（截图读数那三列）。
+
+    和类型建错一样**不自动改**：改公式是改一列已有的配置，面板的纪律是只追加。
+    标准公式整段给出来，人去飞书里粘。"""
+
+    column: str
+    actual: str
+    expected: str
+
+    def describe(self) -> str:
+        return (f"{self.column} 的公式和标准的对不上——在飞书里整段换成："
+                f"{self.expected}（现在是：{self.actual}）")
+
+
+@dataclass
 class SchemaDiff:
-    """现有表 vs 期望，差在哪。三类的处置完全不同，所以分开装。"""
+    """现有表 vs 期望，差在哪。几类的处置完全不同，所以分开装。"""
 
     missing_columns: list = field(default_factory=list)
     missing_options: list = field(default_factory=list)
     wrong_types: list = field(default_factory=list)
+    wrong_formulas: list = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
-        return not (self.missing_columns or self.missing_options or self.wrong_types)
+        return not (self.missing_columns or self.missing_options
+                    or self.wrong_types or self.wrong_formulas)
 
     @property
     def auto_fixable(self) -> bool:
@@ -304,4 +404,10 @@ def diff(settings: Settings, meta: dict) -> SchemaDiff:
             if gap:
                 result.missing_options.append(MissingOptions(
                     column=name, missing=gap, existing=existing))
+    # 截图读数四列排在巡查列后面：一键建齐时先建机器要用的，而且「数据整理」
+    # 一定排在引用它的三个公式前面（readout.COLUMNS 的顺序）。
+    missing, wrong_types, wrong_formulas = _readout_diff(meta)
+    result.missing_columns.extend(missing)
+    result.wrong_types.extend(wrong_types)
+    result.wrong_formulas.extend(wrong_formulas)
     return result

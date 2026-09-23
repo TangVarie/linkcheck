@@ -662,6 +662,38 @@ class TestFieldsMeta(unittest.TestCase):
                                return_value=transport.Response(403, "", "denied")):
             self.assertIsNone(make_table().fields_meta())
 
+    def test_formula_references_are_turned_back_into_column_names(self):
+        """接口按 id 引用列（字段编辑指南的示例就是这种写法），人和模板写的是
+        [列名]。翻回来才能和标准公式逐字比。"""
+        items = [
+            {"field_name": "数据整理", "type": 1, "field_id": "fldDATA"},
+            {"field_name": "曝光量", "type": 20, "field_id": "fldX", "property": {
+                "formula_expression":
+                    'IFERROR(VALUE(MID(bitable::$table[tblB].$field[fldDATA], 5, 3)), "")'}},
+            {"field_name": "别处", "type": 20, "field_id": "fldY", "property": {
+                "formula_expression": "LEN(bitable::$table[tblOTHER].$field[fldDATA])"}},
+            {"field_name": "认不出", "type": 20, "field_id": "fldZ", "property": {
+                "formula_expression": "LEN(bitable::$table[tblB].$field[fldGONE])"}},
+            {"field_name": "已经是列名", "type": 20, "field_id": "fldW", "property": {
+                "formula_expression": "LEN([数据整理])"}},
+            {"field_name": "没给公式", "type": 20, "field_id": "fldV"},
+            {"field_name": "反馈链接", "type": 1, "field_id": "fldL"},
+        ]
+        table = feishu.Bitable("app-id", "app-secret", "bascnA", "tblB")
+        with mock.patch.object(feishu.Bitable, "_fetch_fields", return_value=items):
+            meta = table.fields_meta()
+        self.assertEqual(meta["曝光量"]["formula"],
+                         'IFERROR(VALUE(MID([数据整理], 5, 3)), "")')
+        # 翻不回来的原样留着——比对那边看到残留的 bitable:: 就不会报「对不上」
+        self.assertEqual(meta["别处"]["formula"],
+                         "LEN(bitable::$table[tblOTHER].$field[fldDATA])")
+        self.assertEqual(meta["认不出"]["formula"],
+                         "LEN(bitable::$table[tblB].$field[fldGONE])")
+        self.assertEqual(meta["已经是列名"]["formula"], "LEN([数据整理])")
+        # 接口没给公式原文 = 不知道，不是「空公式」
+        self.assertNotIn("formula", meta["没给公式"])
+        self.assertNotIn("formula", meta["反馈链接"])
+
 
 class TestFieldOptionsPagination(unittest.TestCase):
     def test_field_on_second_page_is_found(self):

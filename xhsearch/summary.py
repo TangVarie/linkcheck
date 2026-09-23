@@ -217,7 +217,8 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
     ]
     if show_digest:
         wanted += [f.comment_digest, f.negative_digest]
-    # 额外要读的列（现在只有「哪一条」那一列，见 `pick_label_column`）。
+    # 额外要读的列（「哪一条」那一列，见 `pick_label_column`；截图读数的
+    # 「相关截图」「数据整理」，见 panel._collect_one）。
     # 读表不计费，多读一列只是多几个字节。
     wanted += [c for c in extra if c]
     # 去重但保持顺序：列名允许被配置成同一个（不推荐，但不该在这里崩）。

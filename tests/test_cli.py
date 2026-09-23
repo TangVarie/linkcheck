@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import cli
-from xhsearch import feishu, runner
+from xhsearch import feishu, readout, runner
 from xhsearch.config import Settings
 
 
@@ -623,10 +623,22 @@ class TestSchemaProblems(unittest.TestCase):
                 "ui_type": "",
                 "options": list(options or []) if field_type in (3, 4) else None,
             }
+        # 截图读数四列每张表都必须有（见 xhsearch/readout.py）。
+        for column in readout.COLUMNS:
+            meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
         return meta
 
     def test_healthy_table_has_no_problems(self):
         self.assertEqual(cli._schema_problems(self.settings, self._healthy_meta()), [])
+
+    def test_doctor_reminds_about_missing_screenshot_columns(self):
+        """这四列每张表都要有，doctor 也得报——但它们不拦巡查，文案要说清。"""
+        meta = self._healthy_meta()
+        del meta["数据整理"], meta["曝光量"]
+        problems = cli._schema_problems(self.settings, meta)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("数据整理、曝光量", problems[0])
+        self.assertIn("巡查不受影响", problems[0])
 
     def test_multiselect_comment_status_is_flagged(self):
         """评论状态现在是单选覆盖写入：建成多选（旧口径的类型）要被点名。"""

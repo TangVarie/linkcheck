@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import feishu, schema, summary
+from . import feishu, readout, schema, summary
 from .config import Settings
 from .schema import expected_schema
 
@@ -71,6 +71,7 @@ class Checkup:
             return []
         out = [w.describe() for w in self.diff.wrong_types]
         out += [g.describe() for g in self.diff.missing_options]
+        out += [g.describe() for g in self.diff.wrong_formulas]
         return out
 
 
@@ -117,6 +118,9 @@ class BuildResult:
     options_added: dict = field(default_factory=dict)
     skipped_options: list = field(default_factory=list)
     failures: list = field(default_factory=list)
+    # 建出来了、但还要人在飞书里补一步的列（「数据整理」要挂 AI 捷径），
+    # 和新建表的结果同一个形状（见 manual_steps）。
+    manual_steps: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -151,15 +155,29 @@ def build_missing(table: feishu.Bitable, diff: schema.SchemaDiff, *,
     result = BuildResult()
     tag = f"{table.app_token[-6:]}/{table.table_id}"
 
+    failed: set = set()
     for column in diff.missing_columns:
+        blocked = [name for name in column.needs if name in failed]
+        if blocked:
+            # 公式要引用的列这次没建成：硬建只会再收一条看不懂的飞书错误，
+            # 不如直接说清楚卡在哪。先把那一列弄好，再点一次就会补上。
+            failed.add(column.name)
+            result.failures.append(
+                f"「{column.name}」没建：它要引用「{'」「'.join(blocked)}」，"
+                "那一列这次没建成。先把它弄好，再点一次「补齐缺的列」")
+            continue
         try:
             table.create_field(column.body())
         except Exception as exc:                                # noqa: BLE001
+            failed.add(column.name)
             result.failures.append(f"建列「{column.name}」失败：{exc}")
             log(f"🧱 [{tag}] 建列失败 {column.name}：{exc}")
             continue
         result.created.append(column.name)
         log(f"🧱 [{tag}] 建列 {column.describe()}")
+    result.manual_steps = manual_steps(result.created)
+    for step in result.manual_steps:
+        log(f"✋ [{tag}] 「{step['column']}」还要人在飞书里补一步")
 
     for gap in diff.missing_options:
         if not allow_option_patch:
@@ -265,6 +283,9 @@ def next_check_formula(settings: Settings) -> str:
     return f'IF({age_now} > {days}, "", {inner})'
 
 
+# 截图读数四列（「数据整理」+ 三个拆数公式）是**每张表都必须有**的业务列，
+# 定义、公式、AI 指令都在 readout.py——体检和建表从同一份取。
+
 # 字符串 = 巡查列的角色名（settings.fields 上的属性），BusinessColumn = 业务列。
 FULL_LAYOUT: tuple = (
     BusinessColumn("素人编号", TEXT),
@@ -284,7 +305,10 @@ FULL_LAYOUT: tuple = (
     BusinessColumn("评论配图", ATTACHMENT),
     "comment_status",
     BusinessColumn("发布截图", ATTACHMENT),
-    BusinessColumn("相关截图", ATTACHMENT),
+    BusinessColumn(readout.SCREENSHOT_COLUMN, ATTACHMENT),
+    # 截图读数：紧挨着「相关截图」，因为读的就是它。三个公式列要等
+    # 「数据整理」先存在，所以和其他公式列一样建完再补、排到表尾。
+    *(BusinessColumn(c.name, c.type_code, formula=c.formula) for c in readout.COLUMNS),
     # 蓝词三件套现在是巡查列（机器回填新蓝词、翻「是否截图」），类型和选项
     # 以 schema.expected_schema 为准；位置沿用西屋表，「是否截图」插在中间。
     "blue_words",
@@ -326,9 +350,9 @@ TEMPLATES = ("full", "monitor")
 
 def template_fields(settings: Settings, template: str = "full"
                     ) -> tuple[list[dict], list[BusinessColumn], list[str]]:
-    """把模板翻译成建表请求：(建表时一次带上的列, 建完再补的自关联列, 没建的列)。
+    """把模板翻译成建表请求：(建表时一次带上的列, 建完再补的列, 没建的列)。
 
-    `monitor` = 只建巡查列（旧行为，顺序按 expected_schema）；
+    `monitor` = 只建必备的列：巡查列（顺序按 expected_schema）+ 截图读数四列；
     `full` = 按西屋表的结构连业务列一起建。
     """
     if template not in TEMPLATES:
@@ -336,8 +360,15 @@ def template_fields(settings: Settings, template: str = "full"
     expected = {name: (allowed, list(options or []))
                 for name, allowed, _label, options, _note in expected_schema(settings)}
     if template == "monitor":
-        return ([schema.create_field_body(name, allowed[0], options or None)
-                 for name, (allowed, options) in expected.items()], [], [])
+        # 截图读数四列每张表都必须有（见 readout）。最小的模板不带它们的话，
+        # 建出来的表第一次体检就是红的——自己建的表过不了自己的体检。
+        fields = [schema.create_field_body(name, allowed[0], options or None)
+                  for name, (allowed, options) in expected.items()]
+        fields += [schema.create_field_body(c.name, c.type_code)
+                   for c in readout.COLUMNS if not c.formula]
+        deferred = [BusinessColumn(c.name, c.type_code, formula=c.formula)
+                    for c in readout.COLUMNS if c.formula]
+        return fields, deferred, []
 
     fields: list[dict] = []
     deferred: list[BusinessColumn] = []
@@ -554,10 +585,11 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
     column_failures: list[str] = []
     for column in deferred:
         if column.formula:
-            prop: dict = {"formula_expression": column.formula}
+            body = schema.create_field_body(column.name, column.type_code,
+                                            formula=column.formula)
         else:
-            prop = {"table_id": table_id, "multiple": False}
-        body = {"field_name": column.name, "type": column.type_code, "property": prop}
+            body = {"field_name": column.name, "type": column.type_code,
+                    "property": {"table_id": table_id, "multiple": False}}
         try:
             workspace.create_field(base["app_token"], table_id, body)
         except Exception as exc:                                # noqa: BLE001
@@ -567,6 +599,9 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
         else:
             built.append(column.name)
     shared = share_table(workspace, base["app_token"], share, log=log) if share else ShareResult()
+    steps = manual_steps(built)
+    for step in steps:
+        log(f"✋ [{base['app_token'][-6:]}/{table_id}] 「{step['column']}」还要人在飞书里补一步")
     # ⚠️ 链接必须带上**新建的这张表**的 table_id。`create_base` 会顺带建一张
     # 飞书自己的默认表，返回的 base 级 url 点进去就是那一张——运营可能直接
     # 在里面开始填数据，而注册表监控的是另一张，填的东西一行都不会被巡查。
@@ -581,7 +616,20 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
             "template": template,
             "columns": len(built), "built": built,
             "skipped_columns": skipped, "column_failures": column_failures,
+            "manual_steps": steps,
             "shared": shared.granted, "share_failures": shared.failures}
+
+
+def manual_steps(built: list) -> list:
+    """建出来之后还要人在飞书里补一步的列，连要粘的原文一起。
+    新建表和「补齐缺的列」都用它。
+
+    只报**真建出来了的**：没建出来的列已经在失败清单里报着，这里再说
+    「去给它挂捷径」就是把人支去找一列不存在的东西。
+    """
+    names = set(built)
+    return [{"column": c.name, "step": c.manual_step, "paste": c.manual_paste}
+            for c in readout.COLUMNS if c.manual_step and c.name in names]
 
 
 def _table_url(base_url: str, app_token: str, table_id: str) -> str:

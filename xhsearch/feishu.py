@@ -708,11 +708,15 @@ class Bitable:
         return None
 
     def fields_meta(self) -> Optional[dict[str, dict]]:
-        """这张表全部字段的元数据：列名 → {"type", "ui_type", "options"}。
+        """这张表全部字段的元数据：列名 → {"type", "ui_type", "options"}，
+        公式列（20）再多一个 "formula"。
 
         读不到（权限/网络）返回 None。options 的三种取值必须区分：
         列表（可能为空）= 这是个选择类字段，列出已建的选项名；
         None = 这个字段没有「选项」概念（文本/数字/日期……）。
+
+        "formula" 是公式原文，本表的列引用已经翻回 `[列名]`（见
+        `readable_formula`）；接口没给公式原文时这个键不出现 = 不知道。
 
         doctor 用它做全量体检（列在不在、类型对不对、选项建没建），
         跑批入口用它一次拿全 列名清单 + 两个选择列的选项，省两次分页请求。
@@ -723,6 +727,8 @@ class Bitable:
         items = self._fetch_fields()
         if items is None:
             return None
+        names_by_id = {str(f["field_id"]): str(f["field_name"]) for f in items
+                       if f.get("field_id") and f.get("field_name")}
         meta: dict[str, dict] = {}
         for field in items:
             name = field.get("field_name")
@@ -735,11 +741,15 @@ class Bitable:
                 # 「不是选择列」是两回事。
                 options = [o["name"] for o in (prop.get("options") or [])
                            if isinstance(o, dict) and o.get("name")]
-            meta[str(name)] = {
+            entry: dict[str, Any] = {
                 "type": field.get("type"),
                 "ui_type": str(field.get("ui_type") or ""),
                 "options": options,
             }
+            expression = prop.get("formula_expression") if isinstance(prop, dict) else None
+            if field.get("type") == 20 and isinstance(expression, str):
+                entry["formula"] = readable_formula(expression, names_by_id, self.table_id)
+            meta[str(name)] = entry
         return meta
 
     def fields_meta_raw(self) -> Optional[dict[str, dict]]:
@@ -958,6 +968,29 @@ def value_fits(field_type: Any, value: Any) -> bool:
     if code in (2, 5):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     return isinstance(value, str)
+
+
+# 公式里对列的引用在接口里长这样（字段编辑指南的请求/响应示例）：
+#     IF(bitable::$table[tblxxxxxxxxxxxxx].$field[fldxxxxxxx].CONTAIN("飞书"),"aaa","bbb")
+# 人在飞书里看到、模板里写的是 [列名]。
+_FORMULA_REF = re.compile(
+    r"bitable::\$table\[(?P<table>[A-Za-z0-9]+)\]\.\$field\[(?P<field>[A-Za-z0-9]+)\]")
+
+
+def readable_formula(expression: str, names_by_id: dict, table_id: str) -> str:
+    """把公式里对**本表**列的 id 引用翻回 `[列名]`，才能和标准公式逐字比。
+
+    接口按 id 存引用（列改名了公式照样对），而运营写、模板里存的是 `[列名]`。
+    翻不回来的（别的表、这张表里找不到的 id）**原样留着**：比对那边看到残留的
+    `bitable::` 就知道这条没法比，不会拿它报「对不上」（readout.formula_differs）。
+    接口要是直接给 `[列名]`，这里什么都不换，照样能比。
+    """
+    def swap(match):
+        if match.group("table") != table_id:
+            return match.group(0)
+        name = names_by_id.get(match.group("field"))
+        return f"[{name}]" if name else match.group(0)
+    return _FORMULA_REF.sub(swap, expression)
 
 
 def read_text(value: Any) -> str:
