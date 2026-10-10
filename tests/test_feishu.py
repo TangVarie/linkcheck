@@ -55,6 +55,128 @@ class TestSearchPagination(unittest.TestCase):
         self.assertIn("page_token=tok%2Bspecial%3D", urls[1])
 
 
+class TestTransientReadRetry(unittest.TestCase):
+    """读接口上飞书说「过一会儿再试」的业务码（1254002 / 1254607）要退避重发。
+
+    2026-10 线上：queue 模式两张表同一轮各报一次 1254002，其余表照常，之后自己好了。
+    它是 HTTP 200 带业务码，传输层当成功响应、从不重试——一次抖动就是这张表
+    这一轮整张不巡查。"""
+
+    def _search(self, responses, **kwargs):
+        sent: list[tuple[str, dict]] = []
+
+        def fake_post(url, headers, body, timeout=30.0):
+            sent.append((url, json.loads(body)))
+            return responses[len(sent) - 1]
+
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep") as slept:
+            result = make_table().search(["链接"], **kwargs)
+        return result, sent, slept
+
+    def test_a_blip_is_retried_and_the_table_is_read(self):
+        records, sent, slept = self._search([
+            feishu_err(1254002, "Fail"),
+            ok({"items": [{"record_id": "rec1"}], "has_more": False}),
+        ], filter_spec={"conjunction": "and", "conditions": []})
+        self.assertEqual([r["record_id"] for r in records], ["rec1"])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0][1], sent[1][1], "重发的是同一个请求")
+        self.assertEqual(slept.call_count, 1, "重发前要退避，不能立刻捶回去")
+
+    def test_a_retry_on_page_two_does_not_reread_page_one(self):
+        records, sent, _ = self._search([
+            ok({"items": [{"record_id": "rec1"}], "has_more": True, "page_token": "p2"}),
+            feishu_err(1254002, "Fail"),
+            ok({"items": [{"record_id": "rec2"}], "has_more": False}),
+        ])
+        self.assertEqual([r["record_id"] for r in records], ["rec1", "rec2"])
+        self.assertNotIn("page_token", sent[0][0])
+        self.assertIn("page_token=p2", sent[1][0])
+        self.assertIn("page_token=p2", sent[2][0])
+
+    def test_data_not_ready_is_retried_too(self):
+        """1254607 是 HTTP 400：传输层只重试 0/429/5xx，原来同样一次就放弃。"""
+        not_ready = transport.Response(
+            400, "application/json",
+            json.dumps({"code": 1254607, "msg": "Data not ready, please try again later"}),
+            "req-400")
+        records, sent, _ = self._search([
+            not_ready, ok({"items": [{"record_id": "rec1"}], "has_more": False})])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(sent), 2)
+
+    def test_it_gives_up_after_a_bounded_number_of_tries_and_says_so(self):
+        with self.assertRaises(feishu.FeishuError) as ctx:
+            self._search([feishu_err(1254002, "Fail")] * feishu._READ_ATTEMPTS)
+        self.assertEqual(ctx.exception.code, 1254002)
+        self.assertIn(f"连试了 {feishu._READ_ATTEMPTS} 次", str(ctx.exception),
+                      "日志里要分得清一次抖动和一直读不出来")
+
+    def test_other_errors_are_not_retried(self):
+        """权限、列名这类每次都一样的错，重试只是白等。"""
+        for code in (91403, 1254045, 99991672):
+            with self.subTest(code):
+                with self.assertRaises(feishu.FeishuError):
+                    self._search([feishu_err(code, "nope")] * 3)
+
+    def test_other_errors_cost_exactly_one_request(self):
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            return feishu_err(1254045, "FieldNameNotFound")
+
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError):
+                make_table().search(["链接"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_batch_get_is_retried(self):
+        responses = [feishu_err(1254002, "Fail"), ok({"records": [{"record_id": "a"}]})]
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            return responses[calls["n"] - 1]
+
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            got = make_table().batch_get(["a"])
+        self.assertEqual([r["record_id"] for r in got], ["a"])
+        self.assertEqual(calls["n"], 2)
+
+    def test_the_column_list_is_retried_and_still_none_when_it_never_clears(self):
+        """读不到列清单 cron 会整张表拒跑这一轮——一次抖动不该落到这一步。"""
+        good = ok({"items": [{"field_name": "反馈链接", "type": 1}], "has_more": False})
+        with mock.patch.object(transport, "get",
+                               side_effect=[feishu_err(1254002, "Fail"), good]), \
+             mock.patch("time.sleep"):
+            meta = make_table().fields_meta()
+        self.assertEqual(meta["反馈链接"]["type"], 1)
+        with mock.patch.object(transport, "get",
+                               return_value=feishu_err(1254002, "Fail")) as got, \
+             mock.patch("time.sleep"):
+            self.assertIsNone(make_table().fields_meta())
+        self.assertEqual(got.call_count, feishu._READ_ATTEMPTS)
+
+    def test_writes_are_not_retried_on_the_same_code(self):
+        """1254002 也可能是「其实写进去了、回包说失败」——写不能盲目重发。"""
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            return feishu_err(1254002, "Fail")
+
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError):
+                make_table().batch_update([{"record_id": "a", "fields": {"x": 1}}],
+                                          errors=[])
+        self.assertEqual(calls["n"], 1)
+
+
 class TestBatchUpdateIsolation(unittest.TestCase):
     """batch_update 是全成功或全失败：一个坏行不该让同分片的好行陪葬，
     更不该让后续分片全部丢掉。"""

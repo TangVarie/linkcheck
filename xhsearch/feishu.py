@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from . import transport
 
@@ -89,6 +89,23 @@ WRITE_CONFLICT_CODE = 1254291
 # 冲突重试次数与基准退避。总等待上限 ≈ base*(1+2+4)，够穿过一次人工批量编辑。
 _CONFLICT_ATTEMPTS = 4
 _CONFLICT_BASE_DELAY = 1.0
+
+# 读接口上「飞书说过一会儿再试」的业务码，按官方 records/search 文档的错误码表：
+# * 1254002 Fail ——「如果该报错偶尔发生，可能是服务器超时或不稳定，请重试解决」。
+#   2026-10 线上实测：queue 模式里两张表同一轮各报一次、其余表照常、之后自己好了。
+#   它是 **HTTP 200** 带业务码，传输层看到的是成功响应，根本不会重试——原来一次
+#   抖动就是「这张表这一轮整张跳过」。
+# * 1254607 Data not ready ——「建议等待一段时间后重试」。HTTP 400，传输层同样不重试。
+# （1255040 请求超时是 HTTP 504，传输层已经按 5xx 重试过，这里不再叠一层。）
+#
+# **只用在读上。** 读重发多少次都改不坏表；写不一样——1254002 也可能是「其实
+# 写进去了、只是回包说失败」，盲目重发 batch_create 会多出重复行（写冲突
+# 1254291 另有自己的整块退避，见 _post_chunk）。
+_TRANSIENT_READ_CODES = frozenset({1254002, 1254607})
+# 总共试几次、退避基准（full jitter：第 1 次重试前等 0~2 秒、第 2 次 0~4 秒）。
+# 一张表最多多等几秒，换掉的是「这张表这一轮整张不巡查」。
+_READ_ATTEMPTS = 3
+_READ_BASE_DELAY = 2.0
 
 # 分页防循环：上游/代理反复返回同一个 page_token 时，原来的 while True
 # 会把进程永远挂在这里。页数、总行数两道闸都要有。
@@ -488,6 +505,30 @@ class Bitable:
 
     # ---------- 读 ----------
 
+    def _read(self, send: Callable[[], transport.Response]) -> dict[str, Any]:
+        """发一个**读**请求并解析出 data；飞书回「过一会儿再试」的业务码
+        （_TRANSIENT_READ_CODES）时整次退避重发，最多 _READ_ATTEMPTS 次。
+
+        `send` 每调一次就真发一次请求（网络断、5xx、429 那层重试在它里面）。
+        试满了还是这个码就照常抛出，并在报错里说明已经连试过几次——日志里
+        看到这句，就知道不是一次抖动，是这张表这会儿一直读不出来。
+        """
+        for attempt in range(_READ_ATTEMPTS):
+            resp = send()
+            try:
+                return _check(resp)
+            except FeishuError as exc:
+                if exc.code not in _TRANSIENT_READ_CODES:
+                    raise
+                if attempt == _READ_ATTEMPTS - 1:
+                    raise FeishuError(
+                        exc.code,
+                        f"{exc.msg}（同一个读请求隔几秒连试了 {_READ_ATTEMPTS} 次都是这个结果）",
+                        exc.hint) from exc
+                time.sleep(transport.backoff_delay(
+                    attempt, _READ_BASE_DELAY, resp.retry_after))
+        raise AssertionError("unreachable")   # 循环里要么 return 要么 raise
+
     def search(
         self,
         field_names: Iterable[str],
@@ -516,14 +557,14 @@ class Bitable:
             if filter_spec:
                 body["filter"] = filter_spec
 
-            resp = transport.post_with_retry(
+            # 按页重试：重发的是**同一页**（同一个 page_token），已经读到的页不重读。
+            data = self._read(lambda: transport.post_with_retry(
                 url,
                 self._headers(),
                 json.dumps(body, ensure_ascii=False),
                 timeout=self.timeout,
                 should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-            )
-            data = _check(resp)
+            ))
             collected.extend(data.get("items") or [])
 
             if max_records is not None and len(collected) >= max_records:
@@ -570,15 +611,14 @@ class Bitable:
         out: list[dict[str, Any]] = []
         for start in range(0, len(ids), BATCH_GET_SIZE):
             chunk = ids[start : start + BATCH_GET_SIZE]
-            resp = transport.post_with_retry(
+            data = self._read(lambda: transport.post_with_retry(
                 self._url("records/batch_get"),
                 self._headers(),
                 json.dumps({"record_ids": chunk, "automatic_fields": False},
                            ensure_ascii=False),
                 timeout=self.timeout,
                 should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-            )
-            data = _check(resp)
+            ))
             out.extend(data.get("records") or data.get("items") or [])
         return out
 
@@ -684,18 +724,19 @@ class Bitable:
             url = self._url("fields?page_size=100")
             if page_token:
                 url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
-            # 和记录接口用同一套重试（0/429/5xx + full jitter）。原来只在
-            # status==0 时固定睡 1 秒重试一次：飞书一次 429 或 502 就让整份
-            # 元数据变成 None（=不过滤），未建选项被放行就是行级写回失败。
-            resp = transport.request_with_retry(
-                "GET", url, self._headers(), "",
-                timeout=self.timeout,
-                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-            )
-            payload = resp.json()
-            if not isinstance(payload, dict) or payload.get("code") not in (0, None):
+            # 和记录接口用同一套重试（0/429/5xx + full jitter），外加 _read 那层
+            # 「过一会儿再试」的业务码。原来只在 status==0 时固定睡 1 秒重试一次：
+            # 飞书一次 429 或 502 就让整份元数据变成 None（=不过滤），未建选项
+            # 被放行就是行级写回失败；一次 1254002 则让 cron 整张表拒跑这一轮。
+            try:
+                data = self._read(lambda: transport.request_with_retry(
+                    "GET", url, self._headers(), "",
+                    timeout=self.timeout,
+                    should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+                ))
+            except FeishuError:
+                # 语义不变：读不到（含重试完仍失败）返回 None，调用方据此拒跑。
                 return None
-            data = payload.get("data") or {}
             items.extend(f for f in (data.get("items") or []) if isinstance(f, dict))
             if not data.get("has_more"):
                 return items
