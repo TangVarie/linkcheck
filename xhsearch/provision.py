@@ -309,6 +309,13 @@ FULL_LAYOUT: tuple = (
     # 截图读数：紧挨着「相关截图」，因为读的就是它。三个公式列要等
     # 「数据整理」先存在，所以和其他公式列一样建完再补、排到表尾。
     *(BusinessColumn(c.name, c.type_code, formula=c.formula) for c in readout.COLUMNS),
+    # 投流维护三列（2026-10-10 加，西屋表里原来没有）：纯人工，机器不读不写、
+    # 不进体检，接管已有表时「补齐缺的列」也不补。排在截图读数后面，因为
+    # 「维护效果」记的就是投流后 12 小时的曝光增长。三列都建成空的多选，
+    # 和「作者」一样，填的时候飞书自动加选项——选项名由运营自己定。
+    BusinessColumn("维护情况", MULTI),   # 准备投流 / 已投流
+    BusinessColumn("维护时间", MULTI),   # 投流的时间
+    BusinessColumn("维护效果", MULTI),   # 投流后 12h 的曝光量增长情况
     # 蓝词三件套现在是巡查列（机器回填新蓝词、翻「是否截图」），类型和选项
     # 以 schema.expected_schema 为准；位置沿用西屋表，「是否截图」插在中间。
     "blue_words",

@@ -308,12 +308,13 @@ class TestCreateMonitoredTable(unittest.TestCase):
 
 # 西屋表（2026-09 导出）的列，按表里的顺序。模板照它抄，这里照它验。
 # 「数据整理」和它后面三个拆数公式是 2026-09-23 补进标准模板的（运营现在的表
-# 里都有，紧挨着「相关截图」——读的就是那一列）。
+# 里都有，紧挨着「相关截图」——读的就是那一列）；投流维护三列是 2026-10-10 加的。
 XIWU_COLUMNS = [
     "素人编号", "发布时间", "反馈链接", "已删除评论留底", "流量状态", "起量时间",
     "笔记状态", "方向", "找人备注", "内容配图", "文案", "随贴评论", "评论的素人编号",
     "评论配图", "评论状态", "发布截图", "相关截图",
     "数据整理", "曝光量", "阅读量", "互动数",
+    "维护情况", "维护时间", "维护效果",
     "蓝词字段", "是否截图", "蓝词图片", "作者",
     "父记录", "负面词", "评论关键词", "是否巡查", "排队刷新", "诊断信息", "置顶状态",
     "已确认存活", "巡查状态", "负面状态", "负面评论快照", "评论区快照",
@@ -339,6 +340,27 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_full_is_the_default(self):
         self.assertEqual(self.made["template"], "full")
+
+    def test_the_promotion_columns_are_empty_multi_selects(self):
+        """投流维护三列：纯人工的多选，选项由运营填的时候自己长出来——
+        模板不替人起选项名。"""
+        names = [f["field_name"] for f in self.fields]
+        start = names.index("维护情况")
+        self.assertEqual(names[start:start + 3], ["维护情况", "维护时间", "维护效果"])
+        for body in self.fields[start:start + 3]:
+            self.assertEqual(body, {"field_name": body["field_name"], "type": 4})
+
+    def test_the_promotion_columns_are_not_required(self):
+        """它们只进默认模板：只建必备列的模板不带，体检也不因为缺它们报问题
+        （机器不读不写，接管已有表时「补齐缺的列」不补）。"""
+        made = provision.create_monitored_table(
+            fake_workspace(), self.settings, "只巡查", template="monitor",
+            log=lambda *a: None)
+        for name in ("维护情况", "维护时间", "维护效果"):
+            self.assertNotIn(name, made["built"])
+        meta = full_meta(self.settings)
+        self.assertEqual(schema.schema_problems(self.settings, meta), [])
+        self.assertTrue(schema.diff(self.settings, meta).clean)
 
     def test_columns_follow_the_xiwu_table_in_order(self):
         """顺序也要一样：运营看惯了那个顺序，机器列全堆到末尾反而要重新找。
