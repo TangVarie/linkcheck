@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 import traceback
@@ -23,15 +24,17 @@ from typing import Any, Callable, Iterable, Optional
 
 from . import analyze, feishu, protocol, providers, shortlink, tags, transport
 from .config import Budget, Display, Settings
-from .rows import Row, ToolCall, plan_calls, estimate_yuan, id_form
+from .rows import (Row, ToolCall, plan_calls, estimate_yuan, id_form,
+                   format_resolved_id, share_key)
 # 状态常量定义在 rows.py（选行也要认它），这里原样再导出，调用方照旧写 runner.STATUS_*。
 from .rows import (  # noqa: F401
     STATUS_OK, STATUS_SUSPECT, STATUS_GONE, STATUS_FAILED,
-    STATUS_SKIPPED, STATUS_COOLDOWN, STATUS_DEFERRED,
+    STATUS_SKIPPED, STATUS_COOLDOWN, STATUS_DEFERRED, STATUS_RIDE_SKIPPED,
 )
 
 # 这些状态没有真正打过上游接口，不该参与熔断的失效比例计算。
-_NOT_ATTEMPTED = frozenset({STATUS_COOLDOWN, STATUS_SKIPPED, STATUS_DEFERRED})
+_NOT_ATTEMPTED = frozenset({STATUS_COOLDOWN, STATUS_SKIPPED, STATUS_DEFERRED,
+                            STATUS_RIDE_SKIPPED})
 
 
 @dataclass
@@ -140,6 +143,12 @@ class RunReport:
     # 失败数一高，多半是短链落地页形态变了，该去看 shortlink.py 的正则。
     short_links_expanded: int = 0
     short_links_failed: int = 0
+    # 同篇共享：本轮有几行直接拿了同一篇内容另一行的结果、没另花钱。
+    shared_rows: int = 0
+    # 「发出去了、没拿到回答」又按已扣费记了账的请求数（见 runner._call_once）。
+    unanswered: int = 0
+    # 本轮因为「收了钱、回的东西认不出来」连续够数而在某个平台上停掉的通道。
+    contract_trips: list = field(default_factory=list)
 
     @property
     def credits(self) -> int:
@@ -196,6 +205,15 @@ class RunReport:
         if self.short_links_expanded or self.short_links_failed:
             line += (f"\n🔗 抖音短链展开：成功 {self.short_links_expanded}，"
                      f"失败 {self.short_links_failed}（失败的行按原链接走备胎）")
+        if self.shared_rows:
+            line += (f"\n♻ 同篇共享：{self.shared_rows} 行和表里另一行是同一篇内容，"
+                     "直接用了那一行本轮的结果，没另花钱")
+        if self.unanswered:
+            line += (f"\n⏳ {self.unanswered} 次请求发出去后没拿到回答（超时/断开），"
+                     "这家失败也收费，已按扣费记账")
+        for name, platform in self.contract_trips:
+            line += (f"\n🧯 {name} 在 {platform} 上连续返回认不出的响应（照样扣费），"
+                     f"本轮剩下的 {platform} 行直接走备胎——多半是上游改版，查一下 providers.py")
         for platform, reason in sorted(self.dead_platforms.items()):
             line += f"\n⚠ {platform} 平台本轮无可用通道：{reason[:150]}"
         if self.aborted_reason:
@@ -283,6 +301,15 @@ class RunBudget:
                 self.calls = 0
 
 
+def _ms_to_utc(ms: Optional[int]) -> Optional[datetime]:
+    if ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _looks_alive(snapshot: Optional[analyze.Snapshot]) -> bool:
     """这一轮有没有拿到「这篇内容还活着」的**强**证据——非零互动数。
 
@@ -328,6 +355,150 @@ class _Spend:
     # 实际发出去的 HTTP 请求数（含传输层重试和降级到备胎的那几次）。
     # 预算的调用闸门按它记账，而不是按「计划里有几个调用」。
     requests: int = 0
+    # 「发出去了、没拿到回答」又按已扣费记了账的次数（见 _call_once）。
+    unanswered: int = 0
+
+
+@dataclass
+class _Fetched:
+    """一行取数的全部结果。以前是个六元组，多了「同篇共享」之后字段太多，
+    位置传参迟早传错一个。"""
+
+    snapshot: Optional[analyze.Snapshot] = None
+    error: Optional[protocol.Err] = None
+    credits: int = 0
+    yuan: float = 0.0
+    failovers: int = 0
+    requests: int = 0
+    unanswered: int = 0
+    # 这一轮现场展开短链得到的 aweme_id，以及它对应的那条链接——要记进「作品ID」，
+    # 下一轮就不用再展开。
+    expanded_id: str = ""
+    expanded_url: str = ""
+    # 结果是同一篇内容的另一行这一轮刚取到的：这一行一分钱没花。
+    shared: bool = False
+
+    def for_sibling(self) -> "_Fetched":
+        """给同篇另一行的那一份：数据照抄，**钱和请求数一律是 0**——
+        钱已经记在第一行头上了，再记一遍账面就比账单多。快照深拷贝：
+        判定逐行做，谁也不该改到别人的那一份。"""
+        return _Fetched(snapshot=copy.deepcopy(self.snapshot), error=self.error,
+                        shared=True)
+
+
+class _ShareEntry:
+    __slots__ = ("done", "value", "abort", "failed")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.value: Optional[_Fetched] = None
+        self.abort: Optional["_Abort"] = None
+        self.failed = False
+
+
+class FetchShare:
+    """一轮之内，同一篇内容只付一次钱。
+
+    同一篇笔记出现在好几行里并不少见（换了个表头重贴、复查表里又登记一遍）。
+    以前每一行各刷各的，两行就是两份钱，买回来的是同一份评论页。现在第一行
+    取到的结果按调用指纹（rows.share_key）存一份，后面同指纹的行直接拿去做
+    **自己的**判定——每行的关键词、上次评论数、现有标签都不一样，判定照旧
+    逐行做，共享的只是「上游这一刻回了什么」。
+
+    线程安全：线程池里两行同时撞上同一篇时，后到的那一行**等**先到的那一行
+    取完，而不是两边各发一次。整次运行共用一份（cli 跨表传进来），
+    复查表和项目表里重复登记的同一篇也只付一次。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries: dict[tuple, _ShareEntry] = {}
+        self.hits = 0
+
+    def has(self, key: tuple) -> bool:
+        """这个指纹本轮已经取完了吗（不等）。"""
+        with self._lock:
+            entry = self._entries.get(key)
+        return entry is not None and entry.done.is_set() and entry.value is not None
+
+    def run(self, key: tuple, produce: Callable[[], _Fetched]) -> _Fetched:
+        """第一个来的人去取，后来的人等它取完拿一份。"""
+        with self._lock:
+            entry = self._entries.get(key)
+            owner = entry is None
+            if owner:
+                entry = _ShareEntry()
+                self._entries[key] = entry
+        if not owner:
+            taken = self._take(entry)
+            if taken is None:
+                raise RuntimeError("同一篇内容的另一行这一轮处理时出错，这一行本轮跳过")
+            return taken
+        try:
+            value = produce()
+        except _Abort as exc:
+            entry.abort = exc
+            entry.done.set()
+            raise
+        except BaseException:
+            entry.failed = True
+            entry.done.set()
+            raise
+        entry.value = value
+        entry.done.set()
+        return value
+
+    def peek(self, key: tuple) -> Optional[_Fetched]:
+        """搭车的行用：本轮有人取过（或正在取）就拿一份，没有就 None——**绝不自己去取**。"""
+        with self._lock:
+            entry = self._entries.get(key)
+        return None if entry is None else self._take(entry)
+
+    def _take(self, entry: _ShareEntry) -> Optional[_Fetched]:
+        entry.done.wait()
+        if entry.abort is not None:
+            # 平台已经倒了：照样中止，但这一行一分钱都没花。
+            raise _Abort(entry.abort.reason, entry.abort.platform)
+        if entry.failed or entry.value is None:
+            return None
+        with self._lock:
+            self.hits += 1
+        return entry.value.for_sibling()
+
+
+class ContractWatch:
+    """盯着「收了钱、回的东西却认不出来」的通道（见 Safety.contract_failures_before_disable）。
+
+    按（通道, 平台）分开数**连续**次数：某一次正常解析出来了就清零。
+    整次运行共用一份（和 disabled 一样跨表），否则多表部署里每张表三五行，
+    永远数不到门槛。
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(0, int(limit or 0))
+        self._lock = threading.Lock()
+        self._streak: dict[tuple[str, str], int] = {}
+        # 本轮被停掉的（通道, 平台），按发生顺序。报表从这里取。
+        self.tripped: list[tuple[str, str]] = []
+
+    def strike(self, name: str, platform: str) -> bool:
+        """记一次。返回 True = 连续次数够门槛了（调用方决定停不停）。"""
+        if not self._limit:
+            return False
+        with self._lock:
+            count = self._streak.get((name, platform), 0) + 1
+            self._streak[(name, platform)] = count
+            return count >= self._limit
+
+    def trip(self, name: str, platform: str) -> None:
+        """真的停掉了才记一笔——没有备胎、没停的那种不算，报表里不该出现。"""
+        with self._lock:
+            if (name, platform) not in self.tripped:
+                self.tripped.append((name, platform))
+
+    def clear(self, name: str, platform: str) -> None:
+        with self._lock:
+            self._streak.pop((name, platform), None)
 
 
 def _was_billed(provider_name: str, result: protocol.Result) -> bool:
@@ -356,14 +527,39 @@ def _call_once(
     *,
     deadline: Optional[float],
     timeout: float,
-) -> tuple[protocol.Result, int]:
-    """打一次供应商接口。返回（解析结果, **实际发出的 HTTP 请求数**）。
+) -> tuple[protocol.Result, int, int]:
+    """打一次供应商接口。返回（解析结果, **实际发出的 HTTP 请求数**,
+    其中「发出去了、没拿到回答」的次数）。
 
     请求数要如实返回：传输层的一次重试也是一个真实请求，按「计划调用数」记账
     会让 MAX_CALLS_PER_RUN 名不副实。
+
+    「发出去了、没拿到回答」（读超时、对方中途断开，见 transport.Response.in_doubt）
+    要单独数：对失败也收费的通道（TikHub），那一次多半已经扣了钱，而以前
+    传输层会照样连试三次，账上一笔都不记。现在这种失败**最多再试一次**——
+    再试一次比降到备胎便宜（小红书 ¥0.072 对 ¥0.10），也不丢置顶和蓝词；
+    第二次还没回答就换人。建连失败（对方根本没收到）照旧按三次重试。
     """
     provider = providers.get_provider(provider_name)
     request = provider.build(api_key, call.platform, call.purpose, call.arguments)
+    unanswered = 0
+
+    def should_retry(response: transport.Response) -> bool:
+        # 传输层只按 HTTP 状态判重试。业务错误可能走 HTTP 200 + body 里的字段，
+        # 传输层看不见，必须由下面按解析结果处理。
+        # 429 刻意**不**在这里重试：限流要按 retry_after 等待，那是 _fetch_one
+        # 的职责（它还要照顾软截止）。传输层的退避对它太短。
+        nonlocal unanswered
+        if response.status >= 500:
+            return True
+        if response.status != 0:
+            return False
+        if response.in_doubt:
+            unanswered += 1
+            if provider.bills_failed_lookups:
+                return unanswered <= 1
+        return True
+
     response = transport.request_with_retry(
         request.method,
         request.url,
@@ -371,11 +567,7 @@ def _call_once(
         request.body,
         timeout=timeout,
         deadline=deadline,
-        # 传输层只按 HTTP 状态判重试。业务错误可能走 HTTP 200 + body 里的字段，
-        # 传输层看不见，必须由下面按解析结果处理。
-        # 429 刻意**不**在这里重试：限流要按 retry_after 等待，那是 _fetch_one
-        # 的职责（它还要照顾软截止）。传输层的退避对它太短。
-        should_retry=lambda r: r.status == 0 or r.status >= 500,
+        should_retry=should_retry,
     )
     result = provider.parse(
         call.platform, call.purpose,
@@ -389,7 +581,7 @@ def _call_once(
             and result.retry_after_seconds is None
             and response.retry_after is not None):
         result.retry_after_seconds = response.retry_after
-    return result, max(1, response.attempts)
+    return result, max(1, response.attempts), unanswered
 
 
 def _call(
@@ -401,6 +593,7 @@ def _call(
     timeout: float,
     disabled: set[str],
     spend: _Spend,
+    watch: Optional[ContractWatch] = None,
 ) -> protocol.Result:
     """双通道：主通道失败就降到备胎，而不是让整批停下。
 
@@ -435,18 +628,28 @@ def _call(
 
     last: protocol.Result = protocol.Err(protocol.Failure.UNKNOWN, "no_attempt", "没有发起任何请求")
     for index, name in enumerate(order):
-        result, attempts = _call_once(name, keys[name], call,
-                                      deadline=deadline, timeout=timeout)
+        result, attempts, unanswered = _call_once(name, keys[name], call,
+                                                  deadline=deadline, timeout=timeout)
         spend.requests += attempts
+        provider = providers.get_provider(name)
+        price = provider.yuan_per_call(call.platform, call.purpose)
 
-        if isinstance(result, protocol.Ok) or _was_billed(name, result):
+        billed = isinstance(result, protocol.Ok) or _was_billed(name, result)
+        if billed:
             spend.provider = name
-            spend.yuan += providers.get_provider(name).yuan_per_call(call.platform, call.purpose)
+            spend.yuan += price
             spend.credits += (getattr(result, "points_cost", None)
                               or (10 if name == providers.SOCIALDATAX else 0))
             spend.tally[name] = spend.tally.get(name, 0) + 1
+        if unanswered and provider.bills_failed_lookups:
+            # 发出去了没回答的那几次：对失败也收费的通道多半已经扣了钱。
+            # 宁可账上多记一点，也不能让真实账单比报表多出一块看不见的。
+            spend.yuan += unanswered * price
+            spend.unanswered += unanswered
 
         if isinstance(result, protocol.Ok):
+            if watch is not None:
+                watch.clear(name, call.platform)
             return result
 
         last = result
@@ -454,6 +657,17 @@ def _call(
             # 这家这一轮别再用了：600 行 × 每行都撞一次同样的 401，
             # 既慢又会把限流打出来。
             disabled.add(name)
+        elif watch is not None:
+            if billed and result.code in providers.CONTRACT_CODES:
+                # 收了钱、回的东西却认不出来。连续够数、而且后面还有一家能接，
+                # 就只在**这个平台上**停掉它：上游改版的时候每一行都会这样，
+                # 再打下去是每行白付一份主通道的钱，数据照样从备胎来。
+                if watch.strike(name, call.platform) and index < len(order) - 1:
+                    disabled.add(providers.scoped(name, call.platform))
+                    watch.trip(name, call.platform)
+            elif result.kind is protocol.Failure.GONE:
+                # 看得懂的「没了」也说明这家的契约是好的。
+                watch.clear(name, call.platform)
         if result.kind not in providers.FAILOVER_KINDS or index == len(order) - 1:
             return result
         # 换下一家。上面已经把这笔（如果被计费了的话）记进账了。
@@ -492,41 +706,70 @@ def _fetch_one(
     tally: dict[str, int],
     lock: Optional[threading.Lock] = None,
     resolver: Optional[shortlink.Resolver] = None,
-) -> tuple[Optional[analyze.Snapshot], Optional[protocol.Err], int, float, int, int]:
+    share: Optional[FetchShare] = None,
+    watch: Optional[ContractWatch] = None,
+) -> _Fetched:
     """跑完一行需要的全部调用。
 
-    返回（快照, 终局错误, 消耗积分, 花费元, 降级次数, 实际发出的请求数）。
     终局错误 code == "deadline" 且无快照 = 这一行根本没开始，留给下一轮。
+    同一篇内容本轮已经有别的行取过（share 里有同指纹的结果），这一行直接拿
+    一份去判定，不再发请求、不再花钱。
     """
     calls = plan_calls(row, settings, now)
     if not calls:
-        return None, protocol.Err(
-            protocol.Failure.UNKNOWN, "bad_link", row.parsed.describe_failure()
-        ), 0, 0.0, 0, 0
-
-    snapshot: Optional[analyze.Snapshot] = None
-    credits = 0
-    yuan = 0.0
-    failovers = 0
-    requests = 0
-    guard = lock or threading.Lock()
+        return _Fetched(error=protocol.Err(
+            protocol.Failure.UNKNOWN, "bad_link", row.parsed.describe_failure()))
 
     # —— 抖音短链 → aweme_id（免费）——
     # 只在「换成 ID 会改变走哪家」时才做：有一家可用通道吃 ID 不吃链接
     # （TikHub）。只配 SocialDataX 的部署它本来就吃短链，多发一次请求
     # 纯属浪费；TikHub 本轮已被判死时同理。
+    # 「作品ID」里已经记着这条链接的 ID 时，row.parsed 本来就是 ID 形态，
+    # 走不到这里。
     expand_failure = ""
+    expand_requests = 0
+    expanded_id = expanded_url = ""
     if resolver is not None and _expansion_changes_routing(calls[0], keys, settings, disabled):
-        expansion = resolver.resolve(calls[0].arguments.get("url", ""))
-        requests += expansion.requests
+        url = calls[0].arguments.get("url", "")
+        expansion = resolver.resolve(url)
+        expand_requests = expansion.requests
         if expansion.ok:
             calls = [ToolCall(c.platform, c.purpose, id_form(c.arguments, expansion.aweme_id))
                      for c in calls]
+            expanded_id, expanded_url = expansion.aweme_id, url
         else:
             expand_failure = expansion.reason
 
+    def produce() -> _Fetched:
+        return _fetch_calls(calls, keys, settings, deadline=deadline, timeout=timeout,
+                            disabled=disabled, tally=tally, lock=lock, watch=watch,
+                            expand_failure=expand_failure)
+
+    fetched = share.run(share_key(calls), produce) if share is not None else produce()
+    # 展开是这一行自己做的（每行记自己那条链接对应的 ID），不随共享结果走。
+    fetched.requests += expand_requests
+    fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
+    return fetched
+
+
+def _fetch_calls(
+    calls: list[ToolCall],
+    keys: dict[str, str],
+    settings: Settings,
+    *,
+    deadline: Optional[float],
+    timeout: float,
+    disabled: set[str],
+    tally: dict[str, int],
+    lock: Optional[threading.Lock],
+    watch: Optional[ContractWatch],
+    expand_failure: str,
+) -> _Fetched:
+    """真正发请求的那一段：评论页 → （可选）detail，带限流退避和失败分类。"""
+    out = _Fetched()
+    guard = lock or threading.Lock()
+
     def attempt(c: ToolCall) -> protocol.Result:
-        nonlocal credits, yuan, failovers, requests
         spend = _Spend()
         # 「降级」的基准是**此刻真正可用**的第一家，而不是配置里写的主通道：
         # 只配了备胎 key 的部署（完全合法）每一次成功调用都不是降级，
@@ -541,26 +784,30 @@ def _fetch_one(
         ]
         expected = candidates[0] if candidates else ""
         result = _call(c, keys, settings, deadline=deadline, timeout=timeout,
-                       disabled=disabled, spend=spend)
+                       disabled=disabled, spend=spend, watch=watch)
         # 多线程共享 tally / 报表计数：加锁——「读-改-写」在线程间会丢更新，
         # 账目哪怕只差一次也会让人怀疑整张账。
         with guard:
-            credits += spend.credits
-            yuan += spend.yuan
-            requests += spend.requests
+            out.credits += spend.credits
+            out.yuan += spend.yuan
+            out.requests += spend.requests
+            out.unanswered += spend.unanswered
             for name, count in spend.tally.items():
                 tally[name] = tally.get(name, 0) + count
         if spend.provider and expected and spend.provider != expected:
-            failovers += 1
+            out.failovers += 1
         return result
+
+    def done(error: Optional[protocol.Err] = None) -> _Fetched:
+        out.error = error
+        return out
 
     for call in calls:
         if deadline is not None and time.monotonic() >= deadline:
-            if snapshot is None:
+            if out.snapshot is None:
                 # 一个请求都还没发：整行留给下一轮，绝不写回。
-                return None, protocol.Err(
-                    protocol.Failure.UNKNOWN, "deadline", "已到软截止，本行留给下一轮"
-                ), credits, yuan, failovers, requests
+                return done(protocol.Err(
+                    protocol.Failure.UNKNOWN, "deadline", "已到软截止，本行留给下一轮"))
             break  # 评论已到手，detail 放弃：按已有数据完成本行
 
         result = attempt(call)
@@ -578,11 +825,10 @@ def _fetch_one(
                 # 等待吃光了预算就别再打了：传输层只会回一个合成的截止响应，
                 # 被当成普通网络失败写成「刷新失败」——该留给下一轮的行
                 # 会因此被顶掉更新时间、清掉排队勾。
-                if snapshot is None:
-                    return None, protocol.Err(
+                if out.snapshot is None:
+                    return done(protocol.Err(
                         protocol.Failure.UNKNOWN, "deadline",
-                        "限流等待中到达软截止，本行留给下一轮"
-                    ), credits, yuan, failovers, requests
+                        "限流等待中到达软截止，本行留给下一轮"))
                 break  # 评论已到手：detail 放弃，按已有数据完成本行
             result = attempt(call)
 
@@ -592,11 +838,11 @@ def _fetch_one(
             if result.kind in protocol.FATAL:
                 # 走到这里说明**这个平台**所有通道都是 AUTH/QUOTA，备胎也没了。
                 # 只停这个平台：另一个平台可能配着完全健康的通道。
-                raise _Abort(str(result), call.platform, credits, yuan)
+                raise _Abort(str(result), call.platform, out.credits, out.yuan)
             if result.kind is protocol.Failure.RATE_LIMIT:
                 # 二连限流：把这一行留给下一轮，别拖垮整批。
-                return snapshot, result, credits, yuan, failovers, requests
-            if result.kind is protocol.Failure.GONE and not _looks_alive(snapshot):
+                return done(result)
+            if result.kind is protocol.Failure.GONE and not _looks_alive(out.snapshot):
                 # 「内容没了」是行级结论，不管它是从评论接口还是 detail 冒出来的。
                 # TikHub 通道上最干净的死亡信号恰恰在 detail 里（小红书 data 为 []、
                 # 抖音 aweme_detail 为 null + filter_list 命中），漏掉它
@@ -605,7 +851,8 @@ def _fetch_one(
                 # 但只在**没有活着的证据**时才认：评论接口刚拿回 200 条评论、
                 # detail 却说笔记不存在，那是上游自相矛盾，这时候信 detail
                 # 就是拿一次上游抖动去杀一条好帖子。
-                return None, result, credits, yuan, failovers, requests
+                out.snapshot = None
+                return done(result)
             if result.code == "unsupported_link" and expand_failure:
                 # 只配 TikHub、短链又展不开：把展开失败的原因带给运营——
                 # 「不支持这种链接形态」本身没说清为什么这一次连免费的
@@ -614,16 +861,16 @@ def _fetch_one(
             # 评论接口失败 = 这一行的结论；detail 失败只是少几个数字，
             # 已经拿到的评论数据仍然有效，不该整行判死。
             if call.purpose == "comments":
-                return snapshot, result, credits, yuan, failovers, requests
+                return done(result)
             continue
 
         assert isinstance(result, protocol.Ok)
         if call.purpose == "comments":
-            snapshot = analyze.read_comment_page(call.platform, result.data)
-        elif snapshot is not None:
-            analyze.merge_detail(snapshot, result.data)
+            out.snapshot = analyze.read_comment_page(call.platform, result.data)
+        elif out.snapshot is not None:
+            analyze.merge_detail(out.snapshot, result.data)
 
-    return snapshot, None, credits, yuan, failovers, requests
+    return out
 
 
 def _base_fields(settings: Settings, *, status: str, notes: list[str],
@@ -656,6 +903,8 @@ def refresh(
     negative_status_options: Optional[list[str]] = None,
     pin_status_options: Optional[list[str]] = None,
     blue_word_shot_options: Optional[list[str]] = None,
+    collation_status_options: Optional[list[str]] = None,
+    collation_ready: bool = False,
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
@@ -664,6 +913,8 @@ def refresh(
     budget: Optional[RunBudget] = None,
     stop: Optional[threading.Event] = None,
     clock: Optional[Callable[[], datetime]] = None,
+    share: Optional[FetchShare] = None,
+    watch: Optional[ContractWatch] = None,
 ) -> RunReport:
     """刷新一批行。不写回，只算结果——写回由调用方决定时机。
 
@@ -683,6 +934,13 @@ def refresh(
 
     stop 是优雅停机的开关（SIGTERM/SIGINT）：置位后不再派发新行，
     已经在跑的行跑完，结果照常返回给调用方写回。
+
+    share / watch 同理是整次运行一份：share 让同一篇内容一轮只付一次钱
+    （跨表也算），watch 数「收了钱、回的东西认不出来」的连续次数。
+    不传就各建一份，只在这张表里生效。
+
+    collation_ready = 表里「数据整理」和三格基线列都在。缺任何一格就整个
+    不做「数据整理过时」判定——半套列会让基线每轮重记、永远报不出来。
 
     now 是**开跑那一刻**，用于筛行（到期、冷却）和算发布时长——整轮一个值，
     行与行之间的判定口径才一致。clock 是**当下**，只用来给每一行盖
@@ -733,6 +991,12 @@ def refresh(
     # 出现在两张表里的概率可以忽略，而 Resolver 的统计是按表报的）。
     resolver = shortlink.Resolver(timeout=min(timeout, shortlink.TIMEOUT_SECONDS),
                                   deadline=deadline)
+    if share is None:
+        share = FetchShare()
+    shared_before = share.hits
+    if watch is None:
+        watch = ContractWatch(settings.safety.contract_failures_before_disable)
+    tripped_before = len(watch.tripped)
 
     def finish(
         row: Row,
@@ -849,6 +1113,38 @@ def refresh(
                 fields[f.comment_digest] = analyze.format_digest(
                     snapshot, settings.digest, hit=verdict.seed_hit)
 
+        # —— 数据整理过时提醒：评论数比整理那一刻涨了一大截 → 需重新整理 ——
+        # 只在这一轮真的量到了评论数时判（失败路径不碰这三格），而且表里
+        # 四列齐了才判，见 refresh 的 collation_ready。
+        collation_note = ""
+        if (collation_ready and touch_tags and snapshot is not None
+                and snapshot.comment_count is not None):
+            check = analyze.recollect_check(
+                collation_text=row.collation_text,
+                stored_comments=row.collation_comments,
+                stored_interactions=row.collation_interactions,
+                comment_count=snapshot.comment_count,
+                settings=settings)
+            if check is not None:
+                if check.baseline_comments is not None:
+                    fields[f.collation_comments] = check.baseline_comments
+                if check.baseline_interactions is not None:
+                    fields[f.collation_interactions] = check.baseline_interactions
+                if check.status != row.collation_status:
+                    if (collation_status_options is not None
+                            and check.status not in collation_status_options):
+                        fields[f.failure_reason] = (
+                            fields[f.failure_reason]
+                            + f"；「{f.collation_status}」里还没建选项「{check.status}」，已跳过"
+                        )[:500]
+                    else:
+                        fields[f.collation_status] = check.status
+                if check.note:
+                    collation_note = check.note
+                    fields[f.failure_reason] = (
+                        f"{fields[f.failure_reason]}；{check.note}"
+                        if fields[f.failure_reason] else check.note)[:500]
+
         # 「负面评论快照」跟着「负面状态」一起写：判过就写（命中的几条，
         # 或者「（未命中）」），没判过一个字都不碰。
         # 判过却不写的话，上一轮的负面评论会一直留在格子里，
@@ -868,6 +1164,8 @@ def refresh(
         # 确认能落表才做——见 BlueWordPlan / _reconcile_blue_words。
         blue_word_plan: Optional[BlueWordPlan] = None
         log_notes = list(verdict.notes)
+        if collation_note:
+            log_notes.append(collation_note)
         if touch_tags and verdict.blue_words:
             fresh = analyze.new_blue_words(verdict.blue_words, row.blue_words)
             if fresh:
@@ -912,43 +1210,79 @@ def refresh(
             return Outcome(row.record_id, STATUS_COOLDOWN, {},
                            f"{settings.safety.cooldown_seconds} 秒内刚刷过，跳过（不计费）", 0)
 
-        # —— 预算：在发请求**之前**预留（SUP-001）——
-        # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
-        # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
-        # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
-        # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
+        # —— 同篇共享：这一篇本轮已经有别的行取过了，直接拿一份，不花钱 ——
+        # 搭车的行（自己没到期、被同篇的到期行带进来的）**只**吃现成的结果：
+        # 那一行没刷成，这一行就原样不动，绝不单独花钱。
         planned = plan_calls(row, settings, now)
-        reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
-                                      disabled=disabled, worst_case=True)
-        # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
-        # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
-        reserved_calls = len(planned) * max(1, len(
-            providers.usable_order(settings.channels, platform, keys, disabled)))
-        if not budget.reserve(reserved_calls, reserved_yuan):
-            return Outcome(row.record_id, STATUS_DEFERRED, {},
-                           budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
+        key = share_key(planned) if planned else None
+        free = key is not None and share.has(key)
+        reserved = False
+        reserved_yuan, reserved_calls = 0.0, 0
+        if row.ride_along:
+            pass
+        elif not free:
+            # —— 预算：在发请求**之前**预留（SUP-001）——
+            # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
+            # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
+            # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
+            # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
+            reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
+                                          disabled=disabled, worst_case=True)
+            # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
+            # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
+            reserved_calls = len(planned) * max(1, len(
+                providers.usable_order(settings.channels, platform, keys, disabled)))
+            if not budget.reserve(reserved_calls, reserved_yuan):
+                return Outcome(row.record_id, STATUS_DEFERRED, {},
+                               budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
+            reserved = True
 
         try:
-            snapshot, error, credits, cost_yuan, failovers, made_requests = _fetch_one(
-                row, keys, settings, now=now, deadline=deadline, timeout=timeout,
-                disabled=disabled, tally=tally, lock=lock, resolver=resolver,
-            )
+            if row.ride_along:
+                fetched = share.peek(key) if key is not None else None
+            else:
+                fetched = _fetch_one(
+                    row, keys, settings, now=now, deadline=deadline, timeout=timeout,
+                    disabled=disabled, tally=tally, lock=lock, resolver=resolver,
+                    share=share, watch=watch,
+                )
         except _Abort as exc:
             # 中止的行也可能已经花过钱：按实际花销校正账面再走。
             # 请求数按预留值保守留着——中止路径拿不到真实计数，宁可多算。
-            budget.settle(reserved_yuan, exc.yuan, reserved_calls, reserved_calls)
+            if reserved:
+                budget.settle(reserved_yuan, exc.yuan, reserved_calls, reserved_calls)
             with lock:
                 dead_platforms.setdefault(exc.platform or platform, exc.reason)
             # 这一行没有完整结论，不写回；但已经花掉的钱要入账。
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            f"{exc.platform or platform} 平台中止：{exc.reason[:150]}",
                            exc.credits, exc.yuan)
+        if fetched is None:
+            # 只有搭车的行会走到这里：同篇那一行这一轮没刷成。
+            return Outcome(row.record_id, STATUS_RIDE_SKIPPED, {},
+                           "同一篇内容的另一行这一轮没刷成，这一行还没到期，不单独花钱", 0)
         # 按**实际**值校正账面：金额是真花掉的，请求数是真发出去的
         # （含传输层重试和降级到备胎的那几次）。悲观预留的差额在这里退还，
-        # 后面的行才是拿真实余量在放行。
-        budget.settle(reserved_yuan, cost_yuan, reserved_calls, made_requests)
+        # 后面的行才是拿真实余量在放行。没预留的行（以为能白拿）照样按实际记：
+        # 万一它真的发了请求，账面也得对得上。
+        budget.settle(reserved_yuan, fetched.yuan, reserved_calls, fetched.requests)
         with lock:
-            report.failovers += failovers
+            report.failovers += fetched.failovers
+            report.unanswered += fetched.unanswered
+        snapshot, error = fetched.snapshot, fetched.error
+        credits, cost_yuan = fetched.credits, fetched.yuan
+
+        def remember(outcome: Outcome) -> Outcome:
+            """这一轮现场展开过短链：把 ID 记进「作品ID」，下一轮就不用再展开。
+            只在这一行本来就要写回时附带——顺延的行一个字都不写。"""
+            if fetched.expanded_id and outcome.fields:
+                value = format_resolved_id(fetched.expanded_id, fetched.expanded_url)
+                if value != row.resolved_id_cell:
+                    outcome.fields[f.resolved_id] = value
+            if fetched.shared and outcome.fields:
+                outcome.reason = ("（同篇另一行本轮已取到，这一行没另花钱）"
+                                  + outcome.reason)[:200]
+            return outcome
 
         # —— 软截止在这一行开始前就到了：不写回，留给下一轮 ——
         if snapshot is None and error is not None and error.code == "deadline":
@@ -960,8 +1294,8 @@ def refresh(
         # 不进熔断的失效比例分母，也不碰任何标签和定罪计数。
         if snapshot is None and error is not None and error.code == "unsupported_link":
             verdict = analyze.Verdict(notes=[error.operator_text()])
-            return finish(row, verdict, None, status=STATUS_SKIPPED,
-                          credits=credits, cost_yuan=cost_yuan, touch_tags=False)
+            return remember(finish(row, verdict, None, status=STATUS_SKIPPED,
+                                   credits=credits, cost_yuan=cost_yuan, touch_tags=False))
 
         # —— 取不到内容：两击定罪 ——
         if snapshot is None and error is not None and error.kind is protocol.Failure.GONE:
@@ -982,7 +1316,7 @@ def refresh(
             # 记下失败签名：小样本熔断靠「是不是全都栽在同一个码上」识别上游漂移。
             outcome.failure_code = f"{error.code}"
             outcome.failure_definitive = bool(error.definitive)
-            return outcome
+            return remember(outcome)
 
         # —— 取不到内容且不是「确认不存在」：只记，绝不打标签 ——
         if snapshot is None:
@@ -1003,7 +1337,7 @@ def refresh(
             # 网络抖动为下一次非权威 GONE 嫌疑「预热」定罪计数——
             # 单次嫌疑就能把活帖标成已失效，正是两击定罪要防的误伤。
             # 这个计数器只由 GONE 路径累加、由成功路径清零。
-            return outcome
+            return remember(outcome)
 
         verdict = analyze.decide(
             snapshot,
@@ -1015,6 +1349,15 @@ def refresh(
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
             current_pin_status=row.pin_status,                # 区分「掉了」和「从来没有」
         )
+        if row.publish_time_inferred(now):
+            # 帖龄是从链接 ID 推出来的：说一声，免得运营以为「发布时间」那一格
+            # 空着也没关系——表里自己的公式（下次检查时间）还是要靠它。
+            inferred = _ms_to_utc(row.id_publish_ms(now))
+            if inferred is not None:
+                verdict.notes.append(
+                    f"「{f.publish_time}」是空的，帖龄按链接 ID 推算"
+                    f"（约 {inferred.astimezone(settings.display.tz()):%Y-%m-%d} 发布）；"
+                    "补上发布时间就以表里的为准")
         if error is not None:
             verdict.notes.append(f"（detail 未取到：{error.operator_text()[:120]}）")
         if snapshot.points_balance is not None:
@@ -1035,7 +1378,7 @@ def refresh(
         # 评论页空壳 + detail 兜底也失败的轮次对存亡零信息，复选框不动。
         if _measured_this_round(snapshot):
             outcome.fields[f.alive_confirmed] = True
-        return outcome
+        return remember(outcome)
 
     def guarded(row: Row) -> Outcome:
         """行级异常隔离（ROB-003）。
@@ -1095,6 +1438,8 @@ def refresh(
     report.used_providers = dict(tally)
     report.short_links_expanded = resolver.expanded
     report.short_links_failed = resolver.failed
+    report.shared_rows = share.hits - shared_before
+    report.contract_trips = list(watch.tripped[tripped_before:])
     _apply_circuit_breaker(report, settings)
     return report
 
@@ -1150,6 +1495,8 @@ def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]],
         "failovers": report.failovers,
         "short_links_expanded": report.short_links_expanded,
         "short_links_failed": report.short_links_failed,
+        "shared_rows": report.shared_rows,
+        "unanswered": report.unanswered,
         "breaker_tripped": report.breaker_tripped,
         "breaker_attempted": report.breaker_attempted,
         "breaker_gone": report.breaker_gone,
@@ -1365,6 +1712,11 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))
                     if f.monitoring in cells else True),
+        resolved_id_cell=feishu.read_text(cells.get(f.resolved_id)),
+        collation_text=feishu.read_text(cells.get(f.collation_source)),
+        collation_comments=feishu.read_int(cells.get(f.collation_comments)),
+        collation_interactions=feishu.read_int(cells.get(f.collation_interactions)),
+        collation_status=feishu.read_text(cells.get(f.collation_status)),
     )
 
 
@@ -1378,10 +1730,20 @@ def load_rows(
     now: Optional[datetime] = None,
     max_records: Optional[int] = None,
     known_fields: Optional[set[str]] = None,
+    seen: Optional[list[Row]] = None,
 ) -> list[Row]:
     """从表里读出待刷新的行。
 
     分层刷新在这里落地，而且只是一个过滤条件，不是一套调度代码。
+
+    seen 传一个列表进来，会收到**这次读回来的每一行**（筛选之前）——
+    给 estimate 数「重复行 / 空发布时间 / 已失效」用，不用再读一遍表。
+
+    sweep 时同一篇内容的其它行会被「搭车」带进来（Row.ride_along）：
+    它们自己没到期，但同一篇的另一行这一轮要刷，结果本来就要付一次钱，
+    顺手给它们也写一份，**不另花钱**。这一下之后两行的「最近检查时间」
+    对齐了，以后每次都一起到期、一起只付一次——不对齐的话两行各有各的
+    节奏，永远凑不到同一轮里，共享就一次都发生不了。
 
     known_fields 传入表里实际存在的列名时，search 只请求存在的列——
     按名字请求不存在的列（比如还没建的「点赞数」）会让整个 search 直接
@@ -1433,11 +1795,14 @@ def load_rows(
 
     wanted = set(only_record_ids or [])
     result: list[Row] = []
+    idle: list[Row] = []          # 读回来了、但这一轮没到期的行（搭车的候选）
     for record in records:
         record_id = record.get("record_id") or ""
         if wanted and record_id not in wanted:
             continue
         row = row_from_record(record, settings)
+        if seen is not None:
+            seen.append(row)
         # 手动触发时无视分层节流——人明确要求刷新，就该刷。
         if wanted:
             result.append(row)
@@ -1448,6 +1813,8 @@ def load_rows(
             continue
         if row.queued or not only_due or row.is_due(settings, now):
             result.append(row)
+        else:
+            idle.append(row)
 
     # —— 派发顺序：等得最久的先走 ——
     # `refresh` 就按这个顺序派发，而单轮预算（MAX_RECORDS_PER_RUN /
@@ -1470,9 +1837,18 @@ def load_rows(
     if only_queued:
         # 排队刷新没有「到期」可言（勾了就是要看），按「数据最旧的先看」排。
         result.sort(key=lambda r: r.hours_since_check(now), reverse=True)
-    else:
-        result.sort(key=lambda r: r.overdue_hours(settings, now), reverse=True)
-    return result
+        return result
+    result.sort(key=lambda r: r.overdue_hours(settings, now), reverse=True)
+    if not only_due:
+        return result
+    # —— 同篇搭车：排在所有到期行**后面**，等它们取完了再白拿 ——
+    due_content = {r.content_key() for r in result} - {None}
+    riders = [r for r in idle
+              if r.content_key() in due_content
+              and r.refresh_interval_hours(settings, now) is not None]   # 已归档的不带
+    for rider in riders:
+        rider.ride_along = True
+    return result + riders
 
 
 def _reconcile_tags(

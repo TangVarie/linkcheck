@@ -120,6 +120,8 @@ class ProjectSnapshot:
     traffic_tag_counts: dict[str, int] = field(default_factory=dict)
     negative_rows: int = 0
     pin_lost_rows: int = 0
+    # 「整理状态 = 需重新整理」的行：评论数比数据整理那一刻涨了一大截。
+    recollect_rows: int = 0
 
     # 关键词覆盖度。没填词的行机器**完全不碰**对应的状态列，所以那两格是空的——
     # 把这件事摆出来，运营才分得清「机器没判」和「这行压根没填词」。
@@ -214,6 +216,7 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         f.last_updated, f.consecutive_failures, f.pinned_status,
         f.platform, f.refresh_status, f.failure_reason,
         f.comment_status, f.negative_status, f.alive_confirmed,
+        f.collation_status,
     ]
     if show_digest:
         wanted += [f.comment_digest, f.negative_digest]
@@ -355,6 +358,8 @@ def build_snapshot(
             snap.negative_rows += 1
         if row.pin_status == settings.pin_status.pinned_lost:
             snap.pin_lost_rows += 1
+        if row.collation_status == settings.collation_status.stale:
+            snap.recollect_rows += 1
 
         if row.seed_keywords:
             snap.seed_keyword_rows += 1
@@ -404,7 +409,9 @@ def build_snapshot(
 
     snap.due_rows = len(due)
     if due:
-        snap.due_yuan = rows_mod.estimate_yuan(due, settings, now, keys=api_keys)
+        # 同一篇内容一轮只付一次钱（runner.FetchShare），按「真正付钱的行」估。
+        snap.due_yuan = rows_mod.estimate_yuan(
+            rows_mod.paying_rows(due, settings, now), settings, now, keys=api_keys)
     todos.sort(key=_todo_sort_key)
     snap.todos = todos[:max_todos]
     snap.todos_dropped = max(0, len(todos) - max_todos)
@@ -416,7 +423,7 @@ def build_snapshot(
 # 置顶掉了是「要补一个动作」——这个顺序就是运营该处理的顺序。
 _REASON_RANK = {
     "风控中": 0, "已失效": 1, "刷新失败": 2, "有负面": 3,
-    "疑似限流": 4, "卡住了": 5, "置顶掉了": 6, "疑似受限": 7,
+    "疑似限流": 4, "卡住了": 5, "置顶掉了": 6, "需重新整理": 7, "疑似受限": 8,
 }
 
 
@@ -447,6 +454,10 @@ def _todo_reasons(row: rows_mod.Row, settings: Settings, *,
         reasons.append(settings.negative_status.found)
     if row.pin_status == settings.pin_status.pinned_lost:
         reasons.append(settings.pin_status.pinned_lost)
+    # 评论数比数据整理那一刻涨了一大截：要人重新截图回收后台数据。
+    # 和「置顶掉了」一样是「要补一个动作」，不是出事了。
+    if row.collation_status == settings.collation_status.stale:
+        reasons.append(settings.collation_status.stale)
     if stale:
         reasons.append("卡住了")
     # 去重但保持顺序：`风控中` 可能同时来自标签和「已失效」，报两遍没意义。

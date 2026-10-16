@@ -972,7 +972,7 @@ _SCRIPT = r"""
 _REASON_CLASS = {
     "风控中": "r", "已失效": "r", "刷新失败": "r",
     "有负面": "a", "疑似限流": "a", "疑似受限": "a",
-    "卡住了": "a", "置顶掉了": "",
+    "卡住了": "a", "置顶掉了": "", "需重新整理": "",
 }
 
 
@@ -1170,7 +1170,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
         return ("<div class=empty>" + _icon("check-circle") +
                 "没有需要处理的行。"
                 "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
-                "刷新失败 / 卡住了 —— 一条都没有。</div></div>")
+                "刷新失败 / 卡住了 / 需重新整理 —— 一条都没有。</div></div>")
     groups: dict = {}
     for label in project_order:
         groups.setdefault(label, [])

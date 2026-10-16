@@ -193,6 +193,43 @@ def douyin_id_in_url(url: str) -> Optional[str]:
     return _match_id(url or "", _DOUYIN_ID_PATTERNS)
 
 
+# ID 里自带的发布时刻不早于这一天（2013-01-01 UTC）。两个平台的 ID 都是
+# 这之后才开始这么编的；解出来比它早 = 不是这种编码的 ID（测试固件里的
+# `"a" * 24`、手填的假 ID），宁可当成「不知道」。
+_ID_TIME_FLOOR = 1356998400
+
+
+def id_timestamp(platform: Optional[str], content_id: Optional[str]) -> Optional[int]:
+    """帖子 ID 里自带的创建时刻（Unix 秒）。解不出返回 None。**纯函数，不发请求。**
+
+    * 小红书 note_id 是 24 位十六进制，前 8 位就是创建时刻的秒数
+      （MongoDB ObjectId 的编码）。`6a8538d6…` → 2026-08-19，和那条笔记
+      2026-09-14 的实测对得上。
+    * 抖音 aweme_id 是十进制整数，右移 32 位就是秒数（雪花式编码）。
+      `7683833454907837105` → 2026-09-10。
+
+    只拿来给**表里没填发布时间**的行算帖龄（见 rows.Row.publish_ms），
+    不往「发布时间」那一列写——那是人工列。上界（不能在未来）由调用方按
+    「此刻」判，这里只挡明显不是这种编码的值。
+    """
+    if not content_id:
+        return None
+    try:
+        if platform == "xhs":
+            if not re.fullmatch(_XHS_NOTE_ID, content_id, re.I):
+                return None
+            seconds = int(content_id[:8], 16)
+        elif platform == "douyin":
+            if not content_id.isdigit():
+                return None
+            seconds = int(content_id) >> 32
+        else:
+            return None
+    except ValueError:
+        return None
+    return seconds if seconds >= _ID_TIME_FLOOR else None
+
+
 def _first_url(text: str, domains: tuple[str, ...]) -> Optional[str]:
     for candidate in _urls(text):
         if _host_matches(candidate, domains):

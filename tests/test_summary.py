@@ -14,6 +14,8 @@ from xhsearch.config import Settings
 UTC = timezone.utc
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 XHS = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b"
+# 小红书短链：光看链接解不出 note_id，也就解不出发布时刻。
+SHORT = "http://xhslink.com/a/AbCdEf"
 
 
 def ms(moment: datetime) -> int:
@@ -176,11 +178,15 @@ class TestMissingPublishTime(unittest.TestCase):
     它不报出来就完全没有声音：不算「卡住了」、不进待办，而 analyze 那句 ⚠
     只在评论数够不上任何热度档时才写。代价是这些行**永远不归档**，
     按最快的一档一直刷到有人发现为止。
+
+    链接 ID 里解得出发布时刻的行（小红书 note_id、抖音 aweme_id）**不算**：
+    它们按 ID 时间照常分层、归档（rows.Row.publish_ms），没有在空转。
+    所以这一组用小红书短链——光看链接解不出时间，那才是真空转的那种。
     """
 
     def test_managed_row_without_publish_time_is_counted(self):
         snap = snapshot([
-            record("r1", published_hours_ago=None),
+            record("r1", published_hours_ago=None, link=SHORT),
             record("r2", published_hours_ago=10),
         ])
         self.assertEqual(snap.missing_publish_time_rows, 1)
@@ -190,8 +196,8 @@ class TestMissingPublishTime(unittest.TestCase):
         """没勾「是否巡查」的多半是还没发的草稿：它本来就不刷，
         报出来只是噪声（Ziao 2026-09 拍板）。"""
         snap = snapshot([
-            record("draft", published_hours_ago=None, monitoring=False),
-            record("live", published_hours_ago=None, monitoring=True),
+            record("draft", published_hours_ago=None, monitoring=False, link=SHORT),
+            record("live", published_hours_ago=None, monitoring=True, link=SHORT),
         ])
         self.assertEqual(snap.missing_publish_time_rows, 1)
         self.assertEqual(snap.rows_without_publish_time, ["live"])
@@ -199,20 +205,26 @@ class TestMissingPublishTime(unittest.TestCase):
     def test_no_monitoring_column_counts_everything(self):
         """表里没有那一列时 row.monitoring 默认 True，这个数就和卡上
         别的数一个口径——那种表另有一条体检提示在说这件事。"""
-        snap = snapshot([record("r1", published_hours_ago=None)])
+        snap = snapshot([record("r1", published_hours_ago=None, link=SHORT)])
         self.assertEqual(snap.missing_publish_time_rows, 1)
 
     def test_it_is_not_a_todo(self):
         """没填发布时间不是「出事了」，是「那一格没填」。
         混进待办会把真正的风控行往下挤。"""
-        snap = snapshot([record("r1", published_hours_ago=None)])
+        snap = snapshot([record("r1", published_hours_ago=None, link=SHORT)])
         self.assertEqual(snap.todos, [])
 
     def test_the_id_list_is_capped_but_the_count_is_not(self):
-        records = [record(f"r{i}", published_hours_ago=None) for i in range(5)]
+        records = [record(f"r{i}", published_hours_ago=None, link=SHORT) for i in range(5)]
         snap = snapshot(records, max_todos=2)
         self.assertEqual(snap.missing_publish_time_rows, 5)
         self.assertEqual(len(snap.rows_without_publish_time), 2)
+
+    def test_a_blank_publish_time_with_an_id_in_the_link_is_not_spinning(self):
+        """note_id 里编着发布时刻：帖龄照样算得出来，到点照样归档，不报。"""
+        snap = snapshot([record("r1", published_hours_ago=None)])   # 65a1b2c3… = 2024-01
+        self.assertEqual(snap.missing_publish_time_rows, 0)
+        self.assertEqual(snap.archived_rows, 1)
 
     def test_a_filled_publish_time_counts_nothing(self):
         snap = snapshot([record("r1", published_hours_ago=10)])

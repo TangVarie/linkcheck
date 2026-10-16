@@ -308,18 +308,21 @@ class TestCreateMonitoredTable(unittest.TestCase):
 
 # 西屋表（2026-09 导出）的列，按表里的顺序。模板照它抄，这里照它验。
 # 「数据整理」和它后面三个拆数公式是 2026-09-23 补进标准模板的（运营现在的表
-# 里都有，紧挨着「相关截图」——读的就是那一列）；投流维护三列是 2026-10-10 加的。
+# 里都有，紧挨着「相关截图」——读的就是那一列）；投流维护三列是 2026-10-10 加的；
+# 数据整理基线三列（整理状态 / 整理时评论数 / 整理时互动数）和「作品ID」
+# 是 2026-10-16 加的机器列。
 XIWU_COLUMNS = [
     "素人编号", "发布时间", "反馈链接", "已删除评论留底", "流量状态", "起量时间",
     "笔记状态", "方向", "找人备注", "内容配图", "文案", "随贴评论", "评论的素人编号",
     "评论配图", "评论状态", "发布截图", "相关截图",
     "数据整理", "曝光量", "阅读量", "互动数",
+    "整理状态", "整理时评论数", "整理时互动数",
     "维护情况", "维护时间", "维护效果",
     "蓝词字段", "是否截图", "蓝词图片", "作者",
     "父记录", "负面词", "评论关键词", "是否巡查", "排队刷新", "诊断信息", "置顶状态",
     "已确认存活", "巡查状态", "负面状态", "负面评论快照", "评论区快照",
     "实时数据.评论数", "最近检查时间", "下次检查时间", "连续失败次数", "平台",
-    "上次评论数",
+    "上次评论数", "作品ID",
 ]
 
 # 建表时带不了、要建完再补的列，按补的顺序（= 模板里的先后）：三个拆数公式
@@ -446,8 +449,10 @@ class TestFullTemplate(unittest.TestCase):
         self.assertEqual(
             body["property"]["formula_expression"],
             'IF(DATEDIF([发布时间], NOW(), "D") > 30, "", '
-            '[最近检查时间] + IF(DATEDIF([发布时间], [最近检查时间], "D") <= 2, 8, '
-            'IF(DATEDIF([发布时间], [最近检查时间], "D") <= 7, 24, 72)) / 24)')
+            '[最近检查时间] + IF([巡查状态] = "已失效", '
+            '72 * POWER(2, MIN(10, MAX(0, [连续失败次数] - 2))), '
+            'IF(DATEDIF([发布时间], [最近检查时间], "D") <= 2, 8, '
+            'IF(DATEDIF([发布时间], [最近检查时间], "D") <= 7, 24, 72))) / 24)')
         self.assertIn("下次检查时间", self.made["built"])
 
     def test_the_tiers_in_the_formula_come_from_the_config(self):
@@ -456,9 +461,18 @@ class TestFullTemplate(unittest.TestCase):
         settings = Settings()
         settings.refresh.tiers = [(1, 4), (5, 12)]
         formula = provision.next_check_formula(settings)
-        self.assertIn('IF(DATEDIF([发布时间], [最近检查时间], "D") <= 1, 4, 12) / 24',
+        self.assertIn('IF(DATEDIF([发布时间], [最近检查时间], "D") <= 1, 4, 12)) / 24',
                       formula)
+        # 已失效那一支从**最慢**的那一档起步退避，同样来自配置。
+        self.assertIn('IF([巡查状态] = "已失效", 12 * POWER(2,', formula)
         self.assertNotIn("72", formula)
+
+    def test_gone_rows_back_off_in_the_formula_like_in_the_code(self):
+        """「下次检查时间」要和 Row.gone_backoff_hours 说同一句话：
+        已失效的行从最慢一档起步，每多确认一次死讯翻一倍。"""
+        formula = provision.next_check_formula(Settings())
+        self.assertIn('IF([巡查状态] = "已失效", '
+                      '72 * POWER(2, MIN(10, MAX(0, [连续失败次数] - 2))), ', formula)
 
     def test_no_tiers_means_a_blank_column_not_a_fake_next_check(self):
         """一档都没配 = 没有任何自动刷新（interval_hours_for_age 全返回 None）。

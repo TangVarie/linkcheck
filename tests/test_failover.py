@@ -7,6 +7,7 @@
 通道故障，换一家只会再花一次钱得到同一个答案。
 """
 
+import hashlib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -75,10 +76,17 @@ def sdx_err(status: int, code: int, message: str) -> transport.Response:
                               "sdx-e")
 
 
+def note_id(record_id: str) -> str:
+    """每行一篇**不同**的笔记。同一个 note_id 现在会被认成同一篇内容、一轮只付
+    一次钱（runner.FetchShare），所以「几行各自独立」的固件必须各有各的 ID。
+    前 8 位留成 aaaaaaaa：解出来在 2060 年，不会被当成发布时间（links.id_timestamp）。"""
+    return "a" * 8 + hashlib.md5(record_id.encode()).hexdigest()[:16]
+
+
 def xhs_row(record_id="rec1", *, age_days=1.0) -> Row:
     return Row(
         record_id=record_id,
-        link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24,
+        link_cell="https://www.xiaohongshu.com/explore/" + note_id(record_id),
         publish_time_ms=int((NOW - timedelta(days=age_days)).timestamp() * 1000),
     )
 
@@ -578,8 +586,11 @@ class TestDouyinShortLinkExpansion(FailoverTest):
                          [runner.STATUS_OK, runner.STATUS_OK])
         self.assertEqual(len(self.expand_calls), 1)
         self.assertEqual(report.short_links_expanded, 1)
-        # 1 跳展开（第二行命中缓存，不再记账）+ 每行 2 个付费请求
-        self.assertEqual(budget.calls, 5)
+        # 1 跳展开（第二行命中缓存，不再记账）+ 第一行 2 个付费请求。
+        # 第二行是同一篇内容：直接用第一行本轮的结果，一个付费请求都不发
+        # （runner.FetchShare）——以前这里是每行各 2 个，共 5。
+        self.assertEqual(budget.calls, 3)
+        self.assertEqual(report.shared_rows, 1)
 
     def test_expansion_hop_counts_against_the_call_budget(self):
         """展开免费，但它是一个真实请求：MAX_CALLS_PER_RUN 记的是请求数。"""
@@ -671,7 +682,7 @@ class TestRetryAfterHeaderReachesTheRunner(FailoverTest):
         with mock.patch.object(transport, "get", return_value=throttled), \
              mock.patch.object(transport, "post", return_value=throttled), \
              mock.patch("time.sleep"):
-            result, attempts = runner_mod._call_once(
+            result, attempts, _unanswered = runner_mod._call_once(
                 "tikhub", "t-key",
                 ToolCall("xhs", "comments", {"note_id": "a" * 24}),
                 deadline=None, timeout=30.0)
@@ -689,7 +700,7 @@ class TestRetryAfterHeaderReachesTheRunner(FailoverTest):
             "sdx-429", retry_after=30.0)
         with mock.patch.object(transport, "post", return_value=both), \
              mock.patch("time.sleep"):
-            result, _ = runner_mod._call_once(
+            result, _, _unanswered = runner_mod._call_once(
                 "socialdatax", "s-key",
                 ToolCall("xhs", "comments", {"note_id": "a" * 24}),
                 deadline=None, timeout=30.0)
