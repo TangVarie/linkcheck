@@ -109,7 +109,10 @@ def load_dotenv(directory: Optional[Path] = None, *,
     """
     root = directory or Path(__file__).resolve().parent.parent
     try:
-        text = (root / ".env").read_text(encoding="utf-8")
+        # utf-8-sig：Windows 上用旧版记事本「UTF-8」或 PowerShell 5.1 的
+        # Out-File 存出来的 .env 开头带 BOM，按 utf-8 读会把第一个变量名读成
+        # 「\ufeffFEISHU_APP_ID」，整个文件被判成「看不懂」拒跑。没有 BOM 时两者一样。
+        text = (root / ".env").read_text(encoding="utf-8-sig")
     except OSError:
         return
     for number, line in enumerate(text.splitlines(), start=1):
