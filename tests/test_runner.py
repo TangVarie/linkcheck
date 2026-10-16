@@ -3,6 +3,7 @@
 这一组测的是最容易出事、也最难在生产上发现的行为：失败时不要写坏表。
 """
 
+import hashlib
 import json
 import time
 import unittest
@@ -43,11 +44,18 @@ def comment_page(count=50, pinned=True, balance=9000):
             "next_page_token": "", "points": {"cost": 10, "balance": balance}}
 
 
+def note_id(record_id: str) -> str:
+    """每行一篇**不同**的笔记。同一个 note_id 现在会被认成同一篇内容、一轮只付
+    一次钱（runner.FetchShare），所以「几行各自独立」的固件必须各有各的 ID。
+    前 8 位留成 aaaaaaaa：解出来在 2060 年，不会被当成发布时间（links.id_timestamp）。"""
+    return "a" * 8 + hashlib.md5(record_id.encode()).hexdigest()[:16]
+
+
 def xhs_row(record_id="rec1", *, age_days=1.0, tags=None, prev_count=None, keywords=None):
     published = NOW - timedelta(days=age_days)
     return Row(
         record_id=record_id,
-        link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24,
+        link_cell="https://www.xiaohongshu.com/explore/" + note_id(record_id),
         publish_time_ms=int(published.timestamp() * 1000),
         current_tags=tags or [],
         previous_comment_count=prev_count,

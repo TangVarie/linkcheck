@@ -120,6 +120,8 @@ class ProjectSnapshot:
     traffic_tag_counts: dict[str, int] = field(default_factory=dict)
     negative_rows: int = 0
     pin_lost_rows: int = 0
+    # 「整理状态 = 需重新整理」的行：评论数比数据整理那一刻涨了一大截。
+    recollect_rows: int = 0
 
     # 关键词覆盖度。没填词的行机器**完全不碰**对应的状态列，所以那两格是空的——
     # 把这件事摆出来，运营才分得清「机器没判」和「这行压根没填词」。
@@ -214,6 +216,10 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         f.last_updated, f.consecutive_failures, f.pinned_status,
         f.platform, f.refresh_status, f.failure_reason,
         f.comment_status, f.negative_status, f.alive_confirmed,
+        f.collation_status,
+        # 抖音短链记过的「作品ID」：没有它，面板认不出这一行是哪个作品，
+        # 「发布时间」空着时就算不出帖龄、把 cron 早已归档的行报成空转。
+        f.resolved_id,
     ]
     if show_digest:
         wanted += [f.comment_digest, f.negative_digest]
@@ -262,7 +268,7 @@ def _is_stale(row: rows_mod.Row, settings: Settings, now: datetime) -> bool:
     那是「发布时间那一格有问题」，`诊断信息` 里已经在报了，
     在这里再报一次只会让同一个毛病占两个位置。
     """
-    if row.age_days(now) is None:
+    if row.schedule_age_days(settings, now) is None:
         return False
     # 和 Row.is_due 用同一个间隔（按上次检查时刻定档），否则面板说的
     # 「卡住了」和机器真正的到期判断不是一个口径。
@@ -293,8 +299,13 @@ def build_snapshot(
     scrub: Optional[Any] = None,
     route: str = "base",
     label_column: str = "",
+    seen_calls: Optional[set] = None,
 ) -> ProjectSnapshot:
     """把一张表读回来的 records 聚合成一个项目快照。
+
+    seen_calls：跨表共用的调用指纹集合（rows.paying_rows）。同一篇内容
+    登记在两张表里时，cron 一轮只付一次钱，「预计花费」也只算在先读到的
+    那张表头上——各项目加起来才等于真花销。
 
     records 应该是**在管的行**（`是否巡查` 勾着的）。取消勾选就是运营
     明确说了「这行别管了」，把它算进任何一个数字都是在制造噪声。
@@ -315,7 +326,9 @@ def build_snapshot(
         row = runner.row_from_record(record, settings)
         snap.total_rows += 1
 
-        age = row.age_days(now)
+        # 和 cron 同一个口径：「发布时间」空着时按链接 ID 推的保守帖龄（见
+        # Row.schedule_publish_ms），算不出来的才是真空转。
+        age = row.schedule_age_days(settings, now)
         archived = age is not None and settings.refresh.interval_hours_for_age(age) is None
         if archived:
             snap.archived_rows += 1
@@ -355,6 +368,8 @@ def build_snapshot(
             snap.negative_rows += 1
         if row.pin_status == settings.pin_status.pinned_lost:
             snap.pin_lost_rows += 1
+        if row.collation_status == settings.collation_status.stale:
+            snap.recollect_rows += 1
 
         if row.seed_keywords:
             snap.seed_keyword_rows += 1
@@ -404,7 +419,10 @@ def build_snapshot(
 
     snap.due_rows = len(due)
     if due:
-        snap.due_yuan = rows_mod.estimate_yuan(due, settings, now, keys=api_keys)
+        # 同一篇内容一轮只付一次钱（runner.FetchShare），按「真正付钱的行」估。
+        snap.due_yuan = rows_mod.estimate_yuan(
+            rows_mod.paying_rows(due, settings, now, seen=seen_calls),
+            settings, now, keys=api_keys)
     todos.sort(key=_todo_sort_key)
     snap.todos = todos[:max_todos]
     snap.todos_dropped = max(0, len(todos) - max_todos)
@@ -416,7 +434,7 @@ def build_snapshot(
 # 置顶掉了是「要补一个动作」——这个顺序就是运营该处理的顺序。
 _REASON_RANK = {
     "风控中": 0, "已失效": 1, "刷新失败": 2, "有负面": 3,
-    "疑似限流": 4, "卡住了": 5, "置顶掉了": 6, "疑似受限": 7,
+    "疑似限流": 4, "卡住了": 5, "置顶掉了": 6, "需重新整理": 7, "疑似受限": 8,
 }
 
 
@@ -447,6 +465,10 @@ def _todo_reasons(row: rows_mod.Row, settings: Settings, *,
         reasons.append(settings.negative_status.found)
     if row.pin_status == settings.pin_status.pinned_lost:
         reasons.append(settings.pin_status.pinned_lost)
+    # 评论数比数据整理那一刻涨了一大截：要人重新截图回收后台数据。
+    # 和「置顶掉了」一样是「要补一个动作」，不是出事了。
+    if row.collation_status == settings.collation_status.stale:
+        reasons.append(settings.collation_status.stale)
     if stale:
         reasons.append("卡住了")
     # 去重但保持顺序：`风控中` 可能同时来自标签和「已失效」，报两遍没意义。

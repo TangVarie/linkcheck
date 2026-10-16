@@ -721,6 +721,11 @@ def get_provider(name: str) -> Provider:
     return provider
 
 
+# 「收了钱、回的东西却认不出来」的那几个错误码：成功信封里没有 data、
+# 或者形状和实测登记的对不上。HTTP 是 200，所以「失败也收费」的通道照样扣钱。
+CONTRACT_CODES = frozenset({"no_data", "unexpected_shape"})
+
+
 # 值得换一家再试的失败。**GONE 不在里面**：那是行级结论，不是通道故障，
 # 换一家只会再花一次钱得到同一个答案。UNKNOWN 也不在——没看懂的错误
 # 换个供应商多半还是看不懂，白烧钱。
@@ -744,6 +749,21 @@ def credentials(api_key: Any) -> dict[str, str]:
     return {SOCIALDATAX: key} if key else {}
 
 
+def scoped(name: str, platform: str) -> str:
+    """「这一家**只在这个平台上**本轮不可用」在 disabled 集合里的写法。
+
+    Key 失效、余额耗尽是整家的事（直接放名字）；契约坏了是**某个端点**的事——
+    TikHub 的小红书端点改版，抖音端点照样好好的，整家停掉会把抖音推到贵 14 倍的
+    备胎上。所以那种情况只停这一个平台。
+    """
+    return f"{name}:{platform}"
+
+
+def is_disabled(name: str, platform: str, disabled: Optional[set[str]]) -> bool:
+    dead = disabled or set()
+    return name in dead or scoped(name, platform) in dead
+
+
 def usable_order(channels: Any, platform: str, keys: dict[str, str],
                  disabled: Optional[set[str]] = None) -> list[str]:
     """这个平台此刻真正可用的供应商顺序：有 key、且本轮没被判死。
@@ -751,5 +771,5 @@ def usable_order(channels: Any, platform: str, keys: dict[str, str],
     channels 是 config.Channels；这里刻意用 Any 接住，好让 providers 不反过来
     依赖 config——依赖保持单向，模块图不成环。
     """
-    dead = disabled or set()
-    return [n for n in channels.for_platform(platform) if keys.get(n) and n not in dead]
+    return [n for n in channels.for_platform(platform)
+            if keys.get(n) and not is_disabled(n, platform, disabled)]

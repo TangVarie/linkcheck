@@ -92,6 +92,18 @@ def expected_schema(settings: Settings) -> list[tuple]:
          "而且任何人工编辑都会刷新它，分层刷新的节奏会被打乱"),
         (f.alive_confirmed, (7,), "复选框", None, None),
         (f.consecutive_failures, (2,), "数字", None, None),
+        # —— 数据整理基线（机器写）——
+        (f.collation_status, (3,), "单选", settings.collation_status.machine_written(),
+         f"评论数比「{f.collation_source}」那一刻涨了一大截时机器写「"
+         f"{settings.collation_status.stale}」；重新截图整理后机器自己改回「"
+         f"{settings.collation_status.fresh}」，不用人改"),
+        (f.collation_comments, (2,), "数字", None,
+         "机器写：这份数据整理对应的评论数基线。手工清空 = 让机器下一轮重新记"),
+        (f.collation_interactions, (2,), "数字", None,
+         "机器写：基线记的是哪一份整理（那一份的互动量），换了一份整理会自动重记"),
+        (f.resolved_id, (1,), "文本", None,
+         "机器写：抖音短链展开出来的作品 ID（带着当时那条链接），之后直接按 ID 刷、"
+         "不用每轮展开；换了链接会自动作废重写。小红书行不写"),
     ]
 
 
@@ -115,7 +127,7 @@ def schema_problems(settings: Settings, meta: dict) -> list[str]:
     # （平台/巡查状态）是直写字符串，没有写侧守卫，缺选项的后果是
     # 写回可能失败——两种情况的文案必须如实区分。
     filtered_columns = {f.traffic_status, f.comment_status, f.negative_status,
-                        f.pinned_status, f.blue_word_shot}
+                        f.pinned_status, f.blue_word_shot, f.collation_status}
     for name, allowed, type_label, required_options, note in expected_schema(settings):
         info = meta.get(name)
         if info is None:

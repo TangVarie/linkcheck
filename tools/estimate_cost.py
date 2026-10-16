@@ -10,10 +10,18 @@
 
 调用次数（已从接口实测核实）：
     小红书 = 1 次评论调用（评论数 + 置顶 + 前 N 条一次拿全）
-             + 新笔记额外 1 次 detail（点赞/收藏）
+             + DETAIL_WITHIN_DAYS 天内的新笔记额外 1 次 detail（**默认 0 = 不调**）
     抖音   = 1 次评论调用 + 恒定 1 次 detail
              （SocialDataX 的 comment_count 是 integer|null，必须兜底；
-               TikHub 的 total 实测是实数，但 detail 还要拿点赞收藏，照调）
+               detail 还是抖音删帖的确定信号和审核中标记的唯一来源）
+
+对照组（全表日刷 / 纯手动 / 开或关 detail）和主表一样**两家分开报**、
+按当前的 detail 配置算——以前它们按 SocialDataX 单价、并假定小红书开着
+detail，报出来的「全表日刷」比真实贵了快一倍，拿它做决策会选错。
+
+这里算的是**每篇只登记一行**、发布时间都填了、没有已失效行的理想表。
+真表里同篇多行（一轮只付一次）、空发布时间（短链永不归档）、已失效
+（退避复查）各有多少，跑 `python3 cli.py estimate` 看开头那几行计数。
 """
 
 from __future__ import annotations
@@ -151,12 +159,29 @@ def _split_by_platform(per_day: float, xhs_share: float, settings: Settings):
     return xhs_calls, dy_calls
 
 
-def flat_daily(total_posts: float, xhs_share: float, with_detail: bool) -> dict:
-    """对照组：不分层，每天全表刷一遍。"""
-    xhs = total_posts * xhs_share
-    dy = total_posts * (1 - xhs_share)
-    calls = xhs * (2 if with_detail else 1) + dy * 2
-    return {"calls_per_day": calls, "yuan_per_month": calls * _yuan_per_call() * 30}
+def _month(xhs_calls: float, dy_calls: float) -> tuple[float, float]:
+    """每天的调用次数 → (走 TikHub 的月成本, 走 SocialDataX 的月成本)。"""
+    sdx = providers.get_provider("socialdatax")
+    tik = providers.get_provider("tikhub")
+    return ((xhs_calls * tik.yuan_per_call("xhs", "comments")
+             + dy_calls * tik.yuan_per_call("douyin", "comments")) * 30,
+            (xhs_calls * sdx.yuan_per_call("xhs", "comments")
+             + dy_calls * sdx.yuan_per_call("douyin", "comments")) * 30)
+
+
+def flat_daily(total_posts: float, xhs_share: float, xhs_detail_posts: float = 0.0) -> dict:
+    """对照组：不分层，每天全表刷一遍。
+
+    xhs_detail_posts = 落在 DETAIL_WITHIN_DAYS 窗口里的小红书篇数：只有它们
+    每天多一次 detail（和生产一样按帖龄判），不是全部小红书都翻倍。
+    """
+    xhs = total_posts * xhs_share + xhs_detail_posts
+    dy = total_posts * (1 - xhs_share) * 2
+    tik, sdx = _month(xhs, dy)
+    return {"calls_per_day": xhs + dy, "xhs_calls": xhs, "dy_calls": dy,
+            "tikhub_month": tik, "socialdatax_month": sdx,
+            # 老字段名：SocialDataX 口径，留给还在读它的调用方。
+            "yuan_per_month": sdx}
 
 
 def main() -> int:
@@ -209,29 +234,42 @@ def main() -> int:
     print(f"\n  当前配置：小红书主通道 {settings.channels.primary('xhs')}，"
           f"抖音主通道 {settings.channels.primary('douyin')}")
 
-    flat_full = flat_daily(result["posts"], xhs_share, with_detail=True)
-    flat_lean = flat_daily(result["posts"], xhs_share, with_detail=False)
-    print(f"【全表日刷】 {flat_full['calls_per_day']:.0f} 次/天 "
-          f"= ¥{flat_full['yuan_per_month']:,.0f}/月"
-          f"（省掉小红书 detail 则 ¥{flat_lean['yuan_per_month']:,.0f}/月）")
+    print("\n对照组（两家分开报，按当前的 detail 配置）：")
+    in_window = _overlap(0.0, float(settings.refresh.archive_after_days) + 1.0,
+                         0.0, float(settings.detail_within_days))
+    flat = flat_daily(result["posts"], xhs_share,
+                      xhs_detail_posts=per_day * in_window * xhs_share)
+    print(f"【全表日刷】 {flat['calls_per_day']:.0f} 次/天 = "
+          f"TikHub ¥{flat['tikhub_month']:,.0f}/月，"
+          f"SocialDataX ¥{flat['socialdatax_month']:,.0f}/月")
 
-    manual = result["posts"] * 0.15 * 1.4
-    print(f"【纯手动点】 {manual:.0f} 次/天（按 15% 行被点到估）"
-          f" = ¥{manual * _yuan_per_call() * 30:,.0f}/月"
+    clicked = result["posts"] * 0.15
+    manual_xhs = clicked * xhs_share
+    manual_dy = clicked * (1 - xhs_share) * 2
+    tik, sdx = _month(manual_xhs, manual_dy)
+    print(f"【纯手动点】 {manual_xhs + manual_dy:.0f} 次/天（按 15% 行被点到估）"
+          f" = TikHub ¥{tik:,.0f}/月，SocialDataX ¥{sdx:,.0f}/月"
           f"  ⚠ 没被点到的行永远不更新，最坏陈旧度无穷大")
 
-    no_detail = estimate(per_day, xhs_share, _without_xhs_detail(settings))
-    print(f"【分层 + 关掉小红书 detail】 {no_detail['calls_per_day']:.0f} 次/天 "
-          f"= ¥{no_detail['yuan_per_month']:,.0f}/月"
-          f"  （代价：没有点赞/收藏，爆文只能靠评论数判）")
+    if settings.detail_within_days > 0:
+        other = estimate(per_day, xhs_share, _with_xhs_detail(settings, 0))
+        label = "【分层 + 关掉小红书 detail】"
+        cost = "（代价：「仅作者可见」这种风控看不见，死讯晚一轮定罪）"
+    else:
+        other = estimate(per_day, xhs_share, _with_xhs_detail(settings, 7))
+        label = "【分层 + 开小红书 detail 7 天】"
+        cost = "（多买的：「仅作者可见」风控的唯一证据、一轮定罪的死讯；赞藏不落表）"
+    tik, sdx = _month(other["xhs_calls_per_day"], other["douyin_calls_per_day"])
+    print(f"{label} {other['calls_per_day']:.0f} 次/天 = "
+          f"TikHub ¥{tik:,.0f}/月，SocialDataX ¥{sdx:,.0f}/月  {cost}")
     return 0
 
 
-def _without_xhs_detail(settings: Settings) -> Settings:
-    lean = Settings()
-    lean.refresh = settings.refresh
-    lean.detail_within_days = 0
-    return lean
+def _with_xhs_detail(settings: Settings, days: int) -> Settings:
+    other = Settings()
+    other.refresh = settings.refresh
+    other.detail_within_days = days
+    return other
 
 
 if __name__ == "__main__":

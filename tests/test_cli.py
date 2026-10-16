@@ -23,8 +23,17 @@ class TestDoctorSchema(unittest.TestCase):
                        in cli._expected_schema(self.settings)}
 
     def test_covers_every_column_the_code_reads(self):
+        # 「数据整理」的体检判据在 readout.py（截图读数四列），schema_problems 一起核对。
+        from xhsearch import readout
+        checked = set(self.schema) | set(readout.NAMES)
         for column in self.settings.fields.must_read():
-            self.assertIn(column, self.schema, f"doctor 的体检清单漏了要读的列「{column}」")
+            self.assertIn(column, checked, f"doctor 的体检清单漏了要读的列「{column}」")
+
+    def test_collation_source_is_the_readout_data_column(self):
+        """基线判定读的那一列，必须就是截图读数四列里的「数据整理」——
+        两个名字漂开，提醒就永远读不到东西，而且没有任何报错。"""
+        from xhsearch import readout
+        self.assertEqual(self.settings.fields.collation_source, readout.DATA_COLUMN)
 
     def test_covers_every_machine_written_column(self):
         f = self.settings.fields
@@ -33,7 +42,8 @@ class TestDoctorSchema(unittest.TestCase):
                        f.comment_digest, f.negative_status, f.negative_digest,
                        f.traffic_status, f.refresh_status,
                        f.failure_reason, f.last_updated, f.alive_confirmed,
-                       f.consecutive_failures):
+                       f.consecutive_failures, f.resolved_id, f.collation_status,
+                       f.collation_comments, f.collation_interactions):
             self.assertIn(column, self.schema, f"doctor 的体检清单漏了要写的列「{column}」")
 
     def test_select_columns_require_every_machine_value(self):

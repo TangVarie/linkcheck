@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import feishu, readout, schema, summary
+from . import feishu, readout, runner, schema, summary
 from .config import Settings
 from .schema import expected_schema
 
@@ -258,6 +258,10 @@ def next_check_formula(settings: Settings) -> str:
     发布 2 天内每 8 小时、7 天内每 24 小时、之后每 72 小时——和分层刷新的
     节奏一致，表里看得到「下一次什么时候来」。
 
+    （上面是去掉「已失效」那一支的样子。实际生成的公式里层还套着一层
+    `IF([巡查状态] = "已失效", 72 * POWER(2, …[连续失败次数]…), <档位>)`：
+    已失效的行按退避节奏走，见 rows.Row.gone_backoff_hours。）
+
     **档位用的是 `[最近检查时间]` 那一刻的帖龄，不是 `NOW()`。** 原来里层
     也写 `NOW()`：中午显示「下次 14:00」的行，下午一跨过 2 天线，这一格
     自己就变成了「次日 06:00」，14:00 什么也没发生。现在它和
@@ -278,8 +282,15 @@ def next_check_formula(settings: Settings) -> str:
     age_now = f'DATEDIF([{f.publish_time}], NOW(), "D")'
     age_at_check = f'DATEDIF([{f.publish_time}], [{f.last_updated}], "D")'
     days = settings.refresh.archive_after_days
-    inner = (f"[{f.last_updated}] + "
-             f"{_tier_expr(age_at_check, settings.refresh.tiers)} / 24")
+    tier = _tier_expr(age_at_check, settings.refresh.tiers)
+    # 已失效的行退避：最慢一档起步，每多确认一次死讯翻一倍
+    # （和 rows.Row.gone_backoff_hours 同一个算法、同一份配置）。
+    # 不用再和档位取大：最慢一档 × 2^k 本来就不小于任何一档。
+    backoff = (f"{settings.refresh.slowest_interval_hours()} * POWER(2, MIN(10, "
+               f"MAX(0, [{f.consecutive_failures}] - "
+               f"{settings.safety.strikes_before_gone})))")
+    interval = f'IF([{f.refresh_status}] = "{runner.STATUS_GONE}", {backoff}, {tier})'
+    inner = f"[{f.last_updated}] + {interval} / 24"
     return f'IF({age_now} > {days}, "", {inner})'
 
 
@@ -309,6 +320,10 @@ FULL_LAYOUT: tuple = (
     # 截图读数：紧挨着「相关截图」，因为读的就是它。三个公式列要等
     # 「数据整理」先存在，所以和其他公式列一样建完再补、排到表尾。
     *(BusinessColumn(c.name, c.type_code, formula=c.formula) for c in readout.COLUMNS),
+    # 数据整理基线三列：机器写，紧跟着截图读数——它们说的就是那一份整理还新不新。
+    "collation_status",
+    "collation_comments",
+    "collation_interactions",
     # 投流维护三列（2026-10-10 加，西屋表里原来没有）：纯人工，机器不读不写、
     # 不进体检，接管已有表时「补齐缺的列」也不补。排在截图读数后面，因为
     # 「维护效果」记的就是投流后 12 小时的曝光增长。三列都建成空的多选，
@@ -341,6 +356,7 @@ FULL_LAYOUT: tuple = (
     "consecutive_failures",
     "platform",
     "previous_comment_count",
+    "resolved_id",
 )
 
 # 模板里有但刻意不建的列。现在是空的：西屋表的列全部建得出来。

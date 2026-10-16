@@ -535,7 +535,10 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                    deadline: float | None = None,
                    disabled: set[str] | None = None,
                    budget: runner.RunBudget | None = None,
-                   stop: threading.Event | None = None):
+                   stop: threading.Event | None = None,
+                   share: runner.FetchShare | None = None,
+                   watch: runner.ContractWatch | None = None,
+                   estimate_seen: set | None = None):
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
@@ -584,6 +587,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         print(f"⚠ 表里没有「{settings.fields.publish_time}」列：全表都算不出帖龄，"
               f"于是每一行都按最快的一档（{_fastest_tier(settings)}）刷，"
               "而且永远不会归档——三年前的老帖也会一直刷下去。先去建这一列。")
+    seen_rows: list = []
     row_list = runner.load_rows(
         table,
         settings,
@@ -594,7 +598,12 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         only_queued=(mode == "queue"),
         now=now,
         known_fields=known_fields,
+        seen=seen_rows,
     )
+    if mode == "estimate":
+        # 三个最容易悄悄多花钱的形态，在在管的全部行上数一遍（读表不花钱）。
+        for line in _waste_report(seen_rows, settings, now):
+            print(line)
     found = {r.record_id for r in row_list}
     if mode == "queue" and not row_list and known_fields is not None \
             and settings.fields.queued not in known_fields:
@@ -631,10 +640,13 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
 
     # 帖龄未知的行：按最快档刷、而且不会归档。数量一多就是在持续多花钱，
     # 而这件事在表里一点痕迹都没有——只有把它数出来，才有人去补那一格。
+    # 「发布时间」空着、但链接 ID 里解得出时刻的行不算：它们已经按 ID 推的
+    # 保守帖龄分层、归档了（见 Row.schedule_publish_ms），两头都没有的才在空转。
     if mode in ("sweep", "estimate"):
-        blind = sum(1 for r in row_list if r.publish_time_ms is None)
+        blind = sum(1 for r in row_list if r.schedule_age_days(settings, now) is None)
         if blind:
-            print(f"⚠ 这批里有 {blind} 行的「{settings.fields.publish_time}」是空的："
+            print(f"⚠ 这批里有 {blind} 行的「{settings.fields.publish_time}」是空的、"
+                  "链接里也解不出发布时刻（短链）："
                   f"算不出帖龄，只能按最快的一档（{_fastest_tier(settings)}）刷，"
                   "而且永远不会归档。把发布时间补上，它们就会自动降频。")
 
@@ -652,7 +664,16 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         row_list = row_list[:first_run_cap]
         found = {r.record_id for r in row_list}
 
-    yuan = rows_mod.estimate_yuan(row_list, settings, now, keys=api_keys)
+    # 同一篇内容一轮只付一次钱、搭车的行不花钱：按真正要付钱的行估。
+    # estimate_seen 跨表共用：同一篇在两张表里都到期，只算在先跑的那张表头上
+    # （cron 跨表共享 FetchShare，真花销就是这样）。
+    paying = rows_mod.paying_rows(row_list, settings, now, seen=estimate_seen)
+    yuan = rows_mod.estimate_yuan(paying, settings, now, keys=api_keys)
+    riders = sum(1 for r in row_list if r.ride_along)
+    if len(paying) < len(row_list):
+        print(f"♻ 其中 {len(row_list) - len(paying)} 行和别的行是同一篇内容"
+              + (f"（{riders} 行是自己没到期、跟着同篇的到期行一起刷）" if riders else "")
+              + "，这一轮不另花钱")
 
     # 显示的通道要和计价用的是同一套选择逻辑（第一家配了 key 的），
     # 否则只配备胎 key 时会按 SDX 计价、嘴上却说走 TikHub，自相矛盾。
@@ -673,6 +694,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     if mode == "estimate":
         return 0, found, len(row_list), yuan, None
 
+    collation_ready = _collation_ready(settings, known_fields)
     report = runner.refresh(
         row_list, api_keys, settings,
         now=now,
@@ -681,14 +703,67 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         negative_status_options=_options_from_meta(fields_meta, settings.fields.negative_status),
         pin_status_options=_options_from_meta(fields_meta, settings.fields.pinned_status),
         blue_word_shot_options=_options_from_meta(fields_meta, settings.fields.blue_word_shot),
+        collation_status_options=_options_from_meta(fields_meta,
+                                                    settings.fields.collation_status),
+        collation_ready=collation_ready,
         forced=(record_ids is not None),
         progress=print,
         deadline=deadline,
         disabled=disabled,
         budget=budget,
         stop=stop,
+        share=share,
+        watch=watch,
     )
     return 0, found, len(row_list), yuan, (report, fields_meta)
+
+
+def _collation_ready(settings: Settings, known_fields: set[str] | None) -> bool:
+    """「数据整理过时提醒」要的四列齐不齐。缺了就说一句、整个不判。
+
+    半套列比没有更糟：缺「整理时互动数」的话，机器认不出「这还是上回那份整理」，
+    基线每轮重记，评论数涨到天上也报不出来。所以要么全在，要么一格都不碰。
+    """
+    f = settings.fields
+    if known_fields is None or f.collation_source not in known_fields:
+        return False     # 这张表没有「数据整理」：本来就没有可比的东西
+    needed = (f.collation_status, f.collation_comments, f.collation_interactions)
+    missing = [c for c in needed if c not in known_fields]
+    if missing:
+        print(f"ℹ 「数据整理过时提醒」没开：表里缺 {'、'.join(missing)}。"
+              "面板上点这张表的「补齐缺的列」建上，下一轮就开始记基线")
+        return False
+    return True
+
+
+def _waste_report(rows: list, settings: Settings, now: datetime) -> list[str]:
+    """estimate 用：这张表里三种「花了钱买不到新东西」的形态各有几行。
+
+    都只看**在管**的行（sweep 读回来的就是「是否巡查」勾着的那些）。
+    数出来不等于在浪费——这一版已经分别把它们管住了（见每行的括号）——
+    但数字大了说明表的录入习惯值得改一改。
+    """
+    f = settings.fields
+    lines: list[str] = []
+    groups: dict = {}
+    for row in rows:
+        key = row.content_key()
+        if key is not None:
+            groups.setdefault(key, []).append(row)
+    dup_rows = sum(len(g) for g in groups.values() if len(g) > 1)
+    dup_notes = sum(1 for g in groups.values() if len(g) > 1)
+    inferred = sum(1 for r in rows if r.publish_time_inferred(now))
+    blind = sum(1 for r in rows if r.schedule_age_days(settings, now) is None)
+    gone = [r for r in rows if r.refresh_status == runner.STATUS_GONE
+            and r.refresh_interval_hours(settings, now) is not None]
+    lines.append(f"🧮 在管 {len(rows)} 行里：")
+    lines.append(f"  · 同一篇内容登记了多行：{dup_notes} 篇 / {dup_rows} 行"
+                 "（同一轮只付一次钱，到期的那行会带上同篇的其它行）")
+    lines.append(f"  · 「{f.publish_time}」空着：{inferred + blind} 行，"
+                 f"其中 {inferred} 行按链接 ID 推了保守帖龄、照常分层归档；"
+                 f"{blind} 行连 ID 也解不出（短链），按最快一档刷、不归档——这些要补发布时间")
+    lines.append(f"  · 已失效、还没归档：{len(gone)} 行（退避复查，越查越慢）")
+    return lines
 
 
 def _fastest_tier(settings: Settings) -> str:
@@ -904,6 +979,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     disabled: set[str] = set()
     # 硬预算同理是整次运行的，不是每张表各领一份。
     budget = runner.RunBudget(settings.budget)
+    # 同一篇内容一轮只付一次钱：跨表也算（复查表和项目表里重复登记的那种）。
+    share = runner.FetchShare()
+    # 「收了钱、回的东西认不出来」的连续次数同样跨表数，否则每张表三五行永远数不到门槛。
+    watch = runner.ContractWatch(settings.safety.contract_failures_before_disable)
+    # 估算同理跨表去重，各表的「预计花费」加起来才等于真花销。
+    estimate_seen: set = set()
     stop = threading.Event()
     _install_stop_handlers(stop)
     on_event, run_id = _event_sink()
@@ -972,7 +1053,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 code, found, row_count, yuan, prep = _refresh_table(
                     mode, record_ids, per_table, api_keys, table, now,
                     quiet_missing=multi, deadline=deadline, disabled=disabled,
-                    budget=budget, stop=stop)
+                    budget=budget, stop=stop, share=share, watch=watch,
+                    estimate_seen=estimate_seen)
             except feishu.FeishuError as exc:
                 # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
                 print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import email.utils
+import http.client
 import json
 import random
 import time
@@ -69,6 +70,11 @@ class Response:
     # 3xx 响应的 Location 头（原样，可能是相对路径）。只有 get_no_redirect()
     # 会填它：付费接口从不重定向，短链展开则只要这一个头、不要落地页正文。
     location: str = ""
+    # 请求**已经整个发出去了**，却没拿到回答（读超时、对方中途断开）。
+    # 这和建连失败（status 0 + in_doubt=False）不是一回事：对方多半已经在
+    # 处理，对「失败也收费」的通道来说这一次很可能已经扣了钱。重试要克制
+    # （见 runner._call_once），账上也要算它（宁可多记，不能少报）。
+    in_doubt: bool = False
 
     @property
     def redirected(self) -> bool:
@@ -154,9 +160,16 @@ def _perform(request: urllib.request.Request, timeout: float,
             return Response(getattr(exc, "code", 0) or 0, "",
                             f"读取错误响应失败：{type(read_exc).__name__}: {read_exc}")
     except urllib.error.URLError as exc:
+        # urllib 只把**发请求那一步**（建连、TLS、写请求）的 OSError 包成
+        # URLError：走到这里说明对方根本没收到完整的请求，重试是安全的。
         return Response(0, "", f"网络错误：{exc.reason}")
     except TimeoutError:
-        return Response(0, "", f"请求超时（{timeout}s）")
+        # 请求已经发完，等回答（或读响应体）的时候超时：对方多半在处理。
+        return Response(0, "", f"请求超时（{timeout}s）", in_doubt=True)
+    except (ConnectionError, http.client.HTTPException) as exc:
+        # 状态行前被断开（RemoteDisconnected）、读到一半被重置（IncompleteRead /
+        # ConnectionResetError）：同样是「发出去了、没拿到回答」。
+        return Response(0, "", f"网络错误：{type(exc).__name__}: {exc}", in_doubt=True)
     except Exception as exc:  # noqa: BLE001
         return Response(0, "", f"网络错误：{type(exc).__name__}: {exc}")
 

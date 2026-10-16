@@ -85,8 +85,22 @@ class FieldNames:
     blue_word_shot: str = "是否截图"          # 单选：机器只写「未截图」，「已截图」由人改
     blue_word_images: str = "蓝词图片"        # 附件：机器不写，人工放截图
 
+    # —— 数据整理基线（见 analyze.recollect_check）——
+    # 运营把后台截图丢进「相关截图」，AI 捷径读出「数据整理」那一行字
+    # （曝光量：600；阅读量：43；互动量：2）。机器第一次看到一份新的整理时，
+    # 把那一刻的评论数记下来当基线；之后评论数比基线涨了一大截，就说明
+    # 后台数据已经旧了，提醒运营重新截图整理。
+    # ⚠️ collation_source 必须和 readout.DATA_COLUMN 是同一个名字（有测试盯着）。
+    collation_source: str = "数据整理"         # 只读：AI 捷径写的那一列
+    collation_status: str = "整理状态"          # 单选：已整理 / 需重新整理（机器写）
+    collation_comments: str = "整理时评论数"    # 数字：这份整理对应的评论数基线（机器写）
+    collation_interactions: str = "整理时互动数"  # 数字：基线记的是哪一份整理（机器写）
+
     # —— 机器写入 · 系统列（建议在运营视图里隐藏）——
     consecutive_failures: str = "连续失败次数"   # 两击定罪的计数器
+    # 抖音短链第一次展开出来的作品 ID，形如 `7584… ← https://v.douyin.com/abc/`。
+    # 之后这一行直接按 ID 走 TikHub，不用每轮现场展开；换了链接自动作废。
+    resolved_id: str = "作品ID"
 
     def must_read(self) -> list[str]:
         """search 时必须拉回来的列。少读一个就会写错。"""
@@ -105,6 +119,11 @@ class FieldNames:
             self.blue_words,              # 回填蓝词要先知道表里已有哪些（只提醒新词）
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
             self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
+            self.resolved_id,             # 抖音短链展开过就不再展开
+            self.collation_source,        # 数据整理：判断有没有新的一份整理
+            self.collation_status,        # 没变化就不重写
+            self.collation_comments,      # 基线：整理那一刻的评论数
+            self.collation_interactions,  # 基线对应的是哪一份整理
         ]
 
 
@@ -263,6 +282,26 @@ class BlueWordShot:
 
 
 @dataclass
+class CollationStatus:
+    """「整理状态」单选列的取值：「数据整理」里那份后台数据还新不新。
+
+        已整理      —— 有一份整理，而且评论数没比整理时涨多少
+        需重新整理  —— 评论数比整理那一刻涨了一大截（判据见 Thresholds.recollect），
+                       后台的曝光 / 阅读 / 互动多半也早变了，请重新截图整理
+
+    两个值都是机器写的、也都是机器摘的：运营重新传了截图、AI 吐出一份
+    互动量不同的新整理，下一轮机器就看得见，基线重记、状态回到「已整理」，
+    不需要人去改这一格。「数据整理」是空的（或者认不出互动量）的行不碰。
+    """
+
+    fresh: str = "已整理"
+    stale: str = "需重新整理"
+
+    def machine_written(self) -> list[str]:
+        return [self.fresh, self.stale]
+
+
+@dataclass
 class PinStatus:
     """「置顶状态」单选列的取值：我们的置顶评论还在不在。
 
@@ -323,9 +362,26 @@ class Thresholds:
     surge_ratio: float = 0.5
     surge_min_gain: int = 20
 
+    # —— 数据整理过时：评论数比整理那一刻涨了多少，就该重新回收后台数据 ——
+    # 和起量是同一种双闸门：比例闸挡住大体量帖子的日常波动，绝对闸挡住
+    # 小基数的假暴涨（2 条涨到 6 条是 +200%，但后台数据不会因此变样）。
+    # 两个都含边界（≥）。基线是「这份整理对应的评论数」，见 analyze.recollect_check。
+    recollect_ratio: float = 0.5
+    recollect_min_gain: int = 20
+
     # 发布这么多小时后评论数仍够不上「评估中」门槛，判「无水花」。
     # 太短会把正常冷启动误标——刚发两小时只有几条评论再正常不过。
     flop_hours: int = 48
+
+    def recollect(self, count: int | None, baseline: int | None) -> bool:
+        """评论数比数据整理时涨得够多了吗——涨幅和绝对增量**两个闸门都要过**。
+
+        乘法不写除法：基线是 0（整理时一条评论都没有）时天然退化成只看增量。
+        """
+        if count is None or baseline is None:
+            return False
+        return (count >= baseline * (1 + self.recollect_ratio)
+                and count - baseline >= self.recollect_min_gain)
 
     def heat_tier(self, count: int, tags: "Tags") -> str | None:
         """按评论数算热度档位。返回 None 表示还够不上最低档。"""
@@ -408,6 +464,12 @@ class RefreshTiers:
         ]
     )
     archive_after_days: int = 30     # 超过就不再自动刷，只保留手动触发
+    # 「发布时间」空着、拿链接 ID 推发布时刻时的保守量：ID 在**排期**那一刻就有了，
+    # 定时发布的帖子真正发出去要晚这么多天。按最晚可能的发布时刻算帖龄，
+    # 推出来的帖龄只会偏小——宁可多刷几次，不会把还活着的帖子提前归档
+    # （见 rows.Row.schedule_publish_ms）。14 天是两个平台定时发布的最长提前量，
+    # 没在真表上核对过，见 docs/待验证清单.md C1。
+    inferred_publish_margin_days: int = 14
 
     def interval_hours_for_age(self, age_days: float) -> int | None:
         """返回该年龄的帖子应有的刷新间隔；None 表示已归档。
@@ -444,6 +506,10 @@ class RefreshTiers:
         """
         return min((hours for _days, hours in self.tiers), default=None)
 
+    def slowest_interval_hours(self) -> int | None:
+        """最慢的那一档间隔。已失效的行从这里起步退避（见 rows.Row.gone_backoff_hours）。"""
+        return max((hours for _days, hours in self.tiers), default=None)
+
 
 @dataclass
 class Safety:
@@ -474,6 +540,14 @@ class Safety:
     # （2026-09「雷诺考特复查」表，50 行 × ¥0.81 × 每 5 分钟）。
     # 1 小时够 TikHub 这种通道级抖动恢复；真是内容集体没了，1 小时后照样判得出来。
     breaker_recheck_hours: float = 1.0
+
+    # 同一家通道在同一个平台上**连续**这么多次「收了钱、却回了一份认不出的
+    # 响应」（HTTP 200 但契约坏了：no_data / unexpected_shape），本轮就不再
+    # 打它，直接走备胎。上游改版的时候每一行都会这样：以前是每一行先付主通道
+    # 一次钱、再付备胎一次钱，一轮 300 行小红书白扔 ¥21.6。
+    # 只在**还有备胎**时才停：没有备胎的话停掉它只是把同样的钱挪到下一轮花，
+    # 还会把这一轮报成故障。
+    contract_failures_before_disable: int = 3
 
     # 同一行在这个时间窗内刚成功刷过就跳过，不花积分。
     # 有人连点 200 次按钮 = 1 次真实调用。
@@ -615,6 +689,7 @@ class Settings:
     comment_status: CommentStatus = field(default_factory=CommentStatus)
     negative_status: NegativeStatus = field(default_factory=NegativeStatus)
     pin_status: PinStatus = field(default_factory=PinStatus)
+    collation_status: CollationStatus = field(default_factory=CollationStatus)
     blue_word_shot: BlueWordShot = field(default_factory=BlueWordShot)
     thresholds: Thresholds = field(default_factory=Thresholds)
     digest: DigestFormat = field(default_factory=DigestFormat)

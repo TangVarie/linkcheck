@@ -13,14 +13,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .config import Settings
-from .links import ParsedLink, parse
+from .links import ParsedLink, id_timestamp, parse
 # 直接导名字并写成一行（理由同 providers.py 顶部的历史说明）。
-from .providers import get_provider  # noqa: F401
+from .providers import get_provider, is_disabled  # noqa: F401
 
 # 「巡查状态」那一列的取值。放在这里而不是 runner 里，是因为**选行**也要认它
 # （熔断记过失败的行要提前复查），而 rows 不能反过来依赖 runner。
@@ -34,6 +35,11 @@ STATUS_COOLDOWN = "冷却跳过"
 # 到软截止（或整批中止）没轮到的行：**完全不写回**，最后更新时间保持原样，
 # 下一轮自然重新捞起——这才是 refresh() docstring 承诺的断点续跑。
 STATUS_DEFERRED = "留待下一轮"
+# 被「同篇搭车」拉进来的行（见 runner.load_rows）：它自己还没到期，只是同一篇
+# 内容的另一行这一轮要刷、顺手白拿一份结果。那一行没刷成（预算、截止、
+# 通道倒了），这一行就**什么都不写**、一分钱不花——它本来就不该这一轮刷。
+# 内部状态，从不落表。
+STATUS_RIDE_SKIPPED = "同篇未刷到"
 
 
 @dataclass
@@ -41,6 +47,30 @@ class ToolCall:
     platform: str            # "xhs" | "douyin"
     purpose: str             # "comments" | "detail"
     arguments: dict[str, Any]
+
+
+# 「作品ID」那一格的写法：`7584415807459888384 ← https://v.douyin.com/abc/`。
+# 箭头右边是**当时展开的那条短链**：运营哪天把「反馈链接」换成另一条，
+# 两边对不上，这一格就自动作废、下一轮重新展开——存下来的 ID 永远只替
+# 它自己那条链接说话。
+_RESOLVED_RE = re.compile(r"^\s*(\d{6,})\s*←\s*(\S+)\s*$")
+
+
+def format_resolved_id(aweme_id: str, url: str) -> str:
+    """短链展开结果 → 「作品ID」那一格要写的字。"""
+    return f"{aweme_id} ← {url}"
+
+
+def read_resolved_id(cell: str, url: Optional[str]) -> Optional[str]:
+    """「作品ID」那一格存的 ID，**仅当它是从这条链接展开出来的**。"""
+    if not cell or not url:
+        return None
+    found = _RESOLVED_RE.match(cell)
+    if not found:
+        return None
+    if found.group(2).rstrip("/") != url.strip().rstrip("/"):
+        return None
+    return found.group(1)
 
 
 def _utc(ms: Optional[int]) -> Optional[datetime]:
@@ -92,16 +122,109 @@ class Row:
     # （刷新失败 + 连续失败次数 ≥ 1），要在 breaker_recheck_hours 之后提前复查，
     # 而不是等分层间隔、也不是排队勾一在就每 5 分钟重刷。
     refresh_status: str = ""
+    # 「作品ID」那一格的现值：抖音短链上一次展开出来的 aweme_id（带着它
+    # 对应的那条短链，见 read_resolved_id）。对得上就直接用 ID，不再展开。
+    resolved_id_cell: str = ""
+    # —— 数据整理基线（见 analyze.recollect_check）——
+    # 「数据整理」原文（AI 读截图吐的那行字），从里面拆出这次整理的互动量。
+    collation_text: str = ""
+    # 「整理时评论数」「整理时互动数」「整理状态」三格的现值。
+    collation_comments: Optional[int] = None
+    collation_interactions: Optional[int] = None
+    collation_status: str = ""
+    # 由 load_rows 置位：这一行自己没到期，是因为同一篇内容的另一行到期了才被
+    # 带进来的。它只吃这一轮已经取到的结果，绝不单独花钱（见 STATUS_RIDE_SKIPPED）。
+    ride_along: bool = False
 
     _parsed: Optional[ParsedLink] = field(default=None, repr=False, compare=False)
 
     @property
     def parsed(self) -> ParsedLink:
+        """这一格链接的解析结果，**加上机器已经知道的 ID**。
+
+        抖音短链本身不带 aweme_id。以前每一轮都要现场跟一次 302 才知道是哪个
+        作品，展不开（短链过期、落地页改版、网络抖动）的那一轮就只能走贵 14 倍
+        的 SocialDataX，只配 TikHub 时干脆跳过。第一次展开成功后机器把 ID 记进
+        「作品ID」，之后这一行就是 ID 形态，和贴了完整链接的行一样走。
+        """
         if self._parsed is None:
-            self._parsed = parse(self.link_cell)
+            link = parse(self.link_cell)
+            if link.platform == "douyin" and not link.content_id:
+                known = read_resolved_id(self.resolved_id_cell, link.url)
+                if known:
+                    link = ParsedLink("douyin", known, None, link.raw)
+            self._parsed = link
         return self._parsed
 
+    def content_key(self) -> Optional[tuple[str, str]]:
+        """这一行是哪一篇内容：（平台, ID）。拿不到 ID 的（小红书短链、没展开过的
+        抖音短链）返回 None——光看链接文字认不出两条短链是不是同一篇。"""
+        link = self.parsed
+        if link.platform and link.content_id:
+            return (link.platform, link.content_id)
+        return None
+
+    def id_publish_ms(self, now: Optional[datetime] = None) -> Optional[int]:
+        """链接 ID 里自带的发布时刻（毫秒）。解不出、或解出来在未来，返回 None。"""
+        link = self.parsed
+        seconds = id_timestamp(link.platform, link.content_id)
+        if seconds is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        # 给一天余量：ID 是平台服务器的时钟，跟我们差几分钟很正常；
+        # 差出一天以上就不是这种编码的 ID 了。
+        if seconds > now.timestamp() + 86400:
+            return None
+        return seconds * 1000
+
+    def schedule_publish_ms(self, settings: Settings,
+                            now: Optional[datetime] = None) -> Optional[int]:
+        """**分层和归档**用的发布时刻：表里填了就用表里的；空着就用链接 ID
+        推一个**最晚可能**的发布时刻。
+
+        「发布时间」空着的行以前按最快一档（8 小时）一直刷、**永远不归档**，
+        一条小红书一个月就是 ¥6.5，而且没有尽头。两个平台的 ID 里编着创建
+        时刻（见 links.id_timestamp），但 ID 创建不等于发布：定时发布的笔记
+        ID 在排期那一刻就有了，真正发出去可能晚好几天。直接拿 ID 时间当发布
+        时间，一条定时发布的帖子会被当成「已经很老了」——分层刷得更慢，甚至
+        还活着就被归档、从此没人看。
+
+        所以这里取**最晚可能的发布时刻** = ID 时间 + 定时发布最长的提前量
+        （RefreshTiers.inferred_publish_margin_days）。拿它算出来的帖龄只会
+        比真实的小、不会比真实的大：任何一条帖子都不会因为这一刀刷得比
+        「填了真实发布时间」更慢，也不会更早归档。代价是没定时的帖子在头
+        两周多按快档刷几次——比起以前的「永远 8 小时」，还是有尽头的。
+
+        **热度档位不用它**（见 age_hours）：那是给人看的结论，宁可照旧报
+        「发布时间是空的，判不了」，也不拿一个推出来的时刻去打「无水花」。
+        填了但填成未来的时间同样不换成 ID 时间：那是填错了，诊断信息要
+        照实报出来让人去改（见 analyze.decide）。
+        """
+        if self.publish_time_ms is not None:
+            return self.publish_time_ms
+        created = self.id_publish_ms(now)
+        if created is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        latest = created + int(settings.refresh.inferred_publish_margin_days * 86_400_000)
+        # 链接都在表里了，帖子不可能还没发：最晚也就是此刻。
+        return min(latest, int(now.timestamp() * 1000))
+
+    def schedule_age_days(self, settings: Settings,
+                          now: Optional[datetime] = None) -> Optional[float]:
+        """分层和归档用的帖龄（天）。见 schedule_publish_ms。"""
+        published = _utc(self.schedule_publish_ms(settings, now))
+        if published is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        return (now - published).total_seconds() / 86400
+
+    def publish_time_inferred(self, now: Optional[datetime] = None) -> bool:
+        """这一行的刷新节奏是不是从链接 ID 推出来的（表里「发布时间」空着）。"""
+        return self.publish_time_ms is None and self.id_publish_ms(now) is not None
+
     def age_hours(self, now: Optional[datetime] = None) -> Optional[float]:
+        """**表里填的**发布时间到现在多少小时。热度档位（观察中 / 无水花）只认它。"""
         published = _utc(self.publish_time_ms)
         if published is None:
             return None
@@ -177,21 +300,51 @@ class Row:
         归档仍然看**当下**的帖龄：归档就是归档，不该因为上次检查发生在
         归档线之前就再刷一轮。
         """
-        age_now = self.age_days(now)
+        age_now = self.schedule_age_days(settings, now)
         if age_now is not None and settings.refresh.interval_hours_for_age(age_now) is None:
             return None  # 已归档
-        published = _utc(self.publish_time_ms)
+        published = _utc(self.schedule_publish_ms(settings, now))
         updated = _utc(self.last_updated_ms)
         if published is None or updated is None:
-            # 帖龄不知道（发布时间那一格是空的/脏的），或者从没刷过：
+            # 帖龄不知道（发布时间空着、链接里也解不出 ID 时间），或者从没刷过：
             # 按最快的那一档兜底。见 RefreshTiers.fastest_interval_hours。
-            return settings.refresh.fastest_interval_hours()
-        age_at_check = (updated - published).total_seconds() / 86400
-        interval = settings.refresh.interval_hours_for_age(age_at_check)
-        # None 只可能出现在「最近检查时间」是未来时间的脏数据上（此刻还没
-        # 归档、上次检查却已经过了归档线）。兜底成最快档，让它能被刷一次
-        # 把那个时间戳纠正回来。
-        return settings.refresh.fastest_interval_hours() if interval is None else interval
+            interval = settings.refresh.fastest_interval_hours()
+        else:
+            age_at_check = (updated - published).total_seconds() / 86400
+            interval = settings.refresh.interval_hours_for_age(age_at_check)
+            # None 只可能出现在「最近检查时间」是未来时间的脏数据上（此刻还没
+            # 归档、上次检查却已经过了归档线）。兜底成最快档，让它能被刷一次
+            # 把那个时间戳纠正回来。
+            if interval is None:
+                interval = settings.refresh.fastest_interval_hours()
+        backoff = self.gone_backoff_hours(settings)
+        if interval is not None and backoff is not None:
+            interval = max(interval, backoff)
+        return interval
+
+    def gone_backoff_hours(self, settings: Settings) -> Optional[float]:
+        """已失效的行多久再看一次；None = 不是已失效的行，按分层走。
+
+        已失效以前和活帖一个节奏：发布第 1 天死掉的笔记，归档前还要按
+        8 / 24 / 72 小时再查十几次，而 TikHub 查一条不存在的笔记**照样扣钱**
+        （返回一个空壳，见 docs/供应商对比.md 3.1）。这十几次几乎只买得到
+        同一个答案。
+
+        但也不能一判死就再也不看：两击定罪认的是启发式的空壳，审核中的
+        笔记偶尔会这样「死」一阵再回来。所以退避而不是停刷——从最慢那一档
+        起步，之后每再确认一次死讯就翻一倍（「连续失败次数」每次失效都 +1）：
+        默认 72 → 144 → 288 小时……发布第 1 天死掉的笔记归档前只再看三次左右。
+        真活过来了，那一轮成功会把计数清零、巡查状态写回「正常」，节奏自动复原。
+        人工勾「排队刷新」不受影响，随时可以手动复查。
+        """
+        if self.refresh_status != STATUS_GONE:
+            return None
+        slowest = settings.refresh.slowest_interval_hours()
+        if slowest is None:
+            return None
+        extra = max(0, (self.consecutive_failures or 0) - settings.safety.strikes_before_gone)
+        # 封顶 2^10：计数被人手填成一个离谱的大数时，别算出一个溢出的间隔。
+        return slowest * 2 ** min(extra, 10)
 
     def is_due(self, settings: Settings, now: Optional[datetime] = None) -> bool:
         """按分层策略判断这一行现在该不该刷。"""
@@ -267,6 +420,18 @@ def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> 
     return calls
 
 
+def share_key(calls: list[ToolCall]) -> tuple:
+    """这一组调用的「指纹」：指纹相同 = 上游会回同一份东西 = 一轮之内只付一次钱。
+
+    用的是**真正要发出去的参数**（平台、用途、ID/链接、排序），不是表里那一格
+    原文：同一篇笔记带不同 xsec_token 的两条链接抽出来是同一个 note_id，
+    指纹相同；同一个 ID 一行要 detail、一行不要（发布时间不同），指纹不同，
+    各走各的——那本来就是两组不同的请求。
+    """
+    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())))
+                 for c in calls)
+
+
 def id_form(arguments: dict[str, Any], aweme_id: str) -> dict[str, Any]:
     """把一条抖音调用的参数从「链接形态」改写成「ID 形态」。
 
@@ -289,6 +454,32 @@ def _argument_forms(call: ToolCall) -> list[dict[str, Any]]:
     if call.platform == "douyin" and args.get("url") and not args.get("aweme_id"):
         return [args, id_form(args, "0")]
     return [args]
+
+
+def paying_rows(rows: list[Row], settings: Settings,
+                now: Optional[datetime] = None,
+                seen: Optional[set] = None) -> list[Row]:
+    """这一批里**真正要付钱**的那些行：搭车的不算，同指纹的只算第一行。
+
+    估算和面板「预计花费」都该按它算——一轮里同一篇只付一次钱
+    （runner.FetchShare），按行数算就会把重复的那几行报成真花销。
+    抖音短链按链接文字算指纹（展开前认不出是不是同一篇），宁可多报一点。
+
+    seen 传同一个集合给每张表，跨表的重复也只算一次（和 cron 跨表共享
+    FetchShare 一个口径：按表的先后顺序，第一张表付钱）。
+    """
+    seen = set() if seen is None else seen
+    out: list[Row] = []
+    for row in rows:
+        if row.ride_along:
+            continue
+        calls = plan_calls(row, settings, now)
+        key = share_key(calls) if calls else ("row", row.record_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
 
 
 def estimate_credits(rows: list[Row], settings: Settings, now: Optional[datetime] = None) -> int:
@@ -340,7 +531,7 @@ def estimate_yuan(
             for name in settings.channels.for_platform(call.platform):
                 if keys is not None and not keys.get(name):
                     continue
-                if name in dead:
+                if is_disabled(name, call.platform, dead):
                     continue
                 try:
                     provider = get_provider(name)

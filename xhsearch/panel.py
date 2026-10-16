@@ -84,6 +84,8 @@ class PanelConfig:
     secret: bytes
     port: int = 8080
     cache_seconds: float = 60.0
+    # 最后一个请求之后多久没人来，后台就停止整表拉取（见 Cache）。0 = 永不停。
+    idle_minutes: float = 15.0
     show_digest: bool = False
     # 飞书租户域名。直达链接靠它拼出来，而面板的价值有一半在那个链接上。
     feishu_base: str = "https://feishu.cn"
@@ -157,6 +159,7 @@ class PanelConfig:
             secret=secret,
             port=_int_env(env, "PORT", 8080, 1, 65535),
             cache_seconds=_float_env(env, "PANEL_CACHE_SECONDS", 60.0, 5.0, 3600.0),
+            idle_minutes=_float_env(env, "PANEL_IDLE_MINUTES", 15.0, 0.0, 1440.0),
             show_digest=_bool_env(env, "PANEL_SHOW_DIGEST", False),
             feishu_base=_feishu_base(env),
             allow_option_patch=_bool_env(env, "PANEL_ALLOW_OPTION_PATCH", False),
@@ -332,6 +335,8 @@ def collect(
     now = now or datetime.now(timezone.utc)
     projects: list[summary.ProjectSnapshot] = []
     scrub = (lambda text: railway.redact(text, secrets)) if secrets else None
+    # 跨表共用：同一篇登记在两张表里，「预计花费」只算一次（和 cron 一个口径）。
+    seen_calls: set = set()
     for label, table in tables:
         # 逐表 Settings：cron 那边 `_run_locked` 是逐表 `apply_overrides` 的。
         # 这里不跟着做，改过 归档天数 的项目会出现「面板说到期 12 行、
@@ -340,7 +345,7 @@ def collect(
         projects.append(_collect_one(
             label, table, per_table, api_keys,
             show_digest=show_digest, feishu_base=feishu_base, now=now,
-            scrub=scrub, label_column=label_column))
+            scrub=scrub, label_column=label_column, seen_calls=seen_calls))
     return summary.Overview(projects=projects, generated_at=now,
                             disabled_tables=[t for t in disabled_tables if t])
 
@@ -348,6 +353,7 @@ def collect(
 def _collect_one(label, table, settings, api_keys, *,
                  show_digest, feishu_base, now,
                  scrub: Optional[Callable[[str], str]] = None,
+                 seen_calls: Optional[set] = None,
                  label_column: str = "",
                  ) -> summary.ProjectSnapshot:
     route = getattr(table, "route", "base")
@@ -399,7 +405,7 @@ def _collect_one(label, table, settings, api_keys, *,
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
-        scrub=scrub, route=route, label_column=picked)
+        scrub=scrub, route=route, label_column=picked, seen_calls=seen_calls)
     # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
     # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
     # 缺列的情况体检那边已经在报，这里不重复。
@@ -442,16 +448,36 @@ def _collect_one(label, table, settings, api_keys, *,
 # ---------- 缓存 ----------
 
 class Cache:
-    """TTL 缓存 + 后台单线程刷新。
+    """TTL 缓存 + 后台单线程刷新，**没人看的时候停下来**。
 
     **不能改成「每次有人开页面就去拉一遍」**：五个人同时刷新页面就是五倍
     飞书请求，而这一趟要把每张表整表读回来。后台一个线程按 TTL 刷，
     所有人看同一份快照，页面秒开。
+
+    但以前这个线程是 7×24 小时不停的：没人打开面板的深夜，也每 60 秒把所有表
+    整表读一遍（一张表一天 1440 次），和 cron 抢同一个飞书应用的限频额度，
+    读回来的东西谁都没看。
+
+    现在：**有人看**的判据是「来了一个请求」——这个页面自己不会轮询，数据
+    只有在有人打开、刷新页面或点按钮时才会送到人眼前，所以请求就是唯一的、
+    确切的信号，不用猜。最后一个请求之后 idle_seconds 内照旧每 TTL 刷一次，
+    和以前完全一样；过了这段时间就停下。停过之后的第一个请求会**先等一趟
+    新的取数再出页面**（和点「重新取数」一样的等待），所以回来的人看到的
+    永远不会比 TTL 更旧——取数失败时照旧显示上一份快照和它的时间、外加
+    错误原因。面板是只读的、不发告警，cron 也不读这份缓存，停下来不会让
+    任何判断出错。idle_seconds=None = 永不停（老行为）。
     """
 
-    def __init__(self, produce: Callable[[], summary.Overview], ttl: float):
+    def __init__(self, produce: Callable[[], summary.Overview], ttl: float,
+                 idle_seconds: Optional[float] = None,
+                 clock: Callable[[], float] = time.monotonic):
         self._produce = produce
         self._ttl = ttl
+        self._idle = idle_seconds if idle_seconds and idle_seconds > 0 else None
+        self._clock = clock
+        self._last_seen = clock()
+        # 后台线程因为没人看跳过过至少一轮：下一个请求得先等一趟新的。
+        self._paused = False
         self._lock = threading.Lock()
         self._done = threading.Condition(self._lock)
         self._value: Optional[summary.Overview] = None
@@ -468,6 +494,34 @@ class Cache:
     def snapshot(self) -> tuple[Optional[summary.Overview], str, float]:
         with self._lock:
             return self._value, self._error, self._fetched_at
+
+    def touch(self) -> None:
+        """有人来了（任何一个登录后的请求）。"""
+        with self._lock:
+            self._last_seen = self._clock()
+
+    def view(self) -> tuple[Optional[summary.Overview], str, float]:
+        """给页面用的快照：记一次「有人在看」；停过的话先等一趟新的再给。
+
+        停过之后同时进来好几个请求（两个人同时打开）：有人正在取就**等它**——
+        停着的时候后台不取，正在跑的那一趟一定是停过之后才开始的，就是新的；
+        没人在取才自己去取。「停过」的标记要等那一趟**取完**才清（见 refresh），
+        否则第二个请求会在第一个还没取完时拿走停之前的旧快照。
+        """
+        with self._done:
+            self._last_seen = self._clock()
+            while self._paused and self._refreshing:
+                self._done.wait()
+            resume = self._paused
+        if resume:
+            self.refresh()
+        return self.snapshot()
+
+    def _someone_watching(self) -> bool:
+        if self._idle is None:
+            return True
+        with self._lock:
+            return self._clock() - self._last_seen < self._idle
 
     def refresh(self) -> None:
         """跑一次取数。**返回时保证有一趟在本次调用之后开始的取数已经完成。**
@@ -498,12 +552,19 @@ class Cache:
         finally:
             with self._done:
                 self._refreshing = False
+                # 这一趟取完了，就是「停过之后的新一趟」：清掉停过的标记，紧接着
+                # 的 view() 不再取第二遍（点「重新取数」= 先 refresh 再出页面）。
+                self._paused = False
                 self._done.notify_all()
 
     def start(self) -> None:
         def loop():
             while not self._stop.is_set():
-                self.refresh()
+                if self._someone_watching():
+                    self.refresh()
+                else:
+                    with self._lock:
+                        self._paused = True
                 self._stop.wait(self._ttl)
         self._thread = threading.Thread(target=loop, name="panel-cache", daemon=True)
         self._thread.start()
@@ -1319,7 +1380,11 @@ class PanelHandler(BaseHTTPRequestHandler):
         for part in raw.split(";"):
             name, _, value = part.strip().partition("=")
             if name == COOKIE_NAME:
-                return valid_session(self.deps.config, value.strip())
+                ok = valid_session(self.deps.config, value.strip())
+                if ok:
+                    # 登录后的任何一个请求都算「有人在看」，后台取数照常（见 Cache）。
+                    self.deps.cache.touch()
+                return ok
         return False
 
     def _session_token(self) -> str:
@@ -1389,7 +1454,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     # —— 页面数据 ——
     def _page(self) -> str:
-        overview, error, fetched_at = self.deps.cache.snapshot()
+        overview, error, fetched_at = self.deps.cache.view()
         runs, log_error = self._runs()
         balances, balance_error = self._balances()
         return self.deps.render_page(
@@ -1654,7 +1719,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         raise NotImplementedError(action)
 
     def _overview_payload(self) -> dict:
-        overview, error, fetched_at = self.deps.cache.snapshot()
+        overview, error, fetched_at = self.deps.cache.view()
         return {
             "error": error,
             "fetched_at": fetched_at,
@@ -1715,6 +1780,7 @@ def _project_json(p: summary.ProjectSnapshot) -> dict:
         "refresh_status_counts": p.refresh_status_counts,
         "traffic_tag_counts": p.traffic_tag_counts,
         "negative_rows": p.negative_rows, "pin_lost_rows": p.pin_lost_rows,
+        "recollect_rows": p.recollect_rows,
         "seed_keyword_rows": p.seed_keyword_rows,
         "negative_keyword_rows": p.negative_keyword_rows,
         "needs_attention": p.needs_attention,
@@ -1764,7 +1830,8 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
 def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
           settings: Optional[Settings] = None) -> int:
     """起面板。阻塞到进程被杀。"""
-    cache = Cache(produce, config.cache_seconds)
+    cache = Cache(produce, config.cache_seconds,
+                  idle_seconds=config.idle_minutes * 60 or None)
     logs = LogFeed(config, config.cache_seconds)
     balances = BalanceFeed(config, config.cache_seconds)
     resolved = settings or Settings()
@@ -1776,7 +1843,9 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     cache.start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"
-          f"评论正文{'展示' if config.show_digest else '不展示'}）", flush=True)
+          + (f"{config.idle_minutes:g} 分钟没人看就停，有人来先取一趟新的，"
+             if config.idle_minutes else "一直刷，")
+          + f"评论正文{'展示' if config.show_digest else '不展示'}）", flush=True)
     if logs.enabled:
         print("Railway 日志：已接入", flush=True)
     else:

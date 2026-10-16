@@ -793,3 +793,106 @@ def suspect_verdict(settings: Settings, strikes: int, reason: str = "") -> Verdi
         (reason or "本轮未取到内容") + f"（第 {strikes} 次，达到 2 次才判定失效，稍后自动复检）"
     )
     return verdict
+
+
+# ---------- 数据整理过时提醒 ----------
+#
+# 老帖都做过一次「数据整理」：运营把后台截图丢进「相关截图」，AI 捷径读出
+# `曝光量：600；阅读量：43；互动量：2`。那一份数字对应的是**截图那一刻**——
+# 之后评论区又涨了一大截的话，后台的曝光 / 阅读 / 互动多半也早变了，
+# 表里那份整理就过时了，该重新回收后台数据。
+#
+# 机器做的事只有两件：第一次看到一份整理时记下「那一刻的评论数」当基线；
+# 之后每轮拿实时评论数和基线比，涨够了就提醒。全程只读「数据整理」，
+# 不碰截图、不碰三个拆数公式，也不多发一个付费请求——评论数本来就在量。
+
+# 拆「互动量」那一段，和「互动数」那个拆数公式同一个口径：冒号后面的
+# 东西整段当一个数（VALUE 转得动才算），认不出（AI 写了「/」、带了「万」）
+# 就当这一份整理里没有互动量，和那一列空着是一回事。
+_INTERACTION_RE = re.compile(r"互动量\s*[：:]\s*([^；;\s]*)")
+
+
+def collation_interactions(text: Any) -> Optional[int]:
+    """从「数据整理」那行字里拆出互动量。认不出返回 None。"""
+    if not isinstance(text, str):
+        return None
+    found = _INTERACTION_RE.search(text)
+    if not found:
+        return None
+    raw = found.group(1).strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return None
+    value = int(float(raw))
+    return value if 0 <= value <= MAX_COUNT else None
+
+
+@dataclass
+class Recollect:
+    """这一轮对「数据整理」的结论。三个值都是要写进表的；None = 那一格不碰。"""
+
+    status: str
+    baseline_comments: Optional[int] = None
+    baseline_interactions: Optional[int] = None
+    stale: bool = False
+    note: str = ""
+
+
+def recollect_check(
+    *,
+    collation_text: Any,
+    stored_comments: Optional[int],
+    stored_interactions: Optional[int],
+    comment_count: Optional[int],
+    settings: Settings,
+) -> Optional[Recollect]:
+    """评论数相对数据整理那一刻涨了多少，要不要提醒重新回收后台数据。
+
+    返回 None = 这一轮不碰这三列（没有整理、认不出互动量、这一轮没量到评论数）。
+
+    **基线怎么来。** 整理是人在某个时刻做的，机器要到下一次巡查才看得见
+    （老帖 3 天一轮），手里最贴近的只有这一轮量到的评论数——它只会比整理
+    那一刻多、不会少（删评另说），拿它当基线是**保守**的：宁可晚提醒，
+    不会刚整理完就报「过时了」。
+
+    但整理那一刻的评论数还有一个硬上界：**不可能超过当时的互动量**
+    （互动量 = 赞 + 藏 + 评……，评论是其中一项）。所以基线取两者较小的那个。
+    这一刀专门照顾上线那一刻已经整理过的老帖：它们的整理可能是几周前做的，
+    这一轮评论数要是已经比当时整个互动量还多出一截，那份整理早就过时了，
+    不用再等它涨一轮才说。
+
+    **怎么认出「换了一份整理」。** 基线连同那份整理的互动量一起记下
+    （「整理时互动数」）；之后读到的互动量和它不一样，就是运营重新截图、
+    AI 重新读了一份——基线重记、状态回到「已整理」，不用人去改那一格。
+    手工清空「整理时评论数」也会让机器在下一轮重新记基线。
+    """
+    interactions = collation_interactions(collation_text)
+    if interactions is None or comment_count is None:
+        return None
+    labels = settings.collation_status
+    th = settings.thresholds
+
+    fresh_collation = stored_comments is None or stored_interactions != interactions
+    baseline = min(comment_count, interactions) if fresh_collation else stored_comments
+    stale = th.recollect(comment_count, baseline)
+
+    note = ""
+    if stale:
+        gain = comment_count - baseline
+        pace = f"，涨了 {gain / baseline:.0%}" if baseline else ""
+        if fresh_collation and baseline == interactions < comment_count:
+            note = (f"📊 评论数 {comment_count}，已经比「{settings.fields.collation_source}」"
+                    f"里整个互动量 {interactions} 还多 {gain} 条——那份后台数据早就过时了"
+                    f" → {labels.stale}，请重新回收后台数据截图")
+        else:
+            note = (f"📊 数据整理时评论数 {baseline}（互动量 {interactions}），"
+                    f"现在 {comment_count}（+{gain}{pace}）→ {labels.stale}，"
+                    "请重新回收后台数据截图")
+    elif fresh_collation:
+        note = f"📊 记下这份数据整理的基线：互动量 {interactions}、评论数 {baseline}"
+    return Recollect(
+        status=labels.stale if stale else labels.fresh,
+        baseline_comments=baseline if fresh_collation else None,
+        baseline_interactions=interactions if fresh_collation else None,
+        stale=stale,
+        note=note,
+    )
