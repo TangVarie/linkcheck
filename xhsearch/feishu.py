@@ -294,6 +294,22 @@ class Workspace:
         )
         return str((_check(resp).get("field") or {}).get("field_id") or "")
 
+    def table(self, app_token: str, table_id: str) -> "Bitable":
+        """这个 base 里某一张表的客户端。共用同一份 token，不多取一次。"""
+        table = Bitable(app_id=self._auth.app_id, app_secret=self._auth.app_secret,
+                        app_token=app_token, table_id=table_id, timeout=self.timeout)
+        table._token = self._auth._token
+        return table
+
+    def create_formula_field(self, app_token: str, table_id: str, column: str,
+                             expression: str, *, result_type: Optional[dict] = None) -> bool:
+        """给刚建好的表补一列公式列，走 `Bitable.create_formula_field` 那条
+        在真表上验过的路（2026-10-16，见待验证清单 C2）：本表的列写成 id 引用、
+        连显示格式一起发、格式被拒就只发公式。返回显示格式有没有一起写进去。
+        """
+        return self.table(app_token, table_id).create_formula_field(
+            column, expression, result_type=result_type)
+
     # ---------- 建好之后：把人和群加成协作者 ----------
     #
     # 应用自己建的 base，应用是**所有者**——而所有者能给任何人开权限，这一步

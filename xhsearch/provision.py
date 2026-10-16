@@ -610,15 +610,31 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
         raise feishu.FeishuError(-1, "建数据表失败：飞书没返回 table_id")
     built = [f["field_name"] for f in fields]
     column_failures: list[str] = []
+    format_steps: list[dict] = []
     for column in deferred:
-        if column.formula:
-            body = schema.create_field_body(column.name, column.type_code,
-                                            formula=column.formula)
-        else:
-            body = {"field_name": column.name, "type": column.type_code,
-                    "property": {"table_id": table_id, "multiple": False}}
         try:
-            workspace.create_field(base["app_token"], table_id, body)
+            if column.name == NEXT_CHECK_COLUMN:
+                # 走「换公式」脚本在真表上验过的那条路：id 引用 + 按日期显示。
+                # 只发公式的话飞书按数字显示（一串像 46312 的数），运营看不懂。
+                # 一档都没配时公式是 '""'（整列留空），没有日期可显示。
+                as_date = column.formula != '""'
+                shown = workspace.create_formula_field(
+                    base["app_token"], table_id, column.name, column.formula,
+                    result_type=feishu.DATE_RESULT if as_date else None)
+                if as_date and not shown:
+                    format_steps.append({
+                        "column": column.name,
+                        "step": f"「{column.name}」现在按数字显示（一串像 46312 的数）："
+                                "点列名 → 编辑字段 → 「格式」选日期，不用动公式",
+                        "paste": ""})
+            else:
+                if column.formula:
+                    body = schema.create_field_body(column.name, column.type_code,
+                                                    formula=column.formula)
+                else:
+                    body = {"field_name": column.name, "type": column.type_code,
+                            "property": {"table_id": table_id, "multiple": False}}
+                workspace.create_field(base["app_token"], table_id, body)
         except Exception as exc:                                # noqa: BLE001
             # 表已经建好了。一列关联列没补上，不该让整张表变成「建失败」。
             column_failures.append(f"建列「{column.name}」失败：{exc}")
@@ -626,7 +642,7 @@ def create_monitored_table(workspace: feishu.Workspace, settings: Settings,
         else:
             built.append(column.name)
     shared = share_table(workspace, base["app_token"], share, log=log) if share else ShareResult()
-    steps = manual_steps(built)
+    steps = manual_steps(built) + format_steps
     for step in steps:
         log(f"✋ [{base['app_token'][-6:]}/{table_id}] 「{step['column']}」还要人在飞书里补一步")
     # ⚠️ 链接必须带上**新建的这张表**的 table_id。`create_base` 会顺带建一张

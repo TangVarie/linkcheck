@@ -424,3 +424,29 @@ class TestWorkspace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWorkspaceFormulaField(unittest.TestCase):
+    """面板「直接新建一张」补「下次检查时间」：走 Bitable.create_formula_field
+    那条在真表上验过的路（id 引用 + 按日期显示），而且不多取一次 token。"""
+
+    def test_creates_on_the_new_table_with_the_shared_token(self):
+        import time as _time
+        workspace = feishu.Workspace("cli_x", "s")
+        workspace._auth._token = feishu._Token("t-shared", _time.monotonic() + 3600)
+        raw = {"发布时间": {"field_id": "fldP", "field_name": "发布时间", "type": 5}}
+        cap = Captured(ok({"field": {"field_id": "fldN"}}))
+        with mock.patch.object(feishu.Bitable, "fields_meta_raw", return_value=raw), \
+             mock.patch.object(transport, "request_with_retry", cap), \
+             mock.patch.object(transport, "post_with_retry",
+                               side_effect=AssertionError("不该再取一次 token")):
+            shown = workspace.create_formula_field(
+                "bascnNEW", "tblNEW", "下次检查时间", "[发布时间] + 1",
+                result_type=feishu.DATE_RESULT)
+        self.assertTrue(shown)
+        [call] = cap.calls
+        self.assertEqual(call["method"], "POST")
+        self.assertTrue(call["url"].endswith("/apps/bascnNEW/tables/tblNEW/fields"))
+        self.assertEqual(call["body"]["property"], {
+            "formula_expression": "bitable::$table[tblNEW].$field[fldP] + 1",
+            "type": feishu.DATE_RESULT})
