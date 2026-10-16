@@ -13,7 +13,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import runner, transport
+from xhsearch import analyze, runner, transport
 from xhsearch.config import Channels, Settings
 from xhsearch.rows import Row
 
@@ -830,3 +830,71 @@ class TestSocialDataXShapeIsFailClosed(FailoverTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCommentsNobodyCanSee(FailoverTest):
+    """2026-10-16 实例走一遍真的巡查路径：评论接口说「共 1 条」、列表是空的、
+    笔记活着（有作者、有排序策略）。表里挂着上一轮的「有负面」。"""
+
+    def test_the_stale_negative_status_is_cleared(self):
+        from dataclasses import replace
+        f = self.settings.fields
+        row = replace(xhs_row(age_days=5), negative_keywords=["过敏"],
+                      seed_keywords=["领券"])
+        self.settings.detail_within_days = 0
+        hidden = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "request_id": "th-1", "data": {"code": 0, "success": True, "data": {
+                "comments": [], "comment_count": 1, "comment_count_l1": 1,
+                "all_sort_strategies": [{"type": "default"}], "user_id": "u9"}}}), "th-1")
+        report = self.run_with(on_get=lambda i: hidden,
+                               on_post=lambda i: self.fail("评论接口好好的，不该降级"),
+                               rows=[row])
+        [outcome] = report.outcomes
+        self.assertEqual(outcome.fields[f.negative_status],
+                         self.settings.negative_status.clean)
+        self.assertEqual(outcome.fields[f.negative_digest], "（未命中）")
+        self.assertEqual(outcome.fields[f.comment_status],
+                         self.settings.comment_status.not_displayed)
+        self.assertIn("一条都看不到", outcome.fields[f.comment_digest])
+        self.assertEqual(outcome.fields[f.comment_count], 0, "和小红书界面一致")
+        self.assertIn("接口报评论数 1，但评论区一条都看不到", outcome.fields[f.failure_reason])
+        self.assertNotIn("本轮未取到评论页内容", outcome.fields[f.failure_reason])
+
+    def test_hidden_comments_still_prove_the_post_is_alive(self):
+        """实时评论数按 0 记了，但接口说有的那 1 条照样是「活着」的强证据：
+        detail 同时说笔记不存在，那是上游自相矛盾，不能据此判死。"""
+        snap = analyze.read_comment_page(
+            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1,
+                    "_empty_page": True})
+        self.assertEqual(snap.comment_count, 0)
+        self.assertTrue(runner._looks_alive(snap))
+
+    def _negative_after(self, comments_field):
+        """走一遍真的巡查：评论接口说「共 1 条」，comments 字段是给定的样子。"""
+        from dataclasses import replace
+        f = self.settings.fields
+        row = replace(xhs_row(age_days=5), negative_keywords=["过敏"])
+        self.settings.detail_within_days = 0
+        page = {"comment_count": 1, "comment_count_l1": 1,
+                "all_sort_strategies": [{"type": "default"}], "user_id": "u9"}
+        if comments_field is not ...:
+            page["comments"] = comments_field
+        response = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "request_id": "th-1",
+            "data": {"code": 0, "success": True, "data": page}}), "th-1")
+        report = self.run_with(on_get=lambda i: response,
+                               on_post=lambda i: transport.Response(0, "", "不通"),
+                               rows=[row])
+        [outcome] = report.outcomes
+        return outcome.fields.get(f.negative_status), outcome.fields.get(f.comment_count)
+
+    def test_a_malformed_comment_field_never_clears_a_negative(self):
+        """Codex 指出的：上游缺 comments 字段、给了别的类型、或者条目全解析不了，
+        归一化之后也是空列表——那是没拿到，不能拿来清掉一条真负面、也不能把
+        评论数改成 0。"""
+        for field in (..., None, "oops", [1, "x"]):
+            with self.subTest(comments=field):
+                self.get_calls.clear()
+                status, count = self._negative_after(field)
+                self.assertIsNone(status, "负面状态保持原样")
+                self.assertEqual(count, 1, "评论数照接口报的记")

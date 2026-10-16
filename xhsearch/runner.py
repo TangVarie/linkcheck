@@ -321,7 +321,10 @@ def _looks_alive(snapshot: Optional[analyze.Snapshot]) -> bool:
     """
     if snapshot is None:
         return False
+    # hidden_comment_count：评论接口说有、只是别人看不到的那几条——实时评论数
+    # 按 0 记，但它们照样证明这篇内容活着。
     return (bool(snapshot.comments) or bool(snapshot.comment_count)
+            or bool(snapshot.hidden_comment_count)
             or bool(snapshot.like_count) or bool(snapshot.collect_count))
 
 
