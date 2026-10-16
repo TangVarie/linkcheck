@@ -326,6 +326,11 @@ def _bool_env(name: str, default: bool) -> bool:
     sys.exit(f"环境变量 {name} 的值 {raw!r} 看不懂，填 1/0（或 true/false）")
 
 
+# INFERRED_PUBLISH_MARGIN_DAYS 的上限。tools/check_id_time.py 的建议值不会超过它——
+# 超过了照着改，cron 和面板两个服务都会起不来。
+INFERRED_MARGIN_MAX_DAYS = 60
+
+
 def build_settings() -> Settings:
     _apply_endpoint_overrides()
     apply_pricing_overrides()
@@ -339,6 +344,11 @@ def build_settings() -> Settings:
         "MAX_CONCURRENCY", int, settings.max_concurrency, minimum=1, maximum=3)
     settings.detail_within_days = _numeric_env(
         "DETAIL_WITHIN_DAYS", int, settings.detail_within_days, minimum=0, maximum=3650)
+    # 「发布时间」空着时，按链接 ID 推发布时刻的保守量（天）。默认 14，照顾定时发布；
+    # 改之前先跑 tools/check_id_time.py 看你们的表里 ID 时间和发布时间最多差几天。
+    settings.refresh.inferred_publish_margin_days = _numeric_env(
+        "INFERRED_PUBLISH_MARGIN_DAYS", int, settings.refresh.inferred_publish_margin_days,
+        minimum=0, maximum=INFERRED_MARGIN_MAX_DAYS)
 
     # —— 单轮硬预算（0 = 不限）——
     settings.budget = Budget(
@@ -1044,11 +1054,7 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             # 逐表阈值：深拷贝 + 浅覆盖，绝不就地改基准 Settings——
             # 就地改会让第一张表的阈值串味到后面所有表，而那种 bug 只在
             # 多表部署上出现，看起来像「判定口径莫名其妙」。
-            per_table = settings
-            row = _REGISTRY_ROWS.get(table.table_id)
-            if row is not None:
-                from xhsearch import registry as registry_mod
-                per_table = registry_mod.apply_overrides(settings, row, log=print)
+            per_table = settings_for_table(settings, table)
             try:
                 code, found, row_count, yuan, prep = _refresh_table(
                     mode, record_ids, per_table, api_keys, table, now,
@@ -1318,27 +1324,48 @@ def cmd_serve(selected: list[str] | None = None) -> int:
     return panel.serve(config, produce, settings)
 
 
+def pop_table_flag(args: list[str]) -> list[str] | None:
+    """从参数里取出 `--table A,B`（就地删掉这两项）。没传返回 None。
+
+    tools/ 下的脚本也用它：同一种写法、同一套报错。
+    """
+    if "--table" not in args:
+        return None
+    index = args.index("--table")
+    if index + 1 >= len(args):
+        sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
+    selected = [s.strip() for s in args[index + 1].split(",") if s.strip()]
+    if not selected:
+        # 「--table ,」这类写法解析出空清单。空清单和「没传 --table」
+        # 在下游没法区分，会静默变成全表都跑——必须在这里吵闹。
+        sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
+    if len(set(selected)) != len(selected):
+        # `--table A,A` 会让同一张表被读两遍、付费刷两遍，两次结果还可能
+        # 互相覆盖。仓库对 FEISHU_TABLES 里的重复物理表已经是报错处理，
+        # 这里保持同一口径。
+        sys.exit(f"--table 里有重复的表标签：{'、'.join(selected)}——"
+                 "同一张表刷两次是白花钱")
+    del args[index:index + 2]
+    return selected
+
+
+def settings_for_table(settings: Settings, table: feishu.Bitable) -> Settings:
+    """这张表专用的 Settings：全局那份 + 注册表里这一行的逐表阈值（归档天数等）。
+
+    必须先调过 `_tables()`（它顺手把注册表读进 `_REGISTRY_ROWS`）。
+    """
+    row = _REGISTRY_ROWS.get(table.table_id)
+    if row is None:
+        return settings
+    from xhsearch import registry as registry_mod
+    return registry_mod.apply_overrides(settings, row, log=print)
+
+
 def main(argv: list[str]) -> int:
     _line_buffer_stdout()
     load_env_or_exit()
     args = list(argv[1:])
-    selected: list[str] | None = None
-    if "--table" in args:
-        index = args.index("--table")
-        if index + 1 >= len(args):
-            sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
-        selected = [s.strip() for s in args[index + 1].split(",") if s.strip()]
-        if not selected:
-            # 「--table ,」这类写法解析出空清单。空清单和「没传 --table」
-            # 在下游没法区分，会静默变成全表都跑——必须在这里吵闹。
-            sys.exit("--table 后面要跟表标签（FEISHU_TABLES 里起的名字），多个用逗号分隔")
-        if len(set(selected)) != len(selected):
-            # `--table A,A` 会让同一张表被读两遍、付费刷两遍，两次结果还可能
-            # 互相覆盖。仓库对 FEISHU_TABLES 里的重复物理表已经是报错处理，
-            # 这里保持同一口径。
-            sys.exit(f"--table 里有重复的表标签：{'、'.join(selected)}——"
-                     "同一张表刷两次是白花钱")
-        del args[index:index + 2]
+    selected = pop_table_flag(args)
     if not args:
         print(__doc__)
         return 2

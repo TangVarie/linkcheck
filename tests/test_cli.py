@@ -328,6 +328,27 @@ class TestLoadDotenv(unittest.TestCase):
                              "TEST_ENVFILE_EXISTING", "TEST_ENVFILE_EMPTY"):
                     os.environ.pop(name, None)
 
+    def test_a_windows_bom_is_not_part_of_the_first_name(self):
+        """记事本 / PowerShell 5.1 存的 .env 开头带 BOM，不能因此拒跑。"""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from xhsearch.envfile import load_dotenv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_bytes(
+                "TEST_ENVFILE_BOM=cli_x\r\nTEST_ENVFILE_BOM2=表\r\n".encode("utf-8-sig"))
+            issues: list = []
+            try:
+                load_dotenv(Path(tmp), issues=issues)
+                self.assertEqual(issues, [])
+                self.assertEqual(os.environ["TEST_ENVFILE_BOM"], "cli_x")
+                self.assertEqual(os.environ["TEST_ENVFILE_BOM2"], "表")
+            finally:
+                os.environ.pop("TEST_ENVFILE_BOM", None)
+                os.environ.pop("TEST_ENVFILE_BOM2", None)
+
     def test_missing_file_is_silently_skipped(self):
         import tempfile
         from pathlib import Path

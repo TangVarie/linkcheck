@@ -297,10 +297,21 @@ def _read(resp: Any) -> Response:
 def request(method: str, url: str, headers: dict[str, str], body: str = "",
             timeout: float = 30.0) -> Response:
     """按方法名分发。双通道之后两家的动词不一样：
-    SocialDataX 是 POST + JSON body，TikHub 是 GET + query string。"""
-    if (method or "POST").upper() == "GET":
+    SocialDataX 是 POST + JSON body，TikHub 是 GET + query string。
+
+    飞书还要 PUT（改字段：补选项、换公式）和 DELETE（删注册表那一行）。
+    以前这里只认 GET，其余一律走 post()——PUT/DELETE 被悄悄发成 POST，
+    飞书在那个路径上没有 POST 路由，回的是网关的「404 page not found」，
+    看着像地址拼错了，其实是动词错了。
+    """
+    verb = (method or "POST").upper()
+    if verb == "GET":
         return get(url, headers, timeout=timeout)
-    return post(url, headers, body, timeout=timeout)
+    if verb == "POST":
+        return post(url, headers, body, timeout=timeout)
+    request = urllib.request.Request(
+        url, data=body.encode("utf-8") if body else None, headers=headers, method=verb)
+    return _perform(request, timeout)
 
 
 def backoff_delay(attempt: int, base_delay: float, retry_after: Optional[float] = None) -> float:
