@@ -515,6 +515,8 @@ cli.py           命令行入口
 tools/
   estimate_cost.py     按配置算月度成本（两家分开报）
   probe_channel.py     拿一条真实链接把某条通道走一遍（会真扣费）
+  check_id_time.py     核对链接 ID 时间和真实发布时间差几天（只读，C1）
+  update_next_check_formula.py  已有表的「下次检查时间」换成新版公式（默认只看，--apply 才改）
 tests/           1000+ 个测试，全离线
 ```
 

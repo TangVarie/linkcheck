@@ -248,6 +248,10 @@ def _tier_expr(age_expr: str, tiers) -> str:
     return expr
 
 
+# 「下次检查时间」不是巡查列（机器不读不写，飞书自己算），名字就定在这里。
+NEXT_CHECK_COLUMN = "下次检查时间"
+
+
 def next_check_formula(settings: Settings) -> str:
     """「下次检查时间」的公式。默认配置下长这样：
 
@@ -352,7 +356,7 @@ FULL_LAYOUT: tuple = (
     "comment_count",
     "last_updated",
     # 公式本体在 next_check_formula()（要按配置里的列名拼），这里只占位。
-    BusinessColumn("下次检查时间", FORMULA, formula="<next_check_formula>"),
+    BusinessColumn(NEXT_CHECK_COLUMN, FORMULA, formula="<next_check_formula>"),
     "consecutive_failures",
     "platform",
     "previous_comment_count",
@@ -669,3 +673,56 @@ def _table_url(base_url: str, app_token: str, table_id: str) -> str:
         return base_url
     return summary.table_url(f"{parts.scheme}://{parts.netloc}",
                              app_token, table_id)
+
+
+# ---------- 已有表：把「下次检查时间」换成新版公式 ----------
+
+
+@dataclass(frozen=True)
+class FormulaPlan:
+    """一张表的「下次检查时间」该怎么处理。**纯数据，不发请求。**
+
+    action：
+        update     换成新版（current 是现在的公式，可能为空 = 读不到原文）
+        up_to_date 已经是新版
+        missing    表里没有这一列（老表多半没有，面板「直接新建」的表才有）
+        wrong_type 这一列不是公式列（有人手填日期？）——不动它，那会丢数据
+        no_refs    公式要引用的列不全，换上去只会算出错误
+    """
+
+    action: str
+    wanted: str
+    current: str = ""
+    reason: str = ""
+
+
+def next_check_plan(settings: Settings, meta: Optional[dict]) -> FormulaPlan:
+    """拿一张表的字段元数据（`fields_meta()`）判断「下次检查时间」要不要换公式。
+
+    新版公式比老版多一支：「巡查状态 = 已失效」的行按退避节奏算（72 → 144 →
+    288 小时……），和机器真正的复查节奏一致（见 rows.Row.gone_backoff_hours）。
+    老版对已失效的行报的是一个**更早**的时间——不出错，但不是真话。
+    """
+    f = settings.fields
+    wanted = next_check_formula(settings)
+    info = (meta or {}).get(NEXT_CHECK_COLUMN)
+    if info is None:
+        return FormulaPlan("missing", wanted,
+                           reason=f"表里没有「{NEXT_CHECK_COLUMN}」这一列，没有可换的")
+    if info.get("type") != FORMULA:
+        return FormulaPlan("wrong_type", wanted,
+                           reason=f"「{NEXT_CHECK_COLUMN}」不是公式列"
+                                  f"（现在是「{schema.type_name(info.get('type'))}」），"
+                                  "改类型会动这一列已有的数据，这里不动它")
+    refs = (f.publish_time, f.last_updated, f.refresh_status, f.consecutive_failures)
+    gaps = [c for c in refs if c not in (meta or {})]
+    if gaps:
+        return FormulaPlan("no_refs", wanted, current=info.get("formula") or "",
+                           reason=f"新公式要引用的列不全：缺 {'、'.join(gaps)}，"
+                                  "先在面板上「补齐缺的列」")
+    current = info.get("formula") or ""
+    if current and readout.canonical(current) == readout.canonical(wanted):
+        return FormulaPlan("up_to_date", wanted, current=current)
+    # 读不到原文、或者原文里还有翻不回列名的引用（`bitable::…`）：比不了，
+    # 按新版覆盖——这一列是机器算的公式，不存人填的数据，换掉不丢东西。
+    return FormulaPlan("update", wanted, current=current)

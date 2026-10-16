@@ -891,6 +891,38 @@ class Bitable:
         _check(resp)
         return added
 
+    def set_formula(self, column: str, expression: str) -> None:
+        """把一个**已有公式列**的公式换掉。只给 tools/update_next_check_formula.py 用。
+
+        公式列不存人填的数据（值是飞书算出来的），换公式不丢东西——这是它和
+        补选项（add_field_options）的根本区别。但 `PUT .../fields/:field_id`
+        对 `property` 同样是整体覆盖，所以照样读-改-写：现有 property 原样
+        带回去（显示格式、新版公式的 type 之类），只换 formula_expression。
+        不是公式列就拒绝——把一列手填的日期改成公式，等于清空那一列。
+        """
+        raw = self.fields_meta_raw()
+        if raw is None:
+            raise FeishuError(-1, f"读不到字段元数据，不能改「{column}」的公式")
+        info = raw.get(column)
+        if info is None:
+            raise FeishuError(-1, f"表里没有「{column}」这一列")
+        if info.get("type") != 20:
+            raise FeishuError(-1, f"「{column}」不是公式列，拒绝改——改了会清掉这一列已有的数据")
+        field_id = str(info.get("field_id") or "")
+        if not field_id:
+            raise FeishuError(-1, f"「{column}」没有 field_id，改不了")
+        prop = dict(info.get("property") or {})
+        prop["formula_expression"] = expression
+        resp = transport.request_with_retry(
+            "PUT", self._url(f"fields/{urllib.parse.quote(field_id, safe='')}"),
+            self._headers(),
+            json.dumps({"field_name": column, "type": 20, "property": prop},
+                       ensure_ascii=False),
+            timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
+
     def batch_create(self, records: list[dict[str, Any]], *,
                      client_token: str) -> list[str]:
         """新增记录，返回新行的 record_id。**`client_token` 是必填的。**
