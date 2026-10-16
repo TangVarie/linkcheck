@@ -683,17 +683,22 @@ class FormulaPlan:
     """一张表的「下次检查时间」该怎么处理。**纯数据，不发请求。**
 
     action：
-        update     换成新版（current 是现在的公式，可能为空 = 读不到原文）
+        update     换成新版（current 是现在的公式，可能为空 = 读不到原文）；
+                   公式已经是新版、但结果按数字显示的，也走这一支（重发一次带日期格式）
         up_to_date 已经是新版
-        missing    表里没有这一列（老表多半没有，面板「直接新建」的表才有）
+        missing    表里没有这一列，`--apply` 会在表尾建一列（引用的列都在才会走到这）
         wrong_type 这一列不是公式列（有人手填日期？）——不动它，那会丢数据
-        no_refs    公式要引用的列不全，换上去只会算出错误
+        no_refs    公式要引用的列不全，换上去 / 建出来只会算出错误
     """
 
     action: str
     wanted: str
     current: str = ""
     reason: str = ""
+
+
+# 公式结果的 data_type：5 = 日期。见 feishu.DATE_RESULT。
+_DATE_RESULT_TYPE = 5
 
 
 def next_check_plan(settings: Settings, meta: Optional[dict]) -> FormulaPlan:
@@ -704,24 +709,30 @@ def next_check_plan(settings: Settings, meta: Optional[dict]) -> FormulaPlan:
     老版对已失效的行报的是一个**更早**的时间——不出错，但不是真话。
     """
     f = settings.fields
+    meta = meta or {}
     wanted = next_check_formula(settings)
-    info = (meta or {}).get(NEXT_CHECK_COLUMN)
-    if info is None:
-        return FormulaPlan("missing", wanted,
-                           reason=f"表里没有「{NEXT_CHECK_COLUMN}」这一列，没有可换的")
-    if info.get("type") != FORMULA:
+    info = meta.get(NEXT_CHECK_COLUMN)
+    if info is not None and info.get("type") != FORMULA:
         return FormulaPlan("wrong_type", wanted,
                            reason=f"「{NEXT_CHECK_COLUMN}」不是公式列"
                                   f"（现在是「{schema.type_name(info.get('type'))}」），"
                                   "改类型会动这一列已有的数据，这里不动它")
     refs = (f.publish_time, f.last_updated, f.refresh_status, f.consecutive_failures)
-    gaps = [c for c in refs if c not in (meta or {})]
+    gaps = [c for c in refs if c not in meta]
+    current = (info or {}).get("formula") or ""
     if gaps:
-        return FormulaPlan("no_refs", wanted, current=info.get("formula") or "",
-                           reason=f"新公式要引用的列不全：缺 {'、'.join(gaps)}，"
+        return FormulaPlan("no_refs", wanted, current=current,
+                           reason=f"公式要引用的列不全：缺 {'、'.join(gaps)}，"
                                   "先在面板上「补齐缺的列」")
-    current = info.get("formula") or ""
+    if info is None:
+        return FormulaPlan("missing", wanted,
+                           reason=f"表里没有「{NEXT_CHECK_COLUMN}」这一列")
     if current and readout.canonical(current) == readout.canonical(wanted):
+        shown_as = info.get("result_type")
+        if shown_as is not None and shown_as != _DATE_RESULT_TYPE:
+            return FormulaPlan("update", wanted, current=current,
+                               reason="公式已经是新版，但结果按数字显示（一串像 46312 的数），"
+                                      "重发一次带上日期格式")
         return FormulaPlan("up_to_date", wanted, current=current)
     # 读不到原文、或者原文里还有翻不回列名的引用（`bitable::…`）：比不了，
     # 按新版覆盖——这一列是机器算的公式，不存人填的数据，换掉不丢东西。

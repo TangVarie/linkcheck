@@ -790,6 +790,10 @@ class Bitable:
             expression = prop.get("formula_expression") if isinstance(prop, dict) else None
             if field.get("type") == 20 and isinstance(expression, str):
                 entry["formula"] = readable_formula(expression, names_by_id, self.table_id)
+            result = prop.get("type") if isinstance(prop, dict) else None
+            if field.get("type") == 20 and isinstance(result, dict):
+                # 公式结果按什么显示（5 = 日期，2 = 数字）。接口没给就不出现 = 不知道。
+                entry["result_type"] = result.get("data_type")
             meta[str(name)] = entry
         return meta
 
@@ -891,14 +895,17 @@ class Bitable:
         _check(resp)
         return added
 
-    def set_formula(self, column: str, expression: str) -> None:
+    def set_formula(self, column: str, expression: str, *,
+                    result_type: Optional[dict] = None) -> bool:
         """把一个**已有公式列**的公式换掉。只给 tools/update_next_check_formula.py 用。
 
         公式列不存人填的数据（值是飞书算出来的），换公式不丢东西——这是它和
         补选项（add_field_options）的根本区别。但 `PUT .../fields/:field_id`
         对 `property` 同样是整体覆盖，所以照样读-改-写：现有 property 原样
-        带回去（显示格式、新版公式的 type 之类），只换 formula_expression。
+        带回去，只换 formula_expression（和 result_type 给了时的显示格式）。
         不是公式列就拒绝——把一列手填的日期改成公式，等于清空那一列。
+
+        返回显示格式有没有一起写进去（见 `_send_formula`）。
         """
         raw = self.fields_meta_raw()
         if raw is None:
@@ -912,20 +919,61 @@ class Bitable:
         if not field_id:
             raise FeishuError(-1, f"「{column}」没有 field_id，改不了")
         prop = dict(info.get("property") or {})
+        prop["formula_expression"] = self._id_formula(expression, raw)
+        return self._send_formula("PUT", f"fields/{urllib.parse.quote(field_id, safe='')}",
+                                  column, prop, result_type)
+
+    def create_formula_field(self, column: str, expression: str, *,
+                             result_type: Optional[dict] = None) -> bool:
+        """在表尾**新建**一列公式列。纯追加，不碰已有的列。
+
+        表里已经有同名的列就拒绝（不管什么类型）——那是 set_formula 的事，
+        或者是一列人填的数据，都不该在这里动。返回显示格式有没有一起写进去。
+        """
+        raw = self.fields_meta_raw()
+        if raw is None:
+            raise FeishuError(-1, f"读不到字段元数据，不能建「{column}」")
+        if column in raw:
+            raise FeishuError(-1, f"表里已经有「{column}」这一列，不再新建")
+        prop = {"formula_expression": self._id_formula(expression, raw)}
+        return self._send_formula("POST", "fields", column, prop, result_type)
+
+    def _id_formula(self, expression: str, raw: dict) -> str:
         # 按接口文档的写法发：本表的列写成 id 引用（读回来的也是这种）。
         # `[列名]` 能不能直接写进去没验过（待验证清单 P12 ③），id 写法是文档给的。
         ids_by_name = {name: str(f.get("field_id")) for name, f in raw.items()
                        if f.get("field_id")}
-        prop["formula_expression"] = id_formula(expression, ids_by_name, self.table_id)
-        resp = transport.request_with_retry(
-            "PUT", self._url(f"fields/{urllib.parse.quote(field_id, safe='')}"),
-            self._headers(),
-            json.dumps({"field_name": column, "type": 20, "property": prop},
-                       ensure_ascii=False),
-            timeout=self.timeout,
-            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-        )
-        _check(resp)
+        return id_formula(expression, ids_by_name, self.table_id)
+
+    def _send_formula(self, method: str, suffix: str, column: str, prop: dict,
+                      result_type: Optional[dict]) -> bool:
+        """发一次公式列的建/改。给了 result_type 就先连显示格式一起发。
+
+        显示格式（`property.type`）是照字段编辑指南写的，没在真表上验过：
+        飞书**明确拒绝**（业务错误码 = 什么都没改）就退一步，只发公式再来一次
+        ——公式本身已经实测能写进去，格式可以在列设置里点一下补上。
+        网络错误 / 非 JSON（code -1）不退：说不准第一次有没有生效，
+        再发一次可能多建一列。返回 True = 格式也一起写进去了。
+        """
+        def send(property_: dict) -> None:
+            resp = transport.request_with_retry(
+                method, self._url(suffix), self._headers(),
+                json.dumps({"field_name": column, "type": 20, "property": property_},
+                           ensure_ascii=False),
+                timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            _check(resp)
+
+        if result_type:
+            try:
+                send({**prop, "type": result_type})
+                return True
+            except FeishuError as exc:
+                if exc.code == -1:
+                    raise
+        send(prop)
+        return False
 
     def batch_create(self, records: list[dict[str, Any]], *,
                      client_token: str) -> list[str]:
@@ -1068,6 +1116,13 @@ def readable_formula(expression: str, names_by_id: dict, table_id: str) -> str:
         name = names_by_id.get(match.group("field"))
         return f"[{name}]" if name else match.group(0)
     return _FORMULA_REF.sub(swap, expression)
+
+
+# 公式结果按日期显示（「下次检查时间」）。照字段编辑指南里新版公式的
+# `property.type` 写：data_type 5 = 日期。没在真表上验过，所以 _send_formula
+# 被拒时会退回只发公式。
+DATE_RESULT = {"data_type": 5, "ui_type": "DateTime",
+               "ui_property": {"date_formatter": "yyyy/MM/dd HH:mm"}}
 
 
 def id_formula(expression: str, ids_by_name: dict, table_id: str) -> str:

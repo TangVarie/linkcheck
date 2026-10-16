@@ -326,6 +326,11 @@ def _bool_env(name: str, default: bool) -> bool:
     sys.exit(f"环境变量 {name} 的值 {raw!r} 看不懂，填 1/0（或 true/false）")
 
 
+# INFERRED_PUBLISH_MARGIN_DAYS 的上限。tools/check_id_time.py 的建议值不会超过它——
+# 超过了照着改，cron 和面板两个服务都会起不来。
+INFERRED_MARGIN_MAX_DAYS = 60
+
+
 def build_settings() -> Settings:
     _apply_endpoint_overrides()
     apply_pricing_overrides()
@@ -343,7 +348,7 @@ def build_settings() -> Settings:
     # 改之前先跑 tools/check_id_time.py 看你们的表里 ID 时间和发布时间最多差几天。
     settings.refresh.inferred_publish_margin_days = _numeric_env(
         "INFERRED_PUBLISH_MARGIN_DAYS", int, settings.refresh.inferred_publish_margin_days,
-        minimum=0, maximum=60)
+        minimum=0, maximum=INFERRED_MARGIN_MAX_DAYS)
 
     # —— 单轮硬预算（0 = 不限）——
     settings.budget = Budget(

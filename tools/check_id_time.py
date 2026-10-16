@@ -68,6 +68,8 @@ class TableCount:
 class Findings:
     counts: list[TableCount] = field(default_factory=list)
     samples: list[Sample] = field(default_factory=list)
+    # 读不到的表。余量对**所有**表生效，有一张没看过，建议值就不作数。
+    unreadable: list[str] = field(default_factory=list)
 
 
 def collect(findings: Findings, label: str, rows: list[Row],
@@ -111,6 +113,12 @@ def recommend(samples: list[Sample], margin_days: int) -> tuple[Optional[int], s
     suggested = max(2, math.ceil(max(worst, 0.0)) + 1)
     if worst > margin_days:
         over = sum(1 for s in samples if s.gap_days > margin_days)
+        if suggested > cli.INFERRED_MARGIN_MAX_DAYS:
+            # 照着改服务会起不来；而晚两个月发的帖子，多半是发布时间填错了。
+            return None, (f"有 {over} 行的发布时间比 ID 时间晚了 {margin_days} 天以上（最多 "
+                          f"{worst:.1f} 天），要罩住得设 {suggested}，超过了上限 "
+                          f"{cli.INFERRED_MARGIN_MAX_DAYS} 天。晚这么多多半是发布时间填错了"
+                          "（年份、月份），先去表里看上面列出的那几行")
         return suggested, (f"有 {over} 行的发布时间比 ID 时间晚了 {margin_days} 天以上（最多 "
                            f"{worst:.1f} 天）：现在的 {margin_days} 天不够，这种帖子要是没填"
                            f"发布时间会被提前归档。建议调大到 {suggested}")
@@ -132,6 +140,8 @@ def report(findings: Findings, margin_days: int) -> list[str]:
     lines.append("")
     if not samples:
         lines.append("一行能比的都没有：要么发布时间都没填，要么链接全是短链。")
+        if findings.unreadable:
+            lines.append(f"另有 {len(findings.unreadable)} 张表读不到：{'、'.join(findings.unreadable)}")
         return lines
 
     gaps = sorted(s.gap_days for s in samples)
@@ -154,6 +164,11 @@ def report(findings: Findings, margin_days: int) -> list[str]:
             [s for s in samples if s.gap_days < -DATE_ONLY_SLACK_DAYS])
 
     suggested, why = recommend(samples, margin_days)
+    if findings.unreadable:
+        suggested = None
+        why = (f"有 {len(findings.unreadable)} 张表读不到（{'、'.join(findings.unreadable)}），"
+               "这次的数不作数：余量对所有表生效，没看过的表里可能正好有定时发布的帖子。"
+               "先让这几张表能读（应用加进表里），再跑一次")
     lines.append("")
     lines.append(f"结论：{why}")
     if suggested is not None and suggested != margin_days:
@@ -191,9 +206,10 @@ def main(argv: list[str]) -> int:
             collect(findings, label, _read_rows(table, settings))
         except Exception as exc:  # noqa: BLE001 —— 一张表读不到不该挡住别的表
             print(f"⚠ 表「{label}」读不到：{exc}")
+            findings.unreadable.append(label)
     for line in report(findings, margin):
         print(line)
-    return 0
+    return 1 if findings.unreadable else 0
 
 
 if __name__ == "__main__":
