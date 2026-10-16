@@ -113,6 +113,41 @@ class TestExceptionEnvelope(unittest.TestCase):
         self.assertIn("读取错误响应失败", resp.body)
 
 
+class TestMethodsAreSentAsAsked(unittest.TestCase):
+    """PUT / DELETE 以前被悄悄发成 POST：飞书改字段、删记录全回网关 404。"""
+
+    def sent(self, method, body):
+        with _urlopen_returning(_FakeResp(b'{"code":0}')) as opened:
+            resp = transport.request(method, "https://x/fields/fld1", {"A": "b"}, body)
+        self.assertEqual(resp.status, 200)
+        return opened.call_args.args[0]
+
+    def test_put_is_a_put_with_the_body(self):
+        request = self.sent("PUT", '{"k":"值"}')
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertEqual(request.data, '{"k":"值"}'.encode("utf-8"))
+        self.assertEqual(request.full_url, "https://x/fields/fld1")
+
+    def test_delete_is_a_delete_without_a_body(self):
+        request = self.sent("delete", "")
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertIsNone(request.data)
+
+    def test_get_and_post_are_unchanged(self):
+        self.assertEqual(self.sent("GET", "").get_method(), "GET")
+        self.assertEqual(self.sent("POST", "{}").get_method(), "POST")
+        self.assertEqual(self.sent("", "{}").get_method(), "POST")
+
+    def test_retries_keep_the_method(self):
+        responses = [_FakeResp(b"busy", status=503), _FakeResp(b'{"code":0}')]
+        with mock.patch("urllib.request.urlopen", side_effect=responses) as opened:
+            resp = transport.request_with_retry("PUT", "https://x", {}, "{}",
+                                                sleep=lambda s: None)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual([c.args[0].get_method() for c in opened.call_args_list],
+                         ["PUT", "PUT"])
+
+
 class TestGetNoRedirect(unittest.TestCase):
     """短链展开只要 302 的 Location 头，不要落地页。"""
 

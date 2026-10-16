@@ -12,6 +12,7 @@ import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 from unittest import mock
 
 import cli
@@ -325,6 +326,81 @@ class TestNextCheckPlan(unittest.TestCase):
 def ok(payload=None):
     return transport.Response(status=200, content_type="application/json",
                               body=json.dumps({"code": 0, "data": payload or {}}))
+
+
+class OkResp:
+    """urlopen 的替身：飞书的一个空成功响应。"""
+
+    status = 200
+
+    def __init__(self):
+        self.headers = Message()
+        self._body = b'{"code":0,"data":{}}'
+
+    def read(self, amount=None):
+        body, self._body = self._body, b""
+        return body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class TestFeishuWritesUseTheRightVerb(unittest.TestCase):
+    """真走一遍传输层（只顶掉 urlopen）。上面那些用例顶的是 request_with_retry，
+    看不见动词被改成 POST——实机上就是这样 404 的。"""
+
+    def table(self):
+        return feishu.Bitable(app_id="cli_x", app_secret="s",
+                              app_token="bascnA", table_id="tblB")
+
+    def opened(self, call):
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: OkResp()) as op:
+            call(self.table())
+        return [c.args[0] for c in op.call_args_list]
+
+    def test_set_formula_is_a_put_with_id_refs(self):
+        f = Settings().fields
+        raw = {name: {"field_id": fid, "field_name": name, "type": 1}
+               for name, fid in ((f.publish_time, "fldP"), (f.last_updated, "fldL"),
+                                 (f.refresh_status, "fldS"), (f.consecutive_failures, "fldC"))}
+        raw[NEXT_CHECK_COLUMN] = {"field_id": "fldN", "field_name": NEXT_CHECK_COLUMN,
+                                  "type": 20, "property": {"formula_expression": "OLD"}}
+        wanted = next_check_formula(Settings())
+        with mock.patch.object(feishu.Bitable, "fields_meta_raw", return_value=raw):
+            [request] = self.opened(lambda t: t.set_formula(NEXT_CHECK_COLUMN, wanted))
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertTrue(request.full_url.endswith("/apps/bascnA/tables/tblB/fields/fldN"))
+        sent = json.loads(request.data)["property"]["formula_expression"]
+        self.assertNotIn("[发布时间]", sent)
+        self.assertIn("bitable::$table[tblB].$field[fldP]", sent)
+        self.assertIn('"已失效"', sent, "引号里的字符串原样不动")
+        names = {fid: name for name, fid in
+                 ((n, r["field_id"]) for n, r in raw.items())}
+        self.assertEqual(feishu.readable_formula(sent, names, "tblB"), wanted,
+                         "读回来翻成列名，要和新版逐字一样——不然脚本会报「不一样」")
+
+    def test_delete_record_is_a_delete(self):
+        [request] = self.opened(lambda t: t.delete_record("recX"))
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertTrue(request.full_url.endswith("/tables/tblB/records/recX"))
+
+    def test_add_field_options_is_a_put(self):
+        raw = {"流量状态": {"field_id": "fld1", "field_name": "流量状态", "type": 4,
+                            "property": {"options": [{"id": "o1", "name": "爆贴"}]}}}
+        with mock.patch.object(feishu.Bitable, "fields_meta_raw", return_value=raw):
+            [request] = self.opened(lambda t: t.add_field_options("流量状态", ["风控中"]))
+        self.assertEqual(request.get_method(), "PUT")
+
+
+class TestIdFormula(unittest.TestCase):
+    def test_only_known_columns_outside_quotes_are_swapped(self):
+        got = feishu.id_formula('IF([甲] = "[甲]", [乙], [没有])', {"甲": "fldA", "乙": "fldB"}, "tblX")
+        self.assertEqual(got, 'IF(bitable::$table[tblX].$field[fldA] = "[甲]", '
+                              'bitable::$table[tblX].$field[fldB], [没有])')
 
 
 class TestSetFormula(unittest.TestCase):

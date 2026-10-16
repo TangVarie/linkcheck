@@ -912,7 +912,11 @@ class Bitable:
         if not field_id:
             raise FeishuError(-1, f"「{column}」没有 field_id，改不了")
         prop = dict(info.get("property") or {})
-        prop["formula_expression"] = expression
+        # 按接口文档的写法发：本表的列写成 id 引用（读回来的也是这种）。
+        # `[列名]` 能不能直接写进去没验过（待验证清单 P12 ③），id 写法是文档给的。
+        ids_by_name = {name: str(f.get("field_id")) for name, f in raw.items()
+                       if f.get("field_id")}
+        prop["formula_expression"] = id_formula(expression, ids_by_name, self.table_id)
         resp = transport.request_with_retry(
             "PUT", self._url(f"fields/{urllib.parse.quote(field_id, safe='')}"),
             self._headers(),
@@ -1064,6 +1068,24 @@ def readable_formula(expression: str, names_by_id: dict, table_id: str) -> str:
         name = names_by_id.get(match.group("field"))
         return f"[{name}]" if name else match.group(0)
     return _FORMULA_REF.sub(swap, expression)
+
+
+def id_formula(expression: str, ids_by_name: dict, table_id: str) -> str:
+    """`readable_formula` 的反方向：把 `[列名]` 换成本表的 id 引用。
+
+    只换引号**外**、而且这张表里确有其列的 `[…]`；引号里的字符串原样不动
+    （`"[草稿]"` 是一个字符串，不是列）。找不到的列名原样留着，交给飞书报错——
+    报错 = 什么都没改。
+    """
+    def swap(match):
+        field_id = ids_by_name.get(match.group(1))
+        if not field_id:
+            return match.group(0)
+        return f"bitable::$table[{table_id}].$field[{field_id}]"
+
+    parts = re.split(r'("[^"]*")', expression)
+    return "".join(part if part.startswith('"') else re.sub(r"\[([^\[\]]+)\]", swap, part)
+                   for part in parts)
 
 
 def read_text(value: Any) -> str:
