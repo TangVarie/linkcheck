@@ -479,7 +479,8 @@ class TestNegativeKeywords(unittest.TestCase):
         可见评论」判：负面清掉、我们种的评论算「没有显示」、置顶算掉了。
         """
         snap = analyze.read_comment_page(
-            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1})
+            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1,
+                    "_empty_page": True})
         self.assertTrue(analyze.comments_hidden(snap))
         self.assertTrue(analyze.saw_comment_page(snap))
         self.assertEqual(snap.comment_count, 0,
@@ -506,9 +507,33 @@ class TestNegativeKeywords(unittest.TestCase):
     def test_the_top_level_count_decides_whether_it_fits_on_one_page(self):
         """总数含楼中楼：12 条里只有 3 条一级评论，一页照样装得下。"""
         snap = analyze.read_comment_page(
-            "xhs", {"items": [], "comment_count": 12, "top_level_comment_count": 3})
+            "xhs", {"items": [], "comment_count": 12, "top_level_comment_count": 3,
+                    "_empty_page": True})
         self.assertTrue(analyze.comments_hidden(snap))
         self.assertEqual((snap.comment_count, snap.hidden_comment_count), (0, 12))
+
+    def test_zero_top_level_comments_also_fit_on_one_page(self):
+        """总数 1、一级 0：剩下的只是看不到的楼中楼，或者一级计数先归零了。"""
+        snap = analyze.read_comment_page(
+            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 0,
+                    "_empty_page": True})
+        self.assertTrue(analyze.comments_hidden(snap))
+
+    def test_an_empty_list_the_channel_did_not_vouch_for_is_not_hidden(self):
+        """缺字段、类型不对、条目全解析不了，归一化之后也是空列表——
+        那是没拿到，不能拿来清掉一条真负面。"""
+        snap = analyze.read_comment_page(
+            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1})
+        self.assertFalse(analyze.comments_hidden(snap))
+        self.assertFalse(analyze.saw_comment_page(snap))
+        self.assertEqual(snap.comment_count, 1)
+
+    def test_douyin_is_left_alone(self):
+        """只在小红书上实测过；抖音一页 20 条、计数口径没对过，不推断。"""
+        snap = analyze.read_comment_page(
+            "douyin", {"items": [], "comment_count": 1, "_empty_page": True})
+        self.assertFalse(analyze.comments_hidden(snap))
+        self.assertEqual(snap.comment_count, 1)
 
     def test_an_empty_page_on_a_post_that_needs_paging_is_still_not_a_verdict(self):
         """评论多到要翻页时，空页更可能是上游这一页没给——照旧不下结论。"""

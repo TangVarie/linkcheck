@@ -547,7 +547,8 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
 
     if platform == "xhs" and purpose == "comments":
         core = inner.get("data") if isinstance(inner.get("data"), dict) else {}
-        comments = core.get("comments") if isinstance(core.get("comments"), list) else []
+        raw_comments = core.get("comments")
+        comments = raw_comments if isinstance(raw_comments, list) else []
         # 死亡嫌疑：活笔记一定带着作者 user_id 和三个排序策略；
         # 不存在的笔记这两样都是空的。启发式，所以不 definitive——交给两击定罪。
         alive = bool(core.get("user_id")) or bool(core.get("all_sort_strategies"))
@@ -561,6 +562,11 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
             # comment_count 是含楼中楼的总数，和 detail 的 comments_count 一致（实测）；
             # comment_count_l1 只算一级评论。阈值用总数，跟 App 里显示的口径对齐。
             "top_level_comment_count": core.get("comment_count_l1"),
+            # 上游给的**确实是一个空列表**（不是缺字段、不是别的类型、也不是一堆
+            # 解析不了的条目被滤空）。只有这时，「说有几条、一条都不给」才是平台的
+            # 真话，analyze 才会按「别人看不到」处理（见 analyze.comments_hidden）。
+            # 只在这条实测过的通道（TikHub × 小红书）上作证。
+            "_empty_page": isinstance(raw_comments, list) and not raw_comments,
             # 没登记就不带这个键（同 _sdx_parse：analyze 退回看键在不在，
             # 而不是让整行炸在 KeyError 上）。
             **({"_capabilities": XHS_COMMENT_CAPABILITIES[TIKHUB]}

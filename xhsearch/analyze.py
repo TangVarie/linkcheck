@@ -176,13 +176,23 @@ def comments_hidden(snapshot: Snapshot) -> bool:
     return snapshot.hidden_comment_count > 0
 
 
-def _hidden_count(comments: list, count: Optional[int],
-                  top_level: Optional[int]) -> int:
-    """read_comment_page 用：这一页说有、却一条都不给的评论数（不是这种情况返回 0）。"""
-    fits = top_level if top_level is not None else count
-    if comments or count is None or fits is None:
+def _hidden_count(platform: str, data: dict[str, Any], comments: list,
+                  count: Optional[int], top_level: Optional[int]) -> int:
+    """read_comment_page 用：这一页说有、却一条都不给的评论数（不是这种情况返回 0）。
+
+    * 只认通道明确作证的空页（`_empty_page`）：缺字段、类型不对、条目全解析
+      不了，归一化之后也是空列表，但那是**没拿到**，不是「别人看不到」；
+    * 只认小红书：实测过的是小红书（界面上不显示评论数、一页 10 条），抖音一页
+      20 条、计数口径也没对过，不拿这条推断去改抖音的表；
+    * 一级评论 0 条也算一页装得下——总数里剩的只是看不到的楼中楼，或者一级
+      计数已经先归零了，正是这条要处理的「计数对不上」。
+    """
+    if platform != "xhs" or data.get("_empty_page") is not True:
         return 0
-    return count if 0 < fits <= FIRST_PAGE_SIZE else 0
+    fits = top_level if top_level is not None else count
+    if comments or count is None or count <= 0 or fits is None:
+        return 0
+    return count if fits <= FIRST_PAGE_SIZE else 0
 
 
 def saw_comment_page(snapshot: Snapshot) -> bool:
@@ -249,7 +259,7 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     points = data.get("points") if isinstance(data.get("points"), dict) else {}
     count = _int_or_none(data.get("comment_count"))
     top_level = _int_or_none(data.get("top_level_comment_count"))
-    hidden = _hidden_count(comments, count, top_level)
+    hidden = _hidden_count(platform, data, comments, count, top_level)
     return Snapshot(
         platform=platform,
         # 一条都看不到的那几条不算：表里的实时评论数跟小红书界面一致（0），
