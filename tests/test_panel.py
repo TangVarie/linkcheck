@@ -1256,7 +1256,7 @@ class TestMissingPublishTimeOnTheCard(unittest.TestCase):
         page = self._page(3)
         self.assertIn("没填发布时间", page)
         self.assertIn("3 行", page)
-        self.assertIn("永不归档", page)
+        self.assertIn("不巡查", page)
 
     def test_zero_takes_no_space_at_all(self):
         self.assertNotIn("没填发布时间", self._page(0))

@@ -1283,11 +1283,11 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
                 if not p.estimate_blocked
                 else "<b style='color:var(--danger-deep)'>无法估算</b>")
     # 有就说，没有就一个字都不占。这一行不是覆盖度（「还没配」），
-    # 是「这些行在空转」：帖龄算不出来 → 永远不归档 → 按最快的一档一直刷。
+    # 是「这些行停着没人查」：帖龄算不出来的行不自动巡查，补上发布时间才开始。
     no_publish = (
         f"<div><span class=lbl>没填发布时间</span>"
         f"<span>{p.missing_publish_time_rows} 行 <span class=muted>"
-        f"（算不出帖龄，永不归档，一直按最快一档刷）</span></span></div>"
+        f"（不巡查，补上发布时间下一轮开始查）</span></span></div>"
         if p.missing_publish_time_rows else "")
     seed_gap = p.total_rows - p.seed_keyword_rows
     neg_gap = p.total_rows - p.negative_keyword_rows

@@ -1960,7 +1960,7 @@ def load_rows(
     due_content = {r.content_key() for r in result} - {None}
     riders = [r for r in idle
               if r.content_key() in due_content
-              and r.refresh_interval_hours(settings, now) is not None]   # 已归档的不带
+              and r.refresh_interval_hours(settings, now) is not None]   # 不自动刷的不带
     for rider in riders:
         rider.ride_along = True
     return result + riders

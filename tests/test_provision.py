@@ -443,11 +443,10 @@ class TestFullTemplate(unittest.TestCase):
         里层的档位判断用的是 `[最近检查时间]` 那一刻的帖龄，**不是 NOW()**：
         这一格必须是定值，否则一跨档它自己就往后跳（见 next_check_formula）。
         """
-        call = self._deferred()["下次检查时间"]
-        body = call[0][2]
-        self.assertEqual(body["type"], 20)
+        call = self.workspace.create_formula_field.call_args
+        self.assertEqual(call.args[:3], ("bascnNEW", "tblNEW", "下次检查时间"))
         self.assertEqual(
-            body["property"]["formula_expression"],
+            call.args[3],
             'IF(DATEDIF([发布时间], NOW(), "D") > 30, "", '
             '[最近检查时间] + IF([巡查状态] = "已失效", '
             '72 * POWER(2, MIN(10, MAX(0, [连续失败次数] - 2))), '
@@ -492,7 +491,43 @@ class TestFullTemplate(unittest.TestCase):
 
     def test_deferred_columns_are_added_in_layout_order(self):
         names = [c[0][2]["field_name"] for c in self.workspace.create_field.call_args_list]
-        self.assertEqual(names, list(DEFERRED))
+        self.assertEqual(names, [n for n in DEFERRED if n != "下次检查时间"])
+        self.workspace.create_formula_field.assert_called_once()
+
+    def test_the_next_check_column_is_shown_as_a_date(self):
+        """只发公式的话飞书按数字显示（实机上是一串 46312）。走「换公式」脚本
+        在真表上验过的那条路：连「按日期显示」一起发。"""
+        call = self.workspace.create_formula_field.call_args
+        self.assertEqual(call.kwargs, {"result_type": feishu.DATE_RESULT})
+        self.assertNotIn("下次检查时间", [m["column"] for m in self.made["manual_steps"]])
+
+    def test_a_rejected_date_format_becomes_a_manual_step(self):
+        workspace = fake_workspace()
+        workspace.create_formula_field.return_value = False
+        made = provision.create_monitored_table(workspace, self.settings, "甲",
+                                                log=lambda *a: None)
+        self.assertIn("下次检查时间", made["built"], "公式建出来了，只是格式要点一下")
+        [step] = [m for m in made["manual_steps"] if m["column"] == "下次检查时间"]
+        self.assertIn("格式」选日期", step["step"])
+
+    def test_a_failed_next_check_column_does_not_fail_the_created_table(self):
+        workspace = fake_workspace()
+        workspace.create_formula_field.side_effect = feishu.FeishuError(1254001, "bad")
+        made = provision.create_monitored_table(workspace, self.settings, "甲",
+                                                log=lambda *a: None)
+        self.assertEqual(made["target"], "bascnNEW:tblNEW")
+        self.assertNotIn("下次检查时间", made["built"])
+        self.assertTrue(any("下次检查时间" in f for f in made["column_failures"]))
+
+    def test_no_tiers_means_no_date_format(self):
+        """一档都没配：整列留空（'""'），没有日期可显示，也就不该提示去改格式。"""
+        settings = Settings()
+        settings.refresh.tiers = []
+        workspace = fake_workspace()
+        workspace.create_formula_field.return_value = False
+        made = provision.create_monitored_table(workspace, settings, "甲", log=lambda *a: None)
+        self.assertEqual(workspace.create_formula_field.call_args.kwargs, {"result_type": None})
+        self.assertNotIn("下次检查时间", [m["column"] for m in made["manual_steps"]])
 
     def test_the_formula_follows_renamed_columns(self):
         from dataclasses import replace

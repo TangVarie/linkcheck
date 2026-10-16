@@ -104,10 +104,10 @@ class ProjectSnapshot:
     oldest_checked_ms: Optional[int] = None
     never_checked_rows: int = 0
 
-    # 「发布时间」那一格空着（或读不出来）的在管行。**这是个会安静烧钱的洞**：
-    # 帖龄算不出来 → 永远跨不过归档线 → 按最快的一档
-    # （`RefreshTiers.fastest_interval_hours`）一直刷下去，永远不停。
-    # 而这件事原来在面板上一点声音都没有：`_is_stale` 故意不把它算成
+    # 「发布时间」那一格空着（或读不出来）、链接里也解不出发布时刻的在管行。
+    # 帖龄算不出来的行**不自动巡查**（见 rows.Row.refresh_interval_hours；以前
+    # 按最快一档一直刷、永不归档，是个会安静烧钱的洞）——于是它们安静地停着，
+    # 补上发布时间才会开始查。这件事原来在面板上一点声音都没有：`_is_stale` 故意不把它算成
     # 「卡住了」，`_todo_reasons` 只收机器下过结论的事，`analyze` 那句
     # ⚠ 也只在**评论数够不上任何热度档**时才写进「诊断信息」——
     # 一条有热度、发布时间空着的行，三道口全部躲过去。所以单独数一个。
@@ -332,7 +332,7 @@ def build_snapshot(
         archived = age is not None and settings.refresh.interval_hours_for_age(age) is None
         if archived:
             snap.archived_rows += 1
-        # 帖龄算不出来 = 那一格是空的或者是脏的，两种都永远不归档。
+        # 帖龄算不出来 = 那一格是空的或者是脏的，两种都不巡查（见 Row.refresh_interval_hours）。
         # `row.monitoring` 在表里没有「是否巡查」列时默认 True，于是这个数
         # 和这张卡上别的数一个口径（那种表另有一条体检提示在说这件事）。
         if age is None and row.monitoring:

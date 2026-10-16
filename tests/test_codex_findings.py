@@ -404,6 +404,10 @@ class TestCreatedTableLink(unittest.TestCase):
         def create_field(self, app_token, table_id, body):
             return "fldNEW"
 
+        def create_formula_field(self, app_token, table_id, column, expression, *,
+                                 result_type=None):
+            return True
+
     def test_the_link_points_at_the_monitored_table(self):
         """base 级链接点进去是飞书自动建的那张默认表——
         运营可能直接在里面填数据，而注册表监控的是另一张。"""

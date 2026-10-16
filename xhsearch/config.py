@@ -495,7 +495,9 @@ class RefreshTiers:
         return self.tiers[-1][1] if self.tiers else None
 
     def fastest_interval_hours(self) -> int | None:
-        """最快的那一档间隔。帖龄未知时用它兜底。
+        """最快的那一档间隔。从没刷过、或者「最近检查时间」是脏数据时用它兜底。
+        （帖龄算不出来的行以前也用它兜底，现在不自动巡查了，见
+        rows.Row.refresh_interval_hours。）
 
         「发布时间那一格是空的」以前等于**无条件到期**——`is_due` 在看
         「最近检查时间」之前就返回 True，于是这一行每一轮 cron（5 分钟）

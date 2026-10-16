@@ -132,11 +132,11 @@ class TestPublishTimeFallback(unittest.TestCase):
         self.assertFalse(row.publish_time_inferred(NOW))
 
     def test_an_id_that_decodes_into_the_future_is_ignored(self):
-        """测试固件里的 "a"*24 解出来在 2060 年：当不知道，老规矩按最快档兜底。"""
+        """测试固件里的 "a"*24 解出来在 2060 年：当不知道——和短链一样不巡查。"""
         row = Row("r", "https://www.xiaohongshu.com/explore/" + "a" * 24)
         self.assertIsNone(row.schedule_publish_ms(self.settings, NOW))
         self.assertIsNone(row.schedule_age_days(self.settings, NOW))
-        self.assertEqual(row.refresh_interval_hours(self.settings, NOW), 8)
+        self.assertIsNone(row.refresh_interval_hours(self.settings, NOW))
 
     def test_a_short_link_without_an_id_is_still_unknown(self):
         row = Row("r", "http://xhslink.com/a/AbC")
@@ -1022,3 +1022,63 @@ class TestConcurrentResumeWaitsForFreshData(unittest.TestCase):
         self.assertEqual(len(produced), 2, "并发进来的几个请求只取一趟")
         self.assertEqual(results["first"].generated_at, results["second"].generated_at)
         self.assertEqual(results["second"].generated_at, NOW + timedelta(minutes=2))
+
+
+class TestBlindRowsAreNotPatrolled(unittest.TestCase):
+    """「发布时间」空着、链接里也解不出发布时刻的行：sweep 不查、不搭车，
+    排队刷新照常（Ziao 2026-10-16 拍板）。面板的「到期 / 预计花费」和 sweep
+    同一个口径，项目卡上「没填发布时间」数的就是它们。"""
+
+    SHORT = "http://xhslink.com/a/AbC"
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def table(self, records):
+        class _Table:
+            def search(self, field_names, *, filter_spec=None, max_records=None):
+                return records
+        return _Table()
+
+    def record(self, record_id, link, *, published=True, queued=False, checked_hours_ago=None):
+        f = self.settings.fields
+        cells = {f.link: link}
+        if published:
+            cells[f.publish_time] = int((NOW - timedelta(days=1)).timestamp() * 1000)
+        if checked_hours_ago is not None:
+            cells[f.last_updated] = int((NOW - timedelta(hours=checked_hours_ago)).timestamp() * 1000)
+        if queued:
+            cells[f.queued] = True
+        return {"record_id": record_id, "fields": cells}
+
+    def test_sweep_skips_it(self):
+        picked = runner.load_rows(self.table([
+            self.record("blind", self.SHORT, published=False),
+            self.record("filled", self.SHORT),
+        ]), self.settings, now=NOW)
+        self.assertEqual([r.record_id for r in picked], ["filled"])
+
+    def test_queue_still_takes_it(self):
+        """勾「排队刷新」是人明确要看这一行，不看到期。"""
+        picked = runner.load_rows(self.table([
+            self.record("blind", self.SHORT, published=False, queued=True),
+        ]), self.settings, only_queued=True, now=NOW)
+        self.assertEqual([r.record_id for r in picked], ["blind"])
+
+    def test_it_does_not_ride_along_with_a_due_sibling(self):
+        """同篇搭车是免费的，但「不巡查」就是不碰它。两行是同一篇（"a"*24），
+        这个 ID 解出来在 2060 年、不算数——没填发布时间的那行就是帖龄算不出。"""
+        note = "https://www.xiaohongshu.com/explore/" + "a" * 24
+        picked = runner.load_rows(self.table([
+            self.record("due", note, checked_hours_ago=30),
+            self.record("blind_sibling", note, published=False, checked_hours_ago=1),
+        ]), self.settings, now=NOW)
+        self.assertEqual([r.record_id for r in picked], ["due"])
+
+    def test_the_panel_counts_it_but_does_not_price_it(self):
+        snap = summary.build_snapshot(
+            label="A", app_token="bascnA", table_id="tblA",
+            records=[self.record("blind", self.SHORT, published=False)],
+            settings=self.settings, now=NOW)
+        self.assertEqual(snap.missing_publish_time_rows, 1)
+        self.assertEqual(snap.due_rows, 0, "面板的到期数要和 sweep 一个口径")
