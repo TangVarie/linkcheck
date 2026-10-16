@@ -536,9 +536,16 @@ class TestPanelPausesWhenNobodyLooks(unittest.TestCase):
 
     def test_the_idle_window_is_configurable(self):
         base = {"PANEL_PASSWORD": "x" * 16, "PANEL_SECRET": "s" * 32}
-        self.assertEqual(panel.PanelConfig.from_env(base).idle_minutes, 15.0)
+        self.assertEqual(panel.PanelConfig.from_env(base).idle_minutes, 0.0,
+                         "默认一直刷：进来看一眼不该先干等一趟整表取数")
         self.assertEqual(panel.PanelConfig.from_env(
-            {**base, "PANEL_IDLE_MINUTES": "0"}).idle_minutes, 0.0)
+            {**base, "PANEL_IDLE_MINUTES": "15"}).idle_minutes, 15.0)
+
+    def test_the_default_never_pauses_the_background_refresh(self):
+        """默认配置走到 Cache 时是 idle_seconds=None（永不停），不是 0 秒就停。"""
+        config = panel.PanelConfig.from_env({"PANEL_PASSWORD": "x" * 16,
+                                             "PANEL_SECRET": "s" * 32})
+        self.assertIsNone(config.idle_minutes * 60 or None)
 
 
 # ---------------------------------------------------------------- 7. 作品ID

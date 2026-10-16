@@ -85,7 +85,9 @@ class PanelConfig:
     port: int = 8080
     cache_seconds: float = 60.0
     # 最后一个请求之后多久没人来，后台就停止整表拉取（见 Cache）。0 = 永不停。
-    idle_minutes: float = 15.0
+    # 默认 0（Ziao 2026-10-16 拍板）：停过之后每次打开都要先等一趟整表取数，
+    # 进来看一眼就得干等；后台一直刷只花飞书的免费读额度，不花钱。
+    idle_minutes: float = 0.0
     show_digest: bool = False
     # 飞书租户域名。直达链接靠它拼出来，而面板的价值有一半在那个链接上。
     feishu_base: str = "https://feishu.cn"
@@ -159,7 +161,7 @@ class PanelConfig:
             secret=secret,
             port=_int_env(env, "PORT", 8080, 1, 65535),
             cache_seconds=_float_env(env, "PANEL_CACHE_SECONDS", 60.0, 5.0, 3600.0),
-            idle_minutes=_float_env(env, "PANEL_IDLE_MINUTES", 15.0, 0.0, 1440.0),
+            idle_minutes=_float_env(env, "PANEL_IDLE_MINUTES", 0.0, 0.0, 1440.0),
             show_digest=_bool_env(env, "PANEL_SHOW_DIGEST", False),
             feishu_base=_feishu_base(env),
             allow_option_patch=_bool_env(env, "PANEL_ALLOW_OPTION_PATCH", False),
