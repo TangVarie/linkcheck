@@ -13,7 +13,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import runner, transport
+from xhsearch import analyze, runner, transport
 from xhsearch.config import Channels, Settings
 from xhsearch.rows import Row
 
@@ -856,5 +856,14 @@ class TestCommentsNobodyCanSee(FailoverTest):
         self.assertEqual(outcome.fields[f.comment_status],
                          self.settings.comment_status.not_displayed)
         self.assertIn("一条都看不到", outcome.fields[f.comment_digest])
-        self.assertIn("评论数 1，但评论区一条都看不到", outcome.fields[f.failure_reason])
+        self.assertEqual(outcome.fields[f.comment_count], 0, "和小红书界面一致")
+        self.assertIn("接口报评论数 1，但评论区一条都看不到", outcome.fields[f.failure_reason])
         self.assertNotIn("本轮未取到评论页内容", outcome.fields[f.failure_reason])
+
+    def test_hidden_comments_still_prove_the_post_is_alive(self):
+        """实时评论数按 0 记了，但接口说有的那 1 条照样是「活着」的强证据：
+        detail 同时说笔记不存在，那是上游自相矛盾，不能据此判死。"""
+        snap = analyze.read_comment_page(
+            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1})
+        self.assertEqual(snap.comment_count, 0)
+        self.assertTrue(runner._looks_alive(snap))

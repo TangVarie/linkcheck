@@ -482,6 +482,9 @@ class TestNegativeKeywords(unittest.TestCase):
             "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1})
         self.assertTrue(analyze.comments_hidden(snap))
         self.assertTrue(analyze.saw_comment_page(snap))
+        self.assertEqual(snap.comment_count, 0,
+                         "实时评论数跟小红书界面一致：别人一条都看不到，就是 0")
+        self.assertEqual(snap.hidden_comment_count, 1)
 
         verdict = self.decide(snap, seed_keywords=["领券"], negative_keywords=["过敏"])
         self.assertTrue(verdict.negative_checked)
@@ -492,10 +495,11 @@ class TestNegativeKeywords(unittest.TestCase):
                          self.settings.comment_status.not_displayed)
         self.assertTrue(verdict.pin_checked)
         notes = "；".join(verdict.notes)
-        self.assertIn("评论数 1，但评论区一条都看不到", notes)
+        self.assertIn("接口报评论数 1，但评论区一条都看不到", notes)
+        self.assertIn("实时评论数按 0 记", notes)
         self.assertIn("评论区一条可见的评论都没有 → 评论没有显示", notes)
         self.assertNotIn("本轮未取到评论页内容", notes)
-        self.assertIn("评论数 1，但评论区一条都看不到",
+        self.assertIn("接口报评论数 1，但评论区一条都看不到",
                       analyze.format_digest(snap, self.settings.digest),
                       "评论区快照不能写「暂无评论」——那和真的 0 条分不开")
 
@@ -504,11 +508,13 @@ class TestNegativeKeywords(unittest.TestCase):
         snap = analyze.read_comment_page(
             "xhs", {"items": [], "comment_count": 12, "top_level_comment_count": 3})
         self.assertTrue(analyze.comments_hidden(snap))
+        self.assertEqual((snap.comment_count, snap.hidden_comment_count), (0, 12))
 
     def test_an_empty_page_on_a_post_that_needs_paging_is_still_not_a_verdict(self):
         """评论多到要翻页时，空页更可能是上游这一页没给——照旧不下结论。"""
         snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 11})
         self.assertFalse(analyze.comments_hidden(snap))
+        self.assertEqual(snap.comment_count, 11, "判不了的时候评论数照原样记")
         self.assertFalse(analyze.saw_comment_page(snap))
         verdict = self.decide(snap, negative_keywords=["过敏"])
         self.assertFalse(verdict.negative_checked)
@@ -520,7 +526,7 @@ class TestNegativeKeywords(unittest.TestCase):
         snap = analyze.read_comment_page("xhs", {"items": []})
         analyze.merge_detail(snap, {"comment_count": 1, "like_count": 9})
         self.assertEqual(snap.comment_count, 1)
-        self.assertFalse(snap.count_on_page)
+        self.assertEqual(snap.hidden_comment_count, 0)
         self.assertFalse(analyze.comments_hidden(snap))
         self.assertFalse(analyze.saw_comment_page(snap))
 
