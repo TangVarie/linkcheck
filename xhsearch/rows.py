@@ -177,27 +177,55 @@ class Row:
             return None
         return seconds * 1000
 
-    def publish_ms(self, now: Optional[datetime] = None) -> Optional[int]:
-        """算帖龄用的发布时刻：表里填了就用表里的，空着就用链接 ID 里自带的。
+    def schedule_publish_ms(self, settings: Settings,
+                            now: Optional[datetime] = None) -> Optional[int]:
+        """**分层和归档**用的发布时刻：表里填了就用表里的；空着就用链接 ID
+        推一个**最晚可能**的发布时刻。
 
         「发布时间」空着的行以前按最快一档（8 小时）一直刷、**永远不归档**，
-        一条小红书一个月就是 ¥6.5，而且没有尽头。两个平台的 ID 里本来就编着
-        发布时刻（见 links.id_timestamp），拿它兜底，这些行就和填了日期的
-        行一样分层、一样归档。表里那一格照旧空着——那是人工列，机器不写。
+        一条小红书一个月就是 ¥6.5，而且没有尽头。两个平台的 ID 里编着创建
+        时刻（见 links.id_timestamp），但 ID 创建不等于发布：定时发布的笔记
+        ID 在排期那一刻就有了，真正发出去可能晚好几天。直接拿 ID 时间当发布
+        时间，一条定时发布的帖子会被当成「已经很老了」——分层刷得更慢，甚至
+        还活着就被归档、从此没人看。
 
-        填了但填成未来的时间**不**换成 ID 时间：那是填错了，诊断信息要
-        照实报出来让人去改（见 analyze.decide），不该被悄悄绕过去。
+        所以这里取**最晚可能的发布时刻** = ID 时间 + 定时发布最长的提前量
+        （RefreshTiers.inferred_publish_margin_days）。拿它算出来的帖龄只会
+        比真实的小、不会比真实的大：任何一条帖子都不会因为这一刀刷得比
+        「填了真实发布时间」更慢，也不会更早归档。代价是没定时的帖子在头
+        两周多按快档刷几次——比起以前的「永远 8 小时」，还是有尽头的。
+
+        **热度档位不用它**（见 age_hours）：那是给人看的结论，宁可照旧报
+        「发布时间是空的，判不了」，也不拿一个推出来的时刻去打「无水花」。
+        填了但填成未来的时间同样不换成 ID 时间：那是填错了，诊断信息要
+        照实报出来让人去改（见 analyze.decide）。
         """
         if self.publish_time_ms is not None:
             return self.publish_time_ms
-        return self.id_publish_ms(now)
+        created = self.id_publish_ms(now)
+        if created is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        latest = created + int(settings.refresh.inferred_publish_margin_days * 86_400_000)
+        # 链接都在表里了，帖子不可能还没发：最晚也就是此刻。
+        return min(latest, int(now.timestamp() * 1000))
+
+    def schedule_age_days(self, settings: Settings,
+                          now: Optional[datetime] = None) -> Optional[float]:
+        """分层和归档用的帖龄（天）。见 schedule_publish_ms。"""
+        published = _utc(self.schedule_publish_ms(settings, now))
+        if published is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        return (now - published).total_seconds() / 86400
 
     def publish_time_inferred(self, now: Optional[datetime] = None) -> bool:
-        """这一行的帖龄是不是从链接 ID 推出来的（表里「发布时间」空着）。"""
+        """这一行的刷新节奏是不是从链接 ID 推出来的（表里「发布时间」空着）。"""
         return self.publish_time_ms is None and self.id_publish_ms(now) is not None
 
     def age_hours(self, now: Optional[datetime] = None) -> Optional[float]:
-        published = _utc(self.publish_ms(now))
+        """**表里填的**发布时间到现在多少小时。热度档位（观察中 / 无水花）只认它。"""
+        published = _utc(self.publish_time_ms)
         if published is None:
             return None
         now = now or datetime.now(timezone.utc)
@@ -272,10 +300,10 @@ class Row:
         归档仍然看**当下**的帖龄：归档就是归档，不该因为上次检查发生在
         归档线之前就再刷一轮。
         """
-        age_now = self.age_days(now)
+        age_now = self.schedule_age_days(settings, now)
         if age_now is not None and settings.refresh.interval_hours_for_age(age_now) is None:
             return None  # 已归档
-        published = _utc(self.publish_ms(now))
+        published = _utc(self.schedule_publish_ms(settings, now))
         updated = _utc(self.last_updated_ms)
         if published is None or updated is None:
             # 帖龄不知道（发布时间空着、链接里也解不出 ID 时间），或者从没刷过：
@@ -429,14 +457,18 @@ def _argument_forms(call: ToolCall) -> list[dict[str, Any]]:
 
 
 def paying_rows(rows: list[Row], settings: Settings,
-                now: Optional[datetime] = None) -> list[Row]:
+                now: Optional[datetime] = None,
+                seen: Optional[set] = None) -> list[Row]:
     """这一批里**真正要付钱**的那些行：搭车的不算，同指纹的只算第一行。
 
     估算和面板「预计花费」都该按它算——一轮里同一篇只付一次钱
     （runner.FetchShare），按行数算就会把重复的那几行报成真花销。
     抖音短链按链接文字算指纹（展开前认不出是不是同一篇），宁可多报一点。
+
+    seen 传同一个集合给每张表，跨表的重复也只算一次（和 cron 跨表共享
+    FetchShare 一个口径：按表的先后顺序，第一张表付钱）。
     """
-    seen: set = set()
+    seen = set() if seen is None else seen
     out: list[Row] = []
     for row in rows:
         if row.ride_along:

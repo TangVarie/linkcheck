@@ -464,6 +464,12 @@ class RefreshTiers:
         ]
     )
     archive_after_days: int = 30     # 超过就不再自动刷，只保留手动触发
+    # 「发布时间」空着、拿链接 ID 推发布时刻时的保守量：ID 在**排期**那一刻就有了，
+    # 定时发布的帖子真正发出去要晚这么多天。按最晚可能的发布时刻算帖龄，
+    # 推出来的帖龄只会偏小——宁可多刷几次，不会把还活着的帖子提前归档
+    # （见 rows.Row.schedule_publish_ms）。14 天是两个平台定时发布的最长提前量，
+    # 没在真表上核对过，见 docs/待验证清单.md C1。
+    inferred_publish_margin_days: int = 14
 
     def interval_hours_for_age(self, age_days: float) -> int | None:
         """返回该年龄的帖子应有的刷新间隔；None 表示已归档。

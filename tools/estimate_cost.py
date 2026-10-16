@@ -169,9 +169,13 @@ def _month(xhs_calls: float, dy_calls: float) -> tuple[float, float]:
              + dy_calls * sdx.yuan_per_call("douyin", "comments")) * 30)
 
 
-def flat_daily(total_posts: float, xhs_share: float, with_detail: bool) -> dict:
-    """对照组：不分层，每天全表刷一遍。"""
-    xhs = total_posts * xhs_share * (2 if with_detail else 1)
+def flat_daily(total_posts: float, xhs_share: float, xhs_detail_posts: float = 0.0) -> dict:
+    """对照组：不分层，每天全表刷一遍。
+
+    xhs_detail_posts = 落在 DETAIL_WITHIN_DAYS 窗口里的小红书篇数：只有它们
+    每天多一次 detail（和生产一样按帖龄判），不是全部小红书都翻倍。
+    """
+    xhs = total_posts * xhs_share + xhs_detail_posts
     dy = total_posts * (1 - xhs_share) * 2
     tik, sdx = _month(xhs, dy)
     return {"calls_per_day": xhs + dy, "xhs_calls": xhs, "dy_calls": dy,
@@ -231,8 +235,10 @@ def main() -> int:
           f"抖音主通道 {settings.channels.primary('douyin')}")
 
     print("\n对照组（两家分开报，按当前的 detail 配置）：")
+    in_window = _overlap(0.0, float(settings.refresh.archive_after_days) + 1.0,
+                         0.0, float(settings.detail_within_days))
     flat = flat_daily(result["posts"], xhs_share,
-                      with_detail=settings.detail_within_days > 0)
+                      xhs_detail_posts=per_day * in_window * xhs_share)
     print(f"【全表日刷】 {flat['calls_per_day']:.0f} 次/天 = "
           f"TikHub ¥{flat['tikhub_month']:,.0f}/月，"
           f"SocialDataX ¥{flat['socialdatax_month']:,.0f}/月")

@@ -109,6 +109,8 @@ class Outcome:
     # （顺延、冷却、熔断作废）。日志逐行打印的就是它——日志和表对得上，
     # 全靠这里和 fields[last_updated] 是同一个值。
     checked_at: Optional[datetime] = None
+    # 结论是拿同一篇内容另一行本轮的上游回答判的（FetchShare）：熔断样本里不重复算。
+    shared: bool = False
 
 
 @dataclass
@@ -387,27 +389,37 @@ class _Fetched:
 
 
 class _ShareEntry:
-    __slots__ = ("done", "value", "abort", "failed")
+    __slots__ = ("done", "started", "state", "value", "abort")
 
-    def __init__(self):
+    def __init__(self, *, started: bool = False):
         self.done = threading.Event()
+        # 认领它的那一行已经真的开始取数了（不只是派发前登记了名字）。
+        self.started = started
+        # pending → ok / abandoned（认领的那一行没去取：冷却、预算、截止……）
+        #         / failed（取的时候抛了异常）/ aborted（平台倒了）
+        self.state = "pending"
         self.value: Optional[_Fetched] = None
         self.abort: Optional["_Abort"] = None
-        self.failed = False
 
 
 class FetchShare:
     """一轮之内，同一篇内容只付一次钱。
 
     同一篇笔记出现在好几行里并不少见（换了个表头重贴、复查表里又登记一遍）。
-    以前每一行各刷各的，两行就是两份钱，买回来的是同一份评论页。现在第一行
-    取到的结果按调用指纹（rows.share_key）存一份，后面同指纹的行直接拿去做
-    **自己的**判定——每行的关键词、上次评论数、现有标签都不一样，判定照旧
-    逐行做，共享的只是「上游这一刻回了什么」。
+    以前每一行各刷各的，两行就是两份钱，买回来的是同一份评论页。现在同一个
+    调用指纹（rows.share_key）只有一行去取，其余的行拿一份结果去做**自己的**
+    判定——每行的关键词、上次评论数、现有标签都不一样，判定照旧逐行做，
+    共享的只是「上游这一刻回了什么」。
 
-    线程安全：线程池里两行同时撞上同一篇时，后到的那一行**等**先到的那一行
-    取完，而不是两边各发一次。整次运行共用一份（cli 跨表传进来），
-    复查表和项目表里重复登记的同一篇也只付一次。
+    **谁去取，派发之前就定好了**（refresh 按顺序 claim）：线程池里谁先跑到
+    不重要，同指纹的第一行就是取数的那一行，后面的行（重复登记的、搭车的）
+    一律等它。以前是「谁先跑到谁取」，两行同时在飞的时候后一行看不到前一行、
+    又付一次预算；搭车的行还可能抢在前面、看见空的就跳过了。
+
+    认领的那一行最后没去取（冷却、预算、截止、平台倒了），等它的重复行
+    自己接手、照常付钱——和没有共享时一模一样；搭车的行则原样不动。
+    整次运行共用一份（cli 跨表传进来），复查表和项目表里重复登记的同一篇
+    也只付一次。
     """
 
     def __init__(self):
@@ -415,51 +427,102 @@ class FetchShare:
         self._entries: dict[tuple, _ShareEntry] = {}
         self.hits = 0
 
-    def has(self, key: tuple) -> bool:
-        """这个指纹本轮已经取完了吗（不等）。"""
+    # —— 派发前：认领 ——
+    def claim(self, key: tuple) -> bool:
+        """这个指纹本轮还没人认领 → 归你（True）。已经有人了 → False。"""
+        with self._lock:
+            if key in self._entries:
+                return False
+            self._entries[key] = _ShareEntry()
+            return True
+
+    # —— 认领的那一行：开始 / 交差 / 放弃 ——
+    def start(self, key: tuple) -> None:
         with self._lock:
             entry = self._entries.get(key)
-        return entry is not None and entry.done.is_set() and entry.value is not None
+            if entry is not None:
+                entry.started = True
 
-    def run(self, key: tuple, produce: Callable[[], _Fetched]) -> _Fetched:
-        """第一个来的人去取，后来的人等它取完拿一份。"""
+    def fulfil(self, key: tuple, value: _Fetched) -> None:
+        self._finish(key, "ok", value=value)
+
+    def fail(self, key: tuple, abort: Optional["_Abort"] = None) -> None:
+        self._finish(key, "aborted" if abort is not None else "failed", abort=abort)
+
+    def release(self, key: tuple) -> None:
+        """认领了却没去取：放开，让等它的行自己接手。已经交差的不受影响。"""
+        self._finish(key, "abandoned", only_if_pending=True)
+
+    def _finish(self, key: tuple, state: str, *, value: Optional[_Fetched] = None,
+                abort: Optional["_Abort"] = None, only_if_pending: bool = False) -> None:
         with self._lock:
             entry = self._entries.get(key)
-            owner = entry is None
-            if owner:
-                entry = _ShareEntry()
-                self._entries[key] = entry
-        if not owner:
-            taken = self._take(entry)
-            if taken is None:
-                raise RuntimeError("同一篇内容的另一行这一轮处理时出错，这一行本轮跳过")
-            return taken
-        try:
-            value = produce()
-        except _Abort as exc:
-            entry.abort = exc
+            if entry is None or entry.done.is_set():
+                return
+            if only_if_pending and entry.state != "pending":
+                return
+            entry.state, entry.value, entry.abort = state, value, abort
             entry.done.set()
-            raise
-        except BaseException:
-            entry.failed = True
-            entry.done.set()
-            raise
-        entry.value = value
-        entry.done.set()
-        return value
 
-    def peek(self, key: tuple) -> Optional[_Fetched]:
-        """搭车的行用：本轮有人取过（或正在取）就拿一份，没有就 None——**绝不自己去取**。"""
+    # —— 其余的行：等 ——
+    def wait(self, key: tuple) -> Optional[_Fetched]:
+        """等认领的那一行取完，拿一份。它没去取 / 取挂了 / 没人认领 → None。
+
+        只能用在**派发前认领过**的指纹上：认领的那一行在派发顺序里一定排在
+        前面，所以它一定已经在跑或跑完了，等它不会死锁。
+        """
         with self._lock:
             entry = self._entries.get(key)
         return None if entry is None else self._take(entry)
 
+    # 搭车的行用的名字：只吃现成的，绝不自己去取。
+    peek = wait
+
+    def run(self, key: tuple, produce: Callable[[], _Fetched]) -> _Fetched:
+        """没认领的行要自己取时用（认领的那一行放弃了，或者展开短链后指纹变了）。
+
+        这个指纹空着、或者上一个认领的放弃了 → 我来取，取到的给后面的人；
+        有人**正在取** → 等它；有人认领了但**还没开始** → 不等（它可能排在我
+        后面，单线程时等它就是死锁），自己取一份、不登记。
+        """
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.state in ("abandoned", "failed"):
+                entry = _ShareEntry(started=True)
+                self._entries[key] = entry
+                mine = True
+            elif entry.state == "pending" and not entry.started:
+                entry, mine = None, False
+            else:
+                mine = False
+        if entry is None:
+            return produce()
+        if not mine:
+            taken = self._take(entry)
+            return taken if taken is not None else produce()
+        try:
+            value = produce()
+        except _Abort as exc:
+            self._settle(entry, "aborted", abort=exc)
+            raise
+        except BaseException:
+            self._settle(entry, "failed")
+            raise
+        self._settle(entry, "ok", value=value)
+        return value
+
+    def _settle(self, entry: _ShareEntry, state: str, *, value: Optional[_Fetched] = None,
+                abort: Optional["_Abort"] = None) -> None:
+        with self._lock:
+            entry.state, entry.value, entry.abort = state, value, abort
+            entry.done.set()
+
     def _take(self, entry: _ShareEntry) -> Optional[_Fetched]:
         entry.done.wait()
-        if entry.abort is not None:
+        if entry.state == "aborted" and entry.abort is not None:
             # 平台已经倒了：照样中止，但这一行一分钱都没花。
             raise _Abort(entry.abort.reason, entry.abort.platform)
-        if entry.failed or entry.value is None:
+        if entry.state != "ok" or entry.value is None:
             return None
         with self._lock:
             self.hits += 1
@@ -708,12 +771,15 @@ def _fetch_one(
     resolver: Optional[shortlink.Resolver] = None,
     share: Optional[FetchShare] = None,
     watch: Optional[ContractWatch] = None,
+    owned_key: Optional[tuple] = None,
 ) -> _Fetched:
     """跑完一行需要的全部调用。
 
     终局错误 code == "deadline" 且无快照 = 这一行根本没开始，留给下一轮。
-    同一篇内容本轮已经有别的行取过（share 里有同指纹的结果），这一行直接拿
-    一份去判定，不再发请求、不再花钱。
+
+    owned_key = 这一行在派发前认领了这个指纹（FetchShare.claim）：取到的结果
+    要交给等着它的同篇行。没认领的行走 share.run：认领的那一行放弃了，
+    它就接手；指纹变了（短链展开成 ID），就看那个指纹有没有人在取。
     """
     calls = plan_calls(row, settings, now)
     if not calls:
@@ -745,7 +811,23 @@ def _fetch_one(
                             disabled=disabled, tally=tally, lock=lock, watch=watch,
                             expand_failure=expand_failure)
 
-    fetched = share.run(share_key(calls), produce) if share is not None else produce()
+    if share is None:
+        fetched = produce()
+    elif owned_key is not None:
+        share.start(owned_key)
+        try:
+            fetched = produce()
+        except _Abort as exc:
+            share.fail(owned_key, abort=exc)
+            raise
+        except BaseException:
+            share.fail(owned_key)
+            raise
+        # 展开成 ID 之后指纹变了也只交给认领的那个指纹：等着的是同一条链接的行。
+        # 不去另一个指纹那儿挂号——那边认领的行可能排在后面，等它就是死锁。
+        share.fulfil(owned_key, fetched)
+    else:
+        fetched = share.run(share_key(calls), produce)
     # 展开是这一行自己做的（每行记自己那条链接对应的 ID），不随共享结果走。
     fetched.requests += expand_requests
     fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
@@ -1210,41 +1292,40 @@ def refresh(
             return Outcome(row.record_id, STATUS_COOLDOWN, {},
                            f"{settings.safety.cooldown_seconds} 秒内刚刷过，跳过（不计费）", 0)
 
-        # —— 同篇共享：这一篇本轮已经有别的行取过了，直接拿一份，不花钱 ——
+        # —— 同篇共享：同一篇内容这一轮只有认领的那一行去取（派发前定好的）——
+        # 重复登记的行等它、拿一份结果去做自己的判定，不预留预算、不花钱；
+        # 认领的那一行没去取（冷却、预算、截止……），重复行就自己接手照常付钱。
         # 搭车的行（自己没到期、被同篇的到期行带进来的）**只**吃现成的结果：
         # 那一行没刷成，这一行就原样不动，绝不单独花钱。
         planned = plan_calls(row, settings, now)
         key = share_key(planned) if planned else None
-        free = key is not None and share.has(key)
+        owned = key is not None and owners.get(id(row)) == key
         reserved = False
         reserved_yuan, reserved_calls = 0.0, 0
-        if row.ride_along:
-            pass
-        elif not free:
-            # —— 预算：在发请求**之前**预留（SUP-001）——
-            # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
-            # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
-            # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
-            # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
-            reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
-                                          disabled=disabled, worst_case=True)
-            # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
-            # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
-            reserved_calls = len(planned) * max(1, len(
-                providers.usable_order(settings.channels, platform, keys, disabled)))
-            if not budget.reserve(reserved_calls, reserved_yuan):
-                return Outcome(row.record_id, STATUS_DEFERRED, {},
-                               budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
-            reserved = True
-
+        fetched: Optional[_Fetched] = None
         try:
-            if row.ride_along:
-                fetched = share.peek(key) if key is not None else None
-            else:
+            if key is not None and not owned:
+                fetched = share.wait(key)
+            if fetched is None and not row.ride_along:
+                # —— 预算：在发请求**之前**预留（SUP-001）——
+                # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
+                # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
+                # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
+                # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
+                reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
+                                              disabled=disabled, worst_case=True)
+                # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
+                # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
+                reserved_calls = len(planned) * max(1, len(
+                    providers.usable_order(settings.channels, platform, keys, disabled)))
+                if not budget.reserve(reserved_calls, reserved_yuan):
+                    return Outcome(row.record_id, STATUS_DEFERRED, {},
+                                   budget.stopped_reason or "本轮预算已用完，留给下一轮", 0)
+                reserved = True
                 fetched = _fetch_one(
                     row, keys, settings, now=now, deadline=deadline, timeout=timeout,
                     disabled=disabled, tally=tally, lock=lock, resolver=resolver,
-                    share=share, watch=watch,
+                    share=share, watch=watch, owned_key=key if owned else None,
                 )
         except _Abort as exc:
             # 中止的行也可能已经花过钱：按实际花销校正账面再走。
@@ -1263,8 +1344,7 @@ def refresh(
                            "同一篇内容的另一行这一轮没刷成，这一行还没到期，不单独花钱", 0)
         # 按**实际**值校正账面：金额是真花掉的，请求数是真发出去的
         # （含传输层重试和降级到备胎的那几次）。悲观预留的差额在这里退还，
-        # 后面的行才是拿真实余量在放行。没预留的行（以为能白拿）照样按实际记：
-        # 万一它真的发了请求，账面也得对得上。
+        # 后面的行才是拿真实余量在放行。白拿的行两边都是 0，什么都不动。
         budget.settle(reserved_yuan, fetched.yuan, reserved_calls, fetched.requests)
         with lock:
             report.failovers += fetched.failovers
@@ -1279,9 +1359,13 @@ def refresh(
                 value = format_resolved_id(fetched.expanded_id, fetched.expanded_url)
                 if value != row.resolved_id_cell:
                     outcome.fields[f.resolved_id] = value
-            if fetched.shared and outcome.fields:
-                outcome.reason = ("（同篇另一行本轮已取到，这一行没另花钱）"
-                                  + outcome.reason)[:200]
+            if fetched.shared:
+                # 熔断的样本里只算一次：同一份上游回答抄给了几行，它仍然只是
+                # **一次**观测（见 _apply_circuit_breaker）。
+                outcome.shared = True
+                if outcome.fields:
+                    outcome.reason = ("（同篇另一行本轮已取到，这一行没另花钱）"
+                                      + outcome.reason)[:200]
             return outcome
 
         # —— 软截止在这一行开始前就到了：不写回，留给下一轮 ——
@@ -1350,14 +1434,14 @@ def refresh(
             current_pin_status=row.pin_status,                # 区分「掉了」和「从来没有」
         )
         if row.publish_time_inferred(now):
-            # 帖龄是从链接 ID 推出来的：说一声，免得运营以为「发布时间」那一格
-            # 空着也没关系——表里自己的公式（下次检查时间）还是要靠它。
-            inferred = _ms_to_utc(row.id_publish_ms(now))
-            if inferred is not None:
+            # 刷新节奏是从链接 ID 推出来的：说一声，免得运营以为「发布时间」那一格
+            # 空着也没关系——热度档位和表里自己的公式（下次检查时间）还是要靠它。
+            created = _ms_to_utc(row.id_publish_ms(now))
+            if created is not None:
                 verdict.notes.append(
-                    f"「{f.publish_time}」是空的，帖龄按链接 ID 推算"
-                    f"（约 {inferred.astimezone(settings.display.tz()):%Y-%m-%d} 发布）；"
-                    "补上发布时间就以表里的为准")
+                    f"「{f.publish_time}」是空的，刷新节奏按链接 ID 推算"
+                    f"（ID 生成于 {created.astimezone(settings.display.tz()):%Y-%m-%d}，"
+                    "按定时发布最晚的情况保守算）；补上发布时间就以表里的为准")
         if error is not None:
             verdict.notes.append(f"（detail 未取到：{error.operator_text()[:120]}）")
         if snapshot.points_balance is not None:
@@ -1410,8 +1494,36 @@ def refresh(
             )
 
     pending = list(rows)
+    # —— 同篇共享：派发之前按顺序认领，谁去取就定了（见 FetchShare）——
+    # 必须在进线程池之前做：在线程里各自去抢，两行同时在飞的时候后一行看不到
+    # 前一行（又付一次预算），搭车的行还可能抢在到期行前面看见空的。
+    # 搭车的行不认领：它们只吃现成的。
+    owners: dict[int, tuple] = {}
+    for row in pending:
+        try:
+            if row.ride_along or not row.parsed.usable:
+                continue
+            planned = plan_calls(row, settings, now)
+        except Exception:  # noqa: BLE001
+            # 行级异常隔离（ROB-003）同样管到这里：这一行不认领，让它进了
+            # 线程池之后照常在 guarded 里被记成「刷新失败」，别的行不受影响。
+            continue
+        if planned:
+            claimed = share_key(planned)
+            if share.claim(claimed):
+                owners[id(row)] = claimed
+
+    def dispatch(row: Row) -> Outcome:
+        try:
+            return guarded(row)
+        finally:
+            claimed = owners.get(id(row))
+            if claimed is not None:
+                # 认领了却没去取（冷却、预算、截止、跳过……）：放开，等它的行自己接手。
+                share.release(claimed)
+
     with ThreadPoolExecutor(max_workers=max(1, settings.max_concurrency)) as pool:
-        for outcome in pool.map(guarded, pending):
+        for outcome in pool.map(dispatch, pending):
             report.outcomes.append(outcome)
             # 行首的时间是**这一行的**「最近检查时间」，和写进表里的是同一个值。
             # pool.map 按提交顺序产出，日志行的打印时刻可能比实际处理晚好几秒
@@ -1554,8 +1666,11 @@ def _apply_circuit_breaker(report: RunReport, settings: Settings) -> None:
     # 分母只算真正打过上游的行：冷却/坏链接/软截止顺延的行没有产生任何
     # 「取不到内容」的观测，混进分母会稀释失效比例，让该熔的批熔不了。
     # 第二次看到失效的行也不算：它们的结论已经定了，熔断管不着。
+    # 同一篇内容的几行共用的是**同一次**上游回答（FetchShare）：抄过去的那几份
+    # 不另算样本，否则一条死链登记三行就能凑满小样本熔断的门槛。
     attempted = [o for o in report.outcomes
-                 if o.status not in _NOT_ATTEMPTED and not _is_second_look(o, settings)]
+                 if o.status not in _NOT_ATTEMPTED and not o.shared
+                 and not _is_second_look(o, settings)]
     total = len(attempted)
     suspects = [o for o in attempted if o.status in (STATUS_GONE, STATUS_SUSPECT)]
     gone = len(suspects)

@@ -217,6 +217,9 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         f.platform, f.refresh_status, f.failure_reason,
         f.comment_status, f.negative_status, f.alive_confirmed,
         f.collation_status,
+        # 抖音短链记过的「作品ID」：没有它，面板认不出这一行是哪个作品，
+        # 「发布时间」空着时就算不出帖龄、把 cron 早已归档的行报成空转。
+        f.resolved_id,
     ]
     if show_digest:
         wanted += [f.comment_digest, f.negative_digest]
@@ -265,7 +268,7 @@ def _is_stale(row: rows_mod.Row, settings: Settings, now: datetime) -> bool:
     那是「发布时间那一格有问题」，`诊断信息` 里已经在报了，
     在这里再报一次只会让同一个毛病占两个位置。
     """
-    if row.age_days(now) is None:
+    if row.schedule_age_days(settings, now) is None:
         return False
     # 和 Row.is_due 用同一个间隔（按上次检查时刻定档），否则面板说的
     # 「卡住了」和机器真正的到期判断不是一个口径。
@@ -296,8 +299,13 @@ def build_snapshot(
     scrub: Optional[Any] = None,
     route: str = "base",
     label_column: str = "",
+    seen_calls: Optional[set] = None,
 ) -> ProjectSnapshot:
     """把一张表读回来的 records 聚合成一个项目快照。
+
+    seen_calls：跨表共用的调用指纹集合（rows.paying_rows）。同一篇内容
+    登记在两张表里时，cron 一轮只付一次钱，「预计花费」也只算在先读到的
+    那张表头上——各项目加起来才等于真花销。
 
     records 应该是**在管的行**（`是否巡查` 勾着的）。取消勾选就是运营
     明确说了「这行别管了」，把它算进任何一个数字都是在制造噪声。
@@ -318,7 +326,9 @@ def build_snapshot(
         row = runner.row_from_record(record, settings)
         snap.total_rows += 1
 
-        age = row.age_days(now)
+        # 和 cron 同一个口径：「发布时间」空着时按链接 ID 推的保守帖龄（见
+        # Row.schedule_publish_ms），算不出来的才是真空转。
+        age = row.schedule_age_days(settings, now)
         archived = age is not None and settings.refresh.interval_hours_for_age(age) is None
         if archived:
             snap.archived_rows += 1
@@ -411,7 +421,8 @@ def build_snapshot(
     if due:
         # 同一篇内容一轮只付一次钱（runner.FetchShare），按「真正付钱的行」估。
         snap.due_yuan = rows_mod.estimate_yuan(
-            rows_mod.paying_rows(due, settings, now), settings, now, keys=api_keys)
+            rows_mod.paying_rows(due, settings, now, seen=seen_calls),
+            settings, now, keys=api_keys)
     todos.sort(key=_todo_sort_key)
     snap.todos = todos[:max_todos]
     snap.todos_dropped = max(0, len(todos) - max_todos)

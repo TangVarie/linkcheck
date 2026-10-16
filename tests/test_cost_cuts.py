@@ -75,42 +75,72 @@ class TestIdTimestamp(unittest.TestCase):
         self.assertIsNone(links.id_timestamp("xhs", None))
 
 
+def note_created(days_ago: float) -> str:
+    """一个「创建于 N 天前」的小红书 note_id。"""
+    created = NOW - timedelta(days=days_ago)
+    return "https://www.xiaohongshu.com/explore/" + f"{int(created.timestamp()):08x}" + "0" * 16
+
+
 class TestPublishTimeFallback(unittest.TestCase):
+    """「发布时间」空着时用 ID 推一个**最晚可能**的发布时刻：ID 时间 + 14 天
+    （定时发布的笔记 ID 在排期时就有了）。推出来的帖龄只会偏小。"""
+
     def setUp(self):
         self.settings = Settings()
 
-    def test_blank_publish_time_uses_the_id_and_archives_like_any_other_row(self):
-        """以前：8 小时一轮、永不归档。现在：ID 说它发了 58 天了 → 归档。"""
+    def test_blank_publish_time_eventually_archives(self):
+        """以前：8 小时一轮、永不归档。现在：ID 生成于 58 天前，最晚也是 44 天前发的 → 归档。"""
         row = Row("r", XHS_LINK, last_updated_ms=ms(NOW - timedelta(hours=9)))
-        self.assertEqual(row.publish_ms(NOW), 0x6a8538d6 * 1000)
+        self.assertEqual(row.schedule_publish_ms(self.settings, NOW),
+                         (0x6a8538d6 + 14 * 86400) * 1000)
         self.assertTrue(row.publish_time_inferred(NOW))
         self.assertIsNone(row.refresh_interval_hours(self.settings, NOW))
         self.assertFalse(row.is_due(self.settings, NOW))
 
-    def test_a_young_inferred_row_gets_the_young_tier(self):
-        published = NOW - timedelta(hours=30)
-        note = f"{int(published.timestamp()):08x}" + "0" * 16
-        row = Row("r", "https://www.xiaohongshu.com/explore/" + note,
-                  last_updated_ms=ms(NOW - timedelta(hours=7)))
+    def test_a_scheduled_post_is_never_archived_early(self):
+        """ID 生成于 40 天前、按最晚的情况是 26 天前才发的：还在管，不能归档。"""
+        row = Row("r", note_created(40), last_updated_ms=ms(NOW - timedelta(hours=73)))
+        self.assertAlmostEqual(row.schedule_age_days(self.settings, NOW), 26, delta=0.01)
+        self.assertEqual(row.refresh_interval_hours(self.settings, NOW), 72)
+        self.assertTrue(row.is_due(self.settings, NOW))
+        self.assertIsNone(Row("old", note_created(46)).refresh_interval_hours(self.settings, NOW))
+
+    def test_the_tier_is_never_slower_than_the_true_date_would_give(self):
+        """ID 生成于 20 天前：真实发布可能就在 6 天前（定时发布），按 24 小时档刷，
+        而不是按 ID 时间算出来的 72 小时档。"""
+        row = Row("r", note_created(20), last_updated_ms=ms(NOW - timedelta(hours=25)))
+        self.assertEqual(row.refresh_interval_hours(self.settings, NOW), 24)
+
+    def test_a_fresh_id_is_treated_as_brand_new(self):
+        row = Row("r", note_created(1.25), last_updated_ms=ms(NOW - timedelta(hours=7)))
+        self.assertEqual(row.schedule_age_days(self.settings, NOW), 0)
         self.assertEqual(row.refresh_interval_hours(self.settings, NOW), 8)
-        self.assertAlmostEqual(row.age_hours(NOW), 30, delta=0.01)
+
+    def test_the_margin_is_configurable(self):
+        self.settings.refresh.inferred_publish_margin_days = 0
+        row = Row("r", note_created(20))
+        self.assertAlmostEqual(row.schedule_age_days(self.settings, NOW), 20, delta=0.01)
+
+    def test_heat_tiers_do_not_use_the_inferred_time(self):
+        """热度档位是给人看的结论：发布时间空着就照旧「判不了」，不拿推出来的时刻打无水花。"""
+        self.assertIsNone(Row("r", note_created(20)).age_hours(NOW))
 
     def test_the_table_wins_when_it_is_filled(self):
         filled = ms(NOW - timedelta(days=1))
         row = Row("r", XHS_LINK, publish_time_ms=filled)
-        self.assertEqual(row.publish_ms(NOW), filled)
+        self.assertEqual(row.schedule_publish_ms(self.settings, NOW), filled)
         self.assertFalse(row.publish_time_inferred(NOW))
 
     def test_an_id_that_decodes_into_the_future_is_ignored(self):
         """测试固件里的 "a"*24 解出来在 2060 年：当不知道，老规矩按最快档兜底。"""
         row = Row("r", "https://www.xiaohongshu.com/explore/" + "a" * 24)
-        self.assertIsNone(row.publish_ms(NOW))
-        self.assertIsNone(row.age_hours(NOW))
+        self.assertIsNone(row.schedule_publish_ms(self.settings, NOW))
+        self.assertIsNone(row.schedule_age_days(self.settings, NOW))
         self.assertEqual(row.refresh_interval_hours(self.settings, NOW), 8)
 
     def test_a_short_link_without_an_id_is_still_unknown(self):
         row = Row("r", "http://xhslink.com/a/AbC")
-        self.assertIsNone(row.age_hours(NOW))
+        self.assertIsNone(row.schedule_age_days(self.settings, NOW))
         self.assertFalse(row.publish_time_inferred(NOW))
 
 
@@ -585,7 +615,7 @@ class TestWasteReport(unittest.TestCase):
         self.assertIn("在管 5 行", text)
         self.assertIn("1 篇 / 2 行", text)
         self.assertIn(f"「{f.publish_time}」空着：2 行", text)
-        self.assertIn("其中 1 行按链接 ID 推算", text)
+        self.assertIn("其中 1 行按链接 ID 推了保守帖龄", text)
         self.assertIn("1 行连 ID 也解不出", text)
         self.assertIn("已失效、还没归档：1 行", text)
 
@@ -772,8 +802,223 @@ class TestInferredPublishTimeIsSaid(SharingTest):
         row = Row("r", XHS_LINK.replace("6a8538d6", f"{int((NOW - timedelta(days=3)).timestamp()):08x}"))
         report = self.run_rows([row])
         reason = report.outcomes[0].fields[self.settings.fields.failure_reason]
-        self.assertIn("帖龄按链接 ID 推算", reason)
+        self.assertIn("刷新节奏按链接 ID 推算", reason)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- Codex 审查（2026-10-16）的回归
+
+
+import threading
+import time as _time
+
+# 模块加载时就拿住真的 sleep：FailoverTest.run_with 会把 time.sleep 换成空操作
+# （掐掉退避），在那里面再调 time.sleep 等于没等。
+_real_sleep = _time.sleep
+
+
+def slow_tikhub_comments(delay=0.05):
+    def respond(i):
+        _real_sleep(delay)          # 让第一行「在飞」的时候第二行也到了
+        return tikhub_ok_comments()
+    return respond
+
+
+class TestClaimsAreMadeBeforeDispatch(SharingTest):
+    def setUp(self):
+        super().setUp()
+        self.settings.max_concurrency = 2
+
+    def slow_reservation(self, record_id, delay=0.1):
+        """让 record_id 那一行在**预留预算之前**慢一拍：同篇的另一行一定先跑到。
+        谁先跑到谁取的话，这时候后一行看不到它；派发前认领就不怕。"""
+        real = runner.estimate_yuan
+
+        def slow(batch, *a, **k):
+            if batch and batch[0].record_id == record_id:
+                _real_sleep(delay)
+            return real(batch, *a, **k)
+        return mock.patch.object(runner, "estimate_yuan", side_effect=slow)
+
+    def test_an_in_flight_duplicate_does_not_take_a_budget_slot(self):
+        """两行同一篇同时在飞：后一行等前一行，不另占一行预算（MAX_RECORDS_PER_RUN=1 也能刷完）。"""
+        budget = runner.RunBudget(Budget(max_records_per_run=1))
+        with self.slow_reservation("a"):
+            report = self.run_with(on_get=slow_tikhub_comments(),
+                                   on_post=lambda i: self.fail("不该降级"),
+                                   rows=[xhs("a", token="1"), xhs("b", token="2")],
+                                   budget=budget)
+        self.assertEqual([o.status for o in report.outcomes], [runner.STATUS_OK] * 2)
+        self.assertEqual(len(self.get_calls), 1)
+        self.assertEqual(budget.records, 1)
+
+    def test_a_rider_waits_for_its_due_sibling_instead_of_skipping(self):
+        due = xhs("due", checked_hours_ago=9)
+        rider = xhs("rider", checked_hours_ago=1)
+        rider.ride_along = True
+        with self.slow_reservation("due"):
+            report = self.run_with(on_get=slow_tikhub_comments(),
+                                   on_post=lambda i: self.fail("不该降级"),
+                                   rows=[due, rider])
+        self.assertEqual([o.status for o in report.outcomes], [runner.STATUS_OK] * 2)
+        self.assertEqual(len(self.get_calls), 1)
+
+    def test_when_the_claiming_row_gives_up_a_duplicate_takes_over(self):
+        """认领的那一行在冷却里（90 秒内刚刷过）：重复行自己接手、照常付钱。"""
+        cooling = xhs("cooling")
+        cooling.last_updated_ms = ms(NOW - timedelta(seconds=30))
+        report = self.run_rows([cooling, xhs("due")])
+        self.assertEqual([o.status for o in report.outcomes],
+                         [runner.STATUS_COOLDOWN, runner.STATUS_OK])
+        self.assertEqual(len(self.get_calls), 1)
+
+    def test_a_single_worker_never_waits_on_a_row_queued_behind_it(self):
+        """单线程 + 短链展开后指纹变成另一行认领的 ID：不能等那一行（它排在后面）。"""
+        self.settings.max_concurrency = 1
+        short = f"7.86 复制打开抖音 {SHORT_DY}"
+        cooling = Row("u1", short, publish_time_ms=ms(NOW - timedelta(days=1)),
+                      last_updated_ms=ms(NOW - timedelta(seconds=30)))
+        taker = Row("u2", short, publish_time_ms=ms(NOW - timedelta(days=1)))
+        by_id = Row("b", "https://www.douyin.com/video/7123456789012345678",
+                    publish_time_ms=ms(NOW - timedelta(days=1)))
+        done = {}
+
+        def go():
+            done["report"] = self.run_with(on_get=tikhub_douyin,
+                                           on_post=lambda i: self.fail("走 TikHub"),
+                                           on_expand=expand_ok,
+                                           rows=[cooling, taker, by_id])
+
+        worker = threading.Thread(target=go, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "死锁了")
+        self.assertEqual([o.status for o in done["report"].outcomes],
+                         [runner.STATUS_COOLDOWN, runner.STATUS_OK, runner.STATUS_OK])
+
+    def test_a_row_that_explodes_while_being_claimed_does_not_take_down_the_batch(self):
+        real = runner.plan_calls
+
+        def flaky(row, settings, now=None):
+            if row.record_id == "boom":
+                raise RuntimeError("坏行")
+            return real(row, settings, now)
+
+        with mock.patch.object(runner, "plan_calls", side_effect=flaky):
+            report = self.run_rows([xhs("a"), xhs("boom", note="6a8538d7000000003300c037")])
+        self.assertEqual([o.status for o in report.outcomes],
+                         [runner.STATUS_OK, runner.STATUS_FAILED])
+
+
+class TestSharedResultsCountOnceInTheBreaker(SharingTest):
+    def test_three_rows_of_one_dead_note_are_one_observation(self):
+        """一条死链登记三行：同一次上游回答，凑不满小样本熔断（≥3 行同码）的门槛。"""
+        empty_shell = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"code": 0, "success": True, "data": {
+                "comments": [], "comment_count": 0, "all_sort_strategies": [],
+                "user_id": ""}}}), "th-x")
+        report = self.run_with(on_get=lambda i: empty_shell,
+                               on_post=lambda i: self.fail("GONE 不降级"),
+                               rows=[xhs("a"), xhs("b", token="2"), xhs("c", token="3")])
+        self.assertEqual(len(self.get_calls), 1)
+        self.assertFalse(report.breaker_tripped)
+        self.assertEqual(report.breaker_attempted, 1)
+        self.assertEqual([o.status for o in report.outcomes], [runner.STATUS_SUSPECT] * 3)
+
+    def test_three_distinct_dead_notes_still_trip_it(self):
+        empty_shell = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "data": {"code": 0, "success": True, "data": {
+                "comments": [], "comment_count": 0, "all_sort_strategies": [],
+                "user_id": ""}}}), "th-x")
+        notes = [f"6a8538d{i}000000003300c037" for i in range(3)]
+        report = self.run_with(on_get=lambda i: empty_shell,
+                               on_post=lambda i: self.fail("GONE 不降级"),
+                               rows=[xhs(f"r{i}", note=n) for i, n in enumerate(notes)])
+        self.assertTrue(report.breaker_tripped)
+
+
+class TestEstimatesDedupeAcrossTables(unittest.TestCase):
+    def test_a_shared_seen_set_counts_a_note_once_across_tables(self):
+        settings = Settings()
+        seen: set = set()
+        first = rows.paying_rows([xhs("a")], settings, NOW, seen=seen)
+        second = rows.paying_rows([xhs("copy")], settings, NOW, seen=seen)
+        self.assertEqual((len(first), len(second)), (1, 0))
+
+    def test_the_panel_counts_it_once_too(self):
+        settings = Settings()
+        f = settings.fields
+        due = [{"record_id": "r", "fields": {
+            f.link: XHS_LINK, f.publish_time: ms(NOW - timedelta(days=1))}}]
+        seen: set = set()
+        one = summary.build_snapshot(label="甲", app_token="a", table_id="t1", records=due,
+                                     settings=settings, now=NOW, api_keys=KEYS, seen_calls=seen)
+        two = summary.build_snapshot(label="乙", app_token="a", table_id="t2", records=due,
+                                     settings=settings, now=NOW, api_keys=KEYS, seen_calls=seen)
+        self.assertGreater(one.due_yuan, 0)
+        self.assertEqual(two.due_yuan, 0)
+        self.assertEqual(two.due_rows, 1, "到期行数照报，只是不重复算钱")
+
+
+class TestPanelReadsTheResolvedId(unittest.TestCase):
+    def test_the_field_is_requested_and_used(self):
+        settings = Settings()
+        f = settings.fields
+        self.assertIn(f.resolved_id, summary.panel_fields(settings))
+        snap = summary.build_snapshot(
+            label="甲", app_token="a", table_id="t", settings=settings, now=NOW,
+            records=[{"record_id": "dy", "fields": {
+                f.link: SHORT_DY,
+                f.resolved_id: rows.format_resolved_id("7123456789012345678", SHORT_DY)}}])
+        self.assertEqual(snap.missing_publish_time_rows, 0, "记过作品ID的短链算得出帖龄")
+        self.assertEqual(snap.archived_rows, 1)
+
+
+class TestFlatDailyUsesTheDetailWindow(unittest.TestCase):
+    def test_only_young_xhs_posts_get_the_extra_detail(self):
+        from tools import estimate_cost
+        lean = estimate_cost.flat_daily(620, 0.7)
+        windowed = estimate_cost.flat_daily(620, 0.7, xhs_detail_posts=20 * 7 * 0.7)
+        self.assertAlmostEqual(windowed["calls_per_day"] - lean["calls_per_day"], 98)
+
+
+class TestConcurrentResumeWaitsForFreshData(unittest.TestCase):
+    def test_a_second_viewer_during_resume_gets_the_new_snapshot(self):
+        gate = threading.Event()
+        entered = threading.Event()
+        produced = []
+
+        def produce():
+            produced.append(1)
+            if len(produced) == 2:          # 第一趟是开机那趟；第二趟是恢复那趟
+                entered.set()
+                gate.wait(5)
+            return summary.Overview(projects=[], generated_at=NOW + timedelta(minutes=len(produced)))
+
+        clock = FakeClock()
+        cache = panel.Cache(produce, ttl=60, idle_seconds=600, clock=clock)
+        cache.refresh()
+        clock.now += 601
+        with cache._lock:
+            cache._paused = True
+        results = {}
+
+        def viewer(name):
+            results[name] = cache.view()[0]
+
+        first = threading.Thread(target=viewer, args=("first",), daemon=True)
+        first.start()
+        self.assertTrue(entered.wait(5))
+        second = threading.Thread(target=viewer, args=("second",), daemon=True)
+        second.start()
+        second.join(timeout=0.2)
+        self.assertTrue(second.is_alive(), "第二个请求不该拿着旧快照先走")
+        gate.set()
+        first.join(5)
+        second.join(5)
+        self.assertEqual(len(produced), 2, "并发进来的几个请求只取一趟")
+        self.assertEqual(results["first"].generated_at, results["second"].generated_at)
+        self.assertEqual(results["second"].generated_at, NOW + timedelta(minutes=2))

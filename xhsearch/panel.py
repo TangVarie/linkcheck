@@ -335,6 +335,8 @@ def collect(
     now = now or datetime.now(timezone.utc)
     projects: list[summary.ProjectSnapshot] = []
     scrub = (lambda text: railway.redact(text, secrets)) if secrets else None
+    # 跨表共用：同一篇登记在两张表里，「预计花费」只算一次（和 cron 一个口径）。
+    seen_calls: set = set()
     for label, table in tables:
         # 逐表 Settings：cron 那边 `_run_locked` 是逐表 `apply_overrides` 的。
         # 这里不跟着做，改过 归档天数 的项目会出现「面板说到期 12 行、
@@ -343,7 +345,7 @@ def collect(
         projects.append(_collect_one(
             label, table, per_table, api_keys,
             show_digest=show_digest, feishu_base=feishu_base, now=now,
-            scrub=scrub, label_column=label_column))
+            scrub=scrub, label_column=label_column, seen_calls=seen_calls))
     return summary.Overview(projects=projects, generated_at=now,
                             disabled_tables=[t for t in disabled_tables if t])
 
@@ -351,6 +353,7 @@ def collect(
 def _collect_one(label, table, settings, api_keys, *,
                  show_digest, feishu_base, now,
                  scrub: Optional[Callable[[str], str]] = None,
+                 seen_calls: Optional[set] = None,
                  label_column: str = "",
                  ) -> summary.ProjectSnapshot:
     route = getattr(table, "route", "base")
@@ -402,7 +405,7 @@ def _collect_one(label, table, settings, api_keys, *,
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
-        scrub=scrub, route=route, label_column=picked)
+        scrub=scrub, route=route, label_column=picked, seen_calls=seen_calls)
     # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
     # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
     # 缺列的情况体检那边已经在报，这里不重复。
@@ -498,11 +501,18 @@ class Cache:
             self._last_seen = self._clock()
 
     def view(self) -> tuple[Optional[summary.Overview], str, float]:
-        """给页面用的快照：记一次「有人在看」；停过的话先等一趟新的再给。"""
-        with self._lock:
+        """给页面用的快照：记一次「有人在看」；停过的话先等一趟新的再给。
+
+        停过之后同时进来好几个请求（两个人同时打开）：有人正在取就**等它**——
+        停着的时候后台不取，正在跑的那一趟一定是停过之后才开始的，就是新的；
+        没人在取才自己去取。「停过」的标记要等那一趟**取完**才清（见 refresh），
+        否则第二个请求会在第一个还没取完时拿走停之前的旧快照。
+        """
+        with self._done:
             self._last_seen = self._clock()
+            while self._paused and self._refreshing:
+                self._done.wait()
             resume = self._paused
-            self._paused = False
         if resume:
             self.refresh()
         return self.snapshot()
@@ -531,9 +541,6 @@ class Cache:
                 return
             self._refreshing = True
             self._started_at = time.monotonic()
-            # 这一趟就是「新的那一趟」：停过的标记清掉，免得紧接着的 view()
-            # 再取一遍（点「重新取数」= 先 refresh 再出页面，不该取两次）。
-            self._paused = False
         try:
             value = self._produce()
             with self._lock:
@@ -545,6 +552,9 @@ class Cache:
         finally:
             with self._done:
                 self._refreshing = False
+                # 这一趟取完了，就是「停过之后的新一趟」：清掉停过的标记，紧接着
+                # 的 view() 不再取第二遍（点「重新取数」= 先 refresh 再出页面）。
+                self._paused = False
                 self._done.notify_all()
 
     def start(self) -> None:

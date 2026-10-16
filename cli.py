@@ -537,7 +537,8 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                    budget: runner.RunBudget | None = None,
                    stop: threading.Event | None = None,
                    share: runner.FetchShare | None = None,
-                   watch: runner.ContractWatch | None = None):
+                   watch: runner.ContractWatch | None = None,
+                   estimate_seen: set | None = None):
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
@@ -639,10 +640,10 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
 
     # 帖龄未知的行：按最快档刷、而且不会归档。数量一多就是在持续多花钱，
     # 而这件事在表里一点痕迹都没有——只有把它数出来，才有人去补那一格。
-    # 「发布时间」空着、但链接 ID 里解得出发布时刻的行不算：它们已经按
-    # ID 时间分层、归档了（见 Row.publish_ms），只有两头都没有的才在空转。
+    # 「发布时间」空着、但链接 ID 里解得出时刻的行不算：它们已经按 ID 推的
+    # 保守帖龄分层、归档了（见 Row.schedule_publish_ms），两头都没有的才在空转。
     if mode in ("sweep", "estimate"):
-        blind = sum(1 for r in row_list if r.age_hours(now) is None)
+        blind = sum(1 for r in row_list if r.schedule_age_days(settings, now) is None)
         if blind:
             print(f"⚠ 这批里有 {blind} 行的「{settings.fields.publish_time}」是空的、"
                   "链接里也解不出发布时刻（短链）："
@@ -664,7 +665,9 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         found = {r.record_id for r in row_list}
 
     # 同一篇内容一轮只付一次钱、搭车的行不花钱：按真正要付钱的行估。
-    paying = rows_mod.paying_rows(row_list, settings, now)
+    # estimate_seen 跨表共用：同一篇在两张表里都到期，只算在先跑的那张表头上
+    # （cron 跨表共享 FetchShare，真花销就是这样）。
+    paying = rows_mod.paying_rows(row_list, settings, now, seen=estimate_seen)
     yuan = rows_mod.estimate_yuan(paying, settings, now, keys=api_keys)
     riders = sum(1 for r in row_list if r.ride_along)
     if len(paying) < len(row_list):
@@ -750,14 +753,14 @@ def _waste_report(rows: list, settings: Settings, now: datetime) -> list[str]:
     dup_rows = sum(len(g) for g in groups.values() if len(g) > 1)
     dup_notes = sum(1 for g in groups.values() if len(g) > 1)
     inferred = sum(1 for r in rows if r.publish_time_inferred(now))
-    blind = sum(1 for r in rows if r.age_hours(now) is None)
+    blind = sum(1 for r in rows if r.schedule_age_days(settings, now) is None)
     gone = [r for r in rows if r.refresh_status == runner.STATUS_GONE
             and r.refresh_interval_hours(settings, now) is not None]
     lines.append(f"🧮 在管 {len(rows)} 行里：")
     lines.append(f"  · 同一篇内容登记了多行：{dup_notes} 篇 / {dup_rows} 行"
                  "（同一轮只付一次钱，到期的那行会带上同篇的其它行）")
     lines.append(f"  · 「{f.publish_time}」空着：{inferred + blind} 行，"
-                 f"其中 {inferred} 行按链接 ID 推算了帖龄、照常分层归档；"
+                 f"其中 {inferred} 行按链接 ID 推了保守帖龄、照常分层归档；"
                  f"{blind} 行连 ID 也解不出（短链），按最快一档刷、不归档——这些要补发布时间")
     lines.append(f"  · 已失效、还没归档：{len(gone)} 行（退避复查，越查越慢）")
     return lines
@@ -980,6 +983,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     share = runner.FetchShare()
     # 「收了钱、回的东西认不出来」的连续次数同样跨表数，否则每张表三五行永远数不到门槛。
     watch = runner.ContractWatch(settings.safety.contract_failures_before_disable)
+    # 估算同理跨表去重，各表的「预计花费」加起来才等于真花销。
+    estimate_seen: set = set()
     stop = threading.Event()
     _install_stop_handlers(stop)
     on_event, run_id = _event_sink()
@@ -1048,7 +1053,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 code, found, row_count, yuan, prep = _refresh_table(
                     mode, record_ids, per_table, api_keys, table, now,
                     quiet_missing=multi, deadline=deadline, disabled=disabled,
-                    budget=budget, stop=stop, share=share, watch=watch)
+                    budget=budget, stop=stop, share=share, watch=watch,
+                    estimate_seen=estimate_seen)
             except feishu.FeishuError as exc:
                 # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
                 print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
