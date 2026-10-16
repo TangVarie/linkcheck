@@ -1055,10 +1055,11 @@ class TestFirstRunCap(unittest.TestCase):
 
 
 class TestBlindRowsAreCounted(unittest.TestCase):
-    """帖龄未知的行按最快档刷、而且永远不会归档——这笔账在表里一点痕迹
-    都没有，只有把它数出来才有人去补那一格。
+    """帖龄算不出来的行不巡查——它们安静地停着、表里一点痕迹都没有，
+    只有把它数出来才有人去补那一格。
 
-    （以前更糟：`is_due` 对这种行无条件返回 True，每一轮 cron 都重刷一次。）
+    （以前是按最快档一直刷、永不归档；再以前 `is_due` 对这种行无条件返回
+    True，每一轮 cron 都重刷一次。）
     """
 
     NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
@@ -1096,8 +1097,15 @@ class TestBlindRowsAreCounted(unittest.TestCase):
     def test_a_row_without_a_publish_time_is_reported(self):
         said = self._run(publish=False)
         self.assertIn("有 1 行的「发布时间」是空的", said)
-        self.assertIn("8 小时", said, "要说清楚它现在按哪一档在刷")
-        self.assertIn("永远不会归档", said)
+        self.assertIn("不巡查", said)
+        self.assertIn("补上，下一轮就开始查", said)
+
+    def test_it_is_reported_even_when_nothing_else_is_due(self):
+        """整张表都是这种行时，「没有需要刷新的行」会提前返回——
+        提示必须赶在那之前说，那正是最该说的时候。"""
+        said = self._run(publish=False)
+        self.assertIn("没有需要刷新的行", said)
+        self.assertLess(said.index("是空的"), said.index("没有需要刷新的行"))
 
     def test_a_normal_row_says_nothing(self):
         self.assertNotIn("是空的", self._run())
@@ -1108,7 +1116,7 @@ class TestBlindRowsAreCounted(unittest.TestCase):
         from xhsearch.config import Settings
         said = self._run(drop=(Settings().fields.publish_time,))
         self.assertIn("表里没有「发布时间」列", said)
-        self.assertIn("永远不会归档", said)
+        self.assertIn("一行都不会巡查", said)
 
 
 class TestEstimateSaysUnknownNotZero(unittest.TestCase):

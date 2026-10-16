@@ -1241,59 +1241,65 @@ class TestRefreshTiering(unittest.TestCase):
                        publish_time_ms=int((self.now - timedelta(days=3)).timestamp() * 1000))
         self.assertTrue(row.is_due(self.settings, self.now))
 
-    def test_unknown_publish_time_is_due(self):
-        self.assertTrue(rows.Row(record_id="r", link_cell="x").is_due(self.settings, self.now))
+    def test_unknown_publish_time_is_not_patrolled(self):
+        """发布时间空着、链接里也解不出：不巡查（Ziao 2026-10-16 拍板）。"""
+        self.assertFalse(rows.Row(record_id="r", link_cell="x").is_due(self.settings, self.now))
 
 
-class TestUnknownAgeIsNotAFreeForAll(unittest.TestCase):
-    """发布时间那一格是空的 ≠ 每一轮都重刷。
+class TestUnknownAgeIsNotPatrolled(unittest.TestCase):
+    """帖龄算不出来的行（发布时间空着、链接里也解不出 ID 时间）不自动巡查。
 
-    旧 `is_due` 在看「最近检查时间」**之前**就 `return True`，于是这种行
-    每一轮 cron（5 分钟）都重刷一次：一条小红书 288 轮/天 × ¥0.072 ≈ ¥20/天，
-    而且每一轮都占掉 MAX_RECORDS_PER_RUN 的名额，把真正到期的行顶到下一轮。
-    现在按最快的那一档兜底——「宁可多刷也别让它永远不更新」的初衷保留，
-    但有了上界。
+    这个口径改过两次：最早是「每一轮都重刷」（is_due 在看「最近检查时间」
+    之前就 return True，一条小红书一天 ¥20）；后来兜底成最快一档——有了上界，
+    但这种行永远跨不过归档线，按 8 小时一直刷、没有尽头。现在干脆不查，
+    补上发布时间才开始（Ziao 2026-10-16 拍板）。面板项目卡会数出来。
     """
 
     def setUp(self):
         self.settings = Settings()
         self.now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 
-    def _blind(self, checked_hours_ago):
-        updated = self.now - timedelta(hours=checked_hours_ago)
-        return rows.Row(record_id="r", link_cell="x",
-                        last_updated_ms=int(updated.timestamp() * 1000))
+    def _blind(self, checked_hours_ago=None):
+        updated = (None if checked_hours_ago is None else
+                   int((self.now - timedelta(hours=checked_hours_ago)).timestamp() * 1000))
+        return rows.Row(record_id="r", link_cell="http://xhslink.com/a/AbC",
+                        last_updated_ms=updated)
 
-    def test_just_checked_is_not_due_again_five_minutes_later(self):
-        self.assertFalse(self._blind(5 / 60).is_due(self.settings, self.now))
+    def test_never_checked_is_not_due(self):
+        self.assertFalse(self._blind().is_due(self.settings, self.now))
 
-    def test_still_not_due_after_seven_hours(self):
-        self.assertFalse(self._blind(7).is_due(self.settings, self.now))
+    def test_long_unchecked_is_not_due(self):
+        self.assertFalse(self._blind(9999).is_due(self.settings, self.now))
 
-    def test_due_again_after_the_fastest_tier(self):
-        self.assertTrue(self._blind(9).is_due(self.settings, self.now))
+    def test_it_has_no_interval_so_it_never_rides_along(self):
+        """搭车也看 refresh_interval_hours：不巡查的行不跟着同篇写数据。"""
+        self.assertIsNone(self._blind(9).refresh_interval_hours(self.settings, self.now))
 
-    def test_never_checked_is_still_due(self):
-        """从没刷过的行照样立刻刷——兜底的是「刷完之后多久再刷」。"""
-        self.assertTrue(rows.Row(record_id="r", link_cell="x")
-                        .is_due(self.settings, self.now))
+    def test_filling_the_publish_time_starts_it(self):
+        row = self._blind()
+        row.publish_time_ms = int((self.now - timedelta(days=1)).timestamp() * 1000)
+        self.assertTrue(row.is_due(self.settings, self.now))
 
-    def test_the_fallback_is_the_fastest_tier_not_a_hardcoded_eight(self):
-        self.settings.refresh.tiers = [(1, 4), (5, 12)]
-        self.assertEqual(self.settings.refresh.fastest_interval_hours(), 4)
-        self.assertFalse(self._blind(3).is_due(self.settings, self.now))
-        self.assertTrue(self._blind(5).is_due(self.settings, self.now))
+    def test_a_full_link_still_gets_its_age_from_the_id(self):
+        """完整链接不受影响：ID 里编着时刻，按 ID 推的保守帖龄照常巡查。"""
+        created = self.now - timedelta(days=1)
+        row = rows.Row(record_id="r", link_cell="https://www.xiaohongshu.com/explore/"
+                       + f"{int(created.timestamp()):08x}" + "0" * 16)
+        self.assertTrue(row.is_due(self.settings, self.now))
+
+    def test_never_checked_with_a_publish_time_is_due_at_once(self):
+        """从没刷过、帖龄知道的行照样立刻刷。"""
+        row = rows.Row(record_id="r", link_cell="x",
+                       publish_time_ms=int((self.now - timedelta(days=1)).timestamp() * 1000))
+        self.assertTrue(row.is_due(self.settings, self.now))
 
     def test_no_tiers_at_all_means_no_automatic_refresh(self):
         """一档都没配 = 没有任何刷新节奏可言，不能退化成「每轮都刷」。"""
         self.settings.refresh.tiers = []
         self.assertIsNone(self.settings.refresh.fastest_interval_hours())
-        self.assertFalse(self._blind(9999).is_due(self.settings, self.now))
-
-    def test_unknown_age_never_archives_so_it_keeps_costing(self):
-        """帖龄未知 = 归档也判不了。这就是 cli 要把这种行数出来的原因。"""
-        self.assertIsNotNone(
-            self._blind(9999).refresh_interval_hours(self.settings, self.now))
+        row = rows.Row(record_id="r", link_cell="x",
+                       publish_time_ms=int((self.now - timedelta(days=1)).timestamp() * 1000))
+        self.assertFalse(row.is_due(self.settings, self.now))
 
 
 class TestTierIsPinnedAtTheLastCheck(unittest.TestCase):
@@ -1673,12 +1679,13 @@ class TestRowTimestampSafety(unittest.TestCase):
         row = rows.Row(record_id="r", link_cell="x", publish_time_ms=10 ** 30)
         self.assertIsNone(row.age_hours(NOW))
         self.assertIsNone(row.age_days(NOW))
-        self.assertTrue(row.is_due(Settings(), NOW))   # 算不出年龄按「该刷」处理
+        self.assertFalse(row.is_due(Settings(), NOW))  # 算不出帖龄 = 不巡查，面板会数出来
 
     def test_absurd_last_updated_does_not_explode(self):
-        row = rows.Row(record_id="r", link_cell="x", last_updated_ms=-(10 ** 30))
+        row = rows.Row(record_id="r", link_cell="x", last_updated_ms=-(10 ** 30),
+                       publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
         self.assertFalse(row.in_cooldown(Settings(), NOW))
-        self.assertTrue(row.is_due(Settings(), NOW))
+        self.assertTrue(row.is_due(Settings(), NOW))   # 脏的「最近检查时间」不能把这一行锁死
 
     def test_future_last_updated_does_not_lock_the_row_forever(self):
         """表里的「最近检查时间」被填成未来：这一行必须还能被刷，

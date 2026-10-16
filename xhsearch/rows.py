@@ -182,7 +182,8 @@ class Row:
         """**分层和归档**用的发布时刻：表里填了就用表里的；空着就用链接 ID
         推一个**最晚可能**的发布时刻。
 
-        「发布时间」空着的行以前按最快一档（8 小时）一直刷、**永远不归档**，
+        「发布时间」空着的行以前按最快一档（8 小时）一直刷、**永远不归档**
+        （现在连 ID 也解不出的干脆不巡查，见 refresh_interval_hours），
         一条小红书一个月就是 ¥6.5，而且没有尽头。两个平台的 ID 里编着创建
         时刻（见 links.id_timestamp），但 ID 创建不等于发布：定时发布的笔记
         ID 在排期那一刻就有了，真正发出去可能晚好几天。直接拿 ID 时间当发布
@@ -287,7 +288,7 @@ class Row:
 
     def refresh_interval_hours(self, settings: Settings,
                                now: Optional[datetime] = None) -> Optional[float]:
-        """这一行现在按几小时的间隔刷；None = 已归档，不再自动刷。
+        """这一行现在按几小时的间隔刷；None = 不自动刷：已归档，或者帖龄算不出来。
 
         **档位按「上一次检查那一刻」的帖龄算，不是按此刻的帖龄算。**
         这是为了让「下次检查时间」那一列说的是真话：档位按此刻算的话，
@@ -299,15 +300,22 @@ class Row:
 
         归档仍然看**当下**的帖龄：归档就是归档，不该因为上次检查发生在
         归档线之前就再刷一轮。
+
+        **帖龄算不出来的行不自动巡查**（「发布时间」空着、链接里也解不出 ID
+        时间，比如小红书短链；Ziao 2026-10-16 拍板）。以前按最快一档兜底，
+        而这种行永远跨不过归档线——一直按 8 小时刷、一直花钱，没有尽头。
+        补上发布时间，下一轮就开始查；「排队刷新」和手动刷一行不看到期，照常管用。
+        面板项目卡「没填发布时间」数的就是这些行。
         """
+        published = _utc(self.schedule_publish_ms(settings, now))
+        if published is None:
+            return None  # 帖龄算不出来：不自动巡查
         age_now = self.schedule_age_days(settings, now)
         if age_now is not None and settings.refresh.interval_hours_for_age(age_now) is None:
             return None  # 已归档
-        published = _utc(self.schedule_publish_ms(settings, now))
         updated = _utc(self.last_updated_ms)
-        if published is None or updated is None:
-            # 帖龄不知道（发布时间空着、链接里也解不出 ID 时间），或者从没刷过：
-            # 按最快的那一档兜底。见 RefreshTiers.fastest_interval_hours。
+        if updated is None:
+            # 从没刷过：按最快的那一档（is_due 对从没刷过的行本来就判到期）。
             interval = settings.refresh.fastest_interval_hours()
         else:
             age_at_check = (updated - published).total_seconds() / 86400

@@ -591,12 +591,11 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         for problem in blockers:
             print(f"  {problem}")
     if mode in ("sweep", "estimate") and settings.fields.publish_time not in known_fields:
-        # 帖龄是分层刷新的全部依据。这一列不存在 = 全表帖龄未知 = 全表都按
-        # 最快的那一档刷、而且**永远不会归档**（归档也是按帖龄判的）。
-        # 不拒跑（拒跑等于整张表停止监控），但这笔账要在日志里说清楚。
-        print(f"⚠ 表里没有「{settings.fields.publish_time}」列：全表都算不出帖龄，"
-              f"于是每一行都按最快的一档（{_fastest_tier(settings)}）刷，"
-              "而且永远不会归档——三年前的老帖也会一直刷下去。先去建这一列。")
+        # 帖龄是分层刷新的全部依据。这一列不存在 = 只有完整链接（ID 里编着
+        # 时刻）还算得出帖龄，其余的行**一行都不巡查**（见
+        # Row.refresh_interval_hours）。不拒跑，但要在日志里说清楚。
+        print(f"⚠ 表里没有「{settings.fields.publish_time}」列：除了完整链接（按链接 ID 推时间），"
+              "别的行都算不出帖龄，一行都不会巡查。先去建这一列、把发布时间填上。")
     seen_rows: list = []
     row_list = runner.load_rows(
         table,
@@ -614,6 +613,18 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         # 三个最容易悄悄多花钱的形态，在在管的全部行上数一遍（读表不花钱）。
         for line in _waste_report(seen_rows, settings, now):
             print(line)
+    # 帖龄算不出来的行（「发布时间」空着、链接里也解不出发布时刻）**不巡查**
+    # （见 Row.refresh_interval_hours）。它们安静地停着、表里一点痕迹都没有——
+    # 只有数出来，才有人去补那一格。数的是读回来的**全部**在管行：它们永远
+    # 不会到期，在 row_list 里数永远是 0；也要赶在下面「没有需要刷新的行」
+    # 提前返回之前说，整张表都是这种行的时候才最该说。
+    if mode in ("sweep", "estimate") and not record_ids:
+        blind = sum(1 for r in seen_rows
+                    if r.monitoring and r.schedule_age_days(settings, now) is None)
+        if blind:
+            print(f"⚠ 有 {blind} 行的「{settings.fields.publish_time}」是空的、"
+                  "链接里也解不出发布时刻（短链）：算不出帖龄，不巡查。"
+                  "把发布时间补上，下一轮就开始查。")
     found = {r.record_id for r in row_list}
     if mode == "queue" and not row_list and known_fields is not None \
             and settings.fields.queued not in known_fields:
@@ -647,18 +658,6 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         if off:
             print(f"🔎 这批里有 {off} 行没开「{settings.fields.monitoring}」，"
                   "是有人主动勾了「排队刷新」要单次取数——照刷，刷完清勾。")
-
-    # 帖龄未知的行：按最快档刷、而且不会归档。数量一多就是在持续多花钱，
-    # 而这件事在表里一点痕迹都没有——只有把它数出来，才有人去补那一格。
-    # 「发布时间」空着、但链接 ID 里解得出时刻的行不算：它们已经按 ID 推的
-    # 保守帖龄分层、归档了（见 Row.schedule_publish_ms），两头都没有的才在空转。
-    if mode in ("sweep", "estimate"):
-        blind = sum(1 for r in row_list if r.schedule_age_days(settings, now) is None)
-        if blind:
-            print(f"⚠ 这批里有 {blind} 行的「{settings.fields.publish_time}」是空的、"
-                  "链接里也解不出发布时刻（短链）："
-                  f"算不出帖龄，只能按最快的一档（{_fastest_tier(settings)}）刷，"
-                  "而且永远不会归档。把发布时间补上，它们就会自动降频。")
 
     # 首轮小闸：整张表**一个**「最近检查时间」都没有 = 要么是全新表，要么是
     # 刚把这一列建出来。两种情况下每一行都判到期，一轮就是全表付费。
@@ -771,16 +770,9 @@ def _waste_report(rows: list, settings: Settings, now: datetime) -> list[str]:
                  "（同一轮只付一次钱，到期的那行会带上同篇的其它行）")
     lines.append(f"  · 「{f.publish_time}」空着：{inferred + blind} 行，"
                  f"其中 {inferred} 行按链接 ID 推了保守帖龄、照常分层归档；"
-                 f"{blind} 行连 ID 也解不出（短链），按最快一档刷、不归档——这些要补发布时间")
+                 f"{blind} 行连 ID 也解不出（短链），不巡查——补上发布时间才开始查")
     lines.append(f"  · 已失效、还没归档：{len(gone)} 行（退避复查，越查越慢）")
     return lines
-
-
-def _fastest_tier(settings: Settings) -> str:
-    """帖龄未知时兜底用的那一档，写成人话。一档都没配时说清楚是「不刷」，
-    别在提示里冒出一个 None。"""
-    hours = settings.refresh.fastest_interval_hours()
-    return "没有配任何档位，这些行不会自动刷" if hours is None else f"{hours} 小时"
 
 
 def _scheduling_blockers(settings: Settings, fields_meta: dict) -> list[str]:
