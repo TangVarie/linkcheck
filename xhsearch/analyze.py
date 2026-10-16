@@ -111,6 +111,11 @@ class Snapshot:
     # 抖音看不见作者是**平台**边界，docs/表结构.md 已经写明「这个排除等于
     # 没开」，每一行再报一次只是固定噪音。
     author_reported: bool = True
+    # 评论数是**评论接口这一页自己报的**（和评论列表出自同一个响应），还是
+    # 后来由 detail 兜底回填的。只有前者能和「这一页是空的」放在一起看：
+    # 同一个响应说「共 1 条」又一条都不给，说的是那 1 条别人看不到；
+    # detail 回填的数和评论页是两次请求，评论页空着只能说明这次没拿到。
+    count_on_page: bool = False
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -151,6 +156,32 @@ def _author_name(author: Any) -> str:
     return ""
 
 
+# 一页评论最多几条（两家通道实测整页 10 条，见 providers 里置顶那段）。
+FIRST_PAGE_SIZE = 10
+
+
+def comments_hidden(snapshot: Snapshot) -> bool:
+    """评论接口自己说「有 N 条」，N 一页就装得下，却一条都没给。
+
+    这是平台的真话，不是没拿到：那 N 条评论**别人看不到**——被删了（计数
+    还没跟上）、被折叠、在审核中，或者只有发评论的人自己看得到（小红书对
+    营销评论常这么处理）。点开链接也是一条都看不到、也没有「有评论被折叠」
+    的提示（2026-10-16 实例：评论数 1、评论区空，表里却还挂着上一轮的
+    「有负面」）。
+
+    两道闸缺一不可：
+    * 数是**这一页自己报的**（count_on_page）——detail 回填的数和评论页是两次
+      请求，评论页空着只说明这次没拿到（saw_comment_page 里那次 150 条的事故）；
+    * 数**一页装得下**——评论多到要翻页时，空页更可能是上游这一页没给，
+      不下结论。
+    """
+    count = (snapshot.top_level_comment_count
+             if snapshot.top_level_comment_count is not None
+             else snapshot.comment_count)
+    return (not snapshot.comments and snapshot.count_on_page
+            and count is not None and 0 < count <= FIRST_PAGE_SIZE)
+
+
 def saw_comment_page(snapshot: Snapshot) -> bool:
     """这一轮到底有没有**看到评论的内容**（不是「这条帖子还活着吗」）。
 
@@ -168,8 +199,12 @@ def saw_comment_page(snapshot: Snapshot) -> bool:
 
     「量到了、就是 0」和「压根没量到」的区别就在这里：前者是结论，
     后者只是没数据。
+
+    第三种也算看到了：评论接口自己说有几条、一页装得下、却一条都没给
+    （comments_hidden）——看到的就是「别人一条都看不到」。
     """
-    return bool(snapshot.comments) or snapshot.comment_count == 0
+    return (bool(snapshot.comments) or snapshot.comment_count == 0
+            or comments_hidden(snapshot))
 
 
 def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
@@ -209,9 +244,11 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
             )
 
     points = data.get("points") if isinstance(data.get("points"), dict) else {}
+    count = _int_or_none(data.get("comment_count"))
     return Snapshot(
         platform=platform,
-        comment_count=_int_or_none(data.get("comment_count")),
+        comment_count=count,
+        count_on_page=count is not None,
         top_level_comment_count=_int_or_none(data.get("top_level_comment_count")),
         comments=comments,
         points_balance=points.get("balance"),
@@ -272,6 +309,9 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat,
     这里显式提前，免得在第 7 行才看到。
     """
     if not snapshot.comments:
+        if snapshot.comment_count:
+            return (f"（评论数 {snapshot.comment_count}，但评论区一条都看不到："
+                    "被删除、被折叠、审核中，或只有发评论的人自己看得到）")
         return "（暂无评论）"
 
     hit_comment: Optional[CommentView] = None
@@ -697,6 +737,11 @@ def decide(
     ):
         verdict.notes.append("⚠ 此前已确认有置顶，本轮置顶已不在")
 
+    if comments_hidden(snapshot):
+        verdict.notes.append(
+            f"评论数 {snapshot.comment_count}，但评论区一条都看不到（被删除、被折叠、"
+            "审核中，或只有发评论的人自己看得到）→ 评论状态、负面状态按「没有可见评论」判")
+
     # —— 关键词命中：任一关键词出现在第一页任一条评论里即算命中 ——
     # 只在真的看到了评论页（有评论、或至少知道评论数）时才下结论：
     # 空壳轮（items 空 + 评论数也没拿到）写「未命中/没有显示」是拿
@@ -704,7 +749,9 @@ def decide(
     if seed_keywords and saw_comment_page(snapshot):
         verdict.seed_checked = True
         verdict.seed_hit = match_seed_keywords(snapshot, seed_keywords)
-        if verdict.seed_hit is None:
+        if verdict.seed_hit is None and not snapshot.comments:
+            verdict.notes.append("⚠ 评论区一条可见的评论都没有 → 评论没有显示")
+        elif verdict.seed_hit is None:
             verdict.notes.append(
                 f"⚠ 第一页 {len(snapshot.comments)} 条评论未命中任何关键词"
                 f"（共 {len(seed_keywords)} 个词）→ 评论没有显示"

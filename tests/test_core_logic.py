@@ -469,6 +469,61 @@ class TestNegativeKeywords(unittest.TestCase):
         self.assertEqual(analyze.negative_status_value(verdict, self.settings),
                          self.settings.negative_status.clean)
 
+    def test_a_small_count_with_an_empty_page_means_nobody_can_see_them(self):
+        """2026-10-16 实例：评论接口自己说「共 1 条」，却一条都不给；点开链接
+        也是空的、没有「有评论被折叠」的提示。表里却一直挂着上一轮的「有负面」
+        ——因为这一页被当成「没看到」，负面状态保持原样。
+
+        评论接口自己报的数、一页就装得下，却一条都不给：说的就是那几条别人
+        看不到（被删、被折叠、审核中、只有发评论的人自己看得到）。按「没有
+        可见评论」判：负面清掉、我们种的评论算「没有显示」、置顶算掉了。
+        """
+        snap = analyze.read_comment_page(
+            "xhs", {"items": [], "comment_count": 1, "top_level_comment_count": 1})
+        self.assertTrue(analyze.comments_hidden(snap))
+        self.assertTrue(analyze.saw_comment_page(snap))
+
+        verdict = self.decide(snap, seed_keywords=["领券"], negative_keywords=["过敏"])
+        self.assertTrue(verdict.negative_checked)
+        self.assertEqual(analyze.negative_status_value(verdict, self.settings),
+                         self.settings.negative_status.clean)
+        self.assertTrue(verdict.seed_checked)
+        self.assertEqual(analyze.comment_status_value(verdict, self.settings),
+                         self.settings.comment_status.not_displayed)
+        self.assertTrue(verdict.pin_checked)
+        notes = "；".join(verdict.notes)
+        self.assertIn("评论数 1，但评论区一条都看不到", notes)
+        self.assertIn("评论区一条可见的评论都没有 → 评论没有显示", notes)
+        self.assertNotIn("本轮未取到评论页内容", notes)
+        self.assertIn("评论数 1，但评论区一条都看不到",
+                      analyze.format_digest(snap, self.settings.digest),
+                      "评论区快照不能写「暂无评论」——那和真的 0 条分不开")
+
+    def test_the_top_level_count_decides_whether_it_fits_on_one_page(self):
+        """总数含楼中楼：12 条里只有 3 条一级评论，一页照样装得下。"""
+        snap = analyze.read_comment_page(
+            "xhs", {"items": [], "comment_count": 12, "top_level_comment_count": 3})
+        self.assertTrue(analyze.comments_hidden(snap))
+
+    def test_an_empty_page_on_a_post_that_needs_paging_is_still_not_a_verdict(self):
+        """评论多到要翻页时，空页更可能是上游这一页没给——照旧不下结论。"""
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 11})
+        self.assertFalse(analyze.comments_hidden(snap))
+        self.assertFalse(analyze.saw_comment_page(snap))
+        verdict = self.decide(snap, negative_keywords=["过敏"])
+        self.assertFalse(verdict.negative_checked)
+        self.assertIn("本轮未取到评论页内容，负面词判定保持原样", verdict.notes)
+
+    def test_a_count_backfilled_from_detail_is_never_read_as_hidden(self):
+        """数是 detail 补的（两次请求），评论页空着只说明这次没拿到——
+        哪怕数小到一页装得下，也不能当成「别人看不到」。"""
+        snap = analyze.read_comment_page("xhs", {"items": []})
+        analyze.merge_detail(snap, {"comment_count": 1, "like_count": 9})
+        self.assertEqual(snap.comment_count, 1)
+        self.assertFalse(snap.count_on_page)
+        self.assertFalse(analyze.comments_hidden(snap))
+        self.assertFalse(analyze.saw_comment_page(snap))
+
     def test_negative_and_seed_keywords_are_independent(self):
         """两列查的是相反的东西，互不干扰：我们的评论显示出来了，
         底下同时有人骂——这两件事都要如实写出来。"""

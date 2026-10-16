@@ -830,3 +830,31 @@ class TestSocialDataXShapeIsFailClosed(FailoverTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCommentsNobodyCanSee(FailoverTest):
+    """2026-10-16 实例走一遍真的巡查路径：评论接口说「共 1 条」、列表是空的、
+    笔记活着（有作者、有排序策略）。表里挂着上一轮的「有负面」。"""
+
+    def test_the_stale_negative_status_is_cleared(self):
+        from dataclasses import replace
+        f = self.settings.fields
+        row = replace(xhs_row(age_days=5), negative_keywords=["过敏"],
+                      seed_keywords=["领券"])
+        self.settings.detail_within_days = 0
+        hidden = transport.Response(200, "application/json", json.dumps({
+            "code": 200, "request_id": "th-1", "data": {"code": 0, "success": True, "data": {
+                "comments": [], "comment_count": 1, "comment_count_l1": 1,
+                "all_sort_strategies": [{"type": "default"}], "user_id": "u9"}}}), "th-1")
+        report = self.run_with(on_get=lambda i: hidden,
+                               on_post=lambda i: self.fail("评论接口好好的，不该降级"),
+                               rows=[row])
+        [outcome] = report.outcomes
+        self.assertEqual(outcome.fields[f.negative_status],
+                         self.settings.negative_status.clean)
+        self.assertEqual(outcome.fields[f.negative_digest], "（未命中）")
+        self.assertEqual(outcome.fields[f.comment_status],
+                         self.settings.comment_status.not_displayed)
+        self.assertIn("一条都看不到", outcome.fields[f.comment_digest])
+        self.assertIn("评论数 1，但评论区一条都看不到", outcome.fields[f.failure_reason])
+        self.assertNotIn("本轮未取到评论页内容", outcome.fields[f.failure_reason])
