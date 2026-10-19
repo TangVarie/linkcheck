@@ -155,5 +155,71 @@ class TestSettingsStore(unittest.TestCase):
             store.set_json("some.key", [])
 
 
+class TestUpdateJson(unittest.TestCase):
+    """读-改-写：「已解决」两个人同时点，不能互相覆盖。"""
+
+    TABLES = [{"table_id": "tblOLD", "name": panel_settings.TABLE_NAME}]
+
+    def _store(self, bitable, log=None):
+        workspace = mock.Mock()
+        workspace.list_tables.return_value = self.TABLES
+        return panel_settings.SettingsStore(
+            workspace, lambda a, t: bitable, "bascnREG",
+            log=log or (lambda *a: None), clock=lambda: 0.0)
+
+    def test_missing_key_starts_from_the_default_and_creates_the_row(self):
+        bitable = FakeBitable()
+        store = self._store(bitable)
+        out = store.update_json("todo.resolved", lambda cur: {**cur, "a": 1}, {})
+        self.assertEqual(out, {"a": 1})
+        self.assertEqual(len(bitable.created), 1)
+        self.assertEqual(store.get_json("todo.resolved", {}), {"a": 1})
+
+    def test_it_changes_what_is_stored_now_not_a_stale_cache(self):
+        bitable = FakeBitable([row("rec1", "todo.resolved", '{"a": 1}')])
+        store = self._store(bitable)
+        self.assertEqual(store.get_json("todo.resolved", {}), {"a": 1})   # 进了缓存
+        # 另一处（人在飞书里手改）把值改了；缓存还没过期
+        bitable.rows[0]["fields"][panel_settings.COL_VALUE] = '{"a": 1, "b": 2}'
+        out = store.update_json("todo.resolved", lambda cur: {**cur, "c": 3}, {})
+        self.assertEqual(out, {"a": 1, "b": 2, "c": 3})
+        self.assertEqual(bitable.updated[0]["record_id"], "rec1")
+        self.assertEqual(bitable.created, [])
+
+    def test_a_broken_value_is_replaced_from_the_default(self):
+        bitable = FakeBitable([row("rec1", "todo.resolved", "{not json")])
+        out = self._store(bitable).update_json("todo.resolved", lambda cur: {**cur, "x": 1}, {})
+        self.assertEqual(out, {"x": 1})
+
+    def test_two_concurrent_updates_both_land(self):
+        import threading
+        import time as time_mod
+
+        bitable = FakeBitable([row("rec1", "todo.resolved", "{}")])
+        real_search = bitable.search
+        def slow_search(*a, **k):
+            time_mod.sleep(0.02)          # 放大「读到」和「写回」之间的窗口
+            return real_search(*a, **k)
+        bitable.search = slow_search
+        store = self._store(bitable)
+        threads = [threading.Thread(target=store.update_json,
+                                    args=("todo.resolved", (lambda k: lambda cur: {**cur, k: 1})(f"k{i}"), {}))
+                   for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(json.loads(bitable.rows[0]["fields"][panel_settings.COL_VALUE]),
+                         {"k0": 1, "k1": 1}, "后一个人的改动把前一个盖掉了")
+
+    def test_the_log_does_not_dump_the_whole_value(self):
+        lines = []
+        store = self._store(FakeBitable(), log=lines.append)
+        store.update_json("todo.resolved", lambda cur: {"tblA/rec1": {"reasons": ["有负面"]}}, {})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("todo.resolved", lines[0])
+        self.assertNotIn("rec1", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()
