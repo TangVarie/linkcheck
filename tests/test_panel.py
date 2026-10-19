@@ -53,7 +53,21 @@ class FakeTable:
             raise self._search_error
         self.searched_fields = list(field_names)
         self.searched_filter = filter_spec
-        return self._records
+        # 照飞书的样子交回「是否巡查」：勾着的是 True；**没勾的这一格干脆不返回**。
+        # 用例里没写这一格的行当成在管的（以前面板按「是否巡查」筛，交回来的
+        # 都是在管的行）；要造一行没勾的，写 `是否巡查: False`。
+        monitoring = Settings().fields.monitoring
+        if not self._meta or monitoring not in self._meta:
+            return self._records
+        out = []
+        for record in self._records:
+            cells = dict(record.get("fields") or {})
+            if cells.get(monitoring) is False:
+                del cells[monitoring]
+            else:
+                cells.setdefault(monitoring, True)
+            out.append({**record, "fields": cells})
+        return out
 
 
 def healthy_meta(settings=None):
@@ -360,12 +374,20 @@ class TestCollect(unittest.TestCase):
         self.assertNotIn(settings.fields.negative_status, table.searched_fields)
         self.assertIn(settings.fields.link, table.searched_fields)
 
-    def test_filters_to_monitored_rows(self):
+    def test_counts_only_monitored_rows(self):
+        """一次读回整张表（不按「是否巡查」筛），在面板这边分：没勾的行不进
+        任何数字。飞书对没勾的复选框**不返回这一格**——不能拿「这一格不在」
+        当在管（Row.monitoring 就是这么默认的）。"""
         settings = Settings()
-        table = FakeTable(healthy_meta(settings), [])
-        panel.collect([("A", table)], settings, {}, now=NOW)
-        self.assertEqual(table.searched_filter["conditions"][0]["field_name"],
-                         settings.fields.monitoring)
+        f = settings.fields
+        link = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b"
+        table = FakeTable(healthy_meta(settings), [
+            {"record_id": "on", "fields": {f.link: link}},
+            {"record_id": "off", "fields": {f.link: link, f.monitoring: False}},
+        ])
+        overview = panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertIsNone(table.searched_filter)
+        self.assertEqual(overview.projects[0].total_rows, 1)
 
     def test_missing_monitoring_column_is_flagged_not_silently_ignored(self):
         """没法过滤在管的行，下面每个数字都包含了本该排除的行——
@@ -812,6 +834,7 @@ class TestOverHttp(unittest.TestCase):
             def search(self, fields, *, filter_spec=None, **kwargs):
                 return [{"record_id": "r1", "fields": {
                     settings.fields.link: "https://www.xiaohongshu.com/explore/aa",
+                    settings.fields.monitoring: True,
                     settings.fields.traffic_status: ["风控中"],
                     settings.fields.failure_reason: "1006 内容被限制",
                 }}]
@@ -1205,7 +1228,8 @@ class TestUnknownEstimateIsNotZero(unittest.TestCase):
 
             def search(self, fields, *, filter_spec=None, **kwargs):
                 return [{"record_id": "r1", "fields": {
-                    settings.fields.link: "https://www.xiaohongshu.com/explore/aa"}}]
+                    settings.fields.link: "https://www.xiaohongshu.com/explore/aa",
+                    settings.fields.monitoring: True}}]
 
         return panel.collect([("A", Table())], settings, {}, now=NOW).projects[0]
 
@@ -2585,3 +2609,106 @@ class TestChannelOutageOnThePage(unittest.TestCase):
         self.assertIn("发不出请求了", html)
         # 另一家照常是白卡
         self.assertIn("8520 积分", html)
+
+
+# ---------------------------------------------------------------- 不在主列表里的异常
+
+class TestAdhocAndArchivedSections(unittest.TestCase):
+    """两件事：
+    * 没勾「是否巡查」、勾了「排队刷新」临时查出问题的行，以前在面板上一个字都
+      看不到（面板只读在管的行）——现在单独一区；
+    * 「已归档的老帖」那一区以前是一行灰色小字，看不到——现在按项目分组、常开。
+    """
+
+    LINK = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b"
+
+    def setUp(self):
+        self.settings = Settings()
+        self.f = self.settings.fields
+
+    def _rec(self, rid, *, checked_hours_ago, tags=("风控中",), monitored=False, **cells):
+        f = self.f
+        fields = {f.link: self.LINK, f.traffic_status: list(tags),
+                  f.last_updated: int((NOW - timedelta(hours=checked_hours_ago))
+                                      .timestamp() * 1000), **cells}
+        if not monitored:
+            fields[f.monitoring] = False
+        return {"record_id": rid, "fields": fields}
+
+    def test_only_recent_problems_count(self):
+        records = [
+            self._rec("fresh", checked_hours_ago=2),
+            self._rec("old", checked_hours_ago=30),                 # 窗口外
+            self._rec("fine", checked_hours_ago=2, tags=()),        # 没问题
+            {"record_id": "never", "fields": {self.f.link: self.LINK,
+                                              self.f.traffic_status: ["风控中"]}},
+        ]
+        got = summary.adhoc_todos(label="A", app_token="t", table_id="tb",
+                                  records=records, settings=self.settings, now=NOW)
+        self.assertEqual([t.record_id for t in got], ["fresh"])
+        self.assertTrue(got[0].adhoc)
+        self.assertNotIn("卡住了", got[0].reasons, "没勾巡查的行本来就不自动刷")
+
+    def test_the_panel_reads_them_but_keeps_them_out_of_every_number(self):
+        table = FakeTable(healthy_meta(self.settings), [
+            # 发布时间要填：这个 note_id 解出来在 2024 年，空着就按 ID 推成已归档。
+            self._rec("watched", checked_hours_ago=2, monitored=True,
+                      **{self.f.publish_time: int((NOW - timedelta(days=2)).timestamp() * 1000)}),
+            self._rec("adhoc", checked_hours_ago=2),
+        ])
+        overview = panel.collect([("A", table)], self.settings, {}, now=NOW)
+        project = overview.projects[0]
+        self.assertEqual(project.total_rows, 1)
+        self.assertEqual([t.record_id for t in project.todos], ["watched"])
+        self.assertEqual([t.record_id for t in overview.adhoc_todos()], ["adhoc"])
+        self.assertEqual([t.record_id for t in overview.todos()], ["watched"],
+                         "主列表和批量勾选里不能有它")
+
+    def _todo(self, rid, project, *, archived=False, adhoc=False, reasons=("风控中",),
+              diagnosis=""):
+        return summary.TodoRow(record_id=rid, project=project,
+                               record_url=f"https://x/{rid}", link_cell=self.LINK,
+                               label=f"帖子{rid}", archived=archived, adhoc=adhoc,
+                               reasons=list(reasons), diagnosis=diagnosis,
+                               checked_at_ms=int(NOW.timestamp() * 1000))
+
+    def _page(self, projects):
+        overview = summary.Overview(projects=projects, generated_at=NOW)
+        return panel_view.overview_page(overview=overview, error="",
+                                        fetched_at=NOW.timestamp(), config=config(),
+                                        csrf="tok")
+
+    def test_the_sections_are_grouped_by_project_and_visible(self):
+        a = summary.ProjectSnapshot(label="途鸽", app_token="t", table_id="a", todos=[
+            self._todo("a1", "途鸽", archived=True),
+            self._todo("a2", "途鸽", archived=True, reasons=("有负面",))])
+        b = summary.ProjectSnapshot(label="西屋", app_token="t", table_id="b", todos=[
+            self._todo("b1", "西屋", archived=True)],
+            adhoc_todos=[self._todo("b2", "西屋", adhoc=True, reasons=("有负面",))])
+        page = self._page([a, b])
+        side = page[page.index("id=s-side"):page.index("id=s-proj")]
+        self.assertIn("不在主列表里的异常", side)
+        self.assertIn("已归档的老帖", side)
+        self.assertIn("没勾巡查、最近 24 小时临时查过的", side)
+        self.assertEqual(side.count("class=side-block"), 2)
+        self.assertEqual(side.count("<details class=side-proj"), 3,
+                         "归档区两个项目各一组，临时查过区一组")
+        self.assertIn("<b>途鸽</b><span class=cnt>2 行</span>", side)
+        self.assertIn("有负面 1", side, "组头写着这个项目各是什么问题")
+        self.assertNotIn("type=checkbox", side, "这两区不在批量勾选的范围里")
+        self.assertIn("其他异常", page[:page.index("<div class=main>")],
+                      "侧栏有入口，带条数")
+
+    def test_nothing_to_show_takes_no_space(self):
+        page = self._page([summary.ProjectSnapshot(label="A", app_token="t", table_id="a")])
+        self.assertNotIn("id=s-side", page)
+        self.assertNotIn("其他异常", page)
+
+    def test_text_from_feishu_is_escaped(self):
+        p = summary.ProjectSnapshot(label="<b>x</b>", app_token="t", table_id="a",
+                                    adhoc_todos=[self._todo("r", "<b>x</b>", adhoc=True,
+                                                            diagnosis="<script>1</script>")])
+        page = self._page([p])
+        side = page[page.index("id=s-side"):page.index("id=s-proj")]
+        self.assertNotIn("<script>1</script>", side)
+        self.assertNotIn("<b><b>x</b></b>", side)

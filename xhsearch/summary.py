@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from . import feishu, links, rows as rows_mod, runner
@@ -49,6 +49,10 @@ class TodoRow:
     # 面板默认**不把它们混进主待办列表**：批量勾选会绕过归档线，
     # 而面板恰好把跨表的老旧失效行摆在一屏、天然鼓励全选。
     archived: bool = False
+    # 没勾「是否巡查」、但最近 ADHOC_WINDOW_HOURS 小时里被查过（多半是有人勾了
+    # 「排队刷新」临时查一下）的行。和已归档一样单独一区、不进批量勾选：
+    # 没勾巡查是运营说了「这行别管了」，全选重刷等于替人改了主意。
+    adhoc: bool = False
     reasons: list[str] = field(default_factory=list)
     refresh_status: str = ""
     diagnosis: str = ""
@@ -131,6 +135,9 @@ class ProjectSnapshot:
     rows_without_negative_keyword: list[str] = field(default_factory=list)
 
     todos: list[TodoRow] = field(default_factory=list)
+    # 没勾「是否巡查」、最近被临时查过、查出了问题的行（见 TodoRow.adhoc）。
+    # 不进 todos、不进任何计数——这张卡上的数字只说在管的行。
+    adhoc_todos: list[TodoRow] = field(default_factory=list)
     # 按 max_todos 截掉了多少条。**必须显示出来**：把截断后的长度当成精确的
     # 「要人管」行数报出去，等于在大面积事故的时候少报，而那正是最不该少报
     # 的时候。0 = 一条没丢，那个计数就是精确的。
@@ -392,30 +399,11 @@ def build_snapshot(
             # 记录顺序截，一次大面积事故就能用低优先级的「卡住了」占满前
             # max_todos 格，把后面的 风控中/已失效/刷新失败 整个藏掉。
             # 待办只是异常行，records 本来就整份在内存里，全收不多占什么。
-            todos.append(TodoRow(
-                archived=archived,
-                record_id=row.record_id,
-                project=label,
-                record_url=record_url(feishu_base, app_token, table_id,
-                                      row.record_id, route=route),
-                app_token=app_token,
-                table_id=table_id,
-                link_cell=row.link_cell,
-                label=clean(row_label(row, cells, settings, label_column)),
-                reasons=reasons,
-                refresh_status=refresh_status,
-                diagnosis=clean(feishu.read_text(cells.get(f.failure_reason))),
-                comment_count=row.previous_comment_count,
-                traffic_tags=list(row.current_tags),
-                seed_keywords=list(row.seed_keywords),
-                negative_keywords=list(row.negative_keywords),
-                checked_at_ms=row.last_updated_ms,
-                queued=row.queued,
-                digest=(clean(feishu.read_text(cells.get(f.comment_digest)))
-                        if show_digest else ""),
-                negative_digest=(clean(feishu.read_text(cells.get(f.negative_digest)))
-                                 if show_digest else ""),
-            ))
+            todos.append(_make_todo(
+                row, cells, settings, reasons=reasons, refresh_status=refresh_status,
+                project=label, app_token=app_token, table_id=table_id,
+                feishu_base=feishu_base, route=route, label_column=label_column,
+                show_digest=show_digest, clean=clean, archived=archived))
 
     snap.due_rows = len(due)
     if due:
@@ -436,6 +424,90 @@ _REASON_RANK = {
     "风控中": 0, "已失效": 1, "刷新失败": 2, "有负面": 3,
     "疑似限流": 4, "卡住了": 5, "置顶掉了": 6, "需重新整理": 7, "疑似受限": 8,
 }
+
+
+def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
+               reasons: list[str], refresh_status: str, project: str,
+               app_token: str, table_id: str, feishu_base: str, route: str,
+               label_column: str, show_digest: bool, clean,
+               archived: bool = False, adhoc: bool = False) -> TodoRow:
+    f = settings.fields
+    return TodoRow(
+        archived=archived,
+        adhoc=adhoc,
+        record_id=row.record_id,
+        project=project,
+        record_url=record_url(feishu_base, app_token, table_id,
+                              row.record_id, route=route),
+        app_token=app_token,
+        table_id=table_id,
+        link_cell=row.link_cell,
+        label=clean(row_label(row, cells, settings, label_column)),
+        reasons=reasons,
+        refresh_status=refresh_status,
+        diagnosis=clean(feishu.read_text(cells.get(f.failure_reason))),
+        comment_count=row.previous_comment_count,
+        traffic_tags=list(row.current_tags),
+        seed_keywords=list(row.seed_keywords),
+        negative_keywords=list(row.negative_keywords),
+        checked_at_ms=row.last_updated_ms,
+        queued=row.queued,
+        digest=(clean(feishu.read_text(cells.get(f.comment_digest)))
+                if show_digest else ""),
+        negative_digest=(clean(feishu.read_text(cells.get(f.negative_digest)))
+                         if show_digest else ""),
+    )
+
+
+# 没勾巡查的行，最近多少小时里查过才算「临时查过」、值得上面板。
+ADHOC_WINDOW_HOURS = 24
+
+
+def adhoc_todos(
+    *,
+    label: str,
+    app_token: str,
+    table_id: str,
+    records: list[dict[str, Any]],
+    settings: Settings,
+    now: Optional[datetime] = None,
+    feishu_base: str = "https://feishu.cn",
+    show_digest: bool = False,
+    max_todos: int = 200,
+    scrub: Optional[Any] = None,
+    route: str = "base",
+    label_column: str = "",
+) -> list[TodoRow]:
+    """**没勾「是否巡查」**的行里，最近 ADHOC_WINDOW_HOURS 小时被查过、而且
+    查出了问题的那些。
+
+    「排队刷新」不看「是否巡查」（见 runner.load_rows）：结案的表里想临时查
+    一行，勾上排队就会刷。以前刷出来的问题只落在飞书那一行里，面板只读在管的
+    行，一个字都看不到。窗口之外的不算——那是很久以前查的，早就不是「刚查出来」。
+    「卡住了」不判：没勾巡查的行本来就不自动刷，谈不上卡住。
+    """
+    now = now or datetime.now(timezone.utc)
+    clean = scrub or (lambda text: text)
+    f = settings.fields
+    since_ms = int((now - timedelta(hours=ADHOC_WINDOW_HOURS)).timestamp() * 1000)
+    out: list[TodoRow] = []
+    for record in records:
+        cells = record.get("fields") or {}
+        row = runner.row_from_record(record, settings)
+        if row.last_updated_ms is None or row.last_updated_ms < since_ms:
+            continue
+        refresh_status = feishu.read_text(cells.get(f.refresh_status))
+        reasons = _todo_reasons(
+            row, settings, refresh_status=refresh_status,
+            negative_status=feishu.read_text(cells.get(f.negative_status)), stale=False)
+        if reasons:
+            out.append(_make_todo(
+                row, cells, settings, reasons=reasons, refresh_status=refresh_status,
+                project=label, app_token=app_token, table_id=table_id,
+                feishu_base=feishu_base, route=route, label_column=label_column,
+                show_digest=show_digest, clean=clean, adhoc=True))
+    out.sort(key=_todo_sort_key)
+    return out[:max_todos]
 
 
 def _todo_sort_key(todo: TodoRow) -> tuple:
@@ -552,6 +624,12 @@ class Overview:
     def archived_todos(self, limit: int = 200) -> list[TodoRow]:
         """已归档但仍有异常的行。单独一区，重刷要另外确认。"""
         merged = [t for p in self.projects for t in p.todos if t.archived]
+        merged.sort(key=_todo_sort_key)
+        return merged[:limit]
+
+    def adhoc_todos(self, limit: int = 200) -> list[TodoRow]:
+        """没勾巡查、最近临时查过、查出了问题的行。单独一区，同上。"""
+        merged = [t for p in self.projects for t in p.adhoc_todos]
         merged.sort(key=_todo_sort_key)
         return merged[:limit]
 

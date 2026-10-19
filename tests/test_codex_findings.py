@@ -215,7 +215,10 @@ class TestPanelUsesPerTableSettings(unittest.TestCase):
                     for c in self._columns}
 
         def search(self, field_names, **kwargs):
-            return self._records
+            # 飞书对勾着的复选框交回 True（面板一次读整表、自己分在管不在管）。
+            monitoring = Settings().fields.monitoring
+            return [{**r, "fields": {**r["fields"], monitoring: True}}
+                    for r in self._records]
 
     def _tables(self):
         settings = Settings()

@@ -379,6 +379,22 @@ code{background:var(--fill);padding:2px 6px;font-size:13px;
   font-family:var(--font-num)}
 details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
   padding:8px 0}
+/* ---------- 不在主列表里的异常：两块提示区，块内按项目分组 ----------
+ * 以前是一行灰色小字的折叠条，运营根本看不到。现在每块是一个常开的
+ * 提示区（警示色左边线 + 标题 + 行数徽标），里面每个项目一组，组头
+ * 就写着这个项目几行、各是什么问题，点开才是明细表。 */
+.side-block{background:var(--surface);border:1px solid var(--border);
+  border-left:3px solid var(--warning);padding:14px 16px;margin:16px 0}
+.side-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  font-size:15px;font-weight:600;color:var(--text-dark)}
+.side-head .icon{color:var(--warning-deep)}
+.side-why{font-size:13px;color:var(--text-light);margin:6px 0 8px;line-height:1.55}
+.side-proj{border-top:1px solid var(--border)}
+.side-proj>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  font-size:14px;color:var(--text-dark);padding:10px 0}
+.side-proj>summary b{font-weight:600}
+.side-proj>summary .cnt{color:var(--warning-deep);font-weight:600}
+.side-proj .tablewrap{margin:0 0 12px}
 #projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
 @media (max-width:900px){
   .app{grid-template-columns:minmax(0,1fr)}
@@ -1231,34 +1247,76 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
             f"{''.join(panels)}</div>")
 
 
-def _archived_section(todos, offset_hours: float, show_digest: bool) -> str:
-    """已归档但仍有异常的行。**折叠着，而且不在批量勾选的范围里。**
-
-    「排队刷新」会绕过归档线——把这些老帖混进主列表，再配一个「全选」，
-    就是一次把钱花在几个月前的内容上。它们大多数时候的正确处置是
-    「取消巡查」，不是「重新刷新」。
-    """
-    if not todos:
-        return ""
+def _side_group(project: str, todos, offset_hours: float, *, open_: bool) -> str:
+    """一个项目的那几行：组头写清几行、各是什么问题，点开是明细。"""
+    counts: dict = {}
+    for todo in todos:
+        for reason in todo.reasons:
+            counts[reason] = counts.get(reason, 0) + 1
     rows = "".join(
         "<tr>"
-        f"<td class=nowrap>{_e(t.project)}</td>"
         f"<td class=which title='{_e(t.label)}'>{_e(_clip(t.label))}</td>"
         f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
         f"<td>{_e(t.diagnosis) or '<span class=muted>—</span>'}</td>"
+        f"<td class=nowrap>{_e(_stamp(t.checked_at_ms, offset_hours))}</td>"
         f"<td class=nowrap><a href='{_e(t.record_url)}' target=_blank "
         "rel='noopener noreferrer' class=act>去这一行</a></td></tr>"
         for t in todos)
-    return f"""<details style='margin-top:12px'>
-  <summary class=muted style='cursor:pointer'>还有 {len(todos)} 行已归档的老帖也有异常
-    （不在上面的列表和批量勾选里）</summary>
-  <div class=note>{_icon('alert-triangle')}<span>这些帖子已经超过归档天数、
-    不再自动刷了。「排队刷新」会<b>绕过归档线</b>，所以它们刻意不混进上面那一屏——
-    多数时候正确的处置是去飞书<b>取消巡查</b>，而不是再花钱刷一次。</span></div>
-  <div class=tablewrap><table>
-  <thead><tr><th>项目</th><th>哪一条</th><th>为什么</th><th>诊断信息</th><th></th></tr></thead>
-  <tbody>{rows}</tbody></table></div>
-</details>"""
+    return (f"<details class=side-proj{' open' if open_ else ''}>"
+            f"<summary><b>{_e(project)}</b><span class=cnt>{len(todos)} 行</span>"
+            f"{_counts_chips(counts)}</summary>"
+            "<div class=tablewrap><table><thead><tr><th>哪一条</th><th>为什么</th>"
+            "<th>诊断信息</th><th>最近检查</th><th></th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div></details>")
+
+
+def _side_block(todos, *, icon: str, title: str, why: str, offset_hours: float,
+                project_order=()) -> str:
+    """一块「不在主列表里」的异常，按项目分组。项目顺序跟上面的标签一致。"""
+    if not todos:
+        return ""
+    by_project: dict = {}
+    for todo in todos:
+        by_project.setdefault(todo.project, []).append(todo)
+    order = [p for p in project_order if p in by_project]
+    order += sorted(p for p in by_project if p not in order)
+    # 行少的时候直接摊开，一眼看完；多了就收起来，只看组头的数。
+    open_ = len(todos) <= 5
+    groups = "".join(_side_group(p, by_project[p], offset_hours, open_=open_)
+                     for p in order)
+    return (f"<div class=side-block><div class=side-head>{_icon(icon)}"
+            f"<span>{_e(title)}</span><span class='chip a'>{len(todos)} 行</span>"
+            f"<span class='chip'>{len(order)} 个项目</span></div>"
+            f"<p class=side-why>{why}</p>{groups}</div>")
+
+
+def _side_sections(archived, adhoc, offset_hours: float, project_order=()) -> str:
+    """主列表之外、同样查出了问题的行。**不在批量勾选的范围里。**
+
+    两种都不该一键重刷：
+    * 已归档的老帖——「排队刷新」会绕过归档线，全选就是把钱花在几个月前的内容上，
+      多数时候正确的处置是去飞书**取消巡查**；
+    * 没勾巡查、刚被临时查过的——没勾巡查是运营说了「这行别管了」，有人勾排队
+      临时查了一下、查出了问题，要人去看的是那一行，不是再全选刷一遍。
+    """
+    if not archived and not adhoc:
+        return ""
+    blocks = _side_block(
+        adhoc, icon="history", title="没勾巡查、最近 24 小时临时查过的",
+        why="这些行没勾「是否巡查」，是有人勾了「排队刷新」临时查了一下（或者刚取消"
+            "巡查），查出了下面的问题。面板平时只统计勾着巡查的行，所以单独放在这里；"
+            "要继续盯着就去飞书把「是否巡查」勾上。",
+        offset_hours=offset_hours, project_order=project_order)
+    blocks += _side_block(
+        archived, icon="inbox", title="已归档的老帖",
+        why="超过归档天数、不再自动刷的帖子，问题会一直挂到有人处理。「排队刷新」会"
+            "<b>绕过归档线</b>，所以它们不在上面的列表和批量勾选里——多数时候正确的"
+            "处置是去飞书<b>取消巡查</b>，而不是再花钱刷一次。",
+        offset_hours=offset_hours, project_order=project_order)
+    total = len(archived) + len(adhoc)
+    return (f"<h2 id=s-side>不在主列表里的异常 <span class=n>{total}</span></h2>"
+            "<p class=sub>下面这些行同样查出了问题，但不该一键重刷，所以不在上面的列表和"
+            "批量勾选里。按项目分组，点项目名展开明细。</p>" + blocks)
 
 
 def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
@@ -1675,6 +1733,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     nav = _sidebar_nav(
         # 侧栏那个数字和 KPI 走同一个口径：截断了就带 `+`，不装成精确值。
         todos=f"{len(todos)}" + ("+" if todos_hidden else ""),
+        side=len(overview.archived_todos()) + len(overview.adhoc_todos()),
         projects=len(projects), runs=len(runs or []),
         # 余额整块读失败时 `_balance_section` 仍然渲染一个 id=s-balance 的
         # 错误区块——侧栏这边也得有入口，否则「余额出事了」这个信息恰好在
@@ -1711,7 +1770,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
       点「去这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做。{hidden_note}</p>
     {_todo_table(todos, offset_hours, config.show_digest,
                  project_order=[p.label for p in projects])}
-    {_archived_section(overview.archived_todos(), offset_hours, config.show_digest)}
+    {_side_sections(overview.archived_todos(), overview.adhoc_todos(), offset_hours,
+                    project_order=[p.label for p in projects])}
 
     <h2 id=s-proj>各项目 <span class=n>{len(projects)}</span></h2>
     {empty_note}{disabled_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
@@ -1728,7 +1788,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
 
 def _sidebar_nav(*, todos, projects: int, runs: int,
-                 balances: bool) -> str:
+                 balances: bool, side: int = 0) -> str:
     """侧栏导航。导航项高 40、图标 20 + 文字 14/500，激活 = 雾蓝底 + 蓝字。
 
     带上每一项的条数：侧栏在这个面板里不只是跳转，它是**第二处**告诉你
@@ -1736,6 +1796,11 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
     """
     items = [
         ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
+    ]
+    if side:
+        # 主列表之外的异常（已归档 / 没勾巡查临时查过的），有才出现。
+        items.append(("s-side", "alert-triangle", "其他异常", str(side)))
+    items += [
         ("s-proj", "layout-grid", "各项目", str(projects)),
         ("s-manage", "folder", "加表 / 改配置", ""),
     ]

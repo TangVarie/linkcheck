@@ -392,22 +392,38 @@ def _collect_one(label, table, settings, api_keys, *,
                   settings, show_digest=show_digest,
                   extra=(picked, readout.SCREENSHOT_COLUMN, readout.DATA_COLUMN))
               if c in known]
-    filter_spec = None
-    if f.monitoring in known:
-        filter_spec = {"conjunction": "and", "conditions": [
-            {"field_name": f.monitoring, "operator": "is", "value": ["true"]}]}
+    # 不按「是否巡查」筛，一次读回整张表，在这里分成两份：在管的行照旧统计；
+    # 没勾的行只挑「最近临时查过、查出了问题」的（summary.adhoc_todos）——
+    # 排队刷新不看「是否巡查」，以前那些结果在面板上一个字都看不到。
+    # 读表不计费，多读几行只是多几个字节，也省得再发第二次 search。
+    #
+    # ⚠️ 分法不能用 Row.monitoring：飞书对**没勾**的复选框直接不返回这一格，
+    # row_from_record 把「这一格不在」当成「表里没这一列」→ 默认在管。
+    # 这里已经确认表里有这一列，所以「这一格不在」就是没勾。
+    has_monitoring = f.monitoring in known
     try:
-        records = table.search(wanted, filter_spec=filter_spec)
+        everything = table.search(wanted, filter_spec=None)
     except Exception as exc:                                    # noqa: BLE001
         blank.error = f"读记录失败：{exc}"
         blank.health = health
         return blank
+    if has_monitoring:
+        records = [r for r in everything
+                   if feishu.read_bool((r.get("fields") or {}).get(f.monitoring))]
+        unmonitored = [r for r in everything
+                       if not feishu.read_bool((r.get("fields") or {}).get(f.monitoring))]
+    else:
+        records, unmonitored = everything, []
 
     snap = summary.build_snapshot(
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
         scrub=scrub, route=route, label_column=picked, seen_calls=seen_calls)
+    snap.adhoc_todos = summary.adhoc_todos(
+        label=label, app_token=table.app_token, table_id=table.table_id,
+        records=unmonitored, settings=settings, now=now, feishu_base=feishu_base,
+        show_digest=show_digest, scrub=scrub, route=route, label_column=picked)
     # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
     # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
     # 缺列的情况体检那边已经在报，这里不重复。
@@ -415,7 +431,7 @@ def _collect_one(label, table, settings, api_keys, *,
         unread = readout.unread_rows(records)
         if unread:
             snap.health = list(snap.health) + [readout.unread_message(unread)]
-    if filter_spec is None:
+    if not has_monitoring:
         snap.health = list(snap.health) + [
             f"表里没有「{f.monitoring}」列，面板无法只统计在管的行，"
             f"下面的数字包含了本该被排除的行"]
