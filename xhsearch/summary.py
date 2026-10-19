@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -46,13 +46,16 @@ class TodoRow:
     app_token: str = ""
     table_id: str = ""
     # 已归档 = 超过 archive_after_days，本来就不再自动刷。
-    # 面板默认**不把它们混进主待办列表**：批量勾选会绕过归档线，
-    # 而面板恰好把跨表的老旧失效行摆在一屏、天然鼓励全选。
+    # 面板默认**不把它们混进主待办列表**（除非刚查过，见 recent）：批量勾选会
+    # 绕过归档线，而面板恰好把跨表的老旧失效行摆在一屏、天然鼓励全选。
     archived: bool = False
     # 没勾「是否巡查」、但最近 ADHOC_WINDOW_HOURS 小时里被查过（多半是有人勾了
-    # 「排队刷新」临时查一下）的行。和已归档一样单独一区、不进批量勾选：
+    # 「排队刷新」临时查一下）的行。进主列表，但「全选」不带它：
     # 没勾巡查是运营说了「这行别管了」，全选重刷等于替人改了主意。
     adhoc: bool = False
+    # 最近 ADHOC_WINDOW_HOURS 小时里查过。已归档的行查过不久（多半是有人勾了排队
+    # 刷新单独看一眼）照样进主列表；过了这个窗口才收进那个项目底下的归档折叠区。
+    recent: bool = False
     reasons: list[str] = field(default_factory=list)
     refresh_status: str = ""
     diagnosis: str = ""
@@ -69,6 +72,8 @@ class TodoRow:
     # 是别人的个人信息，不该因为「顺手」就上一个公网页面。
     digest: str = ""
     negative_digest: str = ""
+    # 只在 Overview.resolved 里的行有：运营什么时候点的「已解决」（毫秒）。
+    resolved_at_ms: Optional[int] = None
 
     @property
     def key(self) -> str:
@@ -136,7 +141,8 @@ class ProjectSnapshot:
 
     todos: list[TodoRow] = field(default_factory=list)
     # 没勾「是否巡查」、最近被临时查过、查出了问题的行（见 TodoRow.adhoc）。
-    # 不进 todos、不进任何计数——这张卡上的数字只说在管的行。
+    # 不进 todos、不进这张卡上的任何计数——卡上的数字只说在管的行；
+    # 主列表那边由 Overview.todos() 合进去。
     adhoc_todos: list[TodoRow] = field(default_factory=list)
     # 按 max_todos 截掉了多少条。**必须显示出来**：把截断后的长度当成精确的
     # 「要人管」行数报出去，等于在大面积事故的时候少报，而那正是最不该少报
@@ -403,7 +409,8 @@ def build_snapshot(
                 row, cells, settings, reasons=reasons, refresh_status=refresh_status,
                 project=label, app_token=app_token, table_id=table_id,
                 feishu_base=feishu_base, route=route, label_column=label_column,
-                show_digest=show_digest, clean=clean, archived=archived))
+                show_digest=show_digest, clean=clean, archived=archived,
+                recent=_checked_recently(row, now)))
 
     snap.due_rows = len(due)
     if due:
@@ -430,11 +437,13 @@ def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
                reasons: list[str], refresh_status: str, project: str,
                app_token: str, table_id: str, feishu_base: str, route: str,
                label_column: str, show_digest: bool, clean,
-               archived: bool = False, adhoc: bool = False) -> TodoRow:
+               archived: bool = False, adhoc: bool = False,
+               recent: bool = False) -> TodoRow:
     f = settings.fields
     return TodoRow(
         archived=archived,
         adhoc=adhoc,
+        recent=recent,
         record_id=row.record_id,
         project=project,
         record_url=record_url(feishu_base, app_token, table_id,
@@ -459,8 +468,16 @@ def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
     )
 
 
-# 没勾巡查的行，最近多少小时里查过才算「临时查过」、值得上面板。
+# 「最近查过」的窗口（小时）。两处用：没勾巡查的行，这么久以内查过才上面板；
+# 已归档的行，这么久以内查过还在主列表，过了才收进归档折叠区。
 ADHOC_WINDOW_HOURS = 24
+
+
+def _checked_recently(row: rows_mod.Row, now: datetime) -> bool:
+    if row.last_updated_ms is None:
+        return False
+    since_ms = int((now - timedelta(hours=ADHOC_WINDOW_HOURS)).timestamp() * 1000)
+    return row.last_updated_ms >= since_ms
 
 
 def adhoc_todos(
@@ -489,12 +506,11 @@ def adhoc_todos(
     now = now or datetime.now(timezone.utc)
     clean = scrub or (lambda text: text)
     f = settings.fields
-    since_ms = int((now - timedelta(hours=ADHOC_WINDOW_HOURS)).timestamp() * 1000)
     out: list[TodoRow] = []
     for record in records:
         cells = record.get("fields") or {}
         row = runner.row_from_record(record, settings)
-        if row.last_updated_ms is None or row.last_updated_ms < since_ms:
+        if not _checked_recently(row, now):
             continue
         refresh_status = feishu.read_text(cells.get(f.refresh_status))
         reasons = _todo_reasons(
@@ -505,7 +521,7 @@ def adhoc_todos(
                 row, cells, settings, reasons=reasons, refresh_status=refresh_status,
                 project=label, app_token=app_token, table_id=table_id,
                 feishu_base=feishu_base, route=route, label_column=label_column,
-                show_digest=show_digest, clean=clean, adhoc=True))
+                show_digest=show_digest, clean=clean, adhoc=True, recent=True))
     out.sort(key=_todo_sort_key)
     return out[:max_todos]
 
@@ -556,6 +572,8 @@ class Overview:
     # 注册表里停用了的表的名字。它们不在 projects 里——停用的表不读、不统计、
     # 行也不进待办——但页面上得说一句，否则「停用了」和「读不到了」分不开。
     disabled_tables: list[str] = field(default_factory=list)
+    # 点了「已解决」、此刻被收起来的行（apply_resolutions 填）。不在 projects 里。
+    resolved: list[TodoRow] = field(default_factory=list)
 
     @property
     def total_rows(self) -> int:
@@ -599,9 +617,7 @@ class Overview:
         和 `todos_dropped` 分开：那个是每张表内部截的，这个是跨表拉平之后
         再截的。两个加起来才是「一共有多少条没显示」。
         """
-        total = sum(len([t for t in p.todos
-                         if include_archived or not t.archived])
-                    for p in self.projects)
+        total = len(self._main(include_archived))
         return max(0, total - limit)
 
     def todos(self, limit: int = 500, *, include_archived: bool = False
@@ -613,17 +629,27 @@ class Overview:
         自动刷，而「排队刷新」会绕过归档线——把一堆老帖混进这一屏，
         再配上一个「全选」，就是一次把钱花在几个月前的内容上。
         要看它们走 `archived_todos()`，那边是折叠的、要单独确认。
+
+        例外是**最近 24 小时查过的**：已归档的行有人勾排队刷新单独看了一眼、
+        没勾巡查的行被临时查了一下——刚查出来的问题照样进主列表（TodoRow.recent /
+        adhoc）。过了这个窗口，已归档的收进折叠区，没勾巡查的就不再显示。
         """
-        merged: list[TodoRow] = []
-        for project in self.projects:
-            merged.extend(t for t in project.todos
-                          if include_archived or not t.archived)
+        merged = self._main(include_archived)
         merged.sort(key=_todo_sort_key)
         return merged[:limit]
 
+    def _main(self, include_archived: bool = False) -> list[TodoRow]:
+        out: list[TodoRow] = []
+        for project in self.projects:
+            out.extend(t for t in project.todos
+                       if include_archived or not t.archived or t.recent)
+            out.extend(project.adhoc_todos)
+        return out
+
     def archived_todos(self, limit: int = 200) -> list[TodoRow]:
-        """已归档但仍有异常的行。单独一区，重刷要另外确认。"""
-        merged = [t for p in self.projects for t in p.todos if t.archived]
+        """已归档、而且 24 小时内没人查过、仍挂着问题的行——每个项目底下的折叠区。"""
+        merged = [t for p in self.projects for t in p.todos
+                  if t.archived and not t.recent]
         merged.sort(key=_todo_sort_key)
         return merged[:limit]
 
@@ -632,6 +658,81 @@ class Overview:
         merged = [t for p in self.projects for t in p.adhoc_todos]
         merged.sort(key=_todo_sort_key)
         return merged[:limit]
+
+
+# ---------- 「已解决」 ----------
+#
+# 运营在面板上点「已解决」= 「这一行的这几个问题我处理完了，先别显示」。
+# 不写业务表（面板对业务表的写白名单只有「排队刷新」一列），存在注册表 base
+# 的「面板设置」里（panel.Resolutions）；这里只管**什么时候再冒出来**。
+#
+# 难点在「下次刷新又发现问题再显示」：有几种问题刷新也不会自己消——
+# 风控中 / 疑似限流是只增不减的标签（Tags.sticky），置顶掉了靠 ever_pinned
+# 一直留着，需重新整理要等下一次数据整理。按「刷过一次就重新显示」处理，
+# 这几种点了「已解决」五分钟后就又回来了，按钮等于没用。所以：
+#
+# * 冒出了**没标过的问题** → 重新显示（新问题一定要看见）；
+# * 只剩标过的问题，而且**还没再刷过**（最近检查 ≤ 点的时候看到的那一次）→ 收着；
+# * 又刷过了、问题还在：每一轮都会重新判的（有负面 / 已失效 / 刷新失败 /
+#   疑似受限 / 卡住了）→ 重新显示——这就是「下次刷新又发现问题」；
+#   只剩上面那几种刷新消不掉的 → 继续收着，它们的「还在」不是新发现。
+#
+# 代价（文档里写了）：刷新消不掉的标签被人在飞书里删掉、之后又被机器打上，
+# 面板分不出这是「又发生了一次」，那一行会继续收着，直到这条记录过期
+# （panel.Resolutions.KEEP_DAYS）或者有人点「撤销」。
+
+
+def resolution_key(table_id: str, record_id: str) -> str:
+    return f"{table_id}/{record_id}"
+
+
+def sticky_reasons(settings: Settings) -> set[str]:
+    """刷新不会自己消掉的问题。见上面那段。"""
+    return {r for r in (*settings.tags.sticky(), settings.pin_status.pinned_lost,
+                        settings.collation_status.stale) if r}
+
+
+def _int_ms(value: Any) -> Optional[int]:
+    """存起来的毫秒数。不是整数（坏了 / 手改过）就当没有。"""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def still_resolved(todo: TodoRow, entry: Any, sticky: set[str]) -> bool:
+    """这一行按那条「已解决」记录该不该继续收着。**纯函数。**"""
+    if not isinstance(entry, dict):
+        return False
+    marked = entry.get("reasons")
+    if not isinstance(marked, list) or not set(todo.reasons) <= set(marked):
+        return False                       # 有没标过的新问题
+    seen = _int_ms(entry.get("seen"))
+    if todo.checked_at_ms is None:
+        return True                        # 从来没查过，自然也没再刷过
+    if seen is not None and todo.checked_at_ms <= seen:
+        return True                        # 点的时候看到的就是这一次的结果
+    return set(todo.reasons) <= sticky     # 又刷过了：只剩刷新消不掉的才继续收着
+
+
+def apply_resolutions(overview: Overview, resolved: dict,
+                      settings: Settings) -> Overview:
+    """按「已解决」记录把行收起来。返回一份新的 Overview，**不改传进来的那份**
+    （它是面板缓存里的，别的请求还在读）。收起来的行放进 `resolved`。"""
+    if not resolved:
+        return overview
+    sticky = sticky_reasons(settings)
+    hidden: list[TodoRow] = []
+
+    def keep(todo: TodoRow) -> bool:
+        entry = resolved.get(resolution_key(todo.table_id, todo.record_id))
+        if entry is None or not still_resolved(todo, entry, sticky):
+            return True
+        hidden.append(replace(todo, resolved_at_ms=_int_ms(entry.get("at"))))
+        return False
+
+    projects = [replace(p, todos=[t for t in p.todos if keep(t)],
+                        adhoc_todos=[t for t in p.adhoc_todos if keep(t)])
+                for p in overview.projects]
+    hidden.sort(key=lambda t: -(t.resolved_at_ms or 0))
+    return replace(overview, projects=projects, resolved=hidden)
 
 
 # ---------- 改阈值之前先算给人看 ----------

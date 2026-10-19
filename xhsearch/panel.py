@@ -1097,6 +1097,143 @@ class Projects:
         registry.remove(self._registry(), record_id)
 
 
+# 「已解决」的 table_id / record_id：飞书的 id 只有字母数字和 _-。
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class Resolutions:
+    """运营在面板上点的「已解决」。**不写业务表**——存在注册表 base 的「面板设置」
+    表（键 todo.resolved，见 panel_settings），出页面之前按它把行收起来；
+    什么时候再冒出来由 summary.apply_resolutions 定。
+
+    读是热路径（每次出页面都要），所以内存里留一份：面板是单进程，点「已解决」
+    写完就地换掉这一份；每 CACHE_SECONDS 才重读一次（有人在飞书里手改那张表也认），
+    而且是**先给旧的、后台再读**——出页面不等飞书。只有进程起来后的第一次要等
+    （serve 里起进程时就先读一遍，一般轮不到页面等）。
+    **读失败不挡页面**：用上一份（第一次就失败 = 什么都不收），一分钟后再试——
+    失败方向是「多显示几行」，不是「藏掉该看的」。
+    """
+
+    # 记录留多久。过期 = 那一行如果还挂着问题，会重新出现（多看一眼，不是少看）。
+    KEEP_DAYS = 90
+    # 整份存在一格文本里，不能无限长。超了先丢最早点的。
+    MAX_ENTRIES = 500
+    RETRY_SECONDS = 60.0
+
+    def __init__(self, projects: Projects, *, log: Callable[[str], None] = print,
+                 clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time,
+                 spawn: Optional[Callable[[Callable[[], None]], None]] = None):
+        self.projects = projects
+        self.log = log
+        self._clock = clock
+        self._wall = wall
+        self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self._lock = threading.Lock()
+        self._data: dict = {}
+        self._loaded_at: Optional[float] = None
+        self._failed_at: Optional[float] = None
+        self._reading = False
+        # 读的时候有人点了「已解决」：读回来的那份比内存里的旧，不能拿它盖掉。
+        self._version = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.projects.enabled
+
+    def snapshot(self) -> dict:
+        """现在有哪些「已解决」。**从不抛**——见类注释。"""
+        if not self.enabled:
+            return {}
+        now = self._clock()
+        with self._lock:
+            fresh = (self._loaded_at is not None
+                     and now - self._loaded_at < panel_settings.CACHE_SECONDS)
+            waiting = (self._failed_at is not None
+                       and now - self._failed_at < self.RETRY_SECONDS)
+            if fresh or waiting or self._reading:
+                return self._data
+            self._reading = True
+            first = self._loaded_at is None
+            version = self._version
+        if first:
+            self._read(now, version)            # 手里什么都没有，只能等这一次
+        else:
+            self._spawn(lambda: self._read(now, version))
+        with self._lock:
+            return self._data
+
+    def _read(self, now: float, version: int) -> None:
+        try:
+            raw = self.projects._store().get_json(panel_settings.KEY_RESOLVED, {})
+        except Exception as exc:                                # noqa: BLE001
+            with self._lock:
+                self._failed_at, self._reading = now, False
+            self.log(f"⚠ 读「已解决」记录失败，先按上一份来、一分钟后再试：{exc}")
+            return
+        with self._lock:
+            if version == self._version:
+                self._data = raw if isinstance(raw, dict) else {}
+                self._loaded_at, self._failed_at = now, None
+            self._reading = False
+
+    def mark(self, table_id: str, record_id: str, reasons: list,
+             seen: Optional[int]) -> None:
+        """记下「这一行的这几个问题处理完了」。seen = 点的时候看到的那一次检查。"""
+        key = summary.resolution_key(table_id, record_id)
+        at = int(self._wall() * 1000)
+
+        def change(current):
+            data = self._pruned(current, at)
+            data.pop(key, None)
+            data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
+            return data
+
+        self._commit(change)
+        self.log(f"✓ 已解决 {key}：{'、'.join(reasons)}")
+
+    def unmark(self, table_id: str, record_id: str) -> None:
+        key = summary.resolution_key(table_id, record_id)
+
+        def change(current):
+            data = self._pruned(current, int(self._wall() * 1000))
+            data.pop(key, None)
+            return data
+
+        self._commit(change)
+        self.log(f"↩ 撤销已解决 {key}")
+
+    def _pruned(self, current: Any, now_ms: int) -> dict:
+        if not isinstance(current, dict):
+            return {}
+        since = now_ms - self.KEEP_DAYS * 86_400_000
+        kept = [(k, v) for k, v in current.items()
+                if isinstance(v, dict) and isinstance(v.get("at"), int)
+                and v["at"] >= since]
+        kept.sort(key=lambda kv: kv[1]["at"])
+        return dict(kept[-(self.MAX_ENTRIES - 1):])
+
+    def _commit(self, change) -> None:
+        value = self.projects._store().update_json(
+            panel_settings.KEY_RESOLVED, change, {})
+        with self._lock:
+            self._data = value
+            self._version += 1
+            self._loaded_at, self._failed_at = self._clock(), None
+
+
+def _clean_reasons(value: Any) -> list[str]:
+    """前端传来的「当时看到的问题」。只认短字符串，去重保序。"""
+    if not isinstance(value, list):
+        raise ValueError("reasons 要是数组")
+    out: list[str] = []
+    for item in value[:12]:
+        # isprintable：这几个字会进日志，不让人往终端里塞控制字符
+        if isinstance(item, str) and 0 < len(item.strip()) <= 16 and item.isprintable():
+            out.append(item.strip())
+    return list(dict.fromkeys(out))
+
+
 # ---------- 鉴权 ----------
 
 def issue_session(config: PanelConfig, *, now: Optional[float] = None) -> str:
@@ -1218,6 +1355,7 @@ class _Deps:
     balances: Optional["BalanceFeed"] = None
     projects: Optional["Projects"] = None
     queueing: Optional["Queueing"] = None
+    resolutions: Optional["Resolutions"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -1328,6 +1466,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._project_action(path.rsplit("/", 1)[-1])
         if path == "/api/queue":
             return self._queue_action()
+        if path == "/api/resolve":
+            return self._resolve_action()
         if path == "/api/refresh":
             # 只是让缓存立刻重取一遍飞书数据和 Railway 日志。
             # **不发任何付费请求。**
@@ -1471,16 +1611,27 @@ class PanelHandler(BaseHTTPRequestHandler):
         self._send(status, body, "application/json; charset=utf-8")
 
     # —— 页面数据 ——
-    def _page(self) -> str:
+    def _view(self):
+        """缓存里那份快照，按「已解决」收掉该收的行。缓存里的那份不动。"""
         overview, error, fetched_at = self.deps.cache.view()
+        resolutions = self.deps.resolutions
+        if overview is not None and resolutions is not None:
+            overview = summary.apply_resolutions(
+                overview, resolutions.snapshot(), self.deps.settings or Settings())
+        return overview, error, fetched_at
+
+    def _page(self) -> str:
+        overview, error, fetched_at = self._view()
         runs, log_error = self._runs()
         balances, balance_error = self._balances()
+        resolutions = self.deps.resolutions
         return self.deps.render_page(
             overview=overview, error=error, fetched_at=fetched_at,
             config=self.deps.config, runs=runs, log_error=log_error,
             balances=balances, balance_error=balance_error,
             runway=runway_from_runs(balances, runs),
             outages=self._outages(balances),
+            resolvable=bool(resolutions and resolutions.enabled),
             csrf=csrf_token(self.deps.config, self._session_token()))
 
     def _outages(self, balances) -> list:
@@ -1517,6 +1668,45 @@ class PanelHandler(BaseHTTPRequestHandler):
                        "message": l.message} for l in lines[:300]],
             "runs": [_run_json(r) for r in railway.build_runs(lines)],
         }
+
+    def _resolve_action(self):
+        """「已解决」/ 撤销。**不写业务表**——只写注册表 base 里的「面板设置」
+        （见 Resolutions）。不花钱，也不碰飞书表里那一行。"""
+        resolutions = self.deps.resolutions
+        if resolutions is None or not resolutions.enabled:
+            projects = self.deps.projects
+            why = projects.why_disabled() if projects else "面板没配 FEISHU_APP_ID"
+            return self._send_json(400, {"error": f"「已解决」要存在注册表那个 base 里，现在存不了：{why}"})
+        body = self._read_body()
+        if body is None:
+            return None
+        try:
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("要是一个对象")
+            table_id = str(payload.get("table_id") or "")
+            record_id = str(payload.get("record_id") or "")
+            if not (_ID_RE.match(table_id) and _ID_RE.match(record_id)):
+                raise ValueError("table_id / record_id 不对")
+            undo = payload.get("undo") is True
+            reasons = [] if undo else _clean_reasons(payload.get("reasons"))
+            if not undo and not reasons:
+                raise ValueError("reasons 不能是空的")
+            seen = payload.get("checked_at_ms")
+            if seen is not None and (isinstance(seen, bool) or not isinstance(seen, int)):
+                raise ValueError("checked_at_ms 要是整数")
+        except (ValueError, TypeError) as exc:
+            return self._send_json(400, {"error": f"请求体不对：{exc}"})
+        try:
+            if undo:
+                resolutions.unmark(table_id, record_id)
+            else:
+                resolutions.mark(table_id, record_id, reasons, seen)
+        except feishu.FeishuError as exc:
+            return self._send_json(400, {"error": f"没存上：{exc.msg}", "hint": exc.hint})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"没存上：{type(exc).__name__}: {exc}"})
+        return self._send_json(200, {"ok": True, "undo": undo})
 
     def _queue_action(self):
         """把选中的行勾上「排队刷新」。**面板对业务表数据唯一的写路径。**
@@ -1737,12 +1927,13 @@ class PanelHandler(BaseHTTPRequestHandler):
         raise NotImplementedError(action)
 
     def _overview_payload(self) -> dict:
-        overview, error, fetched_at = self.deps.cache.view()
+        overview, error, fetched_at = self._view()
         return {
             "error": error,
             "fetched_at": fetched_at,
             "projects": [_project_json(p) for p in (overview.projects if overview else [])],
             "todos": [_todo_json(t) for t in (overview.todos() if overview else [])],
+            "resolved": [_todo_json(t) for t in (overview.resolved if overview else [])],
         }
 
 
@@ -1833,12 +2024,14 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
                  projects: Optional[Projects] = None,
                  queueing: Optional[Queueing] = None,
                  settings: Optional[Settings] = None,
+                 resolutions: Optional[Resolutions] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
         config=config, cache=cache, settings=settings, logs=logs,
         balances=balances, projects=projects, queueing=queueing,
+        resolutions=resolutions,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -1855,10 +2048,14 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     resolved = settings or Settings()
     projects = Projects(config, resolved)
     queueing = Queueing(config, resolved) if config.app_id else None
+    resolutions = Resolutions(projects)
     server = build_server(config, cache, logs=logs, balances=balances,
                           projects=projects, queueing=queueing,
-                          settings=resolved)
+                          settings=resolved, resolutions=resolutions)
     cache.start()
+    if resolutions.enabled:
+        # 先把「已解决」读进来，第一个打开面板的人就不用等这一趟飞书。
+        threading.Thread(target=resolutions.snapshot, daemon=True).start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"
           + (f"{config.idle_minutes:g} 分钟没人看就停，有人来先取一趟新的，"

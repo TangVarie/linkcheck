@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -379,22 +380,46 @@ code{background:var(--fill);padding:2px 6px;font-size:13px;
   font-family:var(--font-num)}
 details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
   padding:8px 0}
-/* ---------- 不在主列表里的异常：两块提示区，块内按项目分组 ----------
- * 以前是一行灰色小字的折叠条，运营根本看不到。现在每块是一个常开的
- * 提示区（警示色左边线 + 标题 + 行数徽标），里面每个项目一组，组头
- * 就写着这个项目几行、各是什么问题，点开才是明细表。 */
-.side-block{background:var(--surface);border:1px solid var(--border);
-  border-left:3px solid var(--warning);padding:14px 16px;margin:16px 0}
-.side-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  font-size:15px;font-weight:600;color:var(--text-dark)}
-.side-head .icon{color:var(--warning-deep)}
-.side-why{font-size:13px;color:var(--text-light);margin:6px 0 8px;line-height:1.55}
-.side-proj{border-top:1px solid var(--border)}
-.side-proj>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  font-size:14px;color:var(--text-dark);padding:10px 0}
-.side-proj>summary b{font-weight:600}
-.side-proj>summary .cnt{color:var(--warning-deep);font-weight:600}
-.side-proj .tablewrap{margin:0 0 12px}
+/* ---------- 每个项目那一页底下的归档折叠区 ----------
+ * **默认收起**，但要让人知道有这一块：以前是一行灰色小字，运营根本看不到。
+ * 现在是一条白底、警示色左边线的条（同 .note 的语义色用法），条上写着几行、
+ * 各是什么问题；点开才是明细。直角、零阴影（DESIGN.md）。 */
+.fold{margin-top:12px;background:var(--surface);border:1px solid var(--border);
+  border-left:3px solid var(--warning)}
+.fold>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  padding:12px 14px;font-size:14px;color:var(--text-dark);list-style:none}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary .icon{color:var(--warning-deep)}
+.fold>summary .chip{margin:0}
+.fold-t b{color:var(--warning-deep);font-weight:600;font-family:var(--font-num)}
+.fold-hint{margin-left:auto;font-size:13px;color:var(--primary);white-space:nowrap}
+.fold-hint::after{content:"";display:inline-block;width:6px;height:6px;
+  margin:0 2px 2px 8px;border-right:1.5px solid currentColor;
+  border-bottom:1.5px solid currentColor;transform:rotate(45deg)}
+.fold[open] .fold-hint::after{transform:rotate(-135deg);margin-bottom:-2px}
+.fold .fold-close,.fold[open] .fold-open{display:none}
+.fold[open] .fold-close{display:inline}
+.fold-why{font-size:13px;color:var(--text-light);margin:0;padding:0 14px 12px;
+  line-height:1.55}
+.fold .tablewrap{border-top:1px solid var(--border)}
+.fold table{border:0}
+.tab-empty{padding:14px 16px;font-size:13px;color:var(--text-light);
+  background:var(--surface);border:1px solid var(--border)}
+/* tab 上「+N」：这个项目底下还收着几行已归档的。淡色，不和主数字抢。 */
+.tabs .more{font-size:12px;font-family:var(--font-num);color:var(--text-faint);
+  margin-left:-4px}
+/* 已归档 / 未巡查：说的是「这一行归谁管」，不是问题本身——描边、不上色。 */
+.chip.o{background:none;border:1px solid var(--border-strong);line-height:18px;
+  color:var(--text-light)}
+/* 行操作里的文字按钮（「已解决」「撤销」）：和「去这一行」同款 13px 主色字。 */
+button.link{height:auto;padding:0;margin-left:12px;background:none;
+  font-size:13px;font-weight:400;color:var(--primary)}
+button.link:hover:not(:disabled){background:none;text-decoration:underline}
+tr.resolvedNote td{font-size:13px;color:var(--success-deep);
+  background:var(--tint-success)}
+tr.resolvedNote button.link{margin-left:8px}
+.resolved{margin-top:12px}
+.resolved .tablewrap{margin-top:4px}
 #projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
 @media (max-width:900px){
   .app{grid-template-columns:minmax(0,1fr)}
@@ -494,12 +519,24 @@ _SCRIPT = r"""
     for (var i = 0; i < tabs.length; i++) if (tabs[i].classList.contains("on")) return tabs[i];
     return null;
   }
+  // 「还在」= 没被筛掉、也没点「已解决」收起来。
+  function shown(tr){ return tr.style.display !== "none" && !tr.hidden; }
+  function countShown(rows){
+    var n = 0;
+    for (var i = 0; i < rows.length; i++) if (shown(rows[i])) n++;
+    return n;
+  }
   function recount(){
     panels.forEach(function(p){
-      var n = 0, rows = p.querySelectorAll("tbody tr");
-      for (var i = 0; i < rows.length; i++) if (rows[i].style.display !== "none") n++;
-      var cnt = document.querySelector("#todos .tab[data-tab='" + p.dataset.tab + "'] .cnt");
-      if (cnt) cnt.textContent = n;
+      var tab = document.querySelector("#todos .tab[data-tab='" + p.dataset.tab + "']");
+      var cnt = tab ? tab.querySelector(".cnt") : null;
+      if (cnt) cnt.textContent = countShown(p.querySelectorAll("table.todos:not(.fold-t) tr[data-rec]"));
+      // 底下归档折叠区的条数，和 tab 上那个淡色的 +N
+      var old = countShown(p.querySelectorAll(".fold tr[data-rec]"));
+      var foldN = p.querySelector(".foldN");
+      if (foldN) foldN.textContent = old;
+      var more = tab ? tab.querySelector(".more") : null;
+      if (more) { more.textContent = "+" + old; more.hidden = !old; }
     });
   }
   // remember=true 只在人亲手切页时给：存的是「你选的是哪个项目」。
@@ -531,7 +568,7 @@ _SCRIPT = r"""
   var box = document.getElementById("filter");
   if (box) box.addEventListener("input", function(){
     var q = box.value.trim().toLowerCase();
-    var rows = document.querySelectorAll("#todos tbody tr");
+    var rows = document.querySelectorAll("#todos tr[data-rec]");
     for (var i = 0; i < rows.length; i++) {
       var hit = !q || rows[i].textContent.toLowerCase().indexOf(q) >= 0;
       rows[i].style.display = hit ? "" : "none";
@@ -552,7 +589,7 @@ _SCRIPT = r"""
   // 提交的行数必须和眼睛看到的一致。分页之后「看得见」还多一层：
   // 这一行所在的 tab 页得是当前这一页（别的页是 hidden 的）。
   function visible(tr){
-    if (!tr || tr.style.display === "none") return false;
+    if (!tr || !shown(tr)) return false;
     var p = panelOf(tr);
     return !(p && p.hidden);
   }
@@ -574,13 +611,14 @@ _SCRIPT = r"""
   }
   for (var i = 0; i < picks.length; i++) picks[i].addEventListener("change", sync);
   // 每一页表头一个「全选」，只管自己这一页里没被筛掉的行。
+  // **不带 .solo 的行**（已归档 / 没勾巡查）：那两种要人单独拿主意，见 _todo_row。
   var alls = document.querySelectorAll("#todos .todoAll");
   for (var a = 0; a < alls.length; a++) alls[a].addEventListener("change", function(ev){
     var head = ev.target;
-    var mine = head.closest("table").querySelectorAll(".todoPick");
+    var mine = head.closest("table").querySelectorAll(".todoPick:not(.solo)");
     for (var i = 0; i < mine.length; i++) {
       var tr = rowsOf(mine[i]);
-      if (tr.style.display !== "none") mine[i].checked = head.checked;
+      if (shown(tr)) mine[i].checked = head.checked;
     }
     sync();
   });
@@ -655,13 +693,77 @@ _SCRIPT = r"""
       .catch(function(err){ if (qOut) qOut.textContent = String(err); btnQ.disabled = false; });
   });
 
+  // ---- 待办：「已解决」 ----
+  // 问题处理完了，不用等下一次刷新就先收起来。存在注册表 base 的「面板设置」里，
+  // **不写业务表**；什么时候再冒出来由服务端定（summary.apply_resolutions）。
+  // 带上「当时看到的是哪几个问题、哪一次检查的结果」：之后刷出了新的问题、
+  // 或者又刷了一次还是这个问题，这一行就会回来。
+  function resolveCall(tr, undo){
+    var reasons = [];
+    try { reasons = JSON.parse(tr.dataset.reasons || "[]"); } catch (e) {}
+    return fetch("/api/resolve", {method: "POST",
+      headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
+      body: JSON.stringify({table_id: tr.dataset.tbl, record_id: tr.dataset.rec,
+        reasons: reasons,
+        checked_at_ms: tr.dataset.checked ? Number(tr.dataset.checked) : null,
+        undo: !!undo})})
+      .then(function(r){ return r.json().then(function(j){
+        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        return j; }); });
+  }
+  document.addEventListener("click", function(ev){
+    var b = ev.target.closest ? ev.target.closest("button.resolve, button.undo, button.unresolve") : null;
+    if (!b) return;
+    var tr = b.closest("tr");
+    if (!tr) return;
+    b.disabled = true;
+    if (b.classList.contains("resolve")) {
+      b.textContent = "标记中…";
+      resolveCall(tr, false).then(function(){
+        var pk = tr.querySelector(".todoPick");
+        if (pk) pk.checked = false;
+        tr.hidden = true;
+        var note = document.createElement("tr");
+        note.className = "resolvedNote";
+        var td = document.createElement("td");
+        td.colSpan = tr.children.length;
+        var which = tr.querySelector("td.which");
+        td.innerHTML = "已标记解决：「" + esc(which ? which.textContent : "") +
+          "」先收起来了，下次刷新又查出问题会自动回来。" +
+          "<button type=button class='link undo'>撤销</button>";
+        note.appendChild(td);
+        tr.parentNode.insertBefore(note, tr.nextSibling);
+        b.disabled = false; b.textContent = "已解决";
+        recount(); sync();
+      }).catch(function(err){
+        b.disabled = false; b.textContent = "没标上，再点一次"; b.title = String(err.message || err);
+      });
+      return;
+    }
+    if (b.classList.contains("undo")) {
+      // 就地撤销：note 的上一行就是被收起来的那一行
+      var row = tr.previousElementSibling;
+      if (!row) return;
+      resolveCall(row, true).then(function(){
+        tr.parentNode.removeChild(tr);
+        row.hidden = false;
+        recount(); sync();
+      }).catch(function(err){ b.disabled = false; b.textContent = "没撤销成，再点一次"; b.title = String(err.message || err); });
+      return;
+    }
+    // 底下「已解决」清单里的撤销：撤完重载，这一行回到它该在的那一页
+    b.textContent = "撤销中…";
+    resolveCall(tr, true).then(function(){ location.reload(); })
+      .catch(function(err){ b.disabled = false; b.textContent = "没撤销成，再点一次"; b.title = String(err.message || err); });
+  });
+
   // 「问题发现」的关键是新增，不是总量。上次看到的存在浏览器本地，
   // 不上服务端——它是每个人自己的阅读进度，不是共享状态。
   try {
     var SEEN = "linkcheck.seen";
     var seen = JSON.parse(localStorage.getItem(SEEN) || "[]");
     var now = [], fresh = 0;
-    var trs = document.querySelectorAll("#todos tbody tr");
+    var trs = document.querySelectorAll("#todos tr[data-key]");
     for (var i = 0; i < trs.length; i++) {
       var k = trs[i].dataset.key;
       if (!k) continue;
@@ -1169,8 +1271,125 @@ def _worst_class(todos) -> str:
     return worst
 
 
+def _scope_chip(todo) -> str:
+    """主列表里「全选带不上」的那两种行的标记：已归档 / 没勾巡查。"""
+    if todo.adhoc:
+        return ("<span class='chip o' title='没勾「是否巡查」，"
+                "最近 24 小时有人勾「排队刷新」临时查过一次'>未巡查</span>")
+    if todo.archived:
+        return ("<span class='chip o' title='发布超过归档天数、不再自动刷；"
+                "最近 24 小时有人勾「排队刷新」单独查过一次'>已归档</span>")
+    return ""
+
+
+def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
+              resolvable: bool) -> str:
+    """一行待办。主列表和归档折叠区共用，折叠区没有勾选框。
+
+    已归档 / 没勾巡查的行在主列表里**有勾选框但「全选」不带它**（class solo）：
+    单独勾一行是人对这一行拿了主意；全选一下把老帖和「说了别管」的行一起
+    重刷，是替人改了主意、还要花钱。
+    """
+    extra = ""
+    if show_digest and (todo.negative_digest or todo.digest):
+        extra = (f"<div class=muted style='margin-top:4px'>"
+                 f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
+    pick = ""
+    if main:
+        if todo.archived or todo.adhoc:
+            pick = ("<td class=nowrap><input type=checkbox class='todoPick solo' "
+                    "title='「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾'></td>")
+        else:
+            pick = "<td class=nowrap><input type=checkbox class=todoPick></td>"
+    # data-key 只给主列表：「新」标记说的是「这一屏多了一件要做的事」，
+    # 折叠区里的老帖不算。
+    key = f" data-key='{_e(todo.key)}'" if main else ""
+    checked = "" if todo.checked_at_ms is None else str(todo.checked_at_ms)
+    resolve = (" <button type=button class='link resolve' title='问题处理完了就点："
+               "先收起来，不用等下一次刷新。下次刷新又查出问题会自动回来'>已解决</button>"
+               if resolvable else "")
+    return (
+        f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
+        f"data-tbl='{_e(todo.table_id)}'{key} "
+        f"data-reasons='{_e(json.dumps(todo.reasons, ensure_ascii=False))}' "
+        f"data-checked='{checked}'>"
+        f"{pick}"
+        f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
+        f"<td>{_chips(todo.reasons, _REASON_CLASS)}{_scope_chip(todo) if main else ''}</td>"
+        f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
+        f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
+        # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
+        # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
+        # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT，按 td.when 找格子）。
+        f"<td class='nowrap when'>{_e(_stamp(todo.checked_at_ms, offset_hours))}"
+        f"{' <span class=chip>排队中</span>' if todo.queued else ''}</td>"
+        f"<td class='nowrap acts'><a href='{_e(todo.record_url)}' "
+        f"target=_blank rel='noopener noreferrer' class=act>去这一行</a>{resolve}</td>"
+        "</tr>")
+
+
+_TODO_COLUMNS = ("<th>哪一条</th><th>为什么</th><th>诊断信息</th>"
+                 "<th>评论数</th><th>最近检查</th><th></th>")
+
+
+def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) -> str:
+    """这个项目里已归档、24 小时内没人查过、还挂着问题的行。**默认收起。**
+
+    收起是因为它们大多数时候的正确处置是「取消巡查」，不是「重新刷新」——
+    「排队刷新」会绕过归档线，摊开再配上全选，就是一次把钱花在几个月前的
+    内容上。但收起不等于藏起来：以前是一行灰色小字，运营根本不知道有这一块。
+    现在是一条带警示色左边线的条，条上就写着几行、各是什么问题。
+    跟着项目标签走：每个项目只看得到自己的。
+    """
+    if not todos:
+        return ""
+    counts: dict = {}
+    for todo in todos:
+        for reason in todo.reasons:
+            counts[reason] = counts.get(reason, 0) + 1
+    rows = "".join(_todo_row(t, offset_hours, show_digest, main=False,
+                             resolvable=resolvable) for t in todos)
+    done = "处理完了点「已解决」收起来；" if resolvable else ""
+    return (
+        "<details class=fold>"
+        f"<summary>{_icon('inbox')}<span class=fold-t>还有 <b class=foldN>{len(todos)}</b> "
+        f"行已归档的老帖也有异常</span>{_counts_chips(counts)}"
+        "<span class=fold-hint><span class=fold-open>点开看</span>"
+        "<span class=fold-close>收起</span></span></summary>"
+        "<p class=fold-why>这些帖子超过了归档天数、不再自动刷，问题会一直挂到有人处理。"
+        "「排队刷新」会<b>绕过归档线</b>，所以它们不在上面的列表和批量勾选里——"
+        f"多数时候正确的处置是去飞书<b>取消巡查</b>；{done}"
+        "在飞书里单独勾「排队刷新」刷过的，24 小时内会回到上面的列表。</p>"
+        f"<div class=tablewrap><table class='todos fold-t'><thead><tr>{_TODO_COLUMNS}</tr>"
+        f"</thead><tbody>{rows}</tbody></table></div></details>")
+
+
+def _resolved_list(rows, offset_hours: float) -> str:
+    """标了「已解决」、暂时收起来的行。收着放在待办底下，点了「撤销」就回来。"""
+    if not rows:
+        return ""
+    body = "".join(
+        f"<tr data-tbl='{_e(t.table_id)}' data-rec='{_e(t.record_id)}'>"
+        f"<td class=nowrap>{_e(t.project)}</td>"
+        f"<td class=which title='{_e(t.label)}'>{_e(_clip(t.label))}</td>"
+        f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
+        f"<td class=nowrap>{_e(_stamp(t.resolved_at_ms, offset_hours))}</td>"
+        f"<td class='nowrap acts'><a href='{_e(t.record_url)}' target=_blank "
+        "rel='noopener noreferrer' class=act>去这一行</a> "
+        "<button type=button class='link unresolve'>撤销</button></td></tr>"
+        for t in rows)
+    return (
+        "<details class=resolved>"
+        f"<summary>{len(rows)} 行标了「已解决」，暂时收起来了——"
+        "下次刷新又查出问题会自动回来</summary>"
+        "<div class=tablewrap><table><thead><tr><th>项目</th><th>哪一条</th>"
+        "<th>当时的问题</th><th>标记于</th><th></th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div></details>")
+
+
 def _todo_table(todos, offset_hours: float, show_digest: bool,
-                project_order=()) -> str:
+                project_order=(), *, folded=(), resolved=(),
+                resolvable: bool = False) -> str:
     """待办：**每个项目一个 tab**，页内按严重度排序。
 
     原来是所有项目拉平成一张长表。跨表视角是这个面板存在的理由，但表一多
@@ -1180,61 +1399,53 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
 
     tab 顺序跟「各项目」那一栏一致（注册表顺序），**不按严重度重排**：
     位置每次刷新都跳的话运营找不到自己的项目。严重度靠数字的颜色说。
-    只给有待办的项目开 tab——没事的项目在下面项目卡里本来就是绿的。
+    只给有待办（或者有归档折叠区）的项目开 tab——没事的项目在下面项目卡里本来就是绿的。
+
+    `folded` 是已归档、24 小时内没人查过的问题行：在各自项目那一页的底下，
+    收起来（见 `_fold`）。tab 上在条数后面跟一个淡色的 +N。
     """
-    if not todos:
+    if not todos and not folded:
         return ("<div class=empty>" + _icon("check-circle") +
                 "没有需要处理的行。"
                 "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
-                "刷新失败 / 卡住了 / 需重新整理 —— 一条都没有。</div></div>")
+                "刷新失败 / 卡住了 / 需重新整理 —— 一条都没有。</div></div>"
+                + _resolved_list(resolved, offset_hours))
     groups: dict = {}
     for label in project_order:
-        groups.setdefault(label, [])
+        groups.setdefault(label, ([], []))
     for todo in todos:
-        groups.setdefault(todo.project, []).append(todo)
-    groups = {label: items for label, items in groups.items() if items}
+        groups.setdefault(todo.project, ([], []))[0].append(todo)
+    for todo in folded:
+        groups.setdefault(todo.project, ([], []))[1].append(todo)
+    groups = {label: g for label, g in groups.items() if g[0] or g[1]}
     # 页内不再有「项目」列——整页都是同一个项目，那一栏只会占宽度。
     # 「新」标记（tr.fresh td:nth-child(2)）随之落到「哪一条」上，正好在标识旁边。
-    head = ("<tr><th><input type=checkbox class=todoAll title='全选这一页'></th>"
-            "<th>哪一条</th><th>为什么</th><th>诊断信息</th>"
-            "<th>评论数</th><th>最近检查</th><th></th></tr>")
+    head = ("<tr><th><input type=checkbox class=todoAll "
+            "title='全选这一页（已归档 / 没勾巡查的行不带）'></th>" + _TODO_COLUMNS + "</tr>")
     tabs, panels = [], []
-    for index, (label, items) in enumerate(groups.items()):
+    for index, (label, (items, old)) in enumerate(groups.items()):
         tid = f"p{index}"
         first = index == 0
         cnt_cls = ("cnt " + _worst_class(items)).strip()
+        more = (f"<span class=more title='另有 {len(old)} 行已归档的老帖有异常，"
+                f"在这一页底下收着'>+{len(old)}</span>" if old else "")
         tabs.append(
             f"<button type=button role=tab class='tab{' on' if first else ''}' "
             f"aria-selected={'true' if first else 'false'} data-tab='{tid}' "
             f"data-project='{_e(label)}' aria-controls='todos-{tid}'>"
-            f"{_e(label)} <span class='{cnt_cls}'>{len(items)}</span></button>")
-        body = []
-        for todo in items:
-            extra = ""
-            if show_digest and (todo.negative_digest or todo.digest):
-                extra = (f"<div class=muted style='margin-top:4px'>"
-                         f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
-            body.append(
-                f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
-                f"data-tbl='{_e(todo.table_id)}' data-key='{_e(todo.key)}'>"
-                "<td class=nowrap><input type=checkbox class=todoPick></td>"
-                f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
-                f"<td>{_chips(todo.reasons, _REASON_CLASS)}</td>"
-                f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
-                f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
-                # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
-                # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
-                # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT，按 td.when 找格子）。
-                f"<td class='nowrap when'>{_e(_stamp(todo.checked_at_ms, offset_hours))}"
-                f"{' <span class=chip>排队中</span>' if todo.queued else ''}</td>"
-                f"<td class=nowrap><a href='{_e(todo.record_url)}' "
-                "target=_blank rel='noopener noreferrer' class=act>去这一行</a></td>"
-                "</tr>")
+            f"{_e(label)} <span class='{cnt_cls}'>{len(items)}</span>{more}</button>")
+        if items:
+            body = "".join(_todo_row(t, offset_hours, show_digest, main=True,
+                                     resolvable=resolvable) for t in items)
+            main = (f"<div class=tablewrap><table class=todos><thead>{head}</thead>"
+                    f"<tbody>{body}</tbody></table></div>")
+        else:
+            main = ("<div class=tab-empty>这个项目在管的行眼下都没事。"
+                    "底下收着的是已归档的老帖。</div>")
         panels.append(
             f"<div class=tabpanel id='todos-{tid}' role=tabpanel data-tab='{tid}' "
             f"data-project='{_e(label)}'{'' if first else ' hidden'}>"
-            f"<div class=tablewrap><table class=todos><thead>{head}</thead>"
-            f"<tbody>{''.join(body)}</tbody></table></div></div>")
+            f"{main}{_fold(old, offset_hours, show_digest, resolvable=resolvable)}</div>")
     # #todos 包住所有 tab 页：脚本里「所有待办行」仍然是 `#todos tbody tr`，
     # 「新」标记、筛选、勾选计数都不用知道有几页。
     return (f"""<div class=queuebar>
@@ -1244,79 +1455,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
   <span id=queueOut class=muted></span>
 </div>
 <div id=todos><div class=tabs role=tablist aria-label='按项目分开看'>{''.join(tabs)}</div>"""
-            f"{''.join(panels)}</div>")
-
-
-def _side_group(project: str, todos, offset_hours: float, *, open_: bool) -> str:
-    """一个项目的那几行：组头写清几行、各是什么问题，点开是明细。"""
-    counts: dict = {}
-    for todo in todos:
-        for reason in todo.reasons:
-            counts[reason] = counts.get(reason, 0) + 1
-    rows = "".join(
-        "<tr>"
-        f"<td class=which title='{_e(t.label)}'>{_e(_clip(t.label))}</td>"
-        f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
-        f"<td>{_e(t.diagnosis) or '<span class=muted>—</span>'}</td>"
-        f"<td class=nowrap>{_e(_stamp(t.checked_at_ms, offset_hours))}</td>"
-        f"<td class=nowrap><a href='{_e(t.record_url)}' target=_blank "
-        "rel='noopener noreferrer' class=act>去这一行</a></td></tr>"
-        for t in todos)
-    return (f"<details class=side-proj{' open' if open_ else ''}>"
-            f"<summary><b>{_e(project)}</b><span class=cnt>{len(todos)} 行</span>"
-            f"{_counts_chips(counts)}</summary>"
-            "<div class=tablewrap><table><thead><tr><th>哪一条</th><th>为什么</th>"
-            "<th>诊断信息</th><th>最近检查</th><th></th></tr></thead>"
-            f"<tbody>{rows}</tbody></table></div></details>")
-
-
-def _side_block(todos, *, icon: str, title: str, why: str, offset_hours: float,
-                project_order=()) -> str:
-    """一块「不在主列表里」的异常，按项目分组。项目顺序跟上面的标签一致。"""
-    if not todos:
-        return ""
-    by_project: dict = {}
-    for todo in todos:
-        by_project.setdefault(todo.project, []).append(todo)
-    order = [p for p in project_order if p in by_project]
-    order += sorted(p for p in by_project if p not in order)
-    # 行少的时候直接摊开，一眼看完；多了就收起来，只看组头的数。
-    open_ = len(todos) <= 5
-    groups = "".join(_side_group(p, by_project[p], offset_hours, open_=open_)
-                     for p in order)
-    return (f"<div class=side-block><div class=side-head>{_icon(icon)}"
-            f"<span>{_e(title)}</span><span class='chip a'>{len(todos)} 行</span>"
-            f"<span class='chip'>{len(order)} 个项目</span></div>"
-            f"<p class=side-why>{why}</p>{groups}</div>")
-
-
-def _side_sections(archived, adhoc, offset_hours: float, project_order=()) -> str:
-    """主列表之外、同样查出了问题的行。**不在批量勾选的范围里。**
-
-    两种都不该一键重刷：
-    * 已归档的老帖——「排队刷新」会绕过归档线，全选就是把钱花在几个月前的内容上，
-      多数时候正确的处置是去飞书**取消巡查**；
-    * 没勾巡查、刚被临时查过的——没勾巡查是运营说了「这行别管了」，有人勾排队
-      临时查了一下、查出了问题，要人去看的是那一行，不是再全选刷一遍。
-    """
-    if not archived and not adhoc:
-        return ""
-    blocks = _side_block(
-        adhoc, icon="history", title="没勾巡查、最近 24 小时临时查过的",
-        why="这些行没勾「是否巡查」，是有人勾了「排队刷新」临时查了一下（或者刚取消"
-            "巡查），查出了下面的问题。面板平时只统计勾着巡查的行，所以单独放在这里；"
-            "要继续盯着就去飞书把「是否巡查」勾上。",
-        offset_hours=offset_hours, project_order=project_order)
-    blocks += _side_block(
-        archived, icon="inbox", title="已归档的老帖",
-        why="超过归档天数、不再自动刷的帖子，问题会一直挂到有人处理。「排队刷新」会"
-            "<b>绕过归档线</b>，所以它们不在上面的列表和批量勾选里——多数时候正确的"
-            "处置是去飞书<b>取消巡查</b>，而不是再花钱刷一次。",
-        offset_hours=offset_hours, project_order=project_order)
-    total = len(archived) + len(adhoc)
-    return (f"<h2 id=s-side>不在主列表里的异常 <span class=n>{total}</span></h2>"
-            "<p class=sub>下面这些行同样查出了问题，但不该一键重刷，所以不在上面的列表和"
-            "批量勾选里。按项目分组，点项目名展开明细。</p>" + blocks)
+            f"{''.join(panels)}</div>{_resolved_list(resolved, offset_hours)}")
 
 
 def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
@@ -1618,7 +1757,9 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                   fetched_at: float, config, csrf: str = "",
                   runs=None, log_error: str = "",
                   balances=None, balance_error: str = "", runway=None,
-                  outages=None, offset_hours: float = 8.0) -> str:
+                  outages=None, offset_hours: float = 8.0,
+                  resolvable: bool = False) -> str:
+    # resolvable = 面板接上了注册表、「已解决」有地方存（见 panel.Resolutions）。
     if overview is None:
         # 四态里的「骨架加载」。给骨架而不是一句「正在取数」，是因为这一屏
         # 要读完整张表，第一次可能要好几秒——一个空盒子看着像坏了。
@@ -1677,6 +1818,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                      "停用的表不巡查、不统计，行也不在上面的待办里；"
                      "要恢复，去下面「项目」里点「启用」。</p>")
     projects = overview.projects
+    resolve_hint = ("；处理完了点「已解决」先收起来，下次刷新又查出问题会自动回来"
+                    if resolvable else "")
     stale_note = ""
     if error:
         stale_note = (f"<div class=note>{_icon('alert-triangle')}<span>"
@@ -1733,7 +1876,6 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     nav = _sidebar_nav(
         # 侧栏那个数字和 KPI 走同一个口径：截断了就带 `+`，不装成精确值。
         todos=f"{len(todos)}" + ("+" if todos_hidden else ""),
-        side=len(overview.archived_todos()) + len(overview.adhoc_todos()),
         projects=len(projects), runs=len(runs or []),
         # 余额整块读失败时 `_balance_section` 仍然渲染一个 id=s-balance 的
         # 错误区块——侧栏这边也得有入口，否则「余额出事了」这个信息恰好在
@@ -1767,11 +1909,12 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     <h2 id=s-todo>要人管的行 <span class=n>{len(todos)}{'+' if todos_hidden else ''}</span></h2>
     <p class=sub>按项目分开看：每个项目一个标签，标签上的数字是这个项目要人管的行数
       （红 = 有风控 / 失效 / 刷新失败），每一页里按严重度排序；筛选时各标签上显示命中数。
-      点「去这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做。{hidden_note}</p>
+      点「去这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做{resolve_hint}。
+      已归档的老帖收在各自项目那一页的底下。{hidden_note}</p>
     {_todo_table(todos, offset_hours, config.show_digest,
-                 project_order=[p.label for p in projects])}
-    {_side_sections(overview.archived_todos(), overview.adhoc_todos(), offset_hours,
-                    project_order=[p.label for p in projects])}
+                 project_order=[p.label for p in projects],
+                 folded=overview.archived_todos(), resolved=overview.resolved,
+                 resolvable=resolvable)}
 
     <h2 id=s-proj>各项目 <span class=n>{len(projects)}</span></h2>
     {empty_note}{disabled_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
@@ -1788,7 +1931,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
 
 def _sidebar_nav(*, todos, projects: int, runs: int,
-                 balances: bool, side: int = 0) -> str:
+                 balances: bool) -> str:
     """侧栏导航。导航项高 40、图标 20 + 文字 14/500，激活 = 雾蓝底 + 蓝字。
 
     带上每一项的条数：侧栏在这个面板里不只是跳转，它是**第二处**告诉你
@@ -1796,11 +1939,6 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
     """
     items = [
         ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
-    ]
-    if side:
-        # 主列表之外的异常（已归档 / 没勾巡查临时查过的），有才出现。
-        items.append(("s-side", "alert-triangle", "其他异常", str(side)))
-    items += [
         ("s-proj", "layout-grid", "各项目", str(projects)),
         ("s-manage", "folder", "加表 / 改配置", ""),
     ]

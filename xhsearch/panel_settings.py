@@ -13,9 +13,11 @@
 
 ## 它是键值表，不是配置文件
 
-两列：`键` / `值`。值一律是 JSON 文本。现在只有一个键：
+两列：`键` / `值`。值一律是 JSON 文本。现在有两个键：
 
 * `share.editor_chats`  → `[{"chat_id": "oc_…", "name": "梨响运营群"}, …]`
+* `todo.resolved`       → `{"tbl…/rec…": {"reasons": ["有负面"], "seen": 毫秒, "at": 毫秒}, …}`
+  面板上点的「已解决」（见 panel.Resolutions、summary.apply_resolutions）。
 
 「谁可管理」刻意**不**存在这里——它来自后台环境变量 FEISHU_TABLE_MANAGERS。
 面板口令是运营共用的，管理权限不能是面板上点一下就给的东西（见 panel.Projects）。
@@ -39,6 +41,7 @@ COL_VALUE = "值"
 FIELDS = [{"field_name": COL_KEY, "type": 1}, {"field_name": COL_VALUE, "type": 1}]
 
 KEY_EDITOR_CHATS = "share.editor_chats"
+KEY_RESOLVED = "todo.resolved"
 
 CACHE_SECONDS = 300.0
 
@@ -123,18 +126,44 @@ class SettingsStore:
         text = json.dumps(value, ensure_ascii=False)
         with self._lock:
             table_id = self._ensure_table()
-            table = self._bitable(self.app_token, table_id)
             # 强制重读：别拿缓存里的「没有这一行」去决定 create——另一个线程
             # 刚建完的那一行缓存里还没有。
-            existing = self._load(force=True).get(key)
-            if existing and existing[0]:
-                table.batch_update([{"record_id": existing[0],
-                                     "fields": {COL_KEY: key, COL_VALUE: text}}])
-            else:
-                # 幂等键按 键+值 算：同一个值重发（超时重试）不会多出一行。
-                table.batch_create(
-                    [{"fields": {COL_KEY: key, COL_VALUE: text}}],
-                    client_token=feishu.idempotency_key(
-                        f"panel-setting:{self.app_token}:{key}:{text}"))
-            self._rows = None
+            self._put(table_id, key, text, self._load(force=True).get(key))
         self.log(f"⚙ 面板设置 {key} = {text}")
+
+    def update_json(self, key: str, change: Callable[[Any], Any], default: Any) -> Any:
+        """读-改-写一个键，**整段在锁里**：两个人同时点，后一个改的是前一个
+        写完的那份，不会互相覆盖。`change` 拿到当前值（没有 / 坏了 → default），
+        返回要写的新值。返回写进去的值。
+
+        和 set_json 不同，日志里不打整段值——这种键（「已解决」）会越攒越长。
+        """
+        with self._lock:
+            table_id = self._ensure_table()
+            existing = self._load(force=True).get(key)
+            current = default
+            if existing and existing[1].strip():
+                try:
+                    current = json.loads(existing[1])
+                except ValueError:
+                    current = default
+            value = change(current)
+            text = json.dumps(value, ensure_ascii=False)
+            self._put(table_id, key, text, existing)
+        self.log(f"⚙ 面板设置 {key} 已更新（{len(text)} 字）")
+        return value
+
+    def _put(self, table_id: str, key: str, text: str,
+             existing: Optional[tuple[str, str]]) -> None:
+        """有那一行就改，没有就建。调用方持锁。"""
+        table = self._bitable(self.app_token, table_id)
+        if existing and existing[0]:
+            table.batch_update([{"record_id": existing[0],
+                                 "fields": {COL_KEY: key, COL_VALUE: text}}])
+        else:
+            # 幂等键按 键+值 算：同一个值重发（超时重试）不会多出一行。
+            table.batch_create(
+                [{"fields": {COL_KEY: key, COL_VALUE: text}}],
+                client_token=feishu.idempotency_key(
+                    f"panel-setting:{self.app_token}:{key}:{text}"))
+        self._rows = None

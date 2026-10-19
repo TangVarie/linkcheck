@@ -2277,13 +2277,13 @@ class TestTodosAreSplitByProject(unittest.TestCase):
         self.assertEqual(by_label, {"红": "cnt r", "黄": "cnt a", "素": "cnt"})
 
     def test_the_project_column_is_gone_from_the_todo_pages(self):
-        """整页都是同一个项目，那一栏只会占宽度。（归档区仍是拉平的一张表，
-        它保留「项目」列——所以只查待办页里的表。）"""
+        """整页都是同一个项目，那一栏只会占宽度。（归档折叠区现在也跟着项目页走，
+        同样没有「项目」列。）"""
         page = self._page([self._snap("甲", "ta", [["有负面"]])])
         block = self._todos_block(page)
         self.assertNotIn("<th>项目</th>", block)
         self.assertIn("<th>哪一条</th>", block)
-        self.assertIn("class=todoAll title='全选这一页'", block)
+        self.assertIn("class=todoAll title='全选这一页", block)
 
     def test_every_page_gets_its_own_select_all(self):
         page = self._page([self._snap("甲", "ta", [["有负面"]]),
@@ -2649,66 +2649,522 @@ class TestAdhocAndArchivedSections(unittest.TestCase):
         self.assertTrue(got[0].adhoc)
         self.assertNotIn("卡住了", got[0].reasons, "没勾巡查的行本来就不自动刷")
 
-    def test_the_panel_reads_them_but_keeps_them_out_of_every_number(self):
+    def _published(self, days_ago):
+        return {self.f.publish_time: int((NOW - timedelta(days=days_ago)).timestamp() * 1000)}
+
+    def test_the_panel_lists_them_but_keeps_them_out_of_the_project_numbers(self):
         table = FakeTable(healthy_meta(self.settings), [
             # 发布时间要填：这个 note_id 解出来在 2024 年，空着就按 ID 推成已归档。
-            self._rec("watched", checked_hours_ago=2, monitored=True,
-                      **{self.f.publish_time: int((NOW - timedelta(days=2)).timestamp() * 1000)}),
+            self._rec("watched", checked_hours_ago=2, monitored=True, **self._published(2)),
             self._rec("adhoc", checked_hours_ago=2),
         ])
         overview = panel.collect([("A", table)], self.settings, {}, now=NOW)
         project = overview.projects[0]
         self.assertEqual(project.total_rows, 1)
         self.assertEqual([t.record_id for t in project.todos], ["watched"])
+        self.assertEqual(project.needs_attention, 1, "项目卡上的数只说在管的行")
         self.assertEqual([t.record_id for t in overview.adhoc_todos()], ["adhoc"])
-        self.assertEqual([t.record_id for t in overview.todos()], ["watched"],
-                         "主列表和批量勾选里不能有它")
+        self.assertEqual(sorted(t.record_id for t in overview.todos()), ["adhoc", "watched"],
+                         "刚临时查出来的问题进主列表")
 
-    def _todo(self, rid, project, *, archived=False, adhoc=False, reasons=("风控中",),
-              diagnosis=""):
+    def test_archived_rows_checked_within_24h_stay_in_the_main_list(self):
+        table = FakeTable(healthy_meta(self.settings), [
+            self._rec("fresh", checked_hours_ago=3, monitored=True, **self._published(60)),
+            self._rec("stale", checked_hours_ago=30, monitored=True, **self._published(60)),
+        ])
+        overview = panel.collect([("A", table)], self.settings, {}, now=NOW)
+        self.assertEqual([t.record_id for t in overview.todos()], ["fresh"])
+        self.assertTrue(overview.todos()[0].archived)
+        self.assertEqual([t.record_id for t in overview.archived_todos()], ["stale"],
+                         "过了 24 小时才收进归档折叠区")
+        self.assertEqual(overview.todos_dropped_by(1), 0)
+
+    def _todo(self, rid, project, *, archived=False, adhoc=False, recent=False,
+              reasons=("风控中",), diagnosis="", table_id="a"):
         return summary.TodoRow(record_id=rid, project=project,
                                record_url=f"https://x/{rid}", link_cell=self.LINK,
                                label=f"帖子{rid}", archived=archived, adhoc=adhoc,
+                               recent=recent or adhoc, app_token="t", table_id=table_id,
                                reasons=list(reasons), diagnosis=diagnosis,
                                checked_at_ms=int(NOW.timestamp() * 1000))
 
-    def _page(self, projects):
-        overview = summary.Overview(projects=projects, generated_at=NOW)
+    def _page(self, projects, *, resolvable=False, resolved=()):
+        overview = summary.Overview(projects=projects, generated_at=NOW,
+                                    resolved=list(resolved))
         return panel_view.overview_page(overview=overview, error="",
                                         fetched_at=NOW.timestamp(), config=config(),
-                                        csrf="tok")
+                                        csrf="tok", resolvable=resolvable)
 
-    def test_the_sections_are_grouped_by_project_and_visible(self):
+    def _panel(self, page, label):
+        """某个项目那一页的 HTML。"""
+        at = page.index(f"role=tabpanel data-tab='p", page.index("<div id=todos>"))
+        while True:
+            end = page.find("<div class=tabpanel ", at + 1)
+            chunk = page[at:end if end > 0 else page.index("<h2 id=s-proj>")]
+            if f"data-project='{label}'" in chunk[:200]:
+                return chunk
+            if end < 0:
+                raise AssertionError(f"没有「{label}」那一页")
+            at = end
+
+    def _two_projects(self):
         a = summary.ProjectSnapshot(label="途鸽", app_token="t", table_id="a", todos=[
+            self._todo("a0", "途鸽", reasons=("有负面",)),
             self._todo("a1", "途鸽", archived=True),
             self._todo("a2", "途鸽", archived=True, reasons=("有负面",))])
         b = summary.ProjectSnapshot(label="西屋", app_token="t", table_id="b", todos=[
-            self._todo("b1", "西屋", archived=True)],
-            adhoc_todos=[self._todo("b2", "西屋", adhoc=True, reasons=("有负面",))])
-        page = self._page([a, b])
-        side = page[page.index("id=s-side"):page.index("id=s-proj")]
-        self.assertIn("不在主列表里的异常", side)
-        self.assertIn("已归档的老帖", side)
-        self.assertIn("没勾巡查、最近 24 小时临时查过的", side)
-        self.assertEqual(side.count("class=side-block"), 2)
-        self.assertEqual(side.count("<details class=side-proj"), 3,
-                         "归档区两个项目各一组，临时查过区一组")
-        self.assertIn("<b>途鸽</b><span class=cnt>2 行</span>", side)
-        self.assertIn("有负面 1", side, "组头写着这个项目各是什么问题")
-        self.assertNotIn("type=checkbox", side, "这两区不在批量勾选的范围里")
-        self.assertIn("其他异常", page[:page.index("<div class=main>")],
-                      "侧栏有入口，带条数")
+            self._todo("b1", "西屋", archived=True, table_id="b")])
+        return [a, b]
+
+    def test_the_fold_lives_under_its_own_project_tab(self):
+        page = self._page(self._two_projects())
+        tugo, xiwu = self._panel(page, "途鸽"), self._panel(page, "西屋")
+        self.assertIn("<details class=fold>", tugo)
+        self.assertIn("还有 <b class=foldN>2</b> 行已归档的老帖也有异常", tugo)
+        self.assertIn("还有 <b class=foldN>1</b> 行已归档的老帖也有异常", xiwu)
+        self.assertNotIn("帖子b1", tugo, "别的项目的老帖不摊在这一页")
+        self.assertNotIn("帖子a1", xiwu)
+        self.assertNotIn("id=s-side", page, "不再有一个汇总所有项目的区")
+        self.assertNotIn("其他异常", page)
+
+    def test_the_fold_is_closed_by_default_but_says_what_is_inside(self):
+        page = self._page(self._two_projects())
+        tugo = self._panel(page, "途鸽")
+        self.assertNotIn("<details class=fold open", page, "默认收起")
+        summary_line = tugo[tugo.index("<details class=fold>"):tugo.index("</summary>")]
+        self.assertIn("风控中 1", summary_line, "条上就写着各是什么问题")
+        self.assertIn("有负面 1", summary_line)
+        self.assertIn("点开看", summary_line)
+        self.assertIn("绕过归档线", tugo)
+        self.assertIn("取消巡查", tugo)
+
+    def test_a_project_with_only_old_problems_still_gets_a_tab(self):
+        page = self._page(self._two_projects())
+        tab = re.search(r"data-project='西屋'[^>]*>西屋 <span class='cnt[^']*'>(\d+)</span>"
+                        r"<span class=more[^>]*>\+(\d+)</span>", page)
+        self.assertIsNotNone(tab, "只有老帖的项目也要有 tab，tab 上带 +N")
+        self.assertEqual(tab.groups(), ("0", "1"))
+        self.assertIn("class=tab-empty", self._panel(page, "西屋"))
+        self.assertNotIn("没有需要处理的行", page)
+
+    def test_fold_rows_are_out_of_batch_selection(self):
+        page = self._page(self._two_projects())
+        fold = self._panel(page, "途鸽")
+        fold = fold[fold.index("<details class=fold>"):]
+        self.assertNotIn("type=checkbox", fold)
+        self.assertNotIn("data-key=", fold, "「新」标记只说主列表")
+
+    def test_recent_archived_and_adhoc_rows_join_the_main_list_but_not_select_all(self):
+        p = summary.ProjectSnapshot(label="途鸽", app_token="t", table_id="a", todos=[
+            self._todo("n", "途鸽"),
+            self._todo("old", "途鸽", archived=True, recent=True)],
+            adhoc_todos=[self._todo("ad", "途鸽", adhoc=True, reasons=("有负面",))])
+        page = self._page([p])
+        main = self._panel(page, "途鸽")
+        self.assertNotIn("<details class=fold", main, "24 小时内查过的不进折叠区")
+        rows = dict(re.findall(r"<tr data-rec='(\w+)'.*?<input type=checkbox class='?([^ >']+(?: solo)?)", main))
+        self.assertEqual(rows, {"n": "todoPick", "old": "todoPick solo", "ad": "todoPick solo"})
+        self.assertIn(">已归档</span>", main)
+        self.assertIn(">未巡查</span>", main)
+        self.assertIn(">3</span></button>", page, "tab 上的数把它们算进去")
+
+    def test_select_all_skips_solo_rows_in_the_script(self):
+        script = panel_view._SCRIPT
+        self.assertIn('querySelectorAll(".todoPick:not(.solo)")', script)
 
     def test_nothing_to_show_takes_no_space(self):
         page = self._page([summary.ProjectSnapshot(label="A", app_token="t", table_id="a")])
-        self.assertNotIn("id=s-side", page)
-        self.assertNotIn("其他异常", page)
+        self.assertNotIn("<details class=fold", page)
+        self.assertIn("没有需要处理的行", page)
 
     def test_text_from_feishu_is_escaped(self):
         p = summary.ProjectSnapshot(label="<b>x</b>", app_token="t", table_id="a",
-                                    adhoc_todos=[self._todo("r", "<b>x</b>", adhoc=True,
-                                                            diagnosis="<script>1</script>")])
+                                    todos=[self._todo("r", "<b>x</b>", archived=True,
+                                                      diagnosis="<script>1</script>")])
         page = self._page([p])
-        side = page[page.index("id=s-side"):page.index("id=s-proj")]
-        self.assertNotIn("<script>1</script>", side)
-        self.assertNotIn("<b><b>x</b></b>", side)
+        block = page[page.index("<div id=todos>"):page.index("id=s-proj")]
+        self.assertNotIn("<script>1</script>", block)
+        self.assertNotIn("<b><b>x</b></b>", block)
+
+    def test_resolve_buttons_only_when_there_is_somewhere_to_store_them(self):
+        self.assertNotIn("class='link resolve'", self._page(self._two_projects()))
+        page = self._page(self._two_projects(), resolvable=True)
+        tugo = self._panel(page, "途鸽")
+        self.assertEqual(tugo.count("class='link resolve'"), 3, "主列表和折叠区都有")
+        self.assertIn("data-reasons='[&quot;有负面&quot;]'", tugo)
+        self.assertIn(f"data-checked='{int(NOW.timestamp() * 1000)}'", tugo)
+
+    def test_resolved_rows_are_listed_with_an_undo(self):
+        gone = summary.TodoRow(record_id="z", project="途鸽", record_url="https://x/z",
+                               link_cell=self.LINK, label="帖子z", table_id="a",
+                               reasons=["有负面"], resolved_at_ms=int(NOW.timestamp() * 1000))
+        page = self._page([summary.ProjectSnapshot(label="途鸽", app_token="t", table_id="a")],
+                          resolvable=True, resolved=[gone])
+        self.assertIn("没有需要处理的行", page)
+        self.assertIn("1 行标了「已解决」", page)
+        self.assertIn("class='link unresolve'", page)
+        self.assertNotIn("<details class=resolved open", page)
+
+
+# ---------------------------------------------------------------- 已解决
+
+class TestResolutionRule(unittest.TestCase):
+    """什么时候继续收着、什么时候重新冒出来（summary.still_resolved）。"""
+
+    SEEN = int(NOW.timestamp() * 1000)
+
+    def setUp(self):
+        self.sticky = summary.sticky_reasons(Settings())
+
+    def _todo(self, reasons, checked_at_ms):
+        return summary.TodoRow(record_id="r", project="A", record_url="", link_cell="",
+                               table_id="t", reasons=list(reasons), checked_at_ms=checked_at_ms)
+
+    def _entry(self, reasons, seen=SEEN):
+        return {"reasons": list(reasons), "seen": seen, "at": self.SEEN + 1000}
+
+    def test_hidden_until_the_next_refresh(self):
+        entry = self._entry(["有负面"])
+        self.assertTrue(summary.still_resolved(self._todo(["有负面"], self.SEEN), entry, self.sticky))
+        self.assertFalse(summary.still_resolved(self._todo(["有负面"], self.SEEN + 60_000),
+                                                entry, self.sticky),
+                         "又刷了一次还是有负面 = 又发现了")
+
+    def test_a_new_kind_of_problem_always_shows(self):
+        entry = self._entry(["风控中"])
+        self.assertFalse(summary.still_resolved(
+            self._todo(["风控中", "有负面"], self.SEEN), entry, self.sticky))
+
+    def test_problems_a_refresh_never_clears_stay_hidden_after_refreshes(self):
+        """风控中 / 疑似限流 是只增不减的标签，置顶掉了、需重新整理也不会因为
+        刷一次就消——按「刷过就重新显示」，点了等于没点。"""
+        for reason in ("风控中", "疑似限流", "置顶掉了", "需重新整理"):
+            entry = self._entry([reason, "有负面"])
+            self.assertTrue(summary.still_resolved(
+                self._todo([reason], self.SEEN + 3_600_000), entry, self.sticky), reason)
+        self.assertFalse(summary.still_resolved(
+            self._todo(["风控中", "有负面"], self.SEEN + 3_600_000),
+            self._entry(["风控中", "有负面"]), self.sticky),
+            "混着一个每轮都重判的问题，刷过之后还在 = 又发现了")
+
+    def test_every_round_reasons_reappear_after_a_refresh(self):
+        for reason in ("有负面", "已失效", "刷新失败", "疑似受限", "卡住了"):
+            self.assertFalse(summary.still_resolved(
+                self._todo([reason], self.SEEN + 1), self._entry([reason]), self.sticky), reason)
+
+    def test_never_checked_rows(self):
+        self.assertTrue(summary.still_resolved(self._todo(["卡住了"], None),
+                                               self._entry(["卡住了"], seen=None), self.sticky))
+        self.assertFalse(summary.still_resolved(self._todo(["卡住了"], self.SEEN),
+                                                self._entry(["卡住了"], seen=None), self.sticky),
+                         "点的时候还没查过，现在查过了")
+
+    def test_broken_entries_hide_nothing(self):
+        todo = self._todo(["有负面"], self.SEEN)
+        # 最后一个：seen 不是毫秒数 = 当作点的时候没看到这一次
+        for entry in (None, "x", {}, {"reasons": "有负面"}, {"reasons": ["有负面"], "seen": True}):
+            self.assertFalse(summary.still_resolved(todo, entry, self.sticky), entry)
+
+    def test_apply_returns_a_copy_and_lists_what_it_hid(self):
+        keep = summary.TodoRow(record_id="k", project="A", record_url="", link_cell="",
+                               table_id="t", reasons=["有负面"], checked_at_ms=self.SEEN)
+        gone = summary.TodoRow(record_id="g", project="A", record_url="", link_cell="",
+                               table_id="t", reasons=["有负面"], checked_at_ms=self.SEEN)
+        adhoc = summary.TodoRow(record_id="h", project="A", record_url="", link_cell="",
+                                table_id="t", reasons=["风控中"], checked_at_ms=self.SEEN,
+                                adhoc=True, recent=True)
+        snap = summary.ProjectSnapshot(label="A", app_token="b", table_id="t",
+                                       todos=[keep, gone], adhoc_todos=[adhoc])
+        original = summary.Overview(projects=[snap])
+        resolved = {"t/g": self._entry(["有负面"]), "t/h": self._entry(["风控中"])}
+        out = summary.apply_resolutions(original, resolved, Settings())
+        self.assertEqual([t.record_id for t in out.todos()], ["k"])
+        self.assertEqual(sorted(t.record_id for t in out.resolved), ["g", "h"])
+        self.assertEqual(out.resolved[0].resolved_at_ms, self.SEEN + 1000)
+        self.assertEqual(out.projects[0].needs_attention, 1)
+        self.assertEqual(len(original.projects[0].todos), 2, "缓存里那份不能被改")
+        self.assertEqual(len(original.projects[0].adhoc_todos), 1)
+        self.assertIs(summary.apply_resolutions(original, {}, Settings()), original)
+
+
+class TestResolutions(unittest.TestCase):
+    """panel.Resolutions：内存里一份、写穿到「面板设置」、读失败不挡页面。"""
+
+    def _make(self, store, *, ticks=None, wall=None):
+        projects = mock.Mock(spec=panel.Projects)
+        projects.enabled = True
+        projects._store.return_value = store
+        ticks = ticks if ticks is not None else [0.0]
+        self.spawned = []
+        res = panel.Resolutions(projects, log=lambda *a: None,
+                                clock=lambda: ticks[0],
+                                wall=wall or (lambda: NOW.timestamp()),
+                                spawn=self.spawned.append)
+        return res, ticks
+
+    def _run_spawned(self):
+        while self.spawned:
+            self.spawned.pop(0)()
+
+    class _Store:
+        def __init__(self, value=None):
+            self.value = value if value is not None else {}
+            self.reads = 0
+            self.fail = None
+
+        def get_json(self, key, default):
+            self.reads += 1
+            if self.fail:
+                raise self.fail
+            return self.value
+
+        def update_json(self, key, change, default):
+            self.value = change(json.loads(json.dumps(self.value)))
+            return self.value
+
+    def test_disabled_means_nothing_is_hidden(self):
+        projects = mock.Mock(spec=panel.Projects)
+        projects.enabled = False
+        self.assertEqual(panel.Resolutions(projects).snapshot(), {})
+        projects._store.assert_not_called()
+
+    def test_mark_and_unmark_write_through(self):
+        store = self._Store()
+        res, _ = self._make(store)
+        res.mark("tblA", "rec1", ["有负面"], 123)
+        self.assertEqual(store.value["tblA/rec1"],
+                         {"reasons": ["有负面"], "seen": 123, "at": int(NOW.timestamp() * 1000)})
+        self.assertEqual(res.snapshot(), store.value)
+        self.assertEqual(store.reads, 0, "刚写完不用再读一遍")
+        res.unmark("tblA", "rec1")
+        self.assertEqual(store.value, {})
+        self.assertEqual(res.snapshot(), {})
+
+    def test_reads_are_cached(self):
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        res, ticks = self._make(store)
+        res.snapshot(); res.snapshot()
+        self.assertEqual(store.reads, 1)
+        self.assertEqual(self.spawned, [], "第一次手里什么都没有，当场读")
+
+    def test_later_rereads_serve_the_old_copy_and_read_in_the_background(self):
+        """出页面不等飞书：过期了先给旧的，后台再读。"""
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        res, ticks = self._make(store)
+        old = res.snapshot()
+        store.value = {"t/x": {"reasons": ["风控中"], "at": 2}}
+        ticks[0] += panel.panel_settings.CACHE_SECONDS + 1
+        self.assertEqual(res.snapshot(), old)
+        self.assertEqual(store.reads, 1, "页面这一下没读")
+        self.assertEqual(len(self.spawned), 1)
+        res.snapshot()
+        self.assertEqual(len(self.spawned), 1, "已经在读了，不再起第二个")
+        self._run_spawned()
+        self.assertEqual(res.snapshot(), store.value)
+
+    def test_a_background_read_does_not_overwrite_a_newer_click(self):
+        store = self._Store({})
+        res, ticks = self._make(store)
+        res.snapshot()
+        ticks[0] += panel.panel_settings.CACHE_SECONDS + 1
+        res.snapshot()                       # 后台读排上了，读的是点之前的那份
+        stale = dict(store.value)
+        res.mark("t", "r", ["有负面"], None)
+        store.value = stale                  # 模拟后台读回来的是点之前的
+        self._run_spawned()
+        self.assertIn("t/r", res.snapshot(), "后台读回来的旧数据盖掉了刚点的")
+
+    def test_a_failed_read_keeps_the_page_up_and_backs_off(self):
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        res, ticks = self._make(store)
+        good = res.snapshot()
+        ticks[0] += panel.panel_settings.CACHE_SECONDS + 1
+        store.fail = panel.feishu.FeishuError(-1, "超时")
+        res.snapshot()
+        self._run_spawned()
+        self.assertEqual(res.snapshot(), good, "读失败用上一份")
+        self.assertEqual(self.spawned, [], "一分钟之内不再试")
+        reads = store.reads
+        ticks[0] += panel.Resolutions.RETRY_SECONDS + 1
+        store.fail = None
+        res.snapshot()
+        self._run_spawned()
+        self.assertEqual(store.reads, reads + 1)
+
+    def test_a_failed_first_read_hides_nothing(self):
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        store.fail = panel.feishu.FeishuError(-1, "超时")
+        res, _ = self._make(store)
+        self.assertEqual(res.snapshot(), {})
+
+    def test_old_entries_expire_and_the_list_is_capped(self):
+        now_ms = int(NOW.timestamp() * 1000)
+        day = 86_400_000
+        old = {"t/old": {"reasons": ["有负面"], "at": now_ms - (panel.Resolutions.KEEP_DAYS + 1) * day},
+               "t/new": {"reasons": ["有负面"], "at": now_ms - day},
+               "t/bad": "x"}
+        store = self._Store(old)
+        res, _ = self._make(store)
+        res.mark("t", "r", ["风控中"], None)
+        self.assertEqual(sorted(store.value), ["t/new", "t/r"])
+        many = {f"t/r{i}": {"reasons": ["有负面"], "at": now_ms - i} for i in range(600)}
+        store.value = many
+        res.mark("t", "fresh", ["有负面"], None)
+        self.assertEqual(len(store.value), panel.Resolutions.MAX_ENTRIES)
+        self.assertIn("t/fresh", store.value)
+        self.assertIn("t/r0", store.value, "留最近点的")
+        self.assertNotIn("t/r599", store.value)
+
+
+class TestResolveRoute(unittest.TestCase):
+    """POST /api/resolve，以及页面上真的收起来。"""
+
+    TS = int(NOW.timestamp() * 1000)
+
+    @classmethod
+    def setUpClass(cls):
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        cls.addClassCleanup(quiet.stop)
+        cls.config = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32,
+                                       port=0, cache_seconds=999)
+        cls.config.app_id, cls.config.app_secret = "cli_x", "s"
+        cls.store = TestResolutions._Store()
+        cls.projects = mock.Mock(spec=panel.Projects)
+        cls.projects.enabled = True
+        cls.projects._store.return_value = cls.store
+        cls.resolutions = panel.Resolutions(cls.projects, log=lambda *a: None)
+        todo = summary.TodoRow(record_id="rec1", project="途鸽", record_url="https://x/1",
+                               link_cell="", label="那条笔记", app_token="bas", table_id="tblA",
+                               reasons=["有负面"], checked_at_ms=cls.TS)
+        snap = summary.ProjectSnapshot(label="途鸽", app_token="bas", table_id="tblA",
+                                       todos=[todo])
+        cache = panel.Cache(lambda: summary.Overview(projects=[snap]), ttl=999)
+        cache.refresh()
+        cls.cache = cache
+        cls.server = panel.build_server(cls.config, cache, projects=cls.projects,
+                                        settings=Settings(), resolutions=cls.resolutions,
+                                        host="127.0.0.1")
+        cls.port = cls.server.server_address[1]
+        __import__("threading").Thread(
+            target=cls.server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.cache.stop()
+
+    def setUp(self):
+        self.store.value = {}
+        self.resolutions._data = {}
+
+    _auth = TestQueueRoute._auth
+
+    def _req(self, path, data=None, headers=None):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(f"http://localhost:{self.port}{path}", data=data,
+                                     headers=headers or {},
+                                     method="POST" if data is not None else "GET")
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    def _resolve(self, body, auth=None):
+        return self._req("/api/resolve", json.dumps(body).encode(),
+                         auth if auth is not None else self._auth())
+
+    def test_needs_a_session_and_a_csrf_header(self):
+        body = json.dumps({"table_id": "tblA", "record_id": "rec1", "reasons": ["有负面"]}).encode()
+        self.assertEqual(self._req("/api/resolve", body)[0], 401)
+        auth = self._auth()
+        auth.pop(panel.CSRF_HEADER)
+        self.assertEqual(self._req("/api/resolve", body, auth)[0], 403)
+        self.assertEqual(self.store.value, {})
+
+    def test_bad_bodies_are_refused(self):
+        auth = self._auth()
+        for body in ({"table_id": "tblA", "record_id": "rec1"},                  # 没有 reasons
+                     {"table_id": "tblA", "record_id": "rec1", "reasons": []},
+                     {"table_id": "../x", "record_id": "rec1", "reasons": ["有负面"]},
+                     {"table_id": "tblA", "record_id": "rec1", "reasons": ["有负面"],
+                      "checked_at_ms": "1"},
+                     {"table_id": "tblA", "record_id": "rec1", "reasons": ["\x1b[2J"]},  # 控制字符进日志
+                     ["tblA"]):
+            status, _ = self._resolve(body, auth)
+            self.assertEqual(status, 400, body)
+        self.assertEqual(self.store.value, {})
+
+    def test_resolving_hides_the_row_and_undo_brings_it_back(self):
+        auth = self._auth()
+        status, page = self._req("/", headers={"Cookie": auth["Cookie"]})
+        self.assertIn("那条笔记", page)
+        self.assertIn("class='link resolve'", page)
+        status, _ = self._resolve({"table_id": "tblA", "record_id": "rec1",
+                                   "reasons": ["有负面"], "checked_at_ms": self.TS}, auth)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.store.value["tblA/rec1"]["seen"], self.TS)
+        _, page = self._req("/", headers={"Cookie": auth["Cookie"]})
+        todos = page[page.index("id=s-todo"):page.index("id=s-proj")]
+        self.assertIn("没有需要处理的行", todos)
+        self.assertIn("1 行标了「已解决」", todos)
+        _, api = self._req("/api/overview", headers={"Cookie": auth["Cookie"]})
+        self.assertEqual(json.loads(api)["todos"], [])
+        self.assertEqual(json.loads(api)["resolved"][0]["record_id"], "rec1")
+        self.assertEqual(len(self.cache.view()[0].projects[0].todos), 1, "缓存里那份不动")
+
+        status, _ = self._resolve({"table_id": "tblA", "record_id": "rec1", "undo": True}, auth)
+        self.assertEqual(status, 200)
+        _, page = self._req("/", headers={"Cookie": auth["Cookie"]})
+        self.assertNotIn("标了「已解决」", page)
+        self.assertIn("那条笔记", page)
+
+    def test_a_store_failure_is_reported_not_swallowed(self):
+        auth = self._auth()
+        with mock.patch.object(self.store, "update_json",
+                               side_effect=panel.feishu.FeishuError(-1, "没权限")):
+            status, out = self._resolve({"table_id": "tblA", "record_id": "rec1",
+                                         "reasons": ["有负面"]}, auth)
+        self.assertEqual(status, 400)
+        self.assertIn("没权限", out)
+
+    def test_it_never_touches_the_business_table(self):
+        with mock.patch.object(panel.feishu.Bitable, "batch_update") as batch_update:
+            self._resolve({"table_id": "tblA", "record_id": "rec1", "reasons": ["有负面"]})
+        batch_update.assert_not_called()
+
+
+class TestResolveWithoutRegistry(unittest.TestCase):
+    def test_says_why_it_cannot_store(self):
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        cfg = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32, port=0,
+                                cache_seconds=999)
+        cfg.app_id, cfg.app_secret = "cli_x", "s"
+        projects = panel.Projects(cfg, Settings())
+        cache = panel.Cache(lambda: summary.Overview(projects=[]), ttl=999)
+        cache.refresh()
+        self.addCleanup(cache.stop)
+        server = panel.build_server(cfg, cache, projects=projects,
+                                    resolutions=panel.Resolutions(projects), host="127.0.0.1")
+        self.addCleanup(server.server_close)
+        __import__("threading").Thread(target=server.serve_forever,
+                                       kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        holder = type("H", (), {"port": server.server_address[1], "config": cfg})()
+        auth = TestQueueRoute._auth(holder)
+        status, out = TestResolveRoute._req(
+            holder, "/api/resolve",
+            json.dumps({"table_id": "tblA", "record_id": "rec1", "reasons": ["有负面"]}).encode(),
+            auth)
+        self.assertEqual(status, 400)
+        self.assertIn("FEISHU_REGISTRY", out)
+        _, page = TestResolveRoute._req(holder, "/", headers={"Cookie": auth["Cookie"]})
+        self.assertNotIn("class='link resolve'", page)
