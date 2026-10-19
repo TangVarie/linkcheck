@@ -20,6 +20,8 @@ from xhsearch.config import Settings
 UTC = timezone.utc
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 GOOD_PASSWORD = "a-very-long-passphrase"
+# 「已解决」记录里的时间戳：和 NOW 同一刻（毫秒），在保留期里。
+TS = int(NOW.timestamp() * 1000)
 
 
 def config(**kwargs):
@@ -2941,7 +2943,7 @@ class TestResolutions(unittest.TestCase):
         self.assertEqual(res.snapshot(), {})
 
     def test_reads_are_cached(self):
-        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": TS}})
         res, ticks = self._make(store)
         res.snapshot(); res.snapshot()
         self.assertEqual(store.reads, 1)
@@ -2949,10 +2951,10 @@ class TestResolutions(unittest.TestCase):
 
     def test_later_rereads_serve_the_old_copy_and_read_in_the_background(self):
         """出页面不等飞书：过期了先给旧的，后台再读。"""
-        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": TS}})
         res, ticks = self._make(store)
         old = res.snapshot()
-        store.value = {"t/x": {"reasons": ["风控中"], "at": 2}}
+        store.value = {"t/x": {"reasons": ["风控中"], "at": TS + 1}}
         ticks[0] += panel.panel_settings.CACHE_SECONDS + 1
         self.assertEqual(res.snapshot(), old)
         self.assertEqual(store.reads, 1, "页面这一下没读")
@@ -2975,7 +2977,7 @@ class TestResolutions(unittest.TestCase):
         self.assertIn("t/r", res.snapshot(), "后台读回来的旧数据盖掉了刚点的")
 
     def test_a_failed_read_keeps_the_page_up_and_backs_off(self):
-        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": TS}})
         res, ticks = self._make(store)
         good = res.snapshot()
         ticks[0] += panel.panel_settings.CACHE_SECONDS + 1
@@ -2992,7 +2994,7 @@ class TestResolutions(unittest.TestCase):
         self.assertEqual(store.reads, reads + 1)
 
     def test_a_failed_first_read_hides_nothing(self):
-        store = self._Store({"t/r": {"reasons": ["有负面"], "at": 1}})
+        store = self._Store({"t/r": {"reasons": ["有负面"], "at": TS}})
         store.fail = panel.feishu.FeishuError(-1, "超时")
         res, _ = self._make(store)
         self.assertEqual(res.snapshot(), {})
@@ -3014,6 +3016,222 @@ class TestResolutions(unittest.TestCase):
         self.assertIn("t/fresh", store.value)
         self.assertIn("t/r0", store.value, "留最近点的")
         self.assertNotIn("t/r599", store.value)
+
+    # ---- Codex 审查 #49 ----
+
+    def test_expired_entries_stop_hiding_without_anyone_clicking(self):
+        """过期要在读的时候就生效：没人再点按钮，存着的旧记录也不能一直藏着行。"""
+        day = 86_400_000
+        store = self._Store({
+            "t/old": {"reasons": ["风控中"], "at": TS - (panel.Resolutions.KEEP_DAYS + 1) * day},
+            "t/new": {"reasons": ["风控中"], "at": TS - day}})
+        res, _ = self._make(store)
+        self.assertEqual(sorted(res.snapshot()), ["t/new"])
+        self.assertEqual(sorted(res.snapshot()), ["t/new"], "缓存里的那份也一样筛")
+        self.assertIn("t/old", store.value, "读的时候不写飞书，下次有人点按钮再删")
+
+    def test_undo_at_the_cap_does_not_evict_someone_elses_entry(self):
+        full = {f"t/r{i}": {"reasons": ["有负面"], "at": TS - i}
+                for i in range(panel.Resolutions.MAX_ENTRIES)}
+        store = self._Store(full)
+        res, _ = self._make(store)
+        res.unmark("t", "r5")
+        self.assertEqual(len(store.value), panel.Resolutions.MAX_ENTRIES - 1)
+        self.assertIn(f"t/r{panel.Resolutions.MAX_ENTRIES - 1}", store.value,
+                      "撤销一条，最早点的那条不能跟着没")
+
+    def test_an_older_commit_cannot_overwrite_a_newer_one_in_memory(self):
+        """先写进飞书的请求晚一步换内存，会把后一个请求的结果盖回旧的。"""
+        import threading
+        import time as time_mod
+
+        class SlowReturnStore(self._Store):
+            def __init__(self):
+                super().__init__()
+                self.lock = threading.Lock()
+                self.calls = 0
+                self.first_waiting = threading.Event()
+                self.release_first = threading.Event()
+
+            def update_json(self, key, change, default):
+                with self.lock:                      # 飞书这边按顺序写
+                    self.calls += 1
+                    first = self.calls == 1
+                    self.value = change(json.loads(json.dumps(self.value)))
+                    value = self.value
+                if first:                            # 写完了，还没回到面板手里
+                    self.first_waiting.set()
+                    self.release_first.wait(2)
+                return value
+
+        store = SlowReturnStore()
+        res, _ = self._make(store)
+        a = threading.Thread(target=res.mark, args=("t", "a", ["有负面"], None))
+        a.start()
+        store.first_waiting.wait(2)
+        b = threading.Thread(target=res.mark, args=("t", "b", ["有负面"], None))
+        b.start()
+        time_mod.sleep(0.05)
+        store.release_first.set()
+        a.join(2)
+        b.join(2)
+        self.assertEqual(sorted(res.snapshot()), ["t/a", "t/b"])
+
+    def _overview(self, todos, *, error=""):
+        snap = summary.ProjectSnapshot(label="A", app_token="b", table_id="t",
+                                       todos=list(todos), error=error)
+        return summary.Overview(projects=[snap])
+
+    def _todo(self, rid, reasons, checked=TS):
+        return summary.TodoRow(record_id=rid, project="A", record_url="", link_cell="",
+                               table_id="t", reasons=list(reasons), checked_at_ms=checked)
+
+    def test_reconcile_strikes_out_problems_that_went_away(self):
+        store = self._Store({
+            "t/gone": {"reasons": ["置顶掉了"], "seen": TS, "at": TS},
+            "t/part": {"reasons": ["风控中", "需重新整理"], "seen": TS, "at": TS},
+            "t/same": {"reasons": ["风控中"], "seen": TS, "at": TS}})
+        res, _ = self._make(store)
+        changed = res.reconcile(self._overview([
+            self._todo("part", ["风控中"]), self._todo("same", ["风控中"])]))
+        self.assertEqual(changed, 2)
+        self.assertNotIn("t/gone", store.value, "重新置顶了 = 这一行不在待办里了")
+        self.assertEqual(store.value["t/part"]["reasons"], ["风控中"])
+        self.assertEqual(store.value["t/same"]["reasons"], ["风控中"])
+        self.assertEqual(res.reconcile(self._overview([
+            self._todo("part", ["风控中"]), self._todo("same", ["风控中"])])), 0,
+            "没有要改的就不写飞书")
+
+    def test_a_recurring_pin_problem_shows_again(self):
+        """置顶掉了 → 点已解决 → 重新置顶好了 → 后来又掉了：要重新显示。"""
+        settings = Settings()
+        store = self._Store({"t/r": {"reasons": ["置顶掉了"], "seen": TS, "at": TS}})
+        res, _ = self._make(store)
+        res.reconcile(self._overview([]))                       # 这一轮好了
+        again = self._overview([self._todo("r", ["置顶掉了"], checked=TS + 3_600_000)])
+        shown = summary.for_display(again, res.snapshot(), settings)
+        self.assertEqual([t.record_id for t in shown.todos()], ["r"])
+
+    def test_reconcile_leaves_tables_it_could_not_read_alone(self):
+        store = self._Store({"t/r": {"reasons": ["风控中"], "seen": TS, "at": TS}})
+        res, _ = self._make(store)
+        self.assertEqual(res.reconcile(self._overview([], error="读记录失败")), 0)
+        self.assertIn("t/r", store.value)
+        other = summary.Overview(projects=[summary.ProjectSnapshot(
+            label="B", app_token="b", table_id="other")])
+        self.assertEqual(res.reconcile(other), 0, "停用 / 不在这一轮里的表不动")
+
+    def test_reconcile_does_not_undo_a_click_made_meanwhile(self):
+        store = self._Store({"t/r": {"reasons": ["风控中"], "seen": TS, "at": TS}})
+        res, _ = self._make(store)
+        res.snapshot()
+        real = store.update_json
+
+        def clicked_meanwhile(key, change, default):
+            store.value["t/r"] = {"reasons": ["风控中"], "seen": TS, "at": TS + 5}
+            return real(key, change, default)
+        store.update_json = clicked_meanwhile
+        res.reconcile(self._overview([]))
+        self.assertIn("t/r", store.value, "以后来那一次点为准")
+
+    def test_reconciling_never_breaks_the_refresh(self):
+        overview = self._overview([])
+        res = mock.Mock(spec=panel.Resolutions)
+        res.enabled = True
+        res.reconcile.side_effect = RuntimeError("飞书挂了")
+        lines = []
+        run = panel.reconciling(lambda: overview, res, log=lines.append)
+        self.assertIs(run(), overview)
+        res.reconcile.assert_called_once_with(overview)
+        self.assertIn("飞书挂了", lines[0])
+
+
+class TestTruncationAfterResolutions(unittest.TestCase):
+    """先按「已解决」收起来，再按条数上限截（summary.for_display）。"""
+
+    def _todos(self, n, *, adhoc=False, prefix="r"):
+        return [summary.TodoRow(record_id=f"{prefix}{i}", project="A", record_url="",
+                                link_cell="", table_id="t", reasons=["风控中"],
+                                checked_at_ms=TS, adhoc=adhoc, recent=adhoc)
+                for i in range(n)]
+
+    def test_resolved_rows_free_their_slots(self):
+        snap = summary.ProjectSnapshot(label="A", app_token="b", table_id="t",
+                                       todos=self._todos(250))
+        resolved = {f"t/r{i}": {"reasons": ["风控中"], "seen": TS, "at": TS}
+                    for i in range(200)}
+        shown = summary.for_display(summary.Overview(projects=[snap]), resolved, Settings())
+        self.assertEqual(len(shown.projects[0].todos), 50, "后面 50 行补上来")
+        self.assertEqual(shown.todos_dropped, 0)
+        plain = summary.for_display(summary.Overview(projects=[snap]), {}, Settings())
+        self.assertEqual(len(plain.projects[0].todos), summary.MAX_TODOS)
+        self.assertEqual(plain.todos_dropped, 50)
+
+    def test_truncated_adhoc_rows_are_counted(self):
+        snap = summary.ProjectSnapshot(label="A", app_token="b", table_id="t",
+                                       adhoc_todos=self._todos(230, adhoc=True, prefix="h"))
+        shown = summary.for_display(summary.Overview(projects=[snap]), {}, Settings())
+        self.assertEqual(len(shown.projects[0].adhoc_todos), summary.MAX_TODOS)
+        self.assertEqual(shown.projects[0].adhoc_dropped, 30)
+        self.assertEqual(shown.todos_dropped, 30, "顶栏和页面那句「另有 N 行」要算上它")
+        self.assertTrue(shown.projects[0].attention_exact, "项目卡上的数只说在管的行")
+
+    def test_the_panel_reads_everything_and_caps_on_the_way_out(self):
+        settings = Settings()
+        f = settings.fields
+        link = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b"
+        published = int((NOW - timedelta(days=2)).timestamp() * 1000)
+        records = [{"record_id": f"r{i}", "fields": {
+            f.link: link, f.traffic_status: ["风控中"], f.publish_time: published,
+            f.last_updated: TS - 3_600_000}} for i in range(230)]
+        overview = panel.collect([("A", FakeTable(healthy_meta(settings), records))],
+                                 settings, {}, now=NOW)
+        self.assertEqual(len(overview.projects[0].todos), 230, "读表这一步不截")
+        self.assertEqual(overview.projects[0].todos_dropped, 0)
+        shown = summary.for_display(overview, {}, settings)
+        self.assertEqual(len(shown.projects[0].todos), summary.MAX_TODOS)
+        self.assertEqual(shown.projects[0].todos_dropped, 30)
+
+    def test_the_page_and_api_go_through_the_cap(self):
+        snap = summary.ProjectSnapshot(label="A", app_token="b", table_id="t",
+                                       todos=self._todos(230))
+        cfg = panel.PanelConfig(password=GOOD_PASSWORD, secret=b"s" * 32, port=0,
+                                cache_seconds=999)
+        cache = panel.Cache(lambda: summary.Overview(projects=[snap]), ttl=999)
+        cache.refresh()
+        self.addCleanup(cache.stop)
+        quiet = mock.patch.object(panel.PanelHandler, "log_message",
+                                  lambda self, fmt, *args: None)
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        server = panel.build_server(cfg, cache, host="127.0.0.1")
+        self.addCleanup(server.server_close)
+        __import__("threading").Thread(target=server.serve_forever,
+                                       kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        holder = type("H", (), {"port": server.server_address[1], "config": cfg})()
+        auth = TestQueueRoute._auth(holder)
+        _, api = TestResolveRoute._req(holder, "/api/overview",
+                                       headers={"Cookie": auth["Cookie"]})
+        self.assertEqual(len(json.loads(api)["todos"]), summary.MAX_TODOS)
+
+
+class TestServeWiring(unittest.TestCase):
+    def test_every_refresh_reconciles_resolutions(self):
+        """serve 里缓存用的取数函数，读完表要顺手收拾「已解决」记录。"""
+        overview = summary.Overview(projects=[])
+        resolutions = mock.Mock(spec=panel.Resolutions)
+        resolutions.enabled = True
+        server = mock.Mock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with mock.patch.object(panel, "Resolutions", return_value=resolutions), \
+             mock.patch.object(panel, "Cache") as cache_cls, \
+             mock.patch.object(panel, "build_server", return_value=server), \
+             mock.patch("builtins.print"):
+            panel.serve(config(), lambda: overview, Settings())
+        produce = cache_cls.call_args[0][0]
+        self.assertIs(produce(), overview)
+        resolutions.reconcile.assert_called_once_with(overview)
 
 
 class TestResolveRoute(unittest.TestCase):

@@ -419,11 +419,15 @@ def _collect_one(label, table, settings, api_keys, *,
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=records, settings=settings, now=now, api_keys=api_keys,
         health=health, feishu_base=feishu_base, show_digest=show_digest,
-        scrub=scrub, route=route, label_column=picked, seen_calls=seen_calls)
+        scrub=scrub, route=route, label_column=picked, seen_calls=seen_calls,
+        # 待办全留着，截断放到出页面那一步——先按「已解决」拿掉再截（summary.for_display）。
+        # 「已解决」记录的收拾（Resolutions.reconcile）也要靠这份没截过的全集。
+        truncate=False)
     snap.adhoc_todos = summary.adhoc_todos(
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=unmonitored, settings=settings, now=now, feishu_base=feishu_base,
-        show_digest=show_digest, scrub=scrub, route=route, label_column=picked)
+        show_digest=show_digest, scrub=scrub, route=route, label_column=picked,
+        max_todos=None)
     # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
     # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
     # 缺列的情况体检那边已经在报，这里不重复。
@@ -1104,7 +1108,8 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 class Resolutions:
     """运营在面板上点的「已解决」。**不写业务表**——存在注册表 base 的「面板设置」
     表（键 todo.resolved，见 panel_settings），出页面之前按它把行收起来；
-    什么时候再冒出来由 summary.apply_resolutions 定。
+    什么时候再冒出来由 summary.apply_resolutions 定。每次读完表之后
+    reconcile 把已经消掉的问题从记录里划掉，同一个问题再发生一次才会重新显示。
 
     读是热路径（每次出页面都要），所以内存里留一份：面板是单进程，点「已解决」
     写完就地换掉这一份；每 CACHE_SECONDS 才重读一次（有人在飞书里手改那张表也认），
@@ -1115,6 +1120,7 @@ class Resolutions:
     """
 
     # 记录留多久。过期 = 那一行如果还挂着问题，会重新出现（多看一眼，不是少看）。
+    # 读的时候就按它筛（_live），不用等下一次有人点按钮才生效。
     KEEP_DAYS = 90
     # 整份存在一格文本里，不能无限长。超了先丢最早点的。
     MAX_ENTRIES = 500
@@ -1130,6 +1136,9 @@ class Resolutions:
         self._wall = wall
         self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self._lock = threading.Lock()
+        # 写飞书 + 换内存那一份，整段串起来：两个请求同时点，飞书那边有锁按顺序
+        # 写进去了，但先写完的那个要是晚一步换内存，就会把后一个的结果盖回旧的。
+        self._commit_lock = threading.Lock()
         self._data: dict = {}
         self._loaded_at: Optional[float] = None
         self._failed_at: Optional[float] = None
@@ -1152,7 +1161,7 @@ class Resolutions:
             waiting = (self._failed_at is not None
                        and now - self._failed_at < self.RETRY_SECONDS)
             if fresh or waiting or self._reading:
-                return self._data
+                return self._live(self._data)
             self._reading = True
             first = self._loaded_at is None
             version = self._version
@@ -1161,7 +1170,45 @@ class Resolutions:
         else:
             self._spawn(lambda: self._read(now, version))
         with self._lock:
-            return self._data
+            return self._live(self._data)
+
+    def _live(self, data: dict) -> dict:
+        """没过期的那些。存着的过期记录不在这里删（删要写飞书），下次有人点按钮时顺手删。"""
+        since = int(self._wall() * 1000) - self.KEEP_DAYS * 86_400_000
+        return {k: v for k, v in data.items()
+                if isinstance(v, dict) and isinstance(v.get("at"), int) and v["at"] >= since}
+
+    def reconcile(self, overview: summary.Overview) -> int:
+        """读完表之后：问题已经消掉了的，从「已解决」记录里划掉。返回改了几条。
+
+        overview 要是 panel.collect 读回来、**没截过**的那份（见 summary.trim_resolutions）。
+        只在有东西要改时才写一次飞书。改的时候核对每条记录的 at：这期间有人
+        重新点过「已解决」的，以那一次为准，不动。
+        """
+        if not self.enabled:
+            return 0
+        current = self.snapshot()
+        edits = summary.trim_resolutions(overview, current)
+        if not edits:
+            return 0
+        stamps = {key: current[key].get("at") for key in edits}
+
+        def change(stored):
+            data = dict(stored) if isinstance(stored, dict) else {}
+            for key, kept in edits.items():
+                entry = data.get(key)
+                if not isinstance(entry, dict) or entry.get("at") != stamps[key]:
+                    continue
+                if kept:
+                    data[key] = {**entry, "reasons": kept}
+                else:
+                    data.pop(key)
+            return data
+
+        self._commit(change)
+        self.log(f"↻ 「已解决」记录里 {len(edits)} 条的问题已经消掉了，划掉"
+                 "（之后再出现就重新显示）")
+        return len(edits)
 
     def _read(self, now: float, version: int) -> None:
         try:
@@ -1184,7 +1231,7 @@ class Resolutions:
         at = int(self._wall() * 1000)
 
         def change(current):
-            data = self._pruned(current, at)
+            data = self._pruned(current, at, room=1)
             data.pop(key, None)
             data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
             return data
@@ -1203,7 +1250,9 @@ class Resolutions:
         self._commit(change)
         self.log(f"↩ 撤销已解决 {key}")
 
-    def _pruned(self, current: Any, now_ms: int) -> dict:
+    def _pruned(self, current: Any, now_ms: int, *, room: int = 0) -> dict:
+        """去掉过期的、坏掉的；超过上限丢最早点的。room = 给马上要加的那条留几个位置
+        （只有 mark 要留：撤销本来就是删，留了位置会白白多挤掉一条别人的）。"""
         if not isinstance(current, dict):
             return {}
         since = now_ms - self.KEEP_DAYS * 86_400_000
@@ -1211,15 +1260,17 @@ class Resolutions:
                 if isinstance(v, dict) and isinstance(v.get("at"), int)
                 and v["at"] >= since]
         kept.sort(key=lambda kv: kv[1]["at"])
-        return dict(kept[-(self.MAX_ENTRIES - 1):])
+        limit = self.MAX_ENTRIES - room
+        return dict(kept[-limit:]) if limit > 0 else {}
 
     def _commit(self, change) -> None:
-        value = self.projects._store().update_json(
-            panel_settings.KEY_RESOLVED, change, {})
-        with self._lock:
-            self._data = value
-            self._version += 1
-            self._loaded_at, self._failed_at = self._clock(), None
+        with self._commit_lock:
+            value = self.projects._store().update_json(
+                panel_settings.KEY_RESOLVED, change, {})
+            with self._lock:
+                self._data = value
+                self._version += 1
+                self._loaded_at, self._failed_at = self._clock(), None
 
 
 def _clean_reasons(value: Any) -> list[str]:
@@ -1612,12 +1663,14 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     # —— 页面数据 ——
     def _view(self):
-        """缓存里那份快照，按「已解决」收掉该收的行。缓存里的那份不动。"""
+        """缓存里那份快照，按「已解决」收掉该收的行、再按条数上限截（顺序见
+        summary.for_display）。缓存里的那份不动。"""
         overview, error, fetched_at = self.deps.cache.view()
-        resolutions = self.deps.resolutions
-        if overview is not None and resolutions is not None:
-            overview = summary.apply_resolutions(
-                overview, resolutions.snapshot(), self.deps.settings or Settings())
+        if overview is not None:
+            resolutions = self.deps.resolutions
+            resolved = resolutions.snapshot() if resolutions is not None else {}
+            overview = summary.for_display(overview, resolved,
+                                           self.deps.settings or Settings())
         return overview, error, fetched_at
 
     def _page(self) -> str:
@@ -2038,17 +2091,32 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
     return PanelServer((host, config.port), deps)
 
 
+def reconciling(produce: Callable[[], summary.Overview], resolutions: Resolutions,
+                log: Callable[[str], None] = print) -> Callable[[], summary.Overview]:
+    """每次读完表，顺手把「已解决」里已经消掉的问题划掉（Resolutions.reconcile）。
+    这一步失败只记一句日志，不能让面板读不出数。"""
+    def run() -> summary.Overview:
+        overview = produce()
+        if resolutions.enabled:
+            try:
+                resolutions.reconcile(overview)
+            except Exception as exc:                            # noqa: BLE001
+                log(f"⚠ 收拾「已解决」记录失败（不影响面板，下一轮再试）：{exc}")
+        return overview
+    return run
+
+
 def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
           settings: Optional[Settings] = None) -> int:
     """起面板。阻塞到进程被杀。"""
-    cache = Cache(produce, config.cache_seconds,
+    resolved = settings or Settings()
+    projects = Projects(config, resolved)
+    resolutions = Resolutions(projects)
+    cache = Cache(reconciling(produce, resolutions), config.cache_seconds,
                   idle_seconds=config.idle_minutes * 60 or None)
     logs = LogFeed(config, config.cache_seconds)
     balances = BalanceFeed(config, config.cache_seconds)
-    resolved = settings or Settings()
-    projects = Projects(config, resolved)
     queueing = Queueing(config, resolved) if config.app_id else None
-    resolutions = Resolutions(projects)
     server = build_server(config, cache, logs=logs, balances=balances,
                           projects=projects, queueing=queueing,
                           settings=resolved, resolutions=resolutions)

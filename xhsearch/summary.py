@@ -148,6 +148,9 @@ class ProjectSnapshot:
     # 「要人管」行数报出去，等于在大面积事故的时候少报，而那正是最不该少报
     # 的时候。0 = 一条没丢，那个计数就是精确的。
     todos_dropped: int = 0
+    # adhoc_todos 按条数上限截掉了多少条（for_display 填）。和 todos_dropped
+    # 分开记：那个说的是项目卡上「要人管」准不准，这个不进项目卡。
+    adhoc_dropped: int = 0
 
     @property
     def needs_attention(self) -> int:
@@ -313,6 +316,7 @@ def build_snapshot(
     route: str = "base",
     label_column: str = "",
     seen_calls: Optional[set] = None,
+    truncate: bool = True,
 ) -> ProjectSnapshot:
     """把一张表读回来的 records 聚合成一个项目快照。
 
@@ -419,8 +423,11 @@ def build_snapshot(
             rows_mod.paying_rows(due, settings, now, seen=seen_calls),
             settings, now, keys=api_keys)
     todos.sort(key=_todo_sort_key)
-    snap.todos = todos[:max_todos]
-    snap.todos_dropped = max(0, len(todos) - max_todos)
+    # truncate=False：全留着，截断交给出页面那一步（面板要先按「已解决」拿掉
+    # 一些行再截，否则被收起来的行占着前 max_todos 格，后面的永远轮不上来，
+    # 见 for_display）。
+    snap.todos = todos[:max_todos] if truncate else todos
+    snap.todos_dropped = max(0, len(todos) - max_todos) if truncate else 0
     return snap
 
 
@@ -490,7 +497,7 @@ def adhoc_todos(
     now: Optional[datetime] = None,
     feishu_base: str = "https://feishu.cn",
     show_digest: bool = False,
-    max_todos: int = 200,
+    max_todos: Optional[int] = 200,
     scrub: Optional[Any] = None,
     route: str = "base",
     label_column: str = "",
@@ -523,7 +530,7 @@ def adhoc_todos(
                 feishu_base=feishu_base, route=route, label_column=label_column,
                 show_digest=show_digest, clean=clean, adhoc=True, recent=True))
     out.sort(key=_todo_sort_key)
-    return out[:max_todos]
+    return out if max_todos is None else out[:max_todos]
 
 
 def _todo_sort_key(todo: TodoRow) -> tuple:
@@ -608,7 +615,7 @@ class Overview:
     @property
     def todos_dropped(self) -> int:
         """各项目按 max_todos 截掉的总条数。>0 = 顶栏那个「要人管」是下界。"""
-        return sum(p.todos_dropped for p in self.projects)
+        return sum(p.todos_dropped + p.adhoc_dropped for p in self.projects)
 
     def todos_dropped_by(self, limit: int = 500, *,
                          include_archived: bool = False) -> int:
@@ -667,9 +674,9 @@ class Overview:
 # 的「面板设置」里（panel.Resolutions）；这里只管**什么时候再冒出来**。
 #
 # 难点在「下次刷新又发现问题再显示」：有几种问题刷新也不会自己消——
-# 风控中 / 疑似限流是只增不减的标签（Tags.sticky），置顶掉了靠 ever_pinned
-# 一直留着，需重新整理要等下一次数据整理。按「刷过一次就重新显示」处理，
-# 这几种点了「已解决」五分钟后就又回来了，按钮等于没用。所以：
+# 风控中 / 疑似限流是只增不减的标签（Tags.sticky），置顶掉了要等有人重新
+# 置顶，需重新整理要等下一次数据整理：人不去动，刷多少次都还在。按「刷过
+# 一次就重新显示」处理，这几种点了「已解决」下一轮又回来了，按钮等于没用。所以：
 #
 # * 冒出了**没标过的问题** → 重新显示（新问题一定要看见）；
 # * 只剩标过的问题，而且**还没再刷过**（最近检查 ≤ 点的时候看到的那一次）→ 收着；
@@ -677,9 +684,10 @@ class Overview:
 #   疑似受限 / 卡住了）→ 重新显示——这就是「下次刷新又发现问题」；
 #   只剩上面那几种刷新消不掉的 → 继续收着，它们的「还在」不是新发现。
 #
-# 代价（文档里写了）：刷新消不掉的标签被人在飞书里删掉、之后又被机器打上，
-# 面板分不出这是「又发生了一次」，那一行会继续收着，直到这条记录过期
-# （panel.Resolutions.KEEP_DAYS）或者有人点「撤销」。
+# 「继续收着」只管同一次没消掉的问题。问题**消掉过**（重新置顶了、标签被人删了、
+# 整理过了）之后再冒出来，是「又发生了一次」，要重新显示——这一步靠面板每次读完
+# 表之后把已经消掉的问题从记录里划掉（trim_resolutions → panel.Resolutions.reconcile）：
+# 记录里没有它了，它再出现就是「没标过的问题」。
 
 
 def resolution_key(table_id: str, record_id: str) -> str:
@@ -733,6 +741,56 @@ def apply_resolutions(overview: Overview, resolved: dict,
                 for p in overview.projects]
     hidden.sort(key=lambda t: -(t.resolved_at_ms or 0))
     return replace(overview, projects=projects, resolved=hidden)
+
+
+def trim_resolutions(overview: Overview, resolved: dict) -> dict[str, Optional[list]]:
+    """哪些「已解决」记录里的问题已经消掉了。**纯函数。**
+
+    返回 {记录键: 还剩下的问题}，None = 整条可以删（这一行已经不在待办里，
+    或者标过的问题一个都不剩）。没变的记录不在返回值里。
+
+    只看读成功的表：读失败的表（ProjectSnapshot.error）分不出「问题消了」和
+    「没读到」，一律不动。overview 必须是**没截过**的那份（panel.collect 读回来的），
+    截过的话「不在列表里」可能只是被截掉了。
+    """
+    by_table = {p.table_id: p for p in overview.projects if p.table_id and not p.error}
+    rows_of: dict[str, dict[str, TodoRow]] = {}
+    edits: dict[str, Optional[list]] = {}
+    for key, entry in resolved.items():
+        table_id, _, record_id = key.partition("/")
+        project = by_table.get(table_id)
+        if project is None or not isinstance(entry, dict):
+            continue
+        if table_id not in rows_of:
+            rows_of[table_id] = {t.record_id: t for t in (*project.todos, *project.adhoc_todos)}
+        todo = rows_of[table_id].get(record_id)
+        marked = entry.get("reasons") if isinstance(entry.get("reasons"), list) else []
+        kept = [r for r in marked if todo is not None and r in todo.reasons]
+        if kept != marked:
+            edits[key] = kept or None
+    return edits
+
+
+# 出页面时每个项目最多列多少条待办（没勾巡查的那几条另算一份）。
+MAX_TODOS = 200
+
+
+def for_display(overview: Overview, resolved: dict, settings: Settings, *,
+                max_todos: int = MAX_TODOS) -> Overview:
+    """出页面前的最后一步：先按「已解决」收起来，**再**按条数上限截。
+
+    顺序不能反：先截再收，被收起来的行照样占着前 max_todos 格——一次大面积
+    事故里运营把前 200 行都点了「已解决」，页面上就一行不剩，却还写着「另有
+    N 行没显示」，而那 N 行永远轮不上来。所以面板读表时全留着（build_snapshot
+    truncate=False），截断放在这里。截掉的条数照样记下来，页面上照实说。
+    """
+    shown = apply_resolutions(overview, resolved, settings)
+    projects = [replace(p, todos=p.todos[:max_todos],
+                        todos_dropped=p.todos_dropped + max(0, len(p.todos) - max_todos),
+                        adhoc_todos=p.adhoc_todos[:max_todos],
+                        adhoc_dropped=p.adhoc_dropped + max(0, len(p.adhoc_todos) - max_todos))
+                for p in shown.projects]
+    return replace(shown, projects=projects)
 
 
 # ---------- 改阈值之前先算给人看 ----------
