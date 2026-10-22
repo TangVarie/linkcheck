@@ -737,11 +737,27 @@ class TestChannelPinCapability(RunnerTest):
                          self.settings.pin_status.pinned_lost)
 
 class TestBlueWordBackfill(RunnerTest):
-    """蓝词回填：评论里出现「蓝词字段」还没有的高亮词 → 追加进去、翻「是否截图」。
+    """蓝词回填（2026-10-22 起的口径）：只在三个时刻扫——
 
-    只在**有新词**时动这两列。同一个蓝词每轮都在，每轮都翻「未截图」等于把
-    运营刚截完的图撤销掉。
+    1. 「蓝词字段」还空着 → 每轮扫，抓到一次就停；
+    2. 帖子到爆贴 → 再扫一次；3. 到大爆 → 再扫一次。
+
+    扫到的新词只加不减，「蓝词来源」记出自哪条评论、什么时候。「是否截图」
+    只在爆贴（含）以上的那次扫描里翻：三五条评论的帖子不叫人截图。
     """
+
+    CHECKED = NOW + timedelta(minutes=3)      # 「蓝词来源」里写的就是它（+8 显示）
+    WHEN = "2026-08-21 20:03"
+
+    def setUp(self):
+        super().setUp()
+        # 固件是 SocialDataX 形状的，而线上 SocialDataX 会抹平蓝词标记、不报这一维
+        # （见 TestBlueWordChannel）。这一组测的是扫描口径，不是通道，所以标成会报。
+        patcher = mock.patch.dict(
+            providers.XHS_COMMENT_CAPABILITIES,
+            {providers.SOCIALDATAX: {"pinned": False, "author": False, "blue_words": True}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _page(self, *contents, count=30):
         return sse({
@@ -756,95 +772,247 @@ class TestBlueWordBackfill(RunnerTest):
         return sse({"like_count": 100, "collect_count": 20,
                     "points": {"cost": 10, "balance": 890}})
 
-    def _run(self, row, *contents, **kwargs):
-        return self.run_with([self._page(*contents), self._detail()], [row], **kwargs)
+    def _run(self, row, *contents, count=30, **kwargs):
+        kwargs.setdefault("clock", lambda: self.CHECKED)
+        return self.run_with([self._page(*contents, count=count), self._detail()], [row],
+                             **kwargs)
+
+    @staticmethod
+    def _row(*, words=(), tags=None, sources=""):
+        row = xhs_row(tags=list(tags or []))
+        row.blue_words = list(words)
+        row.blue_word_sources = sources
+        return row
 
     class _FakeTable:
-        """写回前会重读「蓝词字段」的现值：fresh 就是那一刻表里的值。"""
+        """写回前会重读「蓝词字段」「蓝词来源」的现值：cells 就是那一刻表里的值。"""
 
-        def __init__(self, fresh_words, field_name, *, fail=False):
-            self.fresh_words = fresh_words
-            self.field_name = field_name
+        def __init__(self, cells, *, fail=False):
+            self.cells = cells
             self.fail = fail
             self.updates = None
 
         def batch_get(self, record_ids):
             if self.fail:
                 raise RuntimeError("重读失败")
-            return [{"record_id": rid, "fields": {self.field_name: list(self.fresh_words)}}
-                    for rid in record_ids]
+            return [{"record_id": rid, "fields": dict(self.cells)} for rid in record_ids]
 
         def batch_update(self, updates, errors=None):
             self.updates = updates
             return len(updates)
 
-    def _written(self, report, fresh_words, **kwargs):
-        table = self._FakeTable(fresh_words, self.settings.fields.blue_words)
+    def _written(self, report, fresh_words, sources="", **kwargs):
+        f = self.settings.fields
+        table = self._FakeTable({f.blue_words: list(fresh_words), f.blue_word_sources: sources})
         runner.write_back(table, report, **kwargs)
         return table.updates[0]["fields"]
 
-    def test_new_word_is_appended_and_the_shot_flag_flips(self):
-        row = xhs_row()
-        row.blue_words = ["西屋GT33"]
-        report = self._run(row, "#西屋按摩椅[搜索高亮]# 真不错", "普通评论")
-        # 开跑时只登记材料，不直接写列——真正的值要等写回前重读现值
-        self.assertEqual(report.outcomes[0].blue_word_plan.new_words, ["西屋按摩椅"])
-        self.assertIn("新蓝词：西屋按摩椅", report.outcomes[0].reason)   # 日志行看得到
+    # —— 1. 首抓：还没抓到过就每轮扫，抓到一次就停 ——
+
+    def test_first_capture_below_hot_records_the_word_but_asks_for_no_screenshot(self):
+        """三五条评论的帖子：词记下来、出处记下来，但不翻「是否截图」——
+        截图提醒只针对爆贴的蓝词。"""
         f = self.settings.fields
-        written = self._written(report, ["西屋GT33"])
-        self.assertEqual(written[f.blue_words], ["西屋GT33", "西屋按摩椅"])   # 只加不减
-        self.assertEqual(written[f.blue_word_shot], "未截图")
-        self.assertIn("新蓝词：西屋按摩椅", written[f.failure_reason])
-        self.assertIn("已加进", written[f.failure_reason])
+        report = self._run(self._row(), "普通评论", "是我理解的这个 #西屋911GT[搜索高亮]# 吗",
+                           count=3)
+        self.assertIn("新蓝词：西屋911GT", report.outcomes[0].reason)   # 日志行看得到
+        written = self._written(report, [])
+        self.assertEqual(written[f.blue_words], ["西屋911GT"])
+        self.assertEqual(written[f.blue_word_sources],
+                         f"{self.WHEN} 【观察中】西屋911GT ← 路人: 是我理解的这个 "
+                         "#西屋911GT[搜索高亮]# 吗")
+        self.assertNotIn(f.blue_word_shot, written)
+        note = written[f.failure_reason]
+        self.assertIn("新蓝词：西屋911GT", note)
+        self.assertIn("先不用截图", note)
+        self.assertNotIn("请截图", note)
         self.assertNotIn(f.blue_word_images, written)                       # 附件列机器不碰
+
+    def test_first_capture_on_a_hot_post_asks_for_a_screenshot(self):
+        f = self.settings.fields
+        report = self._run(self._row(tags=["爆贴"]), "#西屋按摩椅[搜索高亮]# 真不错", count=60)
+        written = self._written(report, [])
+        self.assertEqual(written[f.blue_words], ["西屋按摩椅"])
+        self.assertEqual(written[f.blue_word_shot], "未截图")
+        self.assertIn("（已加进「蓝词字段」，请截图）", written[f.failure_reason])
+        self.assertTrue(written[f.blue_word_sources].startswith(f"{self.WHEN} 【爆贴】西屋按摩椅 ← "))
+
+    def test_no_highlight_keeps_scanning_and_touches_nothing(self):
+        """还没抓到过、这一轮也没有：什么都不写，下一轮接着扫。"""
+        report = self._run(self._row(), "好用！", "回购了")
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+    def test_after_the_first_capture_new_words_are_ignored_until_hot(self):
+        """抓到过一次就停：同一档里评论再冒出新词，这几列一个字都不碰。"""
+        row = self._row(words=["西屋GT33"], tags=["评估中"],
+                        sources=f"2026-08-20 10:00 【评估中】西屋GT33 ← 路人: ...")
+        report = self._run(row, "#西屋按摩椅[搜索高亮]# 真不错", count=40)
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+        written = self._written(report, ["西屋GT33"])
+        f = self.settings.fields
+        for column in (f.blue_words, f.blue_word_shot, f.blue_word_sources):
+            self.assertNotIn(column, written)
+        self.assertNotIn("蓝词", written[f.failure_reason])
 
     def test_a_word_added_by_hand_during_the_run_survives(self):
         """开跑到写回隔着几分钟：运营这中间手工补了「新款」，整列覆盖不能把它抹掉。"""
-        row = xhs_row()
-        row.blue_words = ["西屋GT33"]
-        report = self._run(row, "#西屋按摩椅[搜索高亮]#")
-        written = self._written(report, ["西屋GT33", "新款"])
-        self.assertEqual(written[self.settings.fields.blue_words],
-                         ["西屋GT33", "新款", "西屋按摩椅"])
+        report = self._run(self._row(), "#西屋按摩椅[搜索高亮]#")
+        written = self._written(report, ["新款"])
+        self.assertEqual(written[self.settings.fields.blue_words], ["新款", "西屋按摩椅"])
 
     def test_operator_already_added_the_word_means_nothing_to_do(self):
-        """运营这几分钟里自己把这个词填上了：不写、不翻开关——人已经看到了，
-        再翻成「未截图」是在撤销人的动作。"""
-        report = self._run(xhs_row(), "#西屋按摩椅[搜索高亮]#")
+        """首抓那几分钟里运营自己把这个词填上了：不写、不记、不翻开关——人已经看到了。"""
+        f = self.settings.fields
+        report = self._run(self._row(tags=["爆贴"]), "#西屋按摩椅[搜索高亮]#", count=60)
         written = self._written(report, ["西屋按摩椅"])
-        self.assertNotIn(self.settings.fields.blue_words, written)
-        self.assertNotIn(self.settings.fields.blue_word_shot, written)
-        self.assertNotIn("新蓝词", written[self.settings.fields.failure_reason])
+        for column in (f.blue_words, f.blue_word_shot, f.blue_word_sources):
+            self.assertNotIn(column, written)
+        self.assertNotIn("新蓝词", written[f.failure_reason])
+
+    # —— 2/3. 到爆贴、到大爆各再扫一次 ——
+
+    def test_reaching_hot_rescans_once_and_asks_for_a_screenshot(self):
+        f = self.settings.fields
+        old = "2026-08-20 10:00 【评估中】西屋GT33 ← 路人: 买了 #西屋GT33[搜索高亮]#"
+        row = self._row(words=["西屋GT33"], tags=["评估中"], sources=old)
+        report = self._run(row, "#西屋GT33[搜索高亮]# 好用", "#西屋按摩椅[搜索高亮]# 真不错",
+                           count=55)
+        self.assertIn("到了爆贴，蓝词复扫一次", report.outcomes[0].reason)
+        written = self._written(report, ["西屋GT33"], sources=old)
+        self.assertEqual(written[f.blue_words], ["西屋GT33", "西屋按摩椅"])   # 只加不减
+        self.assertEqual(written[f.blue_word_sources],
+                         old + f"\n{self.WHEN} 【爆贴】西屋按摩椅 ← 路人: #西屋按摩椅[搜索高亮]# 真不错")
+        self.assertEqual(written[f.blue_word_shot], "未截图")
+        self.assertIn("到了爆贴，蓝词复扫一次：新蓝词 西屋按摩椅（已加进「蓝词字段」），请截图",
+                      written[f.failure_reason])
+
+    def test_rescan_without_new_words_still_asks_for_a_screenshot_of_what_is_there(self):
+        """爆贴之前抓到的词当时没叫人截图；到了爆贴还看得到，就是要截的「爆贴蓝词」。
+        没有新词也记一行——那一行就是「爆贴这一档扫过了」的账。"""
+        f = self.settings.fields
+        row = self._row(words=["西屋GT33"], tags=["评估中"])
+        report = self._run(row, "#西屋GT33[搜索高亮]# 好用", count=55)
+        written = self._written(report, ["西屋GT33"])
+        self.assertNotIn(f.blue_words, written)
+        self.assertEqual(written[f.blue_word_sources],
+                         f"{self.WHEN} 【爆贴】复扫：没有新蓝词，评论里还看得到：西屋GT33")
+        self.assertEqual(written[f.blue_word_shot], "未截图")
+        self.assertIn("没有新蓝词，评论里还看得到 西屋GT33，请截图", written[f.failure_reason])
+
+    def test_rescan_with_no_blue_words_on_the_page_records_it_and_asks_nothing(self):
+        f = self.settings.fields
+        row = self._row(words=["西屋GT33"], tags=["评估中"])
+        report = self._run(row, "好用！", count=55)
+        written = self._written(report, ["西屋GT33"])
+        self.assertEqual(written[f.blue_word_sources],
+                         f"{self.WHEN} 【爆贴】复扫：没有新蓝词，评论里也没看到蓝词")
+        self.assertNotIn(f.blue_word_shot, written)
+        self.assertIn("蓝词复扫一次：评论里没看到蓝词", written[f.failure_reason])
+
+    def test_once_hot_is_scanned_it_stops_until_super_hot(self):
+        log = f"2026-08-20 10:00 【爆贴】复扫：没有新蓝词，评论里也没看到蓝词"
+        row = self._row(words=["西屋GT33"], tags=["爆贴"], sources=log)
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=80)
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+    def test_reaching_super_hot_rescans_once_more(self):
+        f = self.settings.fields
+        log = f"2026-08-20 10:00 【爆贴】复扫：没有新蓝词，评论里也没看到蓝词"
+        row = self._row(words=["西屋GT33"], tags=["爆贴"], sources=log)
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=120)
+        written = self._written(report, ["西屋GT33"], sources=log)
+        self.assertEqual(written[f.blue_words], ["西屋GT33", "西屋按摩椅"])
+        self.assertIn(f"\n{self.WHEN} 【大爆】西屋按摩椅 ← ", written[f.blue_word_sources])
+        self.assertEqual(written[f.blue_word_shot], "未截图")
+        # 扫完大爆就再也不扫了
+        row = self._row(words=["西屋GT33", "西屋按摩椅"], tags=["大爆"],
+                        sources=written[f.blue_word_sources])
+        report = self._run(row, "#又一个[搜索高亮]#", count=300)
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+    def test_jumping_straight_to_super_hot_is_one_scan(self):
+        row = self._row(words=["西屋GT33"], tags=["评估中"],
+                        sources="2026-08-20 10:00 【评估中】西屋GT33 ← 路人: …")
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=150)
+        plan = report.outcomes[0].blue_word_plan
+        self.assertTrue(plan.rescan)
+        self.assertEqual(plan.stage, "大爆")
+
+    def test_old_rows_that_are_already_hot_do_not_all_rescan_on_day_one(self):
+        """「蓝词来源」是新加的列，老行上它是空的。拿开跑时的档位当账：上线那天
+        已经爆贴的老帖不会集体再被翻一遍「未截图」，把运营截过的图撤销掉。"""
+        row = self._row(words=["西屋GT33"], tags=["爆贴"])
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=70)
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+    def test_a_missed_rescan_is_made_up_from_the_ledger(self):
+        """跨过爆贴那一轮没扫成（降到了抹掉蓝词标记的备胎），「流量状态」却已经
+        升上去了：账上记的最高还是评估中，下一轮照样补扫。"""
+        row = self._row(words=["西屋GT33"], tags=["爆贴"],
+                        sources="2026-08-20 10:00 【评估中】西屋GT33 ← 路人: …")
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=70)
+        plan = report.outcomes[0].blue_word_plan
+        self.assertTrue(plan.rescan)
+        self.assertEqual(plan.stage, "爆贴")
+
+    def test_a_tier_that_cannot_land_does_not_trigger_its_rescan(self):
+        """「流量状态」里没建「大爆」选项：这一档写不进去，复扫也不做——
+        否则账上永远差这一档，每轮都会像是刚到大爆。"""
+        log = "2026-08-20 10:00 【爆贴】复扫：没有新蓝词，评论里也没看到蓝词"
+        row = self._row(words=["西屋GT33"], tags=["爆贴"], sources=log)
+        known = [t for t in self.settings.tags.machine_written() if t != "大爆"]
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=150, known_options=known)
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+    def test_text_inside_a_comment_is_not_read_as_the_ledger(self):
+        """评论正文里有人打了「【大爆】」：账只认行首，不认正文。"""
+        log = "2026-08-20 10:00 【评估中】西屋GT33 ← 路人: 这个必须 【大爆】 啊"
+        row = self._row(words=["西屋GT33"], tags=["评估中"], sources=log)
+        report = self._run(row, "#西屋按摩椅[搜索高亮]#", count=60)
+        self.assertTrue(report.outcomes[0].blue_word_plan.rescan)
+
+    def test_clearing_the_word_column_starts_over(self):
+        """运营想让机器重新抓一遍：把「蓝词字段」清空就回到「每轮扫、抓到就停」。"""
+        log = "2026-08-20 10:00 【大爆】复扫：没有新蓝词，评论里也没看到蓝词"
+        report = self._run(self._row(tags=["大爆"], sources=log), "#西屋按摩椅[搜索高亮]#",
+                           count=150)
+        plan = report.outcomes[0].blue_word_plan
+        self.assertFalse(plan.rescan)
+        self.assertEqual(plan.new_words, ["西屋按摩椅"])
+
+    # —— 写回的几道闸 ——
 
     def test_reread_failure_skips_this_round(self):
         """重读失败就这一轮不回填：词没记下来，下一轮照样当新词扫到，什么都不丢。"""
-        report = self._run(xhs_row(), "#西屋按摩椅[搜索高亮]#")
-        table = self._FakeTable([], self.settings.fields.blue_words, fail=True)
+        f = self.settings.fields
+        report = self._run(self._row(), "#西屋按摩椅[搜索高亮]#")
+        table = self._FakeTable({}, fail=True)
         runner.write_back(table, report)
         written = table.updates[0]["fields"]
-        self.assertNotIn(self.settings.fields.blue_words, written)
-        self.assertNotIn(self.settings.fields.blue_word_shot, written)
-        self.assertIn(self.settings.fields.refresh_status, written)   # 其余列照常
+        for column in (f.blue_words, f.blue_word_shot, f.blue_word_sources):
+            self.assertNotIn(column, written)
+        self.assertIn(f.refresh_status, written)   # 其余列照常
 
     def test_missing_column_does_not_flip_the_flag_or_claim_success(self):
         """表里还没建「蓝词字段」：开关不翻、也不能说「已加进」——否则运营会被
         叫去截一个表里根本没记下来的词，下一轮又当新词再叫一次。"""
         f = self.settings.fields
-        report = self._run(xhs_row(), "#西屋按摩椅[搜索高亮]#")
+        report = self._run(self._row(tags=["爆贴"]), "#西屋按摩椅[搜索高亮]#", count=60)
         known = {f.refresh_status, f.failure_reason, f.last_updated, f.queued,
                  f.comment_count, f.platform, f.traffic_status, f.comment_digest,
-                 f.alive_confirmed, f.consecutive_failures, f.blue_word_shot}
+                 f.alive_confirmed, f.consecutive_failures, f.blue_word_shot,
+                 f.blue_word_sources}
         dropped: set = set()
         written = self._written(report, [], known_fields=known, dropped_fields=dropped)
         self.assertIn(f.blue_words, dropped)
-        self.assertNotIn(f.blue_words, written)
-        self.assertNotIn(f.blue_word_shot, written)
+        for column in (f.blue_words, f.blue_word_shot, f.blue_word_sources):
+            self.assertNotIn(column, written)
         self.assertIn("未能记录", written[f.failure_reason])
         self.assertNotIn("已加进", written[f.failure_reason])
 
     def test_mistyped_column_does_not_flip_the_flag_either(self):
         f = self.settings.fields
-        report = self._run(xhs_row(), "#西屋按摩椅[搜索高亮]#")
+        report = self._run(self._row(tags=["爆贴"]), "#西屋按摩椅[搜索高亮]#", count=60)
         mistyped: set = set()
         written = self._written(report, [], field_types={f.blue_words: 1, f.blue_word_shot: 3},
                                 mistyped_fields=mistyped)
@@ -853,41 +1021,72 @@ class TestBlueWordBackfill(RunnerTest):
         self.assertNotIn(f.blue_word_shot, written)
         self.assertIn("不是多选列", written[f.failure_reason])
 
-    def test_known_word_touches_nothing(self):
-        """表里已经有这个词（大小写不同也算同一个）：两列都不动，运营截过的图不被撤销。"""
-        row = xhs_row()
-        row.blue_words = ["gt33"]
-        report = self._run(row, "买了 #GT33[搜索高亮]#")
-        self.assertIsNone(report.outcomes[0].blue_word_plan)
+    def test_missing_sources_column_still_records_the_words(self):
+        """「蓝词来源」还没建（老表没点「补齐缺的列」）：词照记、开关照翻，
+        这一列被写回的列闸挡下、运行日志点名缺列。复扫退回只看「流量状态」跨没跨门槛。"""
+        f = self.settings.fields
+        report = self._run(self._row(tags=["爆贴"]), "#西屋按摩椅[搜索高亮]#", count=60)
+        known = {f.refresh_status, f.failure_reason, f.last_updated, f.queued,
+                 f.comment_count, f.platform, f.traffic_status, f.comment_digest,
+                 f.alive_confirmed, f.consecutive_failures, f.blue_words, f.blue_word_shot}
+        dropped: set = set()
+        written = self._written(report, [], known_fields=known, dropped_fields=dropped)
+        self.assertEqual(written[f.blue_words], ["西屋按摩椅"])
+        self.assertEqual(written[f.blue_word_shot], "未截图")
+        self.assertIn(f.blue_word_sources, dropped)
+
+    def test_known_word_in_another_case_is_not_new(self):
+        """表里人工填的「gt33」和评论里高亮的「GT33」是同一个词：复扫不重复追加。"""
+        f = self.settings.fields
+        row = self._row(words=["gt33"], tags=["评估中"])
+        report = self._run(row, "买了 #GT33[搜索高亮]#", count=55)
+        self.assertEqual(report.outcomes[0].blue_word_plan.new_words, [])
         written = self._written(report, ["gt33"])
-        self.assertNotIn(self.settings.fields.blue_words, written)
-        self.assertNotIn(self.settings.fields.blue_word_shot, written)
-        self.assertNotIn("新蓝词", written[self.settings.fields.failure_reason])
-
-    def test_no_highlight_touches_nothing(self):
-        report = self._run(xhs_row(), "好用！", "回购了")
-        self.assertIsNone(report.outcomes[0].blue_word_plan)
-
-    def test_first_word_ever_on_an_empty_column(self):
-        report = self._run(xhs_row(), "#快充小片是什么[搜索高亮]#")
-        written = self._written(report, [])
-        self.assertEqual(written[self.settings.fields.blue_words], ["快充小片是什么"])
-        self.assertEqual(written[self.settings.fields.blue_word_shot], "未截图")
+        self.assertNotIn(f.blue_words, written)
+        self.assertIn("复扫：没有新蓝词", written[f.blue_word_sources])
 
     def test_missing_shot_option_still_appends_the_word(self):
         """「是否截图」还没建「未截图」选项：词照样回填，翻转跳过并在诊断里提示，
         别让一个缺选项拖垮整行写回。"""
-        report = self._run(xhs_row(), "#西屋按摩椅[搜索高亮]#", blue_word_shot_options=["已截图"])
+        f = self.settings.fields
+        report = self._run(self._row(tags=["爆贴"]), "#西屋按摩椅[搜索高亮]#", count=60,
+                           blue_word_shot_options=["已截图"])
         written = self._written(report, [])
-        self.assertEqual(written[self.settings.fields.blue_words], ["西屋按摩椅"])
-        self.assertNotIn(self.settings.fields.blue_word_shot, written)
-        self.assertIn("还没建选项「未截图」", written[self.settings.fields.failure_reason])
+        self.assertEqual(written[f.blue_words], ["西屋按摩椅"])
+        self.assertNotIn(f.blue_word_shot, written)
+        self.assertIn("还没建选项「未截图」", written[f.failure_reason])
+
+    def test_missing_shot_option_is_not_mentioned_below_hot(self):
+        """爆贴以下本来就不翻开关：缺不缺「未截图」选项和这一轮无关，别报。"""
+        report = self._run(self._row(), "#西屋按摩椅[搜索高亮]#", count=3,
+                           blue_word_shot_options=["已截图"])
+        written = self._written(report, [])
+        self.assertNotIn("还没建选项", written[self.settings.fields.failure_reason])
 
     def test_failed_round_never_touches_the_blue_word_columns(self):
-        row = xhs_row()
-        row.blue_words = []
-        report = self.run_with(lambda *a, **k: err(500, 1005, "服务暂时不可用"), [row])
+        report = self.run_with(lambda *a, **k: err(500, 1005, "服务暂时不可用"), [self._row()])
         self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+
+class TestBlueWordChannel(RunnerTest):
+    """通道把蓝词标记抹平了（SocialDataX，线上实测）：那一轮蓝词判定整个不做。
+
+    首抓无所谓（抠不到就下一轮再扫），复扫却会被记成「爆贴扫过了、没有新词」，
+    从此不再扫——所以复扫也不能在这种轮次里做，留给通道恢复之后。
+    """
+
+    def test_rescan_waits_for_a_channel_that_keeps_the_markers(self):
+        row = xhs_row(tags=["评估中"])
+        row.blue_words = ["西屋GT33"]
+        row.blue_word_sources = "2026-08-20 10:00 【评估中】西屋GT33 ← 路人: …"
+        page = sse({"items": [{"content": "西屋按摩椅 真不错", "like_count": 1,
+                               "is_pinned": False, "is_author_comment": False}],
+                    "comment_count": 60, "top_level_comment_count": 60,
+                    "points": {"cost": 10, "balance": 900}})
+        detail = sse({"like_count": 1, "points": {"cost": 10, "balance": 890}})
+        report = self.run_with([page, detail], [row])
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+        self.assertNotIn(self.settings.fields.blue_word_sources, report.outcomes[0].fields)
 
 
 class TestFailurePathsLeaveStatusColumnsAlone(RunnerTest):

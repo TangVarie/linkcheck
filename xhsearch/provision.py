@@ -337,9 +337,11 @@ FULL_LAYOUT: tuple = (
     BusinessColumn("维护效果", MULTI),   # 投流后 12h 的曝光量增长情况
     # 蓝词三件套现在是巡查列（机器回填新蓝词、翻「是否截图」），类型和选项
     # 以 schema.expected_schema 为准；位置沿用西屋表，「是否截图」插在中间。
+    # 「蓝词来源」（2026-10-22 加）紧跟在后面：记每个词出自哪条评论、什么时候。
     "blue_words",
     "blue_word_shot",
     "blue_word_images",
+    "blue_word_sources",
     BusinessColumn("作者", SINGLE),
     BusinessColumn("父记录", LINK, self_link=True),
     "negative_keywords",
