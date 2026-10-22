@@ -92,9 +92,9 @@ TIKHUB = "tikhub"
 # blue_words：评论正文里的蓝词标记 `#词[搜索高亮]#` 还在不在。同一次实测
 # （2026-09-21）里，同一条评论 TikHub 给 `#sportsix[搜索高亮]#`、SocialDataX
 # 给光秃秃的 `sportsix` —— 它把上游的富文本标记归一化掉了。
-# 这一维**不进判定**（蓝词回填只追加、空列表不碰任何一列，所以抹平了
-# 也不会写坏数据），登记它是为了让面板能说清「降到备胎之后到底丢了什么」，
-# 而不是在面板那边再硬编一份清单。
+# 这一维也进判定：通道声明不报时那一轮整个不扫蓝词（analyze.Snapshot.
+# blue_words_reported）——不然爆贴/大爆那一次复扫会被记成「扫过了、没有新词」，
+# 从此不再扫。面板也拿它说清「降到备胎之后到底丢了什么」，不在那边再硬编一份清单。
 XHS_COMMENT_CAPABILITIES: dict[str, dict[str, bool]] = {
     TIKHUB: {"pinned": True, "author": True, "blue_words": True},
     SOCIALDATAX: {"pinned": False, "author": False, "blue_words": False},

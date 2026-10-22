@@ -111,6 +111,12 @@ class Snapshot:
     # 抖音看不见作者是**平台**边界，docs/表结构.md 已经写明「这个排除等于
     # 没开」，每一行再报一次只是固定噪音。
     author_reported: bool = True
+    # 这一轮的通道会不会原样带回蓝词标记 `#词[搜索高亮]#`。SocialDataX 会把它
+    # 抹平成光秃秃的词（providers.XHS_COMMENT_CAPABILITIES 里的实测记录）——
+    # 那一轮抠不到蓝词不等于评论里没有蓝词。首抓没关系（抠不到就下一轮再扫），
+    # 爆贴/大爆那一次复扫却会被记成「扫过了、没有新词」，从此不再扫。
+    # 所以通道不报时整个蓝词判定都不做，留给通道恢复后的下一轮。
+    blue_words_reported: bool = True
     # 评论接口**自己**说有几条、却一条都不给的那几条（见 comments_hidden）。
     # 这种时候 comment_count 记的是**别人看得到的** 0——小红书界面上也不显示
     # 评论数——接口报的原数留在这里，只给诊断信息和存活判断用。
@@ -271,6 +277,8 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
         points_balance=points.get("balance"),
         pin_reported=_trusted(data, "pinned", pin_reported, comments),
         author_reported=_trusted(data, "author", author_reported, comments),
+        # 蓝词标记写在正文里，没有「键在不在」可看：没有声明就当它报。
+        blue_words_reported=_trusted(data, "blue_words", True, comments),
     )
 
 
@@ -359,22 +367,40 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat,
 HIGHLIGHT_RE = re.compile(r"#([^#\[\]]+?)\[搜索高亮\]#")
 
 
-def highlighted_words(snapshot: Snapshot) -> list[str]:
-    """这一页评论里所有被标成搜索高亮的词，按出现顺序、去重（大小写和标点不计）。
+@dataclass
+class BlueWordSighting:
+    """一个蓝词第一次出现在这一页的哪条评论里——「蓝词来源」记的就是它。"""
+
+    word: str
+    comment: CommentView
+    text: str        # 那条评论的正文（空白已收成一个空格）
+    at: int          # 标记在 text 里的位置：评论太长时围着它截一段
+
+
+def highlighted(snapshot: Snapshot) -> list[BlueWordSighting]:
+    """这一页评论里所有被标成搜索高亮的词，带出处。按出现顺序、去重
+    （大小写和标点不计），同一个词只记它第一次出现的那条评论。
 
     只看第一页——和关键词、负面词一样，不为它多花一次请求。
     """
     seen: set[str] = set()
-    words: list[str] = []
+    found: list[BlueWordSighting] = []
     for comment in snapshot.comments:
-        for raw in HIGHLIGHT_RE.findall(comment.content or ""):
-            word = raw.strip()
+        # 先收空白再抠：词里夹着换行的话，写进多选选项的就是一个带换行的词。
+        text = re.sub(r"\s+", " ", comment.content or "").strip()
+        for match in HIGHLIGHT_RE.finditer(text):
+            word = match.group(1).strip()
             key = _normalize(word)
             if not key or key in seen:
                 continue
             seen.add(key)
-            words.append(word)
-    return words
+            found.append(BlueWordSighting(word, comment, text, match.start()))
+    return found
+
+
+def highlighted_words(snapshot: Snapshot) -> list[str]:
+    """highlighted 的词本身。"""
+    return [s.word for s in highlighted(snapshot)]
 
 
 def new_blue_words(found: list[str], current: list[str]) -> list[str]:
@@ -382,6 +408,109 @@ def new_blue_words(found: list[str], current: list[str]) -> list[str]:
     表里人工填的「gt33」和评论里高亮的「GT33」是同一个词，不该再提醒一次。"""
     known = {_normalize(w) for w in current}
     return [w for w in found if _normalize(w) not in known]
+
+
+# ---------- 蓝词什么时候扫（2026-10-22 运营定的口径）----------
+#
+# 以前每轮都扫、每出一个新词就翻一次「是否截图」：三条评论的帖子也叫人去截图，
+# 同一条帖子隔三差五冒一个新词就再叫一次。现在只在三个时刻扫：
+#
+#   1. 「蓝词字段」还空着 → 每轮都扫，抓到一次就停；
+#   2. 帖子到「爆贴」（默认 50 条评论，项目里改过「爆贴门槛」就按项目的）→ 再扫一次；
+#   3. 帖子到「大爆」（默认 100 条）→ 再扫一次。
+#
+# 扫到的新词只加不减（竞品的蓝词也留着）。截图提醒只在爆贴（含大爆）以上发：
+# 爆贴以下抓到的词只记录、不叫人截图。
+#
+# 「到爆贴的那一次扫过没有」记在「蓝词来源」里：每条记录行首写着当时的档位，
+# 记过的最高档位就是已经扫到哪一档了。只看「流量状态」这一轮有没有跨过门槛也
+# 能定，但跨门槛那一轮要是正好降到抹掉蓝词标记的备胎、或者写回前重读失败，
+# 这一次复扫就永远错过了；记在账上，没扫成的下一轮接着扫。
+
+# 「蓝词来源」每条记录的行首：「2026-10-22 14:05 【评估中】」。只认行首——评论
+# 正文里有人打了「【大爆】」不算（正文收过空白，不会自己起一行）。
+_SOURCE_HEAD_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 【([^】\n]*)】", re.M)
+
+# 「蓝词来源」里每条评论截多长。比快照那一列宽：这里要看得见蓝词前后在说什么。
+SOURCE_EXCERPT_CHARS = 80
+
+
+def scanned_tier_rank(log_text: str, settings: Settings) -> Optional[int]:
+    """「蓝词来源」里记过的最高档位（rank）。一条记录都没有返回 None。
+
+    行首写的档位不认识（未定档、改过名的旧档位）按 -1 算——比任何门槛都低，
+    最坏是多扫一次，不会少扫。
+    """
+    heads = _SOURCE_HEAD_RE.findall(log_text or "")
+    if not heads:
+        return None
+    return max(settings.tags.rank(h) for h in heads)
+
+
+@dataclass(frozen=True)
+class BlueWordScan:
+    """这一轮扫蓝词的口径。"""
+
+    rescan: bool    # False = 首抓（表里还一个蓝词都没有）；True = 到爆贴/大爆的那一次复扫
+    remind: bool    # 帖子在爆贴（含）以上：评论里看得到蓝词就提醒截图
+    stage: str      # 这一轮落表的热度档位，写进「蓝词来源」行首；没有档位写「未定档」
+
+
+UNTIERED = "未定档"
+
+
+def plan_blue_word_scan(settings: Settings, *, known_words: list[str], log_text: str,
+                        read_tier: Optional[str], landed_tier: Optional[str]
+                        ) -> Optional[BlueWordScan]:
+    """这一轮扫不扫蓝词。None = 不扫，蓝词那几列一个都不碰。
+
+    read_tier 是开跑时「流量状态」里的档位，landed_tier 是这一轮会写进去的档位
+    （选项没建、写不进去的档位不算——不然那一档每轮都像是刚到）。
+
+    复扫看的是「蓝词来源」这本账：记过的最高档位低于爆贴、现在到了爆贴 → 扫；
+    大爆同理。账上一条都没有（这一列刚建、或者还没建）时，拿开跑时的档位当
+    已经扫过的位置——上线那天已经爆贴的老帖不会集体再被叫一遍截图。
+    """
+    t = settings.tags
+    now = t.rank(landed_tier or "")
+    gates = [t.rank(g) for g in (t.hot, t.super_hot) if g and t.rank(g) >= 0]
+    remind = bool(gates) and now >= min(gates)
+    stage = landed_tier or UNTIERED
+    if not known_words:
+        return BlueWordScan(rescan=False, remind=remind, stage=stage)
+    logged = scanned_tier_rank(log_text, settings)
+    done = logged if logged is not None else t.rank(read_tier or "")
+    if any(done < gate <= now for gate in gates):
+        return BlueWordScan(rescan=True, remind=remind, stage=stage)
+    return None
+
+
+def _excerpt(text: str, at: int, width: int) -> str:
+    """围着位置 at 截一段 width 长的正文，蓝词标记不会被截到外面去。"""
+    if len(text) <= width:
+        return text
+    start = max(0, min(at - width // 4, len(text) - width))
+    piece = text[start:start + width]
+    return ("…" if start else "") + piece + ("…" if start + width < len(text) else "")
+
+
+def blue_word_source_line(sighting: BlueWordSighting, *, when: str, stage: str,
+                          fmt: DigestFormat) -> str:
+    """「蓝词来源」里一个新词的那一行：时刻 【当时的档位】词 ← 出自哪条评论。
+
+    昵称跟着快照那一列的开关走（DigestFormat.show_author_name）。
+    """
+    who = (f"{sighting.comment.author_name}: "
+           if fmt.show_author_name and sighting.comment.author_name else "")
+    excerpt = _excerpt(sighting.text, sighting.at, SOURCE_EXCERPT_CHARS)
+    return f"{when} 【{stage}】{sighting.word} ← {who}{excerpt}"
+
+
+def blue_word_rescan_line(*, when: str, stage: str, visible: list[str]) -> str:
+    """复扫没有新词时也记一行——这一行就是「这一档扫过了」的账。"""
+    tail = (f"，评论里还看得到：{'、'.join(visible)}" if visible
+            else "，评论里也没看到蓝词")
+    return f"{when} 【{stage}】复扫：没有新蓝词{tail}"
 
 
 def _normalize(text: str) -> str:
@@ -582,9 +711,12 @@ class Verdict:
     # 它不是标签：热度档位说的是「现在有多热」，这个说的是「这一轮涨得猛」，
     # 两件事。写不写进表由调用方决定——「起量时间」只记第一次。
     surged: bool = False
-    # 第一页评论里被平台标成搜索高亮的词（蓝词），按出现顺序去重。
-    # 只在看到了评论页时填；空壳轮是空列表，调用方据此不碰蓝词三件套。
+    # 第一页评论里被平台标成搜索高亮的词（蓝词），按出现顺序去重；sightings 带出处。
+    # blue_words_checked=False（空壳轮、或这一轮的通道抹掉了蓝词标记）时两个都是
+    # 空列表，调用方据此不碰蓝词那几列——那不是「没有蓝词」，是「没看到」。
     blue_words: list[str] = field(default_factory=list)
+    blue_word_sightings: list[BlueWordSighting] = field(default_factory=list)
+    blue_words_checked: bool = False
 
 
 def decide(
@@ -815,10 +947,12 @@ def decide(
         verdict.notes.append("本轮未取到评论页内容，负面词判定保持原样")
 
     # —— 蓝词：评论正文里的 `#词[搜索高亮]#` 标记，同一份第一页评论 ——
-    # 哪些是新词、要不要翻「是否截图」由调用方对着表里的现值决定；
-    # 这里只负责把词抠出来。
-    if saw_comment_page(snapshot):
-        verdict.blue_words = highlighted_words(snapshot)
+    # 这一轮扫不扫、哪些是新词、要不要翻「是否截图」由调用方对着表里的现值
+    # 决定（plan_blue_word_scan）；这里只负责把词和出处抠出来。
+    if saw_comment_page(snapshot) and snapshot.blue_words_reported:
+        verdict.blue_words_checked = True
+        verdict.blue_word_sightings = highlighted(snapshot)
+        verdict.blue_words = [s.word for s in verdict.blue_word_sightings]
 
     return verdict
 

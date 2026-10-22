@@ -244,6 +244,117 @@ class TestBlueWords(unittest.TestCase):
         snap = self._snap("是我理解的这个 #快充小片[搜索高亮]# 吗")
         self.assertIn("#快充小片[搜索高亮]#", analyze.format_digest(snap, Settings().digest))
 
+    def test_each_word_remembers_the_first_comment_it_appeared_in(self):
+        snap = self._snap("#GT33[搜索高亮]# 好用", "又是 #gt33[搜索高亮]#",
+                          "换行的\n#西屋\n按摩椅[搜索高亮]#")
+        found = analyze.highlighted(snap)
+        self.assertEqual([s.word for s in found], ["GT33", "西屋 按摩椅"])
+        self.assertEqual(found[0].comment.content, "#GT33[搜索高亮]# 好用")
+        self.assertEqual(found[1].text, "换行的 #西屋 按摩椅[搜索高亮]#")   # 空白收成一个空格
+
+    def test_a_channel_that_strips_the_markers_is_not_read_as_no_blue_words(self):
+        """SocialDataX 把标记抹平了：那一轮蓝词判定不做（不是「没有蓝词」）。"""
+        items = [{"content": "#快充小片[搜索高亮]#", "is_pinned": False}]
+        snap = analyze.read_comment_page("xhs", {
+            "items": items, "comment_count": 1,
+            "_capabilities": {"pinned": False, "author": False, "blue_words": False}})
+        self.assertFalse(snap.blue_words_reported)
+        verdict = analyze.decide(snap, Settings(), previous_comment_count=None, age_hours=30)
+        self.assertFalse(verdict.blue_words_checked)
+        self.assertEqual(verdict.blue_words, [])
+
+
+class TestBlueWordScanPlan(unittest.TestCase):
+    """什么时候扫蓝词（2026-10-22 口径）：还没抓到过就一直扫、抓到就停；
+    到爆贴、到大爆各再扫一次；截图提醒只在爆贴（含）以上。"""
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def plan(self, *, words=("GT33",), log="", read=None, landed=None):
+        return analyze.plan_blue_word_scan(self.settings, known_words=list(words),
+                                           log_text=log, read_tier=read, landed_tier=landed)
+
+    def test_nothing_captured_yet_always_scans(self):
+        for landed in (None, "观察中", "评估中", "爆贴", "大爆"):
+            scan = self.plan(words=(), landed=landed)
+            self.assertIsNotNone(scan, landed)
+            self.assertFalse(scan.rescan)
+
+    def test_reminders_start_at_hot(self):
+        self.assertFalse(self.plan(words=(), landed="评估中").remind)
+        self.assertTrue(self.plan(words=(), landed="爆贴").remind)
+        self.assertTrue(self.plan(words=(), landed="大爆").remind)
+
+    def test_no_tier_is_written_as_untiered(self):
+        self.assertEqual(self.plan(words=(), landed=None).stage, "未定档")
+
+    def test_captured_and_still_below_hot_stops(self):
+        self.assertIsNone(self.plan(read="评估中", landed="评估中"))
+        self.assertIsNone(self.plan(log="2026-08-20 10:00 【观察中】GT33 ← …",
+                                    read="观察中", landed="评估中"))
+
+    def test_each_milestone_is_scanned_once(self):
+        log = "2026-08-20 10:00 【评估中】GT33 ← …"
+        self.assertTrue(self.plan(log=log, read="评估中", landed="爆贴").rescan)
+        log += "\n2026-08-21 10:00 【爆贴】复扫：没有新蓝词，评论里也没看到蓝词"
+        self.assertIsNone(self.plan(log=log, read="爆贴", landed="爆贴"))
+        self.assertTrue(self.plan(log=log, read="爆贴", landed="大爆").rescan)
+        log += "\n2026-08-22 10:00 【大爆】复扫：没有新蓝词，评论里也没看到蓝词"
+        self.assertIsNone(self.plan(log=log, read="大爆", landed="大爆"))
+
+    def test_the_ledger_wins_over_the_tier_in_the_table(self):
+        """「流量状态」已经升到爆贴、账上还没有爆贴那一次（那一轮没扫成）→ 补扫。"""
+        log = "2026-08-20 10:00 【评估中】GT33 ← …"
+        self.assertTrue(self.plan(log=log, read="爆贴", landed="爆贴").rescan)
+
+    def test_without_a_ledger_the_tier_in_the_table_is_the_ledger(self):
+        """老行（「蓝词来源」空着）：开跑时已经是爆贴就当爆贴扫过了。"""
+        self.assertIsNone(self.plan(read="爆贴", landed="爆贴"))
+        self.assertTrue(self.plan(read="评估中", landed="爆贴").rescan)
+        self.assertTrue(self.plan(read=None, landed="大爆").rescan)
+
+    def test_only_line_heads_count_as_the_ledger(self):
+        log = "2026-08-20 10:00 【评估中】GT33 ← 路人: 必须 【大爆】"
+        self.assertEqual(analyze.scanned_tier_rank(log, self.settings),
+                         self.settings.tags.rank("评估中"))
+        self.assertIsNone(analyze.scanned_tier_rank("", self.settings))
+        # 不认识的档位按最低算：最坏多扫一次，不会少扫
+        self.assertEqual(analyze.scanned_tier_rank("2026-08-20 10:00 【未定档】GT33 ← …",
+                                                   self.settings), -1)
+
+
+class TestBlueWordSourceLine(unittest.TestCase):
+    def _sighting(self, content, author="路人"):
+        snap = analyze.read_comment_page("xhs", {"items": [
+            {"content": content, "author": {"name": author}}], "comment_count": 1})
+        return analyze.highlighted(snap)[0]
+
+    def test_line_shape(self):
+        line = analyze.blue_word_source_line(
+            self._sighting("是我理解的这个 #快充小片[搜索高亮]# 吗"),
+            when="2026-10-22 14:05", stage="评估中", fmt=Settings().digest)
+        self.assertEqual(line, "2026-10-22 14:05 【评估中】快充小片 ← 路人: "
+                               "是我理解的这个 #快充小片[搜索高亮]# 吗")
+
+    def test_long_comment_is_cut_around_the_marker(self):
+        content = "前" * 150 + "#西屋911GT[搜索高亮]#" + "后" * 150
+        line = analyze.blue_word_source_line(
+            self._sighting(content), when="2026-10-22 14:05", stage="爆贴",
+            fmt=Settings().digest)
+        self.assertIn("#西屋911GT[搜索高亮]#", line)
+        self.assertIn("← 路人: …", line)
+        self.assertTrue(line.endswith("…"))
+        self.assertLess(len(line), 140)
+
+    def test_author_name_follows_the_digest_switch(self):
+        fmt = Settings().digest
+        fmt.show_author_name = False
+        line = analyze.blue_word_source_line(
+            self._sighting("#GT33[搜索高亮]#", author="张三"), when="2026-10-22 14:05",
+            stage="爆贴", fmt=fmt)
+        self.assertNotIn("张三", line)
+
 
 class TestPinnedState(unittest.TestCase):
     """置顶判定。帖子是我们自己发的，置顶评论必然是我方置顶的——

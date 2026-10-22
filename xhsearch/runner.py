@@ -63,14 +63,15 @@ class TagPlan:
 
 @dataclass
 class BlueWordPlan:
-    """写回前回填蓝词的材料：这一轮在评论里扫到的、开跑时表里还没有的词。
+    """写回前回填蓝词的材料：这一轮扫蓝词（首抓或爆贴/大爆复扫）看到了什么。
 
     和 TagPlan 同一个理由：「蓝词字段」是人机共用的多选列，飞书多选没有原子
     append，写入是整列覆盖。开跑时读到的现值到收尾时可能已经被运营改过
     （手工补了一个词、删了一个错词），拿旧快照拼出来整列写回去就把那次
-    编辑抹掉了。所以真正要写的值在 write_back 里**重读一次现值**再算。
+    编辑抹掉了。所以真正要写的值在 write_back 里**重读一次现值**再算，
+    「蓝词来源」同样接在那一刻的现值后面。
 
-    同时它把「翻『是否截图』」和「记新词」绑在一起：只有新词真的能落进
+    同时它把「翻『是否截图』」「记来源」和「记新词」绑在一起：只有词真的能落进
     「蓝词字段」（列存在、类型对、重读成功）时才翻那个开关、才在诊断里说
     「已加进」——否则运营会被叫去截一个表里根本没记下来的词。
     """
@@ -80,8 +81,19 @@ class BlueWordPlan:
     reason_field: str          # 「诊断信息」：回填成功时追加一句
     new_words: list[str]
     snapshot_words: list[str]  # 开跑时的现值，用来判断「这中间有没有人动过」
-    # 「是否截图」要翻成的值；None = 选项还没建，只记词不翻开关。
+    # 「是否截图」要翻成的值；None = 不提醒（见 remind），或选项还没建。
     shot_value: Optional[str] = None
+    # 要不要提醒截图：帖子在爆贴（含）以上，而且这一轮评论里看得到蓝词。
+    remind: bool = False
+    # True = 到爆贴/大爆的那一次复扫：没有新词也要在「蓝词来源」记一行，那就是账。
+    # False = 首抓：没有新词（运营这几分钟里自己填了）就什么都不写。
+    rescan: bool = False
+    stage: str = ""            # 这一轮的档位（诊断里说「到了爆贴」用）
+    hot_tier: str = ""         # 从哪一档起提醒截图（诊断里说「还没到爆贴」用）
+    sources_field: str = ""    # 「蓝词来源」
+    source_lines: dict[str, str] = field(default_factory=dict)  # 新词 → 记进「蓝词来源」的那一行
+    rescan_line: str = ""      # 复扫没有新词时记的那一行
+    visible: list[str] = field(default_factory=list)  # 这一轮评论里看得到的全部蓝词
 
 
 @dataclass
@@ -1104,6 +1116,9 @@ def refresh(
         fields = _base_fields(settings, status=status, notes=verdict.notes,
                               checked_at=checked_at)
         tag_plan: Optional[TagPlan] = None
+        # 这一轮落表的热度档位。蓝词的爆贴/大爆复扫认的是它，不是算出来的那一档：
+        # 「大爆」选项没建、写不进去的话，那一档每轮都会像是刚到。
+        landed_tier: Optional[str] = None
 
         if touch_tags:
             merged = tags.merge(
@@ -1135,6 +1150,7 @@ def refresh(
             # 也避免让人看到这一行被反复改动。
             if merged.changed:
                 fields[f.traffic_status] = merged.final
+            landed_tier = settings.tags.top_tier(merged.final)
 
         # 「评论状态」「置顶状态」都是单选列，机器直接覆盖当前值——
         # 单选只显示当前状态（「待评论」这类人工排期旧值一并被结论覆盖）。
@@ -1238,11 +1254,13 @@ def refresh(
             fields[f.negative_digest] = analyze.format_negative_digest(
                 verdict.negative_hits, settings.digest)
 
-        # —— 蓝词回填：只在出现**表里还没有**的词时动这两列 ——
-        # 「蓝词字段」只追加不删除：人工填的、机器此前回填的都原样保留，
-        # 蓝词掉了是要人去看的事，不是机器撤掉的事。
-        # 「是否截图」只在有新词时翻成「未截图」：同一个蓝词每轮都在，
-        # 每轮都翻等于把运营刚截完的图撤销掉；没有新词就一个字都不碰。
+        # —— 蓝词：只在三个时刻扫（analyze.plan_blue_word_scan）——
+        # 「蓝词字段」还空着就每轮扫、抓到一次就停；到爆贴、到大爆各再扫一次。
+        # 其余轮次评论里冒出什么新词都不动——这几列一个字都不碰。
+        # 「蓝词字段」只追加不删除：人工填的、机器此前回填的、竞品的词都原样
+        # 保留，蓝词掉了是要人去看的事，不是机器撤掉的事。
+        # 「是否截图」只在爆贴（含）以上的那次扫描里、评论里看得到蓝词时翻成
+        # 「未截图」：爆贴以下抓到的词只记录不提醒。
         #
         # 这里只登记材料，不直接写列：真正的值在 write_back 里重读现值之后
         # 再拼（人机共用的多选列，整列覆盖），而且「翻开关」必须等「记词」
@@ -1251,21 +1269,42 @@ def refresh(
         log_notes = list(verdict.notes)
         if collation_note:
             log_notes.append(collation_note)
-        if touch_tags and verdict.blue_words:
-            fresh = analyze.new_blue_words(verdict.blue_words, row.blue_words)
-            if fresh:
-                pending: Optional[str] = settings.blue_word_shot.pending
-                if blue_word_shot_options is not None and pending not in blue_word_shot_options:
-                    fields[f.failure_reason] = (
-                        fields[f.failure_reason]
-                        + f"；「{f.blue_word_shot}」里还没建选项「{pending}」，已跳过"
-                    )[:500]
-                    pending = None
-                blue_word_plan = BlueWordPlan(
-                    field_name=f.blue_words, shot_field=f.blue_word_shot,
-                    reason_field=f.failure_reason, new_words=fresh,
-                    snapshot_words=list(row.blue_words), shot_value=pending)
-                log_notes.append(f"🔵 评论里出现新蓝词：{'、'.join(fresh)}")
+        scan = (analyze.plan_blue_word_scan(
+                    settings, known_words=row.blue_words,
+                    log_text=row.blue_word_sources,
+                    read_tier=settings.tags.top_tier(row.current_tags),
+                    landed_tier=landed_tier)
+                if touch_tags and verdict.blue_words_checked else None)
+        fresh = (analyze.new_blue_words(verdict.blue_words, row.blue_words)
+                 if scan is not None else [])
+        if scan is not None and (fresh or scan.rescan):
+            remind = scan.remind and bool(verdict.blue_words)
+            pending: Optional[str] = settings.blue_word_shot.pending if remind else None
+            if pending and blue_word_shot_options is not None \
+                    and pending not in blue_word_shot_options:
+                fields[f.failure_reason] = (
+                    fields[f.failure_reason]
+                    + f"；「{f.blue_word_shot}」里还没建选项「{pending}」，已跳过"
+                )[:500]
+                pending = None
+            when = settings.display.minute(checked_at)
+            blue_word_plan = BlueWordPlan(
+                field_name=f.blue_words, shot_field=f.blue_word_shot,
+                reason_field=f.failure_reason, new_words=fresh,
+                snapshot_words=list(row.blue_words), shot_value=pending,
+                remind=remind, rescan=scan.rescan, stage=scan.stage,
+                hot_tier=settings.tags.hot,
+                sources_field=f.blue_word_sources,
+                source_lines={
+                    s.word: analyze.blue_word_source_line(
+                        s, when=when, stage=scan.stage, fmt=settings.digest)
+                    for s in verdict.blue_word_sightings if s.word in fresh},
+                rescan_line=analyze.blue_word_rescan_line(
+                    when=when, stage=scan.stage, visible=verdict.blue_words),
+                visible=list(verdict.blue_words))
+            log_notes.append(
+                f"🔵 到了{scan.stage}，蓝词复扫一次" if scan.rescan
+                else f"🔵 评论里出现新蓝词：{'、'.join(fresh)}")
 
         return Outcome(row.record_id, status, fields, "；".join(log_notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at,
@@ -1826,6 +1865,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         queued=feishu.read_bool(cells.get(f.queued)),
         refresh_status=feishu.read_text(cells.get(f.refresh_status)),
         blue_words=feishu.read_multi_select(cells.get(f.blue_words)),
+        blue_word_sources=feishu.read_text(cells.get(f.blue_word_sources)),
         # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))
@@ -2053,7 +2093,9 @@ def _reconcile_blue_words(
     1. **重读现值再拼**。「蓝词字段」是人机共用的多选列，写入是整列覆盖。
        开跑到收尾隔着几分钟付费调用，运营这几分钟里手工加的词会被按旧快照
        拼出来的值抹掉（和 _reconcile_tags 同一个坑）。重读失败就这一轮不写：
-       词没记下来，下一轮照样会当新词再扫到，什么都不丢。
+       首抓的词没记下来，「蓝词字段」还空着，下一轮照样扫；爆贴/大爆复扫的
+       账没记上，下一轮看账还是没扫过，也照样扫。只有「蓝词来源」一条账都
+       没有的老行例外——它拿开跑时的档位当账，这一次复扫就错过了。
     2. **记词和翻开关绑定**。只有词真的能落进「蓝词字段」（列存在、类型对）
        才翻「是否截图」、才在诊断里说「已加进」。列没建/建错时 write_back 会
        把这一列挡掉，若开关和那句话照写，运营就会被叫去截一个表里根本
@@ -2077,9 +2119,10 @@ def _reconcile_blue_words(
     if unwritable:
         for outcome in targets:
             plan = outcome.blue_word_plan
-            _append_note(outcome.fields, plan.reason_field,
-                         f"🔵 评论里出现新蓝词：{'、'.join(plan.new_words)}，"
-                         f"但{unwritable}，未能记录")
+            if plan.new_words:
+                _append_note(outcome.fields, plan.reason_field,
+                             f"🔵 评论里出现新蓝词：{'、'.join(plan.new_words)}，"
+                             f"但{unwritable}，未能记录")
         return
 
     try:
@@ -2097,16 +2140,40 @@ def _reconcile_blue_words(
             continue   # 行被删了：交给 batch_update 报 1254043 并隔离
         current = feishu.read_multi_select(cells.get(plan.field_name))
         still_new = analyze.new_blue_words(plan.new_words, current)
-        if not still_new:
-            # 运营在这几分钟里自己把词填上了：那就什么都不写、也不翻开关——
-            # 人已经看到了，再翻成「未截图」是在撤销人的动作。
+        if not still_new and not plan.rescan:
+            # 首抓，而运营在这几分钟里自己把词填上了：那就什么都不写、也不翻
+            # 开关——人已经看到了，再翻成「未截图」是在撤销人的动作。
             continue
-        outcome.fields[plan.field_name] = list(current) + still_new
-        if plan.shot_value is not None:
+        if still_new:
+            outcome.fields[plan.field_name] = list(current) + still_new
+        # 「蓝词来源」只追加，接在**那一刻**的现值后面。复扫没有新词也记一行——
+        # 那一行就是「这一档扫过了」的账，下一轮据此不再扫。
+        lines = [plan.source_lines[w] for w in still_new] or [plan.rescan_line]
+        log = feishu.read_text(cells.get(plan.sources_field)).rstrip()
+        outcome.fields[plan.sources_field] = "\n".join(([log] if log else []) + lines)
+        if plan.remind and plan.shot_value is not None:
             outcome.fields[plan.shot_field] = plan.shot_value
-        _append_note(outcome.fields, plan.reason_field,
-                     f"🔵 评论里出现新蓝词：{'、'.join(still_new)}"
-                     f"（已加进「{plan.field_name}」，请截图）")
+        _append_note(outcome.fields, plan.reason_field, _blue_word_note(plan, still_new))
+
+
+def _blue_word_note(plan: BlueWordPlan, still_new: list[str]) -> str:
+    """回填落表那一轮在「诊断信息」里说的那一句。
+
+    「请截图」只在真要人截图时说（爆贴含以上、评论里看得到蓝词）——
+    爆贴以下抓到的词明说先不用截，免得运营以为机器漏翻了「是否截图」。
+    """
+    added = f"已加进「{plan.field_name}」"
+    if not plan.rescan:
+        ask = "，请截图" if plan.remind else f"；还没到{plan.hot_tier}，先不用截图"
+        return f"🔵 评论里出现新蓝词：{'、'.join(still_new)}（{added}{ask}）"
+    head = f"🔵 到了{plan.stage}，蓝词复扫一次："
+    if still_new:
+        body = f"新蓝词 {'、'.join(still_new)}（{added}）"
+    elif plan.visible:
+        body = f"没有新蓝词，评论里还看得到 {'、'.join(plan.visible)}"
+    else:
+        return head + "评论里没看到蓝词"
+    return head + body + ("，请截图" if plan.remind else "")
 
 
 def write_back(
