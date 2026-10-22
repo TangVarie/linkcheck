@@ -185,7 +185,8 @@ class TestNumericEnvBounds(unittest.TestCase):
         self._saved = {}
         for name in ("MAX_CONCURRENCY", "SOFT_DEADLINE_SECONDS", "DETAIL_WITHIN_DAYS",
                      "MAX_RECORDS_PER_RUN", "TIKHUB_BASE", "CHANNEL_ORDER",
-                     "DISPLAY_UTC_OFFSET", "TAG_OBSERVING"):
+                     "DISPLAY_UTC_OFFSET", "TAG_OBSERVING", "EVAL_MIN_GAIN",
+                     "EVAL_START_HOURS", "EVAL_WINDOW_HOURS"):
             self._saved[name] = os.environ.pop(name, None)
 
     def tearDown(self):
@@ -206,6 +207,16 @@ class TestNumericEnvBounds(unittest.TestCase):
         for value in ("0", "4", "1000", "-1"):
             with self.subTest(value=value), self.assertRaises(SystemExit):
                 self._settings_with(MAX_CONCURRENCY=value)
+
+    def test_eval_growth_knobs(self):
+        settings = self._settings_with(EVAL_MIN_GAIN="5", EVAL_START_HOURS="72",
+                                       EVAL_WINDOW_HOURS="48")
+        self.assertEqual((settings.thresholds.eval_min_gain,
+                          settings.thresholds.eval_start_hours,
+                          settings.thresholds.eval_window_hours), (5, 72, 48))
+        for name in ("EVAL_MIN_GAIN", "EVAL_START_HOURS", "EVAL_WINDOW_HOURS"):
+            with self.subTest(name=name), self.assertRaises(SystemExit):
+                self._settings_with(**{name: "0"})
 
     def test_negative_deadline_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -1171,3 +1182,30 @@ class TestDisabledTablesAreRecordedForThePanel(unittest.TestCase):
              mock.patch("sys.stdout", new=io.StringIO()):
             cli._entries_or_raise("cli_x", "s")
         self.assertEqual(cli._REGISTRY_DISABLED, [])
+
+
+class TestEvalUnready(unittest.TestCase):
+    """「评估中」增长判据要的两列：都在、类型都对才判；否则说清楚原因。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        f = self.settings.fields
+        self.meta = {f.eval_baseline_count: {"type": 2}, f.eval_baseline_time: {"type": 5}}
+
+    def _reason(self, meta):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            reason = cli._eval_unready(self.settings, meta)
+        return reason, out.getvalue()
+
+    def test_both_columns_ready(self):
+        self.assertEqual(self._reason(self.meta), ("", ""))
+
+    def test_missing_columns_are_named(self):
+        reason, printed = self._reason({})
+        self.assertEqual(reason, "表里没建「评估基线评论数」、「评估基线时间」")
+        self.assertIn("补齐缺的列", printed)
+
+    def test_wrong_type_is_named(self):
+        self.meta[self.settings.fields.eval_baseline_time] = {"type": 1}
+        reason, _ = self._reason(self.meta)
+        self.assertEqual(reason, "「评估基线时间」不是日期列")

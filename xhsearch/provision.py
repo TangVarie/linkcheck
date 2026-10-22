@@ -363,6 +363,9 @@ FULL_LAYOUT: tuple = (
     "platform",
     "previous_comment_count",
     "resolved_id",
+    # 评估中增长判据的基线两列（2026-10-22 加，机器写）：系统列，排在最后。
+    "eval_baseline_count",
+    "eval_baseline_time",
 )
 
 # 模板里有但刻意不建的列。现在是空的：西屋表的列全部建得出来。

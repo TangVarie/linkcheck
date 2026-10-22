@@ -53,6 +53,11 @@ class FieldNames:
     # ⚠️ 分辨率受分层刷新节奏限制：写进去的是**发现**起量的那一刻，
     # 真正起飞发生在上一次巡查到这一次之间（0-2 天档 8 小时，往后更粗）。
     surge_time: str = "起量时间"
+    # 「评估中」增长判据的基线：评论数和记下它的时刻（见 Thresholds.eval_*）。
+    # 只在量到了评论数的轮次写——「最近检查时间」不能代替它，巡查失败的
+    # 轮次也会推进那一格，拿它当基线时刻会把窗口算短。
+    eval_baseline_count: str = "评估基线评论数"
+    eval_baseline_time: str = "评估基线时间"
     # 「点赞数 / 上次点赞数 / 收藏数 / 上次收藏数」四列已经去掉了。
     # 小红书的赞藏只能从 detail 接口拿（评论接口不带），而 detail 占了
     # 月成本的 39%——运营确认这两个数字不看，那就没有理由继续为它付费。
@@ -129,6 +134,8 @@ class FieldNames:
             self.blue_word_sources,       # 复扫的账本：在哪一档扫过（只扫爆贴/大爆各一次）
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
             self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
+            self.eval_baseline_count,     # 评估中的增长判据：拿这一轮和基线比
+            self.eval_baseline_time,
             self.resolved_id,             # 抖音短链展开过就不再展开
             self.collation_source,        # 数据整理：判断有没有新的一份整理
             self.collation_status,        # 没变化就不重写
@@ -144,7 +151,8 @@ class Tags:
     热度档位（观察中 / 无水花 / 评估中 / 爆贴 / 大爆）是**互斥**的：一条帖子
     同时挂着几个没有意义，所以每轮只留最高的那一个。而且只升不降（棘轮）——
     爆过就是爆过，评论被删导致数字掉下去不该让它从「大爆」退回「爆贴」，
-    那种异常该由 疑似限流 表达。
+    那种异常该由 疑似限流 表达。两个例外都在爆贴以下（2026-10-22）：评估中
+    满窗口涨不够判无水花；无水花没到爆贴门槛之前不回评估中（analyze.held_tier）。
 
     「观察中」是最低档，代表**还没到下结论的时候**：发布不满
     Thresholds.flop_hours（默认 48 小时）且评论数还够不上「评估中」。
@@ -358,6 +366,12 @@ class Thresholds:
         发布不满 flop_hours → 观察中（还在冷启动窗口，没到下结论的时候）
         发布满 flop_hours   → 无水花（给了足够时间还是没起来）
 
+    评估中（20–50 条）的帖发布满 eval_start_hours 之后看**增长**（2026-10-22
+    运营定的口径，见 analyze.decide）：记一个基线（评论数 + 时刻），满
+    eval_window_hours 再看——涨了不到 eval_min_gain 条 → 无水花；够了 →
+    继续评估中、基线重记，下一个窗口接着看。正好涨够算有增长。
+    判过的无水花（含人手改的）没到爆贴之前不回评估中。
+
     另外两组是**和上一次比**的口径，一涨一跌，互为镜像，**两边都含边界**：
         跌幅 ≥ risk_drop_ratio（基线 ≥ 20）→ 疑似限流
         涨幅 ≥ surge_ratio 且增量 ≥ surge_min_gain → 起量，记一个时刻
@@ -389,6 +403,14 @@ class Thresholds:
     # 发布这么多小时后评论数仍够不上「评估中」门槛，判「无水花」。
     # 太短会把正常冷启动误标——刚发两小时只有几条评论再正常不过。
     flop_hours: int = 48
+
+    # —— 评估中的增长判据（评论数在 [评估中门槛, 爆贴门槛) 的帖）——
+    # 发布满 eval_start_hours 才开始看；每 eval_window_hours 一个窗口，
+    # 窗口里涨不到 eval_min_gain 条就判无水花。环境变量 EVAL_MIN_GAIN /
+    # EVAL_START_HOURS / EVAL_WINDOW_HOURS 可以覆盖。
+    eval_min_gain: int = 10
+    eval_start_hours: int = 48
+    eval_window_hours: int = 24
 
     def recollect(self, count: int | None, baseline: int | None) -> bool:
         """评论数比数据整理时涨得够多了吗——涨幅和绝对增量**两个闸门都要过**。
@@ -722,6 +744,9 @@ class Settings:
     channels: Channels = field(default_factory=Channels)
     budget: Budget = field(default_factory=Budget)
     display: Display = field(default_factory=Display)
+    # 这张表不往「蓝词字段」里记的词（竞品名之类）。按表配：登记表里的
+    # 「蓝词排除词」那一格，见 registry.apply_overrides 和 analyze.excluded_by。
+    blue_word_excludes: tuple[str, ...] = ()
 
     # 小红书笔记发布多少天内额外调一次 detail。**默认 0 = 不调。**
     #

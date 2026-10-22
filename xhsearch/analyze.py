@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
@@ -403,6 +404,32 @@ def highlighted_words(snapshot: Snapshot) -> list[str]:
     return [s.word for s in highlighted(snapshot)]
 
 
+def excluded_by(word: str, excludes) -> Optional[str]:
+    """这个蓝词被哪个排除词排掉了（登记表里那一格，见 registry）；没排掉返回 None。
+
+    两种匹配，按排除词本身是什么字分：
+
+    * 带中文（或任何非 ASCII 字符）的按**子串**、不分大小写：「奥佳华」排得掉
+      「奥佳华7598vpro」；
+    * 纯英文 / 数字的按**整词**、不分大小写，前后挨着的不能是字母或数字：
+      「sis」排得掉「sis黑胶」「SiS 能量胶」，排不掉「analysis」。英文按子串
+      会误伤——这正是不拿每行的「负面词」来排的原因（careplus 里有 are）。
+
+    不到 2 个字的排除词不生效（registry.read_blue_word_excludes 已经报过）。
+    """
+    for term in excludes or ():
+        term = term.strip()
+        if len(term) < 2:
+            continue
+        if term.isascii():
+            pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
+            if re.search(pattern, word, re.IGNORECASE):
+                return term
+        elif term.casefold() in word.casefold():
+            return term
+    return None
+
+
 def new_blue_words(found: list[str], current: list[str]) -> list[str]:
     """found 里哪些是「蓝词字段」还没有的。比对不计大小写、空白和标点：
     表里人工填的「gt33」和评论里高亮的「GT33」是同一个词，不该再提醒一次。"""
@@ -506,10 +533,13 @@ def blue_word_source_line(sighting: BlueWordSighting, *, when: str, stage: str,
     return f"{when} 【{stage}】{sighting.word} ← {who}{excerpt}"
 
 
-def blue_word_rescan_line(*, when: str, stage: str, visible: list[str]) -> str:
+def blue_word_rescan_line(*, when: str, stage: str, visible: list[str],
+                          excluded: Optional[list[str]] = None) -> str:
     """复扫没有新词时也记一行——这一行就是「这一档扫过了」的账。"""
     tail = (f"，评论里还看得到：{'、'.join(visible)}" if visible
             else "，评论里也没看到蓝词")
+    if excluded:
+        tail += f"（排除词不记：{'、'.join(excluded)}）"
     return f"{when} 【{stage}】复扫：没有新蓝词{tail}"
 
 
@@ -717,6 +747,77 @@ class Verdict:
     blue_words: list[str] = field(default_factory=list)
     blue_word_sightings: list[BlueWordSighting] = field(default_factory=list)
     blue_words_checked: bool = False
+    # 评论里看得到、但被这张表的「蓝词排除词」排掉的词（不记、不叫截图）。
+    blue_words_excluded: list[str] = field(default_factory=list)
+    # 「评估中」增长判据：这一轮要不要把（本轮评论数, 本轮时刻）记成新基线——
+    # 第一次进入判断、或者这个窗口涨够了。写不写由 runner 定（两列在不在）。
+    eval_baseline_reset: bool = False
+
+
+def held_tier(current_tags: Optional[list[str]], settings: Settings) -> Optional[str]:
+    """表里现有的热度档位——棘轮从这里起算。
+
+    一般就是最高的那一档。例外是「无水花」：判过（或人手改成）无水花的帖，
+    格子里哪怕还挂着「评估中」「观察中」，也按无水花算——否则排序上评估中
+    高一档，下一轮就被改回去了（2026-10-22 运营定的口径）。爆贴、大爆照旧
+    压过它：那两档只升不降，大爆不会因为删评退回爆贴，更不会退回无水花。
+    """
+    t = settings.tags
+    best = t.top_tier(current_tags)
+    if (t.flop and t.flop in (current_tags or [])
+            and t.rank(best or "") <= t.rank(t.evaluating)):
+        return t.flop
+    return best
+
+
+def _eval_growth(verdict: Verdict, settings: Settings, *, count: int,
+                 count_tier: Optional[str], held: Optional[str],
+                 age_hours: Optional[float], baseline_count: Optional[int],
+                 baseline_at: Optional[datetime], now: Optional[datetime],
+                 unready: str) -> tuple[bool, str]:
+    """「评估中」的增长判据（2026-10-22 运营定的口径）。返回（判无水花了吗, 诊断那句话）。
+
+    发布满 eval_start_hours、评论数在爆贴门槛以下、现在是评估中的帖：
+
+    1. 没有基线 → 记下（本轮评论数, 本轮时刻），档位照旧；
+    2. 距基线不到 eval_window_hours → 什么都不改；
+    3. 满了 → 涨了不到 eval_min_gain 条判无水花；涨够了继续评估中、基线重记。
+
+    「现在是评估中」包括评论数掉回评估中门槛以下、靠棘轮挂着评估中的帖——
+    不然它们永远判不了：掉下去本来就是没涨。基线只在量到评论数的轮次写
+    （巡查失败那一轮走不到这里），所以中间一轮失败，窗口就顺延到下一次量到为止。
+    门槛读的是这张表生效的那一套（登记表里的「评估中门槛」「爆贴门槛」）。
+    """
+    t = settings.tags
+    th = settings.thresholds
+    in_eval = (age_hours is not None and age_hours >= th.eval_start_hours
+               and count < th.tier_hot
+               and (count_tier == t.evaluating or held == t.evaluating)
+               and held != t.flop
+               and t.rank(held or "") <= t.rank(t.evaluating))
+    if not in_eval:
+        return False, ""
+    window = th.eval_window_hours
+    if unready:
+        return False, (f"⚠ {unready}，评估中满 {th.eval_start_hours} 小时后的增长判断"
+                       "这一轮跳过了（面板上点这张表的「补齐缺的列」）")
+    if baseline_count is None or baseline_at is None or (now is not None and baseline_at > now):
+        verdict.eval_baseline_reset = True
+        return False, (f"记下评估基线：评论数 {count}，满 {window} 小时看涨没涨够 "
+                       f"{th.eval_min_gain} 条")
+    if now is None:
+        return False, ""
+    elapsed = (now - baseline_at).total_seconds() / 3600
+    gain = count - baseline_count
+    if elapsed < window:
+        return False, (f"评估中：距基线（{baseline_count} 条）{elapsed:.0f} 小时，"
+                       f"满 {window} 小时再判")
+    if gain < th.eval_min_gain:
+        return True, (f"评估中 {elapsed:.0f} 小时只涨了 {gain} 条（{baseline_count} → {count}，"
+                      f"不足 {th.eval_min_gain} 条）→ {t.flop}")
+    verdict.eval_baseline_reset = True
+    return False, (f"评估中 {elapsed:.0f} 小时涨了 {gain} 条（{baseline_count} → {count}），"
+                   "继续评估中，基线重记")
 
 
 def decide(
@@ -729,11 +830,19 @@ def decide(
     negative_keywords: Optional[list[str]] = None,
     current_tags: Optional[list[str]] = None,
     current_pin_status: str = "",
+    eval_baseline_count: Optional[int] = None,
+    eval_baseline_at: Optional[datetime] = None,
+    now: Optional[datetime] = None,
+    eval_unready: str = "",
 ) -> Verdict:
     """算出这一行本次应有的机器标签和置顶判定。
 
     只产出 settings.tags.namespace() 里的标签。人工标签由 tags.merge 保护，
     这里完全不需要知道它们的存在。
+
+    eval_baseline_count / eval_baseline_at 是「评估基线评论数 / 时间」那两格，
+    now 是这一轮的时刻（窗口满没满拿它比）；eval_unready 非空 = 那两列不能用，
+    增长判据整个跳过，这句话就是原因（写进诊断信息）。
     """
     t = settings.tags
     th: Thresholds = settings.thresholds
@@ -741,12 +850,8 @@ def decide(
 
     count = snapshot.comment_count
 
-    # —— 热度档位：互斥，取最高，且只升不降 ——
-    previous_best = max(
-        (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
-        key=t.rank,
-        default=None,
-    )
+    # —— 热度档位：互斥，取最高，且只升不降（无水花例外，见 held_tier）——
+    previous_best = held_tier(current_tags, settings)
     if count is not None:
         # 评论数够得上档位时，发布时长根本不参与判定——先把这一档单独算出来，
         # 后面「发布时间有没有毛病」才问得准（它只在评论数定不了档时才是关键）。
@@ -773,16 +878,33 @@ def decide(
             tier = t.flop
         elif observing:
             tier = t.observing
+        stalled, eval_note = _eval_growth(
+            verdict, settings, count=count, count_tier=count_tier, held=previous_best,
+            age_hours=age_hours if age_usable else None,
+            baseline_count=eval_baseline_count, baseline_at=eval_baseline_at,
+            now=now, unready=eval_unready)
         # 棘轮：算上表里已有的档位取最高。评论被删导致数字掉下去，不该让
         # 一条帖子从「大爆」退回「爆贴」——那种异常由「疑似限流」表达。
-        best = max(
-            (x for x in (tier, previous_best) if x),
-            key=t.rank,
-            default=None,
-        )
+        # 两个例外都只在爆贴以下：增长判据判了无水花（评估中 → 无水花）；
+        # 格子里已经是无水花（见 held_tier），没到爆贴门槛之前不回评估中。
+        flop_held = previous_best == t.flop and count < th.tier_hot
+        if stalled or flop_held:
+            best = t.flop
+        else:
+            best = max(
+                (x for x in (tier, previous_best) if x),
+                key=t.rank,
+                default=None,
+            )
         if best:
             verdict.tags.add(best)
-            if best != tier:
+            if stalled:
+                pass   # 增长判据那句话（eval_note）说清楚了
+            elif flop_held and tier != t.flop:
+                verdict.notes.append(
+                    f"评论数 {count}，此前已判「{t.flop}」，没到「{t.hot}」"
+                    f"（{th.tier_hot} 条）之前不回「{tier or t.evaluating}」")
+            elif best != tier:
                 verdict.notes.append(f"评论数 {count}，但曾达到「{best}」，保留高档位")
             elif flopped:
                 verdict.notes.append(
@@ -794,6 +916,8 @@ def decide(
                     f"冷启动窗口内，暂不下结论 → {t.observing}")
             else:
                 verdict.notes.append(f"评论数 {count} → {best}")
+        if eval_note:
+            verdict.notes.append(eval_note)
         # 发布时间有毛病、而且这一轮**正好要靠它**定档（评论数够不上任何一档）
         # → 如实报出来。这一条**不能**挂在 `if best` 的 else 上：表里已经有档位时
         # `best` 是真值，那条路径只会说「保留高档位」，而真正的问题是那一格坏了。
@@ -949,9 +1073,16 @@ def decide(
     # —— 蓝词：评论正文里的 `#词[搜索高亮]#` 标记，同一份第一页评论 ——
     # 这一轮扫不扫、哪些是新词、要不要翻「是否截图」由调用方对着表里的现值
     # 决定（plan_blue_word_scan）；这里只负责把词和出处抠出来。
+    # 登记表里配的排除词（竞品名）在这里就筛掉：后面的「是新词吗」「要不要
+    # 截图」「还没抓到过蓝词吗」都只看剩下的——一轮里只出现了排除词，就和
+    # 没出现蓝词一样，「是否截图」不翻。
     if saw_comment_page(snapshot) and snapshot.blue_words_reported:
         verdict.blue_words_checked = True
-        verdict.blue_word_sightings = highlighted(snapshot)
+        for sighting in highlighted(snapshot):
+            if excluded_by(sighting.word, settings.blue_word_excludes):
+                verdict.blue_words_excluded.append(sighting.word)
+            else:
+                verdict.blue_word_sightings.append(sighting)
         verdict.blue_words = [s.word for s in verdict.blue_word_sightings]
 
     return verdict
@@ -969,12 +1100,7 @@ def gone_verdict(settings: Settings, reason: str = "",
     """
     verdict = Verdict()
     verdict.tags.add(settings.tags.risk)
-    t = settings.tags
-    best = max(
-        (tag for tag in (current_tags or []) if t.rank(tag) >= 0),
-        key=t.rank,
-        default=None,
-    )
+    best = held_tier(current_tags, settings)
     if best:
         verdict.tags.add(best)
     verdict.notes.append(reason or "接口返回内容不存在/已删除/无法访问")

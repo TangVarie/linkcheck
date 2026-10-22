@@ -857,14 +857,22 @@ class TestRiskDetection(unittest.TestCase):
         self.assertIn("爆贴", v.tags)
         self.assertFalse(any("发布时间" in n for n in v.notes), v.notes)
 
-    def test_flop_ratchets_up_but_never_back(self):
-        """无水花是最低热度档：起来了就换高档，绝不从评估中退回无水花。"""
-        up = self.decide(25, age_hours=72, current_tags=["无水花"])
-        self.assertIn("评估中", up.tags)
-        self.assertNotIn("无水花", up.tags)
+    def test_flop_holds_until_hot(self):
+        """判过的无水花没到爆贴之前不回评估中（2026-10-22 口径）；到了爆贴照常升。
+        以前排序上评估中高一档，下一轮就被改回去了。"""
+        held = self.decide(49, age_hours=72, current_tags=["无水花"])
+        self.assertEqual(held.tags, {"无水花"})
+        self.assertTrue(any("不回「评估中」" in n for n in held.notes))
+        up = self.decide(50, age_hours=72, current_tags=["无水花"])
+        self.assertEqual(up.tags, {"爆贴"})
+
+    def test_evaluating_does_not_drop_to_flop_without_the_growth_check(self):
+        """评估中只有增长判据能把它降成无水花——评论数掉回 20 以下的这一轮
+        只是记基线，不当场判。"""
         down = self.decide(3, age_hours=72, current_tags=["评估中"])
         self.assertIn("评估中", down.tags)
         self.assertNotIn("无水花", down.tags)
+        self.assertTrue(down.eval_baseline_reset)
 
     def test_censor_flag_from_upstream_flags_risk(self):
         """风控中的硬证据之一：上游明确返回了审核/受限标记。"""
@@ -1993,3 +2001,248 @@ class TestDisplayTimezone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvalGrowth(unittest.TestCase):
+    """「评估中」的增长判据（2026-10-22 运营定的口径）：
+
+    发布满 48 小时、评论数在 [评估中门槛, 爆贴门槛) 的帖记一个基线；满 24 小时
+    再看，涨了不到 10 条 → 无水花，涨够了 → 继续评估中、基线重记。
+    """
+
+    NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def decide(self, count, *, age=72.0, tags=("评估中",), base=None, hours_ago=24.0,
+               settings=None, **kw):
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": count})
+        return analyze.decide(
+            snap, settings or self.settings, previous_comment_count=None, age_hours=age,
+            current_tags=list(tags), eval_baseline_count=base,
+            eval_baseline_at=None if base is None else self.NOW - timedelta(hours=hours_ago),
+            now=self.NOW, **kw)
+
+    def heat(self, verdict):
+        return {t for t in verdict.tags if self.settings.tags.rank(t) >= 0}
+
+    def test_first_round_after_48h_records_a_baseline(self):
+        v = self.decide(30, age=50)
+        self.assertTrue(v.eval_baseline_reset)
+        self.assertEqual(self.heat(v), {"评估中"})
+        self.assertTrue(any("记下评估基线" in n for n in v.notes))
+
+    def test_before_48h_nothing_happens(self):
+        v = self.decide(30, age=40)
+        self.assertFalse(v.eval_baseline_reset)
+        self.assertEqual(self.heat(v), {"评估中"})
+
+    def test_gain_of_9_in_24h_is_a_flop(self):
+        v = self.decide(39, base=30)
+        self.assertEqual(self.heat(v), {"无水花"})
+        self.assertFalse(v.eval_baseline_reset)
+        self.assertTrue(any("只涨了 9 条" in n and "→ 无水花" in n for n in v.notes))
+
+    def test_gain_of_exactly_10_keeps_evaluating_and_resets_the_baseline(self):
+        v = self.decide(40, base=30)
+        self.assertEqual(self.heat(v), {"评估中"})
+        self.assertTrue(v.eval_baseline_reset)
+
+    def test_inside_the_window_nothing_changes(self):
+        v = self.decide(31, base=30, hours_ago=20)
+        self.assertEqual(self.heat(v), {"评估中"})
+        self.assertFalse(v.eval_baseline_reset)
+
+    def test_a_longer_window_after_a_failed_round_is_judged_on_the_whole_gap(self):
+        """中间一轮巡查失败：基线没动，窗口顺延到这一次（48 小时），按整段的增长判。"""
+        v = self.decide(42, base=30, hours_ago=48)
+        self.assertEqual(self.heat(v), {"评估中"})
+        self.assertTrue(v.eval_baseline_reset)
+
+    def test_falling_comments_count_as_no_growth(self):
+        """评论数掉回 20 以下、靠棘轮挂着评估中的帖也在判断里：掉了就是没涨。"""
+        v = self.decide(12, base=30)
+        self.assertEqual(self.heat(v), {"无水花"})
+
+    def test_hot_rows_are_not_judged(self):
+        v = self.decide(45, tags=("爆贴",), base=30)
+        self.assertEqual(self.heat(v), {"爆贴"})
+        self.assertFalse(v.eval_baseline_reset)
+
+    def test_reaching_hot_leaves_the_judgement(self):
+        v = self.decide(50, base=45)
+        self.assertEqual(self.heat(v), {"爆贴"})
+
+    def test_missing_columns_skip_the_check_and_say_why(self):
+        v = self.decide(31, base=30, eval_unready="表里没建「评估基线评论数」")
+        self.assertEqual(self.heat(v), {"评估中"})
+        self.assertFalse(v.eval_baseline_reset)
+        self.assertTrue(any("表里没建「评估基线评论数」" in n and "跳过" in n for n in v.notes))
+
+    def test_a_future_baseline_is_rewritten(self):
+        v = self.decide(31, base=30, hours_ago=-5)
+        self.assertTrue(v.eval_baseline_reset)
+
+    def test_per_table_thresholds_are_used(self):
+        """门槛按表：登记表里填了 评估中 10 / 爆贴 30 的表，15 条也在判断里，30 条已经是爆贴。"""
+        from xhsearch import registry
+        entry = registry.Entry(label="小表", thresholds={
+            registry.COL_TIER_EVALUATING: 10, registry.COL_TIER_HOT: 30})
+        table = registry.apply_overrides(self.settings, entry)
+        self.assertEqual(self.heat(self.decide(15, base=10, settings=table)), {"无水花"})
+        self.assertEqual(self.heat(self.decide(20, base=10, settings=table)), {"评估中"})
+        self.assertEqual(self.heat(self.decide(30, base=10, settings=table)), {"爆贴"})
+        # 全局口径下 15 条够不上评估中：发布 72 小时直接是无水花（旧规则），不走增长判据
+        v = self.decide(15, tags=(), base=None)
+        self.assertEqual(self.heat(v), {"无水花"})
+        self.assertFalse(v.eval_baseline_reset)
+
+    def test_the_three_knobs_are_configurable(self):
+        self.settings.thresholds.eval_min_gain = 5
+        self.assertEqual(self.heat(self.decide(35, base=30)), {"评估中"})
+        self.settings.thresholds.eval_window_hours = 48
+        self.assertFalse(self.decide(35, base=30).eval_baseline_reset)   # 窗口还没满
+        self.settings.thresholds.eval_start_hours = 96
+        self.assertFalse(self.decide(30, age=72).eval_baseline_reset)
+
+
+class TestFlopHolds(unittest.TestCase):
+    """无水花不能被改回评估中（2026-10-22）：格子里已有无水花、评论数还没到爆贴门槛，
+    就保持无水花。人手改的也一样。爆贴 / 大爆照旧只升不降。"""
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def decide(self, count, tags, **kw):
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": count})
+        return analyze.decide(snap, self.settings, previous_comment_count=None,
+                              age_hours=kw.pop("age", 96), current_tags=list(tags), **kw)
+
+    def heat(self, verdict):
+        return {t for t in verdict.tags if self.settings.tags.rank(t) >= 0}
+
+    def test_grows_to_49_still_flop_then_50_is_hot(self):
+        self.assertEqual(self.heat(self.decide(49, ["无水花"])), {"无水花"})
+        self.assertEqual(self.heat(self.decide(50, ["无水花"])), {"爆贴"})
+
+    def test_hand_set_flop_next_to_evaluating_wins(self):
+        """运营在多选里把「无水花」加上、没去掉「评估中」：按无水花算，下一轮机器
+        不会把它摘掉。"""
+        v = self.decide(30, ["评估中", "无水花", "客户已确认"])
+        self.assertEqual(self.heat(v), {"无水花"})
+        merged = tags.merge(["评估中", "无水花", "客户已确认"], v.tags,
+                            self.settings.tags.namespace(),
+                            exclusive=(self.settings.tags.heat_tiers(),),
+                            sticky=self.settings.tags.sticky())
+        self.assertIn("无水花", merged.final)
+        self.assertNotIn("评估中", merged.final)
+        self.assertIn("客户已确认", merged.final)
+
+    def test_flop_held_rows_skip_the_growth_check(self):
+        v = self.decide(45, ["无水花"], eval_baseline_count=20,
+                        eval_baseline_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                        now=datetime(2026, 10, 3, tzinfo=timezone.utc))
+        self.assertFalse(v.eval_baseline_reset)
+        self.assertEqual(self.heat(v), {"无水花"})
+
+    def test_hot_beats_a_stray_flop(self):
+        """爆贴 / 大爆只升不降：格子里混着一个无水花也不退回去。"""
+        self.assertEqual(self.heat(self.decide(30, ["爆贴", "无水花"])), {"爆贴"})
+
+    def test_unknown_count_keeps_the_flop(self):
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": None})
+        v = analyze.decide(snap, self.settings, previous_comment_count=None, age_hours=96,
+                           current_tags=["评估中", "无水花"])
+        self.assertEqual(self.heat(v), {"无水花"})
+
+    def test_dead_link_keeps_the_flop(self):
+        v = analyze.gone_verdict(self.settings, current_tags=["评估中", "无水花"])
+        self.assertEqual(self.heat(v), {"无水花"})
+
+
+class TestEvalWindowSchedule(unittest.TestCase):
+    """评估中的增长判据要每 24 小时看一次：发布 8 天以后分层是 72 小时，凑不出窗口。"""
+
+    NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+
+    def row(self, *, age_days=10.0, hours_since=25.0, tags=("评估中",), base=30):
+        ms = lambda dt: int(dt.timestamp() * 1000)
+        return rows.Row(
+            record_id="r", link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24,
+            publish_time_ms=ms(self.NOW - timedelta(days=age_days)),
+            last_updated_ms=ms(self.NOW - timedelta(hours=hours_since)),
+            current_tags=list(tags), previous_comment_count=35,
+            eval_baseline_count=base,
+            eval_baseline_ms=None if base is None else ms(self.NOW - timedelta(hours=hours_since)))
+
+    def test_rows_in_the_judgement_are_checked_every_24h(self):
+        settings = Settings()
+        self.assertEqual(self.row().refresh_interval_hours(settings, self.NOW), 24)
+        self.assertTrue(self.row().is_due(settings, self.NOW))
+
+    def test_rows_without_a_baseline_keep_the_tier_schedule(self):
+        settings = Settings()
+        self.assertEqual(self.row(base=None).refresh_interval_hours(settings, self.NOW), 72)
+        self.assertFalse(self.row(base=None).is_due(settings, self.NOW))
+
+    def test_decided_rows_go_back_to_the_tier_schedule(self):
+        settings = Settings()
+        for tags_ in (("无水花",), ("爆贴",), ("评估中", "无水花")):
+            self.assertEqual(self.row(tags=tags_).refresh_interval_hours(settings, self.NOW), 72)
+
+    def test_archived_rows_stay_archived(self):
+        self.assertIsNone(self.row(age_days=31).refresh_interval_hours(Settings(), self.NOW))
+
+
+class TestBlueWordExcludes(unittest.TestCase):
+    """蓝词排除词（竞品名）：中文按子串、英文按整词，都不分大小写，至少 2 个字。"""
+
+    def test_chinese_terms_match_as_substrings(self):
+        self.assertEqual(analyze.excluded_by("奥佳华7598vpro", ["奥佳华"]), "奥佳华")
+        self.assertEqual(analyze.excluded_by("荣康按摩椅", ["荣康"]), "荣康")
+        self.assertIsNone(analyze.excluded_by("西屋911GT", ["奥佳华"]))
+
+    def test_english_terms_match_whole_words_ignoring_case(self):
+        self.assertEqual(analyze.excluded_by("sis黑胶", ["sis"]), "sis")
+        self.assertEqual(analyze.excluded_by("SiS 能量胶", ["sis"]), "sis")
+        self.assertEqual(analyze.excluded_by("Maurten320", ["maurten"]), None,
+                         "后面挨着数字就不是整词")
+        self.assertEqual(analyze.excluded_by("maurten 320", ["MAURTEN"]), "MAURTEN")
+        self.assertIsNone(analyze.excluded_by("analysis", ["sis"]))
+        self.assertIsNone(analyze.excluded_by("careplus", ["are"]))
+        self.assertIsNone(analyze.excluded_by("OliveYoung", ["live"]))
+
+    def test_mixed_terms_match_as_substrings_ignoring_case(self):
+        self.assertEqual(analyze.excluded_by("西屋911gt按摩椅", ["西屋911GT"]), "西屋911GT")
+
+    def test_terms_shorter_than_two_characters_do_nothing(self):
+        self.assertIsNone(analyze.excluded_by("S码", ["S"]))
+        self.assertIsNone(analyze.excluded_by("黑胶", ["黑"]))
+
+    def test_registry_reads_the_list_and_reports_short_terms(self):
+        from xhsearch import registry
+        entry = registry.Entry(label="SPX", blue_word_excludes=["康比特", "迈胜", "S", "maurten"])
+        kept, problems = registry.read_blue_word_excludes(entry)
+        self.assertEqual(kept, ["康比特", "迈胜", "maurten"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("S", problems[0])
+        logged = []
+        settings = registry.apply_overrides(Settings(), entry, log=logged.append)
+        self.assertEqual(settings.blue_word_excludes, ("康比特", "迈胜", "maurten"))
+        self.assertTrue(any("不到 2 个字" in line for line in logged))
+        self.assertEqual(Settings().blue_word_excludes, (), "不能串到全局那一份上")
+
+    def test_registry_splits_a_comma_separated_cell(self):
+        from xhsearch import feishu
+        self.assertEqual(feishu.read_keywords("康比特,迈胜，maurten、sis"),
+                         ["康比特", "迈胜", "maurten", "sis"])
+
+    def test_decide_drops_excluded_words_before_anything_else(self):
+        settings = Settings()
+        settings.blue_word_excludes = ("康比特",)
+        items = [{"content": c} for c in ("#康比特[搜索高亮]# 也不错", "#SPX[搜索高亮]# 好用")]
+        snap = analyze.read_comment_page("xhs", {"items": items, "comment_count": 2})
+        verdict = analyze.decide(snap, settings, previous_comment_count=None, age_hours=30)
+        self.assertEqual(verdict.blue_words, ["SPX"])
+        self.assertEqual(verdict.blue_words_excluded, ["康比特"])

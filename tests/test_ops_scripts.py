@@ -16,7 +16,8 @@ from email.message import Message
 from unittest import mock
 
 import cli
-from tools import check_id_time, update_next_check_formula as updater
+from tools import check_id_time, purge_blue_word_excludes as purger, \
+    update_next_check_formula as updater
 from xhsearch import feishu, provision, registry, transport
 from xhsearch.config import Settings
 from xhsearch.provision import NEXT_CHECK_COLUMN, next_check_formula, next_check_plan
@@ -776,6 +777,110 @@ class TestUpdaterMain(unittest.TestCase):
         self.assertEqual(code, 2)
         tables.assert_not_called()
         self.assertEqual(old.formulas, [])
+
+
+class FakeWordTable:
+    """「蓝词字段」清理脚本用：fields_meta / search / batch_get / batch_update。"""
+
+    def __init__(self, rows: dict, *, table_id="tblSPX", fresh=None, meta=None):
+        f = Settings().fields
+        self.table_id = table_id
+        self.rows = rows
+        self.fresh = fresh            # 写之前重读到的值；None = 和 search 一样
+        self.meta = meta if meta is not None else {f.blue_words: {"type": 4},
+                                                   f.link: {"type": 1}}
+        self.updates = []
+
+    def fields_meta(self):
+        return self.meta
+
+    def _records(self, rows):
+        f = Settings().fields
+        return [{"record_id": rid, "fields": {f.blue_words: list(words),
+                                              f.link: f"https://x/{rid}"}}
+                for rid, words in rows.items()]
+
+    def search(self, fields):
+        return self._records(self.rows)
+
+    def batch_get(self, record_ids):
+        source = self.fresh if self.fresh is not None else self.rows
+        return [r for r in self._records(source) if r["record_id"] in record_ids]
+
+    def batch_update(self, updates):
+        self.updates.extend(updates)
+        return len(updates)
+
+
+class TestPurgeBlueWordExcludes(unittest.TestCase):
+    """一次性清理「蓝词字段」里的竞品词：默认只列清单，--apply 才删。"""
+
+    def setUp(self):
+        self.settings = Settings()
+        self.column = self.settings.fields.blue_words
+        cli._REGISTRY_ROWS.clear()
+        self.addCleanup(cli._REGISTRY_ROWS.clear)
+        cli._REGISTRY_ROWS["tblSPX"] = registry.Entry(
+            label="SPX", blue_word_excludes=["康比特", "迈胜", "maurten", "sis"])
+        self.table = FakeWordTable({
+            "rec1": ["SPX能量胶", "康比特", "Maurten 320", "sis黑胶"],
+            "rec2": ["analysis", "SPX"],
+            "rec3": ["迈胜"],
+        })
+
+    def run_it(self, apply, **kw):
+        lines = []
+        code = purger.run([("SPX", self.table)], self.settings, apply, out=lines.append, **kw)
+        return code, "\n".join(lines)
+
+    def test_dry_run_lists_and_writes_nothing(self):
+        code, text = self.run_it(False)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.table.updates, [])
+        self.assertIn("rec1  删：康比特、Maurten 320（maurten）、sis黑胶（sis）  →  剩：SPX能量胶", text)
+        self.assertIn("rec3  删：迈胜  →  剩：（空）", text)
+        self.assertNotIn("rec2", text, "analysis 不是 sis：英文按整词")
+        self.assertIn("合计：2 行、4 个词要删", text)
+        self.assertIn("加 --apply 再跑一次才真删", text)
+
+    def test_apply_rereads_then_writes_what_is_left(self):
+        self.table.fresh = {"rec1": ["SPX能量胶", "康比特", "运营刚加的"], "rec3": ["迈胜"]}
+        code, text = self.run_it(True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.table.updates, [
+            {"record_id": "rec1", "fields": {self.column: ["SPX能量胶", "运营刚加的"]}},
+            {"record_id": "rec3", "fields": {self.column: []}},
+        ])
+        self.assertIn("这次改了 2 行", text)
+
+    def test_explicit_list_overrides_the_registry(self):
+        _, text = self.run_it(False, excludes_override=["迈胜"])
+        self.assertIn("rec3", text)
+        self.assertNotIn("rec1", text)
+
+    def test_tables_without_a_list_are_skipped(self):
+        cli._REGISTRY_ROWS.clear()
+        code, text = self.run_it(True)
+        self.assertEqual((code, self.table.updates), (0, []))
+        self.assertIn("没填「蓝词排除词」，跳过", text)
+
+    def test_exclude_needs_table(self):
+        with mock.patch.object(cli, "load_env_or_exit"), \
+             mock.patch.object(cli, "_tables") as tables, \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            code = purger.main(["purge_blue_word_excludes.py", "--exclude", "康比特"])
+        self.assertEqual(code, 2)
+        tables.assert_not_called()
+        self.assertIn("要和 --table 一起用", out.getvalue())
+
+    def test_default_is_a_dry_run(self):
+        with mock.patch.object(cli, "load_env_or_exit"), \
+             mock.patch.object(cli, "_tables", return_value=[("SPX", self.table)]), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            code = purger.main(["purge_blue_word_excludes.py"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.table.updates, [])
+        self.assertIn("只看不改", out.getvalue())
 
 
 if __name__ == "__main__":

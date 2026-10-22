@@ -854,7 +854,11 @@ def preview_tier_shift(records: list[dict], old: Settings, new: Settings,
 
 def _tier_for(row: rows_mod.Row, count: int, settings: Settings,
               now: datetime) -> Optional[str]:
-    """这一行按这套口径落在哪一档。和 analyze 那边同一套判据。"""
+    """这一行按这套口径落在哪一档。和 analyze 那边同一套**按评论数**的判据。
+
+    评估中的增长判据（满 48 小时后按窗口增长判无水花）要看这一行的基线历史，
+    这里不重放：改门槛的预览只回答「按评论数会挪档的有几行」。
+    """
     tier = settings.thresholds.heat_tier(count, settings.tags)
     if tier:
         return tier
