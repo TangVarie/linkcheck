@@ -2246,3 +2246,60 @@ class TestBlueWordExcludes(unittest.TestCase):
         verdict = analyze.decide(snap, settings, previous_comment_count=None, age_hours=30)
         self.assertEqual(verdict.blue_words, ["SPX"])
         self.assertEqual(verdict.blue_words_excluded, ["康比特"])
+
+
+class TestDueSlack(unittest.TestCase):
+    """到期判断的余量（DUE_SLACK_MINUTES）：sweep 一天只在固定几个时刻跑时，
+    「最近检查时间」比 sweep 启动晚一两分钟，没有余量的话每一档都要多等一整轮。"""
+
+    SWEEP = datetime(2026, 10, 23, 8, 7, tzinfo=timezone.utc)   # 北京 16:07 那轮
+
+    def row(self, *, age_days, checked):
+        ms = lambda dt: int(dt.timestamp() * 1000)
+        return rows.Row(record_id="r", link_cell="https://www.xiaohongshu.com/explore/" + "a" * 24,
+                        publish_time_ms=ms(checked - timedelta(days=age_days)),
+                        last_updated_ms=ms(checked))
+
+    def next_sweep(self, row, settings):
+        """一天三次 sweep（每 8 小时，每次都晚两分钟启动）里，第一次判它到期的是哪一次。"""
+        for k in range(1, 13):
+            slot = self.SWEEP + timedelta(hours=8 * k)
+            if row.is_due(settings, slot):
+                return (slot - self.SWEEP).total_seconds() / 3600
+        return None
+
+    def test_without_slack_every_tier_slips_a_whole_sweep(self):
+        settings = Settings()
+        checked = self.SWEEP + timedelta(seconds=30)      # 这一行在开跑 30 秒后刷完
+        self.assertEqual(self.next_sweep(self.row(age_days=1, checked=checked), settings), 16)
+        self.assertEqual(self.next_sweep(self.row(age_days=5, checked=checked), settings), 32)
+
+    def test_with_slack_each_tier_lands_on_its_own_sweep(self):
+        settings = Settings()
+        settings.refresh.due_slack_minutes = 30
+        checked = self.SWEEP + timedelta(minutes=3)       # 一轮跑了几分钟，最后几行也一样
+        self.assertEqual(self.next_sweep(self.row(age_days=1, checked=checked), settings), 8)
+        self.assertEqual(self.next_sweep(self.row(age_days=5, checked=checked), settings), 24)
+        self.assertEqual(self.next_sweep(self.row(age_days=10, checked=checked), settings), 72)
+
+    def test_slack_never_makes_a_row_due_twice_in_one_interval(self):
+        """余量最多让到间隔的一半：配错成很大的数也不会变成每一轮都刷。"""
+        settings = Settings()
+        settings.refresh.due_slack_minutes = 600
+        self.assertEqual(settings.refresh.slack_hours(8), 4)
+        row = self.row(age_days=1, checked=self.SWEEP)
+        self.assertFalse(row.is_due(settings, self.SWEEP + timedelta(hours=3, minutes=59)))
+        self.assertTrue(row.is_due(settings, self.SWEEP + timedelta(hours=4)))
+
+    def test_the_eval_window_uses_the_same_slack(self):
+        """一行到期被刷了，增长判据也得认它满了 24 小时，不然要白等一整轮。"""
+        now = self.SWEEP + timedelta(hours=24)
+        snap = analyze.read_comment_page("xhs", {"items": [], "comment_count": 32})
+        def decide(slack):
+            settings = Settings()
+            settings.refresh.due_slack_minutes = slack
+            return analyze.decide(snap, settings, previous_comment_count=None, age_hours=80,
+                                  current_tags=["评估中"], eval_baseline_count=30,
+                                  eval_baseline_at=self.SWEEP + timedelta(minutes=2), now=now)
+        self.assertNotIn("无水花", decide(0).tags)
+        self.assertIn("无水花", decide(30).tags)

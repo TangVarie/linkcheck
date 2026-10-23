@@ -509,6 +509,31 @@ class RefreshTiers:
     # （见 rows.Row.schedule_publish_ms）。14 天是两个平台定时发布的最长提前量，
     # 没在真表上核对过，见 docs/待验证清单.md C1。
     inferred_publish_margin_days: int = 14
+    # 到期判断留的余量（分钟）：离到期只差这么一点的行，这一轮就算到期。
+    #
+    # 默认 0，给「一个服务每 5 分钟跑 queue && sweep」的标准部署：差几分钟的行
+    # 下一个 5 分钟自然会刷到，用不着余量。
+    #
+    # sweep 一天只在固定几个时刻跑时（比如 UTC 00:05 / 08:05 / 16:05）必须设：
+    # 「最近检查时间」记的是一行**处理完**的时刻，比 sweep 启动晚一两分钟；
+    # 8 小时后下一轮 sweep 启动时它还差一两分钟才到期，就得再等一整轮——
+    # 8 小时档实际变成 16 小时，24 小时档变成 32 小时，72 小时档变成 80 小时。
+    # 余量要盖过一轮 sweep 跑完的时长再加上启动漂移，30 就够了。
+    # 不会多刷：余量最多算到间隔的一半，到期的行在两个 sweep 之间本来就刷不到。
+    # 评估中的 24 小时窗口（Thresholds.eval_window_hours）用同一个余量，见 window_reached。
+    # 环境变量 DUE_SLACK_MINUTES 覆盖。
+    due_slack_minutes: int = 0
+
+    def slack_hours(self, interval_hours: float) -> float:
+        """这个间隔实际让出的余量（小时）。最多让到间隔的一半——
+        配错成一个很大的数，也不会变成每一轮都刷。"""
+        return min(self.due_slack_minutes / 60, interval_hours / 2)
+
+    def window_reached(self, elapsed_hours: float, interval_hours: float) -> bool:
+        """过了这么久，算不算到了这个间隔（算上余量）。到期判断和评估中的
+        增长窗口共用这一个口径——两边对「满没满」说法不一，一行就会被刷了
+        却不判，或者判了却还没到刷的时候。"""
+        return elapsed_hours >= interval_hours - self.slack_hours(interval_hours)
 
     def interval_hours_for_age(self, age_days: float) -> int | None:
         """返回该年龄的帖子应有的刷新间隔；None 表示已归档。

@@ -99,6 +99,9 @@ jobs:
           # 单轮硬预算：Actions 上跑的多半是临时补刷，给一个明确上界，
           # 免得一次误操作（比如全表被勾上「排队刷新」）在这里烧起来。
           MAX_RECORDS_PER_RUN: "300"
+          # sweep 一天只跑三次：不留余量的话，差一两分钟没到期的行要多等一整轮
+          # （8 小时档实际变 16 小时）。见 .env.example 的 DUE_SLACK_MINUTES。
+          DUE_SLACK_MINUTES: "30"
           # 结构化日志，方便在 Actions 的日志里按 run_id 聚合。
           RUN_LOG_JSON: "1"
           MODE: ${{ steps.mode.outputs.value }}

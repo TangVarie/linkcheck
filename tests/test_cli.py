@@ -186,7 +186,7 @@ class TestNumericEnvBounds(unittest.TestCase):
         for name in ("MAX_CONCURRENCY", "SOFT_DEADLINE_SECONDS", "DETAIL_WITHIN_DAYS",
                      "MAX_RECORDS_PER_RUN", "TIKHUB_BASE", "CHANNEL_ORDER",
                      "DISPLAY_UTC_OFFSET", "TAG_OBSERVING", "EVAL_MIN_GAIN",
-                     "EVAL_START_HOURS", "EVAL_WINDOW_HOURS"):
+                     "EVAL_START_HOURS", "EVAL_WINDOW_HOURS", "DUE_SLACK_MINUTES"):
             self._saved[name] = os.environ.pop(name, None)
 
     def tearDown(self):
@@ -217,6 +217,12 @@ class TestNumericEnvBounds(unittest.TestCase):
         for name in ("EVAL_MIN_GAIN", "EVAL_START_HOURS", "EVAL_WINDOW_HOURS"):
             with self.subTest(name=name), self.assertRaises(SystemExit):
                 self._settings_with(**{name: "0"})
+
+    def test_due_slack_minutes(self):
+        self.assertEqual(self._settings_with(DUE_SLACK_MINUTES="30").refresh.due_slack_minutes, 30)
+        for value in ("-1", "121"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self._settings_with(DUE_SLACK_MINUTES=value)
 
     def test_negative_deadline_is_rejected(self):
         with self.assertRaises(SystemExit):

@@ -59,10 +59,19 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual(config.missing(), [])
 
-    def test_service_id_accepts_either_name(self):
-        a = railway.RailwayConfig.from_env({"RAILWAY_CRON_SERVICE_ID": "s1"})
-        b = railway.RailwayConfig.from_env({"RAILWAY_SERVICE_ID": "s2"})
-        self.assertEqual((a.service_id, b.service_id), ("s1", "s2"))
+    def test_auto_injected_service_id_is_ignored(self):
+        """RAILWAY_SERVICE_ID 是 Railway 自动注入的「本服务 ID」——在面板上
+        就是面板自己。认了它，过滤出来的只有面板的访问日志，运行历史永远空。"""
+        config = railway.RailwayConfig.from_env({
+            "RAILWAY_SERVICE_ID": "panel-self", "RAILWAY_CRON_SERVICE_ID": "cron-1"})
+        self.assertEqual(config.service_ids, ("cron-1",))
+        alone = railway.RailwayConfig.from_env({"RAILWAY_SERVICE_ID": "panel-self"})
+        self.assertEqual(alone.service_ids, ())
+
+    def test_several_service_ids_split_and_deduped(self):
+        config = railway.RailwayConfig.from_env(
+            {"RAILWAY_CRON_SERVICE_ID": " q-1, s-2，q-1  s-3 "})
+        self.assertEqual(config.service_ids, ("q-1", "s-2", "s-3"))
 
     def test_fetch_without_config_raises_not_configured(self):
         with self.assertRaises(railway.NotConfigured):
@@ -120,6 +129,42 @@ class TestRequestShape(unittest.TestCase):
         filt = seen["body"]["variables"]["filter"]
         self.assertIn("@service:svc-9", filt)
         self.assertIn("风控中", filt)
+
+    def test_each_service_is_queried_separately_and_merged(self):
+        """队列和整轮拆成两个服务：各查各的（各有自己的 beforeLimit 窗口），
+        合并后新的在前。拼成一条 OR 过滤的话，整轮那几行会被队列挤出窗口。"""
+        filters = []
+        answers = {
+            "q-1": [log_item("q-old", ts="2026-10-23T01:00:00Z", service="q-1"),
+                    log_item("q-new", ts="2026-10-23T09:00:00Z", service="q-1")],
+            "s-2": [log_item("s-mid", ts="2026-10-23T08:05:00Z", service="s-2"),
+                    log_item("s-bad", ts="不是时间", service="s-2")],
+        }
+
+        def post(url, headers, body, **kwargs):
+            variables = json.loads(body)["variables"]
+            filters.append(variables["filter"])
+            service = variables["filter"].split()[0].split(":", 1)[1]
+            return resp(payload=envelope(answers[service]))
+
+        lines = railway.fetch_logs(cfg(service_id="q-1,s-2"), filter_expr="风控中",
+                                   post=post)
+        self.assertEqual(filters, ["@service:q-1 风控中", "@service:s-2 风控中"])
+        self.assertEqual([l.message for l in lines],
+                         ["q-new", "s-mid", "q-old", "s-bad"])
+
+    def test_one_service_failing_fails_the_fetch(self):
+        """一个服务读不到就整批报错（面板会保留上一批），不悄悄只给一半。"""
+        calls = []
+
+        def post(url, headers, body, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                return resp(payload={"errors": [{"message": "boom"}]})
+            return resp(payload=envelope([log_item("ok")]))
+
+        with self.assertRaises(railway.RailwayError):
+            railway.fetch_logs(cfg(service_id="a b"), post=post)
 
     def test_limit_is_clamped(self):
         post, seen = sender(resp(payload=envelope([])))
