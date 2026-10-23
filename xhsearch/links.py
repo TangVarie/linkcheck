@@ -129,6 +129,17 @@ def _urls(text: str) -> list[str]:
     return [_clean_url(u) for u in _URL_RE.findall(text)]
 
 
+def first_url(cell: str) -> str:
+    """一格文字里的第一条 http(s) 链接（剥掉粘在尾巴上的标点）；没有返回空串。
+
+    给面板「帖子链接」那一栏用：运营贴进「反馈链接」的往往是一整段分享
+    文案，链接夹在中间。全角冒号、斜杠先归一化，和 parse 一个口径。
+    """
+    text = (cell or "").replace("：", ":").replace("／", "/").replace("？", "?")
+    found = _urls(text)
+    return found[0] if found else ""
+
+
 # 裸域名后面粘着的那一段路径。只剥域名的话，`xhslink.com/a/AbC` 会在文本里
 # 留下一截 `/a/AbC`，比留着整条链接还难认。右边界和 `_URL_RE` 同一套。
 _BARE_URL_TAIL = r"(?:/[^\s，。、！？；：）】》（《【\"'<>一-鿿]*)*"

@@ -425,6 +425,25 @@ class TestCollect(unittest.TestCase):
         panel.collect([("A", table)], settings, {}, now=NOW)
         self.assertNotIn(settings.fields.comment_digest, table.searched_fields)
 
+    def test_persona_column_is_read_when_the_table_has_it(self):
+        """「素人编号」跟着同一次 search 读回来，进待办那一栏；表里没有就不请求。"""
+        settings = Settings()
+        f = settings.fields
+        link = "这款按摩椅绝了 https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b 复制打开"
+        meta = healthy_meta(settings)
+        meta["素人编号"] = {"type": "text", "ui_type": "", "options": None}
+        table = FakeTable(meta, [{"record_id": "r1", "fields": {
+            f.link: link, f.traffic_status: ["风控中"], "素人编号": "SR-012"}}])
+        overview = panel.collect([("A", table)], settings, {}, now=NOW)
+        self.assertIn("素人编号", table.searched_fields)
+        todo = overview.projects[0].todos[0]
+        self.assertEqual(todo.persona, "SR-012")
+        self.assertEqual(todo.post_url,
+                         "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b")
+        bare = FakeTable(healthy_meta(settings), [])
+        panel.collect([("A", bare)], settings, {}, now=NOW)
+        self.assertNotIn("素人编号", bare.searched_fields)
+
     # —— 「哪一条」用哪一列 ——
 
     def _with_content_column(self, name="笔记内容", *, text="露营装备清单"):
@@ -677,6 +696,32 @@ class TestRendering(unittest.TestCase):
         self.assertNotIn("<script>alert(1)</script>", page)
         self.assertNotIn("<img src=x onerror", page)
         self.assertIn("&lt;script&gt;", page)
+
+    def test_persona_and_post_link_have_their_own_columns(self):
+        """素人编号、帖子链接各占一栏，和评论数一样一眼看得到；帖子链接点开就是帖子。"""
+        url = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b?xsec_token=AB"
+        todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               reasons=["风控中"], persona="SR-012", post_url=url)
+        page = self._page(self._snap(todos=[todo]))
+        self.assertIn("<th>素人编号</th><th>帖子链接</th>", page)
+        self.assertIn("<td class='nowrap persona'>SR-012</td>", page)
+        link = re.search(r"<td class='nowrap post'><a href='([^']*)' title='[^']*' "
+                         r"target=_blank rel='noopener noreferrer'>([^<]*)</a></td>", page)
+        self.assertIsNotNone(link)
+        self.assertEqual(link.group(1), url.replace("&", "&amp;"))
+        self.assertTrue(link.group(2).startswith("xiaohongshu.com/explore/"))
+
+    def test_post_link_only_allows_http(self):
+        """链接是运营贴进表里的字：`javascript:` 不能变成一个能点的链接。"""
+        todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
+                               record_url="https://x/base/t?table=tb&record=r1",
+                               reasons=["风控中"], persona="<b>x</b>",
+                               post_url="javascript:alert(1)")
+        page = self._page(self._snap(todos=[todo]))
+        self.assertNotIn("javascript:alert(1)", page)
+        self.assertIn("<td class='nowrap post'><span class=muted>—</span></td>", page)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
 
     def test_the_which_one_cell_is_clipped_but_keeps_the_full_text_on_hover(self):
         """这一栏太长会把「为什么」和「诊断信息」挤没；太短就定位不了。

@@ -361,6 +361,36 @@ class TestTextWithoutUrls(unittest.TestCase):
                          "看这条 很火")
 
 
+class TestFirstUrl(unittest.TestCase):
+    def test_the_url_inside_a_share_text(self):
+        cell = "露营清单｜第三个坑 https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b，复制打开"
+        self.assertEqual(links.first_url(cell),
+                         "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b")
+
+    def test_no_url_is_an_empty_string(self):
+        self.assertEqual(links.first_url("65a1b2c3d4e5f60718293a4b"), "")
+        self.assertEqual(links.first_url(""), "")
+
+    def test_fullwidth_colon_is_normalized(self):
+        self.assertEqual(links.first_url("https：//xhslink.com/a/AbC"), "https://xhslink.com/a/AbC")
+
+
+class TestPersonaAndPostLink(unittest.TestCase):
+    """待办行上的「素人编号」和「帖子链接」。"""
+
+    def test_both_come_from_the_row(self):
+        rec = record(refresh_status="刷新失败", link="新款按摩椅 " + XHS + " 复制打开",
+                     extra={summary.PERSONA_COLUMN: " SR-012 "})
+        todo = snapshot([rec]).todos[0]
+        self.assertEqual(todo.persona, "SR-012")
+        self.assertEqual(todo.post_url, XHS)
+
+    def test_missing_values_stay_empty(self):
+        rec = record(refresh_status="刷新失败", link="65a1b2c3d4e5f60718293a4b")
+        todo = snapshot([rec]).todos[0]
+        self.assertEqual((todo.persona, todo.post_url), ("", ""))
+
+
 class TestPickLabelColumn(unittest.TestCase):
     def test_candidates_are_tried_in_order(self):
         self.assertEqual(summary.pick_label_column({"文案", "笔记内容", "标题"}),

@@ -42,6 +42,10 @@ class TodoRow:
     # 直接定位，不用每条都点开一个新网页——「去这一行」是兜底不是主路径。
     # 来源见 `row_label()`。
     label: str = ""
+    # 「素人编号」那一格（PERSONA_COLUMN），和帖子本身的网页链接（「反馈链接」
+    # 里的第一条 http 链接）。面板上各占一栏，帖子链接点开就是帖子。
+    persona: str = ""
+    post_url: str = ""
     # 勾「排队刷新」要拿这两个去定位那张表。
     app_token: str = ""
     table_id: str = ""
@@ -167,6 +171,10 @@ class ProjectSnapshot:
 
 
 # 「哪一条」优先去这些列里找。第一个命中的就用，所以顺序 = 优先级。
+# 「素人编号」：标准业务表里那一列（provision.FULL_LAYOUT），面板待办里单独
+# 一栏显示——运营对账、找人都按这个编号说话。表里没有这一列就显示「—」。
+PERSONA_COLUMN = "素人编号"
+
 # 「笔记内容」排第一是因为运营表里那一列就叫这个名字（2026-08 确认）；
 # 后面几个是兜底，别的表换了叫法不至于整栏空掉。
 LABEL_CANDIDATES = ("笔记内容", "文案", "笔记标题", "标题", "内容")
@@ -459,6 +467,8 @@ def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
         table_id=table_id,
         link_cell=row.link_cell,
         label=clean(row_label(row, cells, settings, label_column)),
+        persona=clean(feishu.read_text(cells.get(PERSONA_COLUMN)).strip()),
+        post_url=links.first_url(row.link_cell),
         reasons=reasons,
         refresh_status=refresh_status,
         diagnosis=clean(feishu.read_text(cells.get(f.failure_reason))),

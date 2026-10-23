@@ -390,7 +390,8 @@ def _collect_one(label, table, settings, api_keys, *,
     # 数没出来」的行（见下面）——不多发一个请求。
     wanted = [c for c in summary.panel_fields(
                   settings, show_digest=show_digest,
-                  extra=(picked, readout.SCREENSHOT_COLUMN, readout.DATA_COLUMN))
+                  extra=(picked, summary.PERSONA_COLUMN,
+                         readout.SCREENSHOT_COLUMN, readout.DATA_COLUMN))
               if c in known]
     # 不按「是否巡查」筛，一次读回整张表，在这里分成两份：在管的行照旧统计；
     # 没勾的行只挑「最近临时查过、查出了问题」的（summary.adhoc_todos）——
