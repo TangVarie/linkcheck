@@ -61,6 +61,13 @@ MAX_LIMIT = 5000
 #   curl -s -X POST https://backboard.railway.com/graphql/v2 \
 #     -H 'Content-Type: application/json' \
 #     -d '{"query":"{__type(name:\"Query\"){fields{name args{name}}}}"}'
+#
+# ⚠️ **要拿 `attributes { key value }`。** Railway 会把一行就是一个 JSON 对象的
+# 日志当成「结构化日志」解析掉：`message` 字段当正文，其余字段全部变成
+# attributes（docs.railway.com/observability/logs「Structured logs」）。
+# RUN_LOG_JSON 打的事件没有 message 字段，所以在 Railway 上正文是空的，
+# run_id / event 这些都在 attributes 里。只读 message 的话，运行历史永远是
+# 「暂时没有可解析的运行记录」（踩过）。
 _QUERY = """query environmentLogs($environmentId: String!, $filter: String,
                             $beforeLimit: Int) {
   environmentLogs(environmentId: $environmentId, filter: $filter,
@@ -69,6 +76,7 @@ _QUERY = """query environmentLogs($environmentId: String!, $filter: String,
     message
     severity
     tags { serviceId deploymentId }
+    attributes { key value }
   }
 }"""
 
@@ -314,15 +322,52 @@ def _parse_response(resp: transport.Response, secrets: Iterable[str]) -> list[Lo
             continue
         tags = item.get("tags") or {}
         message = redact(str(item.get("message") or ""), secrets)
+        event = _as_event(message)
+        if event is None:
+            # Railway 把 JSON 日志拆成了 attributes（见 _QUERY 上面的说明）。
+            event = _as_event_dict(_attributes(item.get("attributes"), secrets))
+            if event is not None and not message.strip():
+                # 正文是空的：拼回原来那一行，原始日志那一栏才不是一片空白。
+                message = json.dumps(event, ensure_ascii=False)
         lines.append(LogLine(
             timestamp=str(item.get("timestamp") or ""),
             message=message,
             severity=str(item.get("severity") or ""),
             service_id=str(tags.get("serviceId") or "") if isinstance(tags, dict) else "",
             deployment_id=str(tags.get("deploymentId") or "") if isinstance(tags, dict) else "",
-            event=_as_event(message),
+            event=event,
         ))
     return lines
+
+
+def _attributes(raw: Any, secrets: Iterable[str]) -> dict:
+    """Railway 的 attributes（`[{key, value}]`，value 一律是字符串）→ dict。
+
+    value 怎么编码的没有文档：数字、对象可能是 JSON 文本，字符串可能带引号也
+    可能不带。所以能按 JSON 解析就解析，解析不了就当原样的字符串。
+    嵌套对象万一被拍平成 `counts.正常` 这种键，再拼回嵌套的 dict。
+    **先脱敏再解析**：这些值会原样进到浏览器里（比如 run_end 的 error）。
+    """
+    out: dict = {}
+    if not isinstance(raw, list):
+        return out
+    for pair in raw:
+        if not isinstance(pair, dict) or not pair.get("key"):
+            continue
+        text = redact(str(pair.get("value") if pair.get("value") is not None else ""),
+                      secrets)
+        try:
+            value = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            value = text
+        parts = str(pair["key"]).split(".")
+        target = out
+        for part in parts[:-1]:
+            if not isinstance(target.get(part), dict):
+                target[part] = {}
+            target = target[part]
+        target[parts[-1]] = value
+    return out
 
 
 def _as_event(message: str) -> Optional[dict]:
@@ -339,6 +384,11 @@ def _as_event(message: str) -> Optional[dict]:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return None
+    return _as_event_dict(parsed)
+
+
+def _as_event_dict(parsed: Any) -> Optional[dict]:
+    """同一条判据，给已经是 dict 的（Railway 拆出来的 attributes）用。"""
     if not isinstance(parsed, dict):
         return None
     if "run_id" not in parsed or "event" not in parsed:
