@@ -141,10 +141,16 @@ class RailwayConfig:
         return tuple(seen)
 
     def headers(self) -> dict:
-        """两种 token 走不同的头，Railway 对此没有兼容处理。"""
+        """两种 token 走不同的头，Railway 对此没有兼容处理。
+
+        User-Agent 必须带：backboard 挡在 Cloudflare 后面，urllib 默认的
+        `Python-urllib/3.x` 会被直接 403（error code: 1010）。那个 403 和
+        「token 不对」长得一模一样，会把人送去重建一把好好的 token（踩过）。
+        """
         key = "Project-Access-Token" if self.project_scoped else "Authorization"
         value = self.token if self.project_scoped else f"Bearer {self.token}"
-        return {key: value, "Content-Type": "application/json"}
+        return {key: value, "Content-Type": "application/json",
+                "User-Agent": transport.BROWSER_UA}
 
     def missing(self) -> list[str]:
         """还差哪些变量。面板要照原样说给人听，而不是只显示「日志不可用」。"""
@@ -271,9 +277,15 @@ def fetch_logs(
 
 
 def _parse_response(resp: transport.Response, secrets: Iterable[str]) -> list[LogLine]:
+    if resp.status == 403 and "1010" in (resp.body or ""):
+        raise RailwayError("Railway 前面的 Cloudflare 按 User-Agent 拦下了请求"
+                           "（403 / error code 1010）。不是 token 的问题，别去重建它")
     if resp.status == 401 or resp.status == 403:
-        raise RailwayError("Railway 拒绝了这个 token（401/403）。"
-                           "去 railway.com 重新生成一个 account 或 workspace token")
+        # 不再劝人换 account token：那把钥匙能读回项目的全部密钥（见 RailwayConfig）。
+        raise RailwayError(
+            f"Railway 拒绝了这个 token（HTTP {resp.status}）："
+            f"{redact(resp.body or '', secrets)[:120]}。"
+            "检查 RAILWAY_PROJECT_TOKEN 是不是整串粘对了、没带空格或引号")
     if resp.status == 429:
         raise RailwayError("Railway 限流了（429）。Hobby 是 1000 次/小时，"
                            "把 PANEL_CACHE_SECONDS 调大一点")
@@ -281,14 +293,20 @@ def _parse_response(resp: transport.Response, secrets: Iterable[str]) -> list[Lo
     if not isinstance(payload, dict):
         raise RailwayError(
             f"Railway 返回的不是 JSON（HTTP {resp.status}）："
-            f"{redact(resp.body[:200], secrets)}")
+            f"{redact(resp.body or '', secrets)[:200]}")
     if payload.get("errors"):
         # GraphQL 的错误是 HTTP 200 + errors 数组。只看状态码会把每一个
         # 「字段名写错了」当成成功，然后拿到一个空列表——和「真的没有日志」
         # 长得一模一样，最难查。
         first = payload["errors"][0] if payload["errors"] else {}
-        raise RailwayError("Railway GraphQL 报错："
-                           + redact(str(first.get("message") or first)[:300], secrets))
+        # 先抹再截：反过来的话，跨在截断处的密钥只会被抹掉首尾 8 个字符。
+        message = redact(str(first.get("message") or first), secrets)[:300]
+        hint = ""
+        if "not authorized" in message.lower():
+            # token 错了、或者读不了这个环境，Railway 都是 HTTP 200 + 这一句。
+            hint = ("。这把 token 读不了这个环境的日志：确认它整串粘对了、建在这个项目、"
+                    "建的时候选的是和 RAILWAY_ENVIRONMENT_ID 同一个环境")
+        raise RailwayError("Railway GraphQL 报错：" + message + hint)
     raw = ((payload.get("data") or {}).get("environmentLogs")) or []
     lines: list[LogLine] = []
     for item in raw:
