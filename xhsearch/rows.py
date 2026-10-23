@@ -121,6 +121,10 @@ class Row:
     # 「蓝词来源」的现值。行首记着每次扫描时的档位，是「爆贴/大爆那一次
     # 复扫做过没有」的账（见 analyze.plan_blue_word_scan）。
     blue_word_sources: str = ""
+    # 「评估基线评论数 / 评估基线时间」的现值：评估中的增长判据拿这一轮和它比
+    # （见 analyze._eval_growth）。两格都有才算有基线。
+    eval_baseline_count: Optional[int] = None
+    eval_baseline_ms: Optional[int] = None
     # 「巡查状态」的现值。选行只用它认一种情况：熔断记过一次失败的行
     # （刷新失败 + 连续失败次数 ≥ 1），要在 breaker_recheck_hours 之后提前复查，
     # 而不是等分层间隔、也不是排队勾一在就每 5 分钟重刷。
@@ -328,10 +332,29 @@ class Row:
             # 把那个时间戳纠正回来。
             if interval is None:
                 interval = settings.refresh.fastest_interval_hours()
+        if interval is not None and self.in_eval_window(settings):
+            # 评估中的增长判据要每个窗口看一次：发布 8 天以后的档位是 72 小时，
+            # 凑不出 24 小时的窗口。判出无水花（或升了爆贴）就回到分层节奏。
+            interval = min(interval, settings.thresholds.eval_window_hours)
         backoff = self.gone_backoff_hours(settings)
         if interval is not None and backoff is not None:
             interval = max(interval, backoff)
         return interval
+
+    def in_eval_window(self, settings: Settings) -> bool:
+        """这一行是不是正在走「评估中」的增长判据：记过基线、现在还是评估中。
+
+        认基线而不是认评论数：基线是 analyze 真进了这条判断才写的（表里
+        填了发布时间、满了起算小时、两列都建了），这里不用再把那几个条件
+        抄一遍。还没记基线的老帖下一次照常按分层节奏查，那一次记上基线，
+        之后就按窗口查——和「从下一次巡查开始建基线，24 小时后判」一致。
+        """
+        if self.eval_baseline_count is None or self.eval_baseline_ms is None:
+            return False
+        if self.publish_time_ms is None:
+            return False      # 热度档位只认表里的发布时间，空了就判不了
+        t = settings.tags
+        return t.top_tier(self.current_tags) == t.evaluating and t.flop not in self.current_tags
 
     def gone_backoff_hours(self, settings: Settings) -> Optional[float]:
         """已失效的行多久再看一次；None = 不是已失效的行，按分层走。

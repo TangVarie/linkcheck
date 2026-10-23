@@ -206,6 +206,7 @@ h2 .n{font-weight:400;color:var(--text-faint)}
 table{width:100%;border-collapse:collapse;background:var(--surface);
   border:1px solid var(--border)}
 .tablewrap table{min-width:720px}
+.tablewrap table.todos{min-width:900px}
 th{height:44px;background:var(--bg);font-size:13px;font-weight:500;
   color:var(--text-light);text-align:left;padding:0 12px;white-space:nowrap}
 td{padding:12px;border-top:1px solid var(--border);font-size:14px;
@@ -1282,6 +1283,21 @@ def _scope_chip(todo) -> str:
     return ""
 
 
+def _post_link(url: str) -> str:
+    """「帖子链接」那一格：点开就是帖子。显示去掉协议头的一小截，完整链接挂 title。
+
+    链接是运营贴进表里的字，**只放行 http(s)**——`javascript:` 之类的
+    一律当没有，不然一格就能在面板上执行脚本。
+    """
+    url = (url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return "<span class=muted>—</span>"
+    shown = url.split("://", 1)[1]
+    shown = shown[4:] if shown.lower().startswith("www.") else shown
+    return (f"<a href='{_e(url)}' title='{_e(url)}' target=_blank "
+            f"rel='noopener noreferrer'>{_e(_clip(shown, 24))}</a>")
+
+
 def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
               resolvable: bool) -> str:
     """一行待办。主列表和归档折叠区共用，折叠区没有勾选框。
@@ -1315,6 +1331,8 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         f"data-checked='{checked}'>"
         f"{pick}"
         f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
+        f"<td class='nowrap persona'>{_e(todo.persona) or '<span class=muted>—</span>'}</td>"
+        f"<td class='nowrap post'>{_post_link(todo.post_url)}</td>"
         f"<td>{_chips(todo.reasons, _REASON_CLASS)}{_scope_chip(todo) if main else ''}</td>"
         f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
         f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
@@ -1328,8 +1346,8 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         "</tr>")
 
 
-_TODO_COLUMNS = ("<th>哪一条</th><th>为什么</th><th>诊断信息</th>"
-                 "<th>评论数</th><th>最近检查</th><th></th>")
+_TODO_COLUMNS = ("<th>哪一条</th><th>素人编号</th><th>帖子链接</th><th>为什么</th>"
+                 "<th>诊断信息</th><th>评论数</th><th>最近检查</th><th></th>")
 
 
 def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) -> str:

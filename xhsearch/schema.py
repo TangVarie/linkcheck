@@ -67,6 +67,12 @@ def expected_schema(settings: Settings) -> list[tuple]:
         (f.surge_time, (5,), "日期", None,
          "普通日期字段。机器只在**第一次**判定起量时写一次，之后不再改；"
          "手工清空这一格就等于让它重新计一次"),
+        (f.eval_baseline_count, (2,), "数字", None,
+         "机器写：评估中的帖发布满 48 小时后记下的评论数基线，每 24 小时拿新评论数"
+         "和它比，涨不到 10 条判无水花。手工清空 = 让机器下一轮重新记"),
+        (f.eval_baseline_time, (5,), "日期", None,
+         "机器写：上面那个基线是什么时候记的。普通日期字段，不能用「最近检查时间」代替——"
+         "巡查失败的轮次也会推进那一格"),
         (f.pinned_status, (3,), "单选", settings.pin_status.machine_written(),
          "机器直接覆盖写入当前状态；抖音行不写这一列"),
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),

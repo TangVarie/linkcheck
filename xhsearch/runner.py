@@ -94,6 +94,7 @@ class BlueWordPlan:
     source_lines: dict[str, str] = field(default_factory=dict)  # 新词 → 记进「蓝词来源」的那一行
     rescan_line: str = ""      # 复扫没有新词时记的那一行
     visible: list[str] = field(default_factory=list)  # 这一轮评论里看得到的全部蓝词
+    excluded: list[str] = field(default_factory=list)  # 看得到、但被排除词排掉的
 
 
 @dataclass
@@ -1002,6 +1003,7 @@ def refresh(
     blue_word_shot_options: Optional[list[str]] = None,
     collation_status_options: Optional[list[str]] = None,
     collation_ready: bool = False,
+    eval_unready: str = "",
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
@@ -1038,6 +1040,10 @@ def refresh(
 
     collation_ready = 表里「数据整理」和三格基线列都在。缺任何一格就整个
     不做「数据整理过时」判定——半套列会让基线每轮重记、永远报不出来。
+
+    eval_unready 非空 = 「评估基线评论数 / 时间」两列不能用（没建、建错类型），
+    评估中的增长判据整个跳过，这句话写进走到这条判断的行的诊断信息。
+    两列都得能写：只写得进一格的话，基线每轮重记、永远判不出来。
 
     now 是**开跑那一刻**，用于筛行（到期、冷却）和算发布时长——整轮一个值，
     行与行之间的判定口径才一致。clock 是**当下**，只用来给每一行盖
@@ -1192,6 +1198,12 @@ def refresh(
             # 时间」，而那个问题「评论增量」已经回答了。格子空着才写。
             # 写的时刻和「最近检查时间」是同一个 checked_at——两列必须逐字
             # 对得上，否则运营拿它对运行日志会差出几分钟。
+            # 评估中的增长判据：记基线（第一次进判断，或这个窗口涨够了）。
+            # 时刻和「最近检查时间」是同一个 checked_at——下一轮到没到窗口，
+            # 和到没到期是同一把尺子量的。
+            if verdict.eval_baseline_reset and snapshot.comment_count is not None:
+                fields[f.eval_baseline_count] = snapshot.comment_count
+                fields[f.eval_baseline_time] = int(checked_at.timestamp() * 1000)
             if verdict.surged and row.surge_time_ms is None:
                 fields[f.surge_time] = int(checked_at.timestamp() * 1000)
                 # 补一句「这是第一次」，把这一轮和后面几波区分开。
@@ -1300,8 +1312,10 @@ def refresh(
                         s, when=when, stage=scan.stage, fmt=settings.digest)
                     for s in verdict.blue_word_sightings if s.word in fresh},
                 rescan_line=analyze.blue_word_rescan_line(
-                    when=when, stage=scan.stage, visible=verdict.blue_words),
-                visible=list(verdict.blue_words))
+                    when=when, stage=scan.stage, visible=verdict.blue_words,
+                    excluded=verdict.blue_words_excluded),
+                visible=list(verdict.blue_words),
+                excluded=list(verdict.blue_words_excluded))
             log_notes.append(
                 f"🔵 到了{scan.stage}，蓝词复扫一次" if scan.rescan
                 else f"🔵 评论里出现新蓝词：{'、'.join(fresh)}")
@@ -1474,6 +1488,10 @@ def refresh(
             negative_keywords=row.negative_keywords,          # 负面/竞品词，复用同一份评论页
             current_tags=row.current_tags,                    # 热度档位的棘轮要看现有档位
             current_pin_status=row.pin_status,                # 区分「掉了」和「从来没有」
+            eval_baseline_count=row.eval_baseline_count,      # 评估中的增长判据
+            eval_baseline_at=_ms_to_utc(row.eval_baseline_ms),
+            now=now,
+            eval_unready=eval_unready,
         )
         if row.publish_time_inferred(now):
             # 刷新节奏是从链接 ID 推出来的：说一声，免得运营以为「发布时间」那一格
@@ -1866,6 +1884,8 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         refresh_status=feishu.read_text(cells.get(f.refresh_status)),
         blue_words=feishu.read_multi_select(cells.get(f.blue_words)),
         blue_word_sources=feishu.read_text(cells.get(f.blue_word_sources)),
+        eval_baseline_count=feishu.read_int(cells.get(f.eval_baseline_count)),
+        eval_baseline_ms=feishu.read_timestamp_ms(cells.get(f.eval_baseline_time)),
         # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))
@@ -2163,17 +2183,18 @@ def _blue_word_note(plan: BlueWordPlan, still_new: list[str]) -> str:
     爆贴以下抓到的词明说先不用截，免得运营以为机器漏翻了「是否截图」。
     """
     added = f"已加进「{plan.field_name}」"
+    skipped = f"；排除词不记：{'、'.join(plan.excluded)}" if plan.excluded else ""
     if not plan.rescan:
         ask = "，请截图" if plan.remind else f"；还没到{plan.hot_tier}，先不用截图"
-        return f"🔵 评论里出现新蓝词：{'、'.join(still_new)}（{added}{ask}）"
+        return f"🔵 评论里出现新蓝词：{'、'.join(still_new)}（{added}{ask}）{skipped}"
     head = f"🔵 到了{plan.stage}，蓝词复扫一次："
     if still_new:
         body = f"新蓝词 {'、'.join(still_new)}（{added}）"
     elif plan.visible:
         body = f"没有新蓝词，评论里还看得到 {'、'.join(plan.visible)}"
     else:
-        return head + "评论里没看到蓝词"
-    return head + body + ("，请截图" if plan.remind else "")
+        return head + "评论里没看到蓝词" + skipped
+    return head + body + ("，请截图" if plan.remind else "") + skipped
 
 
 def write_back(

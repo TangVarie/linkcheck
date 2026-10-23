@@ -59,6 +59,14 @@ COL_ARCHIVE_DAYS = "归档天数"
 THRESHOLD_COLUMNS = (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT,
                      COL_FLOP_HOURS, COL_ARCHIVE_DAYS)
 
+# —— 逐表蓝词排除词（2026-10-22 加）——
+# 这张表不往「蓝词字段」里记的词，主要是竞品名。文本列，逗号分隔（顿号、
+# 分号、换行也认）。和门槛一样是纯行级的，一张表填了不影响别的表。
+# 不拿每行的「负面词」代替：那一列按子串匹配评论正文，拿来排蓝词会误伤
+# （careplus 里有 are，OliveYoung 里有 live）。匹配规则见 analyze.excluded_by。
+# 老的注册表里没有这一列：在飞书里手工加一列同名的文本列就行，没加 = 不排除。
+COL_BLUE_WORD_EXCLUDES = "蓝词排除词"
+
 # 建注册表时用的列定义（类型码见 schema.FIELD_TYPE_NAMES）。
 REGISTRY_FIELDS = [
     {"field_name": COL_LABEL, "type": 1},
@@ -71,6 +79,7 @@ REGISTRY_FIELDS = [
     {"field_name": COL_FIRST_RUN, "type": 7},
     *[{"field_name": name, "type": 2, "property": {"formatter": "0"}}
       for name in THRESHOLD_COLUMNS],
+    {"field_name": COL_BLUE_WORD_EXCLUDES, "type": 1},
 ]
 
 # 认出「这确实是一张注册表」要的最小列集。用来挡住 FEISHU_REGISTRY 被误填成
@@ -101,6 +110,8 @@ class Entry:
     route: str = "base"
     # 逐表阈值。None = 这一格空着，用全局默认。
     thresholds: dict = field(default_factory=dict)
+    # 「蓝词排除词」那一格拆出来的词（没校验长度，见 read_blue_word_excludes）。
+    blue_word_excludes: list = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
@@ -145,7 +156,8 @@ def read(table: feishu.Bitable) -> list[Entry]:
             "填成业务表了？机器绝不会往一张认不出来的表里写东西")
 
     wanted = [c for c in (COL_LABEL, COL_TARGET, COL_ENABLED, COL_NOTE,
-                          COL_STATUS, COL_FIRST_RUN, *THRESHOLD_COLUMNS)
+                          COL_STATUS, COL_FIRST_RUN, *THRESHOLD_COLUMNS,
+                          COL_BLUE_WORD_EXCLUDES)
               if c in meta]
     entries: list[Entry] = []
     for record in table.search(wanted):
@@ -163,6 +175,7 @@ def read(table: feishu.Bitable) -> list[Entry]:
             thresholds={name: feishu.read_int(cells.get(name))
                         for name in THRESHOLD_COLUMNS
                         if feishu.read_int(cells.get(name)) is not None},
+            blue_word_excludes=feishu.read_keywords(cells.get(COL_BLUE_WORD_EXCLUDES)),
         )
         if not entry.target:
             entry.problem = f"「{COL_TARGET}」是空的"
@@ -331,6 +344,27 @@ def read_overrides(entry: Entry, base) -> Override:
     return out
 
 
+# 排除词至少几个字：一个字的词（「S」「黑」）几乎能排掉任何东西。
+MIN_EXCLUDE_CHARS = 2
+
+
+def read_blue_word_excludes(entry: Entry) -> tuple[list[str], list[str]]:
+    """「蓝词排除词」那一格 → (生效的词, 问题)。**纯函数。**
+
+    太短的词不生效、也不静默丢：写进问题里，日志和面板看得见。
+    """
+    kept: list[str] = []
+    short: list[str] = []
+    for word in entry.blue_word_excludes or []:
+        word = word.strip()
+        if not word:
+            continue
+        (kept if len(word) >= MIN_EXCLUDE_CHARS else short).append(word)
+    problems = ([f"「{COL_BLUE_WORD_EXCLUDES}」里这些词不到 {MIN_EXCLUDE_CHARS} 个字，"
+                 f"不生效：{'、'.join(short)}"] if short else [])
+    return kept, problems
+
+
 def apply_overrides(base, entry: Entry, *, log=None):
     """全局 Settings + 这一行的覆盖 → 这张表专用的 Settings。**纯函数。**
 
@@ -341,13 +375,22 @@ def apply_overrides(base, entry: Entry, *, log=None):
     import copy
 
     override = read_overrides(entry, base)
+    excludes, exclude_problems = read_blue_word_excludes(entry)
     if log:
         for problem in override.problems:
             log(f"⚠ 注册表里「{entry.label}」的阈值有问题：{problem}")
-    if not override.any:
+        for problem in exclude_problems:
+            log(f"⚠ 注册表里「{entry.label}」的{problem}")
+    if not override.any and not excludes:
         return base
 
     settings = copy.deepcopy(base)
+    if excludes:
+        settings.blue_word_excludes = tuple(excludes)
+        if log:
+            log(f"⚙ 「{entry.label}」的蓝词排除词：{'、'.join(excludes)}")
+    if not override.any:
+        return settings
     values = override.values
     if COL_TIER_EVALUATING in values:
         settings.thresholds.tier_evaluating = values[COL_TIER_EVALUATING]

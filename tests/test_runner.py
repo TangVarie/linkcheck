@@ -736,15 +736,8 @@ class TestChannelPinCapability(RunnerTest):
         self.assertEqual(fields[self.settings.fields.pinned_status],
                          self.settings.pin_status.pinned_lost)
 
-class TestBlueWordBackfill(RunnerTest):
-    """蓝词回填（2026-10-22 起的口径）：只在三个时刻扫——
-
-    1. 「蓝词字段」还空着 → 每轮扫，抓到一次就停；
-    2. 帖子到爆贴 → 再扫一次；3. 到大爆 → 再扫一次。
-
-    扫到的新词只加不减，「蓝词来源」记出自哪条评论、什么时候。「是否截图」
-    只在爆贴（含）以上的那次扫描里翻：三五条评论的帖子不叫人截图。
-    """
+class BlueWordCase(RunnerTest):
+    """蓝词那几组用例共用的固件：一页带蓝词标记的评论 + 写回前重读的假表。"""
 
     CHECKED = NOW + timedelta(minutes=3)      # 「蓝词来源」里写的就是它（+8 显示）
     WHEN = "2026-08-21 20:03"
@@ -806,6 +799,18 @@ class TestBlueWordBackfill(RunnerTest):
         table = self._FakeTable({f.blue_words: list(fresh_words), f.blue_word_sources: sources})
         runner.write_back(table, report, **kwargs)
         return table.updates[0]["fields"]
+
+
+
+class TestBlueWordBackfill(BlueWordCase):
+    """蓝词回填（2026-10-22 起的口径）：只在三个时刻扫——
+
+    1. 「蓝词字段」还空着 → 每轮扫，抓到一次就停；
+    2. 帖子到爆贴 → 再扫一次；3. 到大爆 → 再扫一次。
+
+    扫到的新词只加不减，「蓝词来源」记出自哪条评论、什么时候。「是否截图」
+    只在爆贴（含）以上的那次扫描里翻：三五条评论的帖子不叫人截图。
+    """
 
     # —— 1. 首抓：还没抓到过就每轮扫，抓到一次就停 ——
 
@@ -1068,6 +1073,46 @@ class TestBlueWordBackfill(RunnerTest):
         self.assertIsNone(report.outcomes[0].blue_word_plan)
 
 
+class TestBlueWordExcludes(BlueWordCase):
+    """登记表里的「蓝词排除词」：写进「蓝词字段」之前就筛掉。"""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.blue_word_excludes = ("康比特", "sis")
+
+    def test_only_excluded_words_change_nothing(self):
+        """一轮里只出现了排除词：不记词、不翻「是否截图」，还算「没抓到过」。"""
+        report = self._run(self._row(tags=["爆贴"]), "#康比特[搜索高亮]# 也行",
+                           "#SiS黑胶[搜索高亮]#", count=60)
+        self.assertIsNone(report.outcomes[0].blue_word_plan)
+
+    def test_excluded_words_are_left_out_and_named(self):
+        f = self.settings.fields
+        report = self._run(self._row(tags=["爆贴"]), "#康比特[搜索高亮]#",
+                           "#SPX能量胶[搜索高亮]#", count=60)
+        written = self._written(report, [])
+        self.assertEqual(written[f.blue_words], ["SPX能量胶"])
+        self.assertEqual(written[f.blue_word_shot], "未截图")
+        self.assertNotIn("康比特", written[f.blue_word_sources])
+        self.assertIn("排除词不记：康比特", written[f.failure_reason])
+
+    def test_rescan_with_only_excluded_words_does_not_ask_for_a_screenshot(self):
+        f = self.settings.fields
+        row = self._row(words=["SPX"], tags=["评估中"])
+        report = self._run(row, "#康比特[搜索高亮]#", count=55)
+        written = self._written(report, ["SPX"])
+        self.assertNotIn(f.blue_word_shot, written)
+        self.assertIn("排除词不记：康比特", written[f.blue_word_sources])
+
+    def test_existing_words_are_never_removed(self):
+        """格子里已有的竞品词不自动删：分不清是不是人手填的（要删走一次性脚本）。"""
+        f = self.settings.fields
+        row = self._row(words=["康比特"], tags=["评估中"])
+        report = self._run(row, "#SPX[搜索高亮]#", count=55)
+        written = self._written(report, ["康比特"])
+        self.assertEqual(written[f.blue_words], ["康比特", "SPX"])
+
+
 class TestBlueWordChannel(RunnerTest):
     """通道把蓝词标记抹平了（SocialDataX，线上实测）：那一轮蓝词判定整个不做。
 
@@ -1087,6 +1132,67 @@ class TestBlueWordChannel(RunnerTest):
         report = self.run_with([page, detail], [row])
         self.assertIsNone(report.outcomes[0].blue_word_plan)
         self.assertNotIn(self.settings.fields.blue_word_sources, report.outcomes[0].fields)
+
+
+class TestEvalBaselineWriteBack(RunnerTest):
+    """评估中的增长判据落表：基线两列只在量到评论数的轮次写，时刻就是「最近检查时间」。"""
+
+    CHECKED = NOW + timedelta(minutes=2)
+
+    def _row(self, *, base=None, hours_ago=24.0, tags=("评估中",)):
+        row = xhs_row(age_days=2.5, tags=list(tags))
+        if base is not None:
+            row.eval_baseline_count = base
+            row.eval_baseline_ms = int((NOW - timedelta(hours=hours_ago)).timestamp() * 1000)
+        return row
+
+    def _run(self, row, count, **kwargs):
+        kwargs.setdefault("clock", lambda: self.CHECKED)
+        page = sse(comment_page(count=count, pinned=False))
+        detail = sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})
+        return self.run_with([page, detail], [row], **kwargs).outcomes[0].fields
+
+    def test_first_round_writes_the_baseline(self):
+        f = self.settings.fields
+        fields = self._run(self._row(), 30)
+        self.assertEqual(fields[f.eval_baseline_count], 30)
+        self.assertEqual(fields[f.eval_baseline_time], fields[f.last_updated])
+        self.assertIn("记下评估基线", fields[f.failure_reason])
+
+    def test_a_stalled_row_becomes_flop_and_keeps_its_baseline(self):
+        f = self.settings.fields
+        fields = self._run(self._row(base=30), 39)
+        self.assertEqual(fields[f.traffic_status], ["无水花"])
+        self.assertNotIn(f.eval_baseline_count, fields)
+        self.assertNotIn(f.eval_baseline_time, fields)
+
+    def test_a_growing_row_stays_evaluating_and_moves_the_baseline(self):
+        f = self.settings.fields
+        fields = self._run(self._row(base=30), 40)
+        self.assertNotIn(f.traffic_status, fields)        # 评估中没变，不写
+        self.assertEqual(fields[f.eval_baseline_count], 40)
+
+    def test_a_failed_round_never_touches_the_baseline(self):
+        f = self.settings.fields
+        report = self.run_with(lambda *a, **k: err(500, 1005, "服务暂时不可用"),
+                               [self._row(base=30)])
+        fields = report.outcomes[0].fields
+        self.assertNotIn(f.eval_baseline_count, fields)
+        self.assertNotIn(f.eval_baseline_time, fields)
+        self.assertNotIn(f.traffic_status, fields)
+
+    def test_missing_columns_skip_the_check_with_a_note(self):
+        f = self.settings.fields
+        fields = self._run(self._row(base=30), 31,
+                           eval_unready="表里没建「评估基线评论数」「评估基线时间」")
+        self.assertNotIn(f.eval_baseline_count, fields)
+        self.assertNotIn(f.traffic_status, fields)
+        self.assertIn("表里没建「评估基线评论数」「评估基线时间」", fields[f.failure_reason])
+
+    def test_hand_set_flop_survives_a_round(self):
+        """人手改成的无水花（还挂着评估中）：这一轮把评估中摘掉，无水花留着。"""
+        fields = self._run(self._row(tags=("评估中", "无水花")), 35)
+        self.assertEqual(fields[self.settings.fields.traffic_status], ["无水花"])
 
 
 class TestFailurePathsLeaveStatusColumnsAlone(RunnerTest):

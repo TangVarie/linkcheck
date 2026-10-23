@@ -361,6 +361,58 @@ class TestTextWithoutUrls(unittest.TestCase):
                          "看这条 很火")
 
 
+class TestFirstUrl(unittest.TestCase):
+    def test_the_url_inside_a_share_text(self):
+        cell = "露营清单｜第三个坑 https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b，复制打开"
+        self.assertEqual(links.first_url(cell),
+                         "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b")
+
+    def test_no_url_is_an_empty_string(self):
+        self.assertEqual(links.first_url("65a1b2c3d4e5f60718293a4b"), "")
+        self.assertEqual(links.first_url(""), "")
+
+    def test_fullwidth_colon_is_normalized(self):
+        self.assertEqual(links.first_url("https：//xhslink.com/a/AbC"), "https://xhslink.com/a/AbC")
+
+
+class TestEvalWindowInThePanel(unittest.TestCase):
+    """记了评估基线、还是评估中的行 cron 每 24 小时查一次；面板算到期得用同一份输入，
+    不然「到期待刷 / 预计花费 / 卡住了」按 72 小时算，和 cron 对不上。"""
+
+    def _rec(self, *, baseline):
+        f = Settings().fields
+        extra = ({f.eval_baseline_count: 30,
+                  f.eval_baseline_time: ms(NOW - timedelta(hours=25))} if baseline else {})
+        return record(published_hours_ago=240, checked_hours_ago=25, tags=["评估中"],
+                      comment_count=33, extra=extra)
+
+    def test_the_panel_reads_the_baseline_columns(self):
+        f = Settings().fields
+        wanted = summary.panel_fields(Settings())
+        self.assertIn(f.eval_baseline_count, wanted)
+        self.assertIn(f.eval_baseline_time, wanted)
+
+    def test_a_row_in_the_window_is_due_after_24_hours(self):
+        self.assertEqual(snapshot([self._rec(baseline=True)]).due_rows, 1)
+        self.assertEqual(snapshot([self._rec(baseline=False)]).due_rows, 0)
+
+
+class TestPersonaAndPostLink(unittest.TestCase):
+    """待办行上的「素人编号」和「帖子链接」。"""
+
+    def test_both_come_from_the_row(self):
+        rec = record(refresh_status="刷新失败", link="新款按摩椅 " + XHS + " 复制打开",
+                     extra={summary.PERSONA_COLUMN: " SR-012 "})
+        todo = snapshot([rec]).todos[0]
+        self.assertEqual(todo.persona, "SR-012")
+        self.assertEqual(todo.post_url, XHS)
+
+    def test_missing_values_stay_empty(self):
+        rec = record(refresh_status="刷新失败", link="65a1b2c3d4e5f60718293a4b")
+        todo = snapshot([rec]).todos[0]
+        self.assertEqual((todo.persona, todo.post_url), ("", ""))
+
+
 class TestPickLabelColumn(unittest.TestCase):
     def test_candidates_are_tried_in_order(self):
         self.assertEqual(summary.pick_label_column({"文案", "笔记内容", "标题"}),

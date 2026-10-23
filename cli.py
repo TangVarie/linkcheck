@@ -349,6 +349,16 @@ def build_settings() -> Settings:
     settings.refresh.inferred_publish_margin_days = _numeric_env(
         "INFERRED_PUBLISH_MARGIN_DAYS", int, settings.refresh.inferred_publish_margin_days,
         minimum=0, maximum=INFERRED_MARGIN_MAX_DAYS)
+    # 「评估中」的增长判据（见 config.Thresholds.eval_*）：满多少小时开始看、
+    # 窗口多长、一个窗口里至少涨几条才算还在涨。
+    settings.thresholds.eval_min_gain = _numeric_env(
+        "EVAL_MIN_GAIN", int, settings.thresholds.eval_min_gain, minimum=1, maximum=100000)
+    settings.thresholds.eval_start_hours = _numeric_env(
+        "EVAL_START_HOURS", int, settings.thresholds.eval_start_hours,
+        minimum=1, maximum=24 * 365)
+    settings.thresholds.eval_window_hours = _numeric_env(
+        "EVAL_WINDOW_HOURS", int, settings.thresholds.eval_window_hours,
+        minimum=1, maximum=24 * 30)
 
     # —— 单轮硬预算（0 = 不限）——
     settings.budget = Budget(
@@ -704,6 +714,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         return 0, found, len(row_list), yuan, None
 
     collation_ready = _collation_ready(settings, known_fields)
+    eval_unready = _eval_unready(settings, fields_meta)
     report = runner.refresh(
         row_list, api_keys, settings,
         now=now,
@@ -715,6 +726,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         collation_status_options=_options_from_meta(fields_meta,
                                                     settings.fields.collation_status),
         collation_ready=collation_ready,
+        eval_unready=eval_unready,
         forced=(record_ids is not None),
         progress=print,
         deadline=deadline,
@@ -743,6 +755,31 @@ def _collation_ready(settings: Settings, known_fields: set[str] | None) -> bool:
               "面板上点这张表的「补齐缺的列」建上，下一轮就开始记基线")
         return False
     return True
+
+
+def _eval_unready(settings: Settings, fields_meta: dict | None) -> str:
+    """「评估中」增长判据要的两列能不能用。能用返回空串，不能用返回原因。
+
+    两列要么都能写、要么整个不判：只写得进评论数、写不进时刻（或者反过来）
+    的话，下一轮读回来还是「没有基线」，每轮重记、永远判不出来。
+    原因写进走到这条判断的那几行的「诊断信息」，这里再在运行日志里说一次。
+    """
+    f = settings.fields
+    if fields_meta is None:
+        return ""        # 读不到元数据的轮次根本不会走到这里（run 开头就拒跑了）
+    wanted = ((f.eval_baseline_count, 2, "数字"), (f.eval_baseline_time, 5, "日期"))
+    missing = [name for name, _, _ in wanted if name not in fields_meta]
+    if missing:
+        reason = "表里没建" + "、".join(f"「{name}」" for name in missing)
+    else:
+        wrong = [f"「{name}」不是{label}列" for name, code, label in wanted
+                 if fields_meta[name].get("type") != code]
+        if not wrong:
+            return ""
+        reason = "、".join(wrong)
+    print(f"ℹ 「评估中 → 无水花」的增长判断没开：{reason}。"
+          "面板上点这张表的「补齐缺的列」建上，下一轮就开始记基线")
+    return reason
 
 
 def _waste_report(rows: list, settings: Settings, now: datetime) -> list[str]:
