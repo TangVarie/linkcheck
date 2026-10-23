@@ -809,7 +809,10 @@ def _eval_growth(verdict: Verdict, settings: Settings, *, count: int,
         return False, ""
     elapsed = (now - baseline_at).total_seconds() / 3600
     gain = count - baseline_count
-    if elapsed < window:
+    # 「满没满 24 小时」和到期判断同一个口径（含 DUE_SLACK_MINUTES 的余量）：
+    # 不然 sweep 一天只跑几次的部署上，一行到期被刷了，却因为还差两分钟不满
+    # 24 小时而不判，要再等一整轮。
+    if not settings.refresh.window_reached(elapsed, window):
         return False, (f"评估中：距基线（{baseline_count} 条）{elapsed:.0f} 小时，"
                        f"满 {window} 小时再判")
     if gain < th.eval_min_gain:

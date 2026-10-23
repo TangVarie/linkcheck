@@ -121,9 +121,24 @@ class RailwayConfig:
             token=project or account,
             project_scoped=bool(project),
             environment_id=(environ.get("RAILWAY_ENVIRONMENT_ID") or "").strip(),
-            service_id=(environ.get("RAILWAY_SERVICE_ID") or
-                        environ.get("RAILWAY_CRON_SERVICE_ID") or "").strip(),
+            # **只认 RAILWAY_CRON_SERVICE_ID，不认 RAILWAY_SERVICE_ID**：后者是
+            # Railway 往每个服务里自动注入的「本服务 ID」，在面板服务上它就是
+            # 面板自己。以前两个都认、还优先它，结果过滤成「只看面板自己的访问
+            # 日志」，巡检输出一条都进不来，运行历史永远是空的（踩过）。
+            service_id=(environ.get("RAILWAY_CRON_SERVICE_ID") or "").strip(),
         )
+
+    @property
+    def service_ids(self) -> tuple[str, ...]:
+        """要看哪几个服务。逗号或空格分隔，去重保序。
+
+        队列和整轮拆成两个 cron 服务时两个 ID 都要填，否则只看得到一半的轮次。
+        """
+        seen: list[str] = []
+        for part in self.service_id.replace("，", ",").replace(",", " ").split():
+            if part not in seen:
+                seen.append(part)
+        return tuple(seen)
 
     def headers(self) -> dict:
         """两种 token 走不同的头，Railway 对此没有兼容处理。"""
@@ -213,27 +228,46 @@ def fetch_logs(
         raise NotConfigured("、".join(config.missing()) + " 没配")
     limit = max(1, min(int(limit), MAX_LIMIT))
     expr = filter_expr.strip()
-    if config.service_id:
-        # 只要这个服务的日志。面板服务自己的访问日志混进来毫无价值，
-        # 还会把真正要看的巡检输出挤出翻页窗口。
-        #
-        # 走 filter 字符串而不是参数：environmentLogs **没有** serviceId 参数
-        # （有的是 dnsQueryLogs / networkFlowLogs）。
-        expr = f"@service:{config.service_id} {expr}".strip()
-
     sender = post or transport.post_with_retry
-    resp = sender(
-        ENDPOINT,
-        config.headers(),
-        json.dumps({"query": _QUERY, "variables": {
-            "environmentId": config.environment_id,
-            "filter": expr,
-            "beforeLimit": limit,
-        }}),
-        timeout=config.timeout,
-        should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-    )
-    return _parse_response(resp, secrets)
+
+    def one(filter_text: str) -> list[LogLine]:
+        resp = sender(
+            ENDPOINT,
+            config.headers(),
+            json.dumps({"query": _QUERY, "variables": {
+                "environmentId": config.environment_id,
+                "filter": filter_text,
+                "beforeLimit": limit,
+            }}),
+            timeout=config.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        return _parse_response(resp, secrets)
+
+    services = config.service_ids
+    if not services:
+        return one(expr)
+    # 只要这几个服务的日志。面板服务自己的访问日志混进来毫无价值，
+    # 还会把真正要看的巡检输出挤出翻页窗口。
+    #
+    # 走 filter 字符串而不是参数：environmentLogs **没有** serviceId 参数
+    # （有的是 dnsQueryLogs / networkFlowLogs）。
+    #
+    # 多个服务**每个单独查一次**再合并，不拼成一条 OR 过滤：一来 Railway 的
+    # 过滤语法里 OR 怎么写没实测过，写错了是整条查询报错；二来队列每 5 分钟
+    # 跑一轮、整轮一天三轮，共用一个 beforeLimit 窗口的话，整轮那几行会被
+    # 队列的输出挤出去。各查各的，每个服务都有自己那 limit 条。
+    if len(services) == 1:
+        return one(f"@service:{services[0]} {expr}".strip())
+    merged: list[LogLine] = []
+    for service in services:
+        merged.extend(one(f"@service:{service} {expr}".strip()))
+    # 合并后按时间新的在前（调用方取前几百行当「最近的」）；
+    # 时间戳解析不了的排最后，不丢。
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    merged.sort(key=lambda line: (line.moment is not None, line.moment or floor),
+                reverse=True)
+    return merged
 
 
 def _parse_response(resp: transport.Response, secrets: Iterable[str]) -> list[LogLine]:

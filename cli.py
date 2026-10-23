@@ -349,6 +349,11 @@ def build_settings() -> Settings:
     settings.refresh.inferred_publish_margin_days = _numeric_env(
         "INFERRED_PUBLISH_MARGIN_DAYS", int, settings.refresh.inferred_publish_margin_days,
         minimum=0, maximum=INFERRED_MARGIN_MAX_DAYS)
+    # 到期判断的余量（分钟）。sweep 一天只在固定几个时刻跑时设 30，见
+    # config.RefreshTiers.due_slack_minutes；每 5 分钟跑一次的标准部署不用设。
+    settings.refresh.due_slack_minutes = _numeric_env(
+        "DUE_SLACK_MINUTES", int, settings.refresh.due_slack_minutes,
+        minimum=0, maximum=120)
     # 「评估中」的增长判据（见 config.Thresholds.eval_*）：满多少小时开始看、
     # 窗口多长、一个窗口里至少涨几条才算还在涨。
     settings.thresholds.eval_min_gain = _numeric_env(

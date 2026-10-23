@@ -396,7 +396,9 @@ class Row:
         elapsed_hours = (now - updated).total_seconds() / 3600
         # 未来的更新时间同样按「该刷」处理：否则一个填错的日期能让这一行
         # 长期不到期，而且没有任何人会发现。
-        return elapsed_hours < 0 or elapsed_hours >= interval
+        # 余量（DUE_SLACK_MINUTES）只在 sweep 一天跑固定几次的部署上有用，
+        # 见 RefreshTiers.due_slack_minutes。
+        return elapsed_hours < 0 or settings.refresh.window_reached(elapsed_hours, interval)
 
     def overdue_hours(self, settings: Settings,
                       now: Optional[datetime] = None) -> float:
