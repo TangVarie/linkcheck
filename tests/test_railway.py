@@ -101,6 +101,14 @@ class TestTokenScope(unittest.TestCase):
         self.assertEqual(config.headers()["Authorization"], "Bearer acct-1")
         self.assertNotIn("Project-Access-Token", config.headers())
 
+    def test_user_agent_is_not_urllibs_default(self):
+        """backboard 前面的 Cloudflare 把 `Python-urllib/3.x` 直接 403（1010）。"""
+        post, seen = sender(resp(payload=envelope([])))
+        railway.fetch_logs(cfg(), post=post)
+        agent = seen["headers"].get("User-Agent", "")
+        self.assertTrue(agent)
+        self.assertNotIn("Python-urllib", agent)
+
     def test_the_right_header_actually_goes_out(self):
         post, seen = sender(resp(payload=envelope([])))
         railway.fetch_logs(
@@ -235,6 +243,24 @@ class TestErrorHandling(unittest.TestCase):
         with self.assertRaises(railway.RailwayError) as ctx:
             railway.fetch_logs(cfg(), post=post)
         self.assertIn("token", str(ctx.exception))
+        # 不再把人往「能读回全部密钥」的 account token 上推。
+        self.assertNotIn("account", str(ctx.exception))
+
+    def test_cloudflare_1010_is_not_blamed_on_the_token(self):
+        """Cloudflare 按 UA 拦截是 403 + `error code: 1010`，和 token 无关。"""
+        post, _ = sender(resp(status=403, body="error code: 1010"))
+        with self.assertRaises(railway.RailwayError) as ctx:
+            railway.fetch_logs(cfg(), post=post)
+        self.assertIn("1010", str(ctx.exception))
+        self.assertIn("不是 token 的问题", str(ctx.exception))
+
+    def test_not_authorized_explains_the_likely_causes(self):
+        """token 错了或者读不了这个环境，Railway 都是 HTTP 200 + Not Authorized。"""
+        post, _ = sender(resp(payload={"errors": [{"message": "Not Authorized"}]}))
+        with self.assertRaises(railway.RailwayError) as ctx:
+            railway.fetch_logs(cfg(), post=post)
+        self.assertIn("Not Authorized", str(ctx.exception))
+        self.assertIn("RAILWAY_ENVIRONMENT_ID", str(ctx.exception))
 
     def test_429_points_at_the_cache_setting(self):
         post, _ = sender(resp(status=429, payload={}))
