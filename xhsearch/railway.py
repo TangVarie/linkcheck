@@ -284,7 +284,7 @@ def _parse_response(resp: transport.Response, secrets: Iterable[str]) -> list[Lo
         # 不再劝人换 account token：那把钥匙能读回项目的全部密钥（见 RailwayConfig）。
         raise RailwayError(
             f"Railway 拒绝了这个 token（HTTP {resp.status}）："
-            f"{redact((resp.body or '')[:120], secrets)}。"
+            f"{redact(resp.body or '', secrets)[:120]}。"
             "检查 RAILWAY_PROJECT_TOKEN 是不是整串粘对了、没带空格或引号")
     if resp.status == 429:
         raise RailwayError("Railway 限流了（429）。Hobby 是 1000 次/小时，"
@@ -293,13 +293,14 @@ def _parse_response(resp: transport.Response, secrets: Iterable[str]) -> list[Lo
     if not isinstance(payload, dict):
         raise RailwayError(
             f"Railway 返回的不是 JSON（HTTP {resp.status}）："
-            f"{redact(resp.body[:200], secrets)}")
+            f"{redact(resp.body or '', secrets)[:200]}")
     if payload.get("errors"):
         # GraphQL 的错误是 HTTP 200 + errors 数组。只看状态码会把每一个
         # 「字段名写错了」当成成功，然后拿到一个空列表——和「真的没有日志」
         # 长得一模一样，最难查。
         first = payload["errors"][0] if payload["errors"] else {}
-        message = redact(str(first.get("message") or first)[:300], secrets)
+        # 先抹再截：反过来的话，跨在截断处的密钥只会被抹掉首尾 8 个字符。
+        message = redact(str(first.get("message") or first), secrets)[:300]
         hint = ""
         if "not authorized" in message.lower():
             # token 错了、或者读不了这个环境，Railway 都是 HTTP 200 + 这一句。

@@ -246,6 +246,22 @@ class TestErrorHandling(unittest.TestCase):
         # 不再把人往「能读回全部密钥」的 account token 上推。
         self.assertNotIn("account", str(ctx.exception))
 
+    def test_error_bodies_are_redacted_before_truncation(self):
+        """先截再抹的话，跨在截断处的密钥只会被抹掉首尾，中间一截照样送到浏览器。"""
+        secret = "sk-0123456789abcdefghijklmnopqrstuvwx"
+        # 每一种都让密钥跨在截断处：截断后只剩前 19-20 个字符。
+        cases = [
+            resp(status=401, body="x" * 100 + secret),
+            resp(status=502, body="<" + "x" * 180 + secret),
+            resp(payload={"errors": [{"message": "y" * 280 + secret}]}),
+        ]
+        for response in cases:
+            post, _ = sender(response)
+            with self.assertRaises(railway.RailwayError) as ctx:
+                railway.fetch_logs(cfg(), secrets=[secret], post=post)
+            # 首 8 个字符之后的那一截：先截再抹时它会原样漏出去。
+            self.assertNotIn(secret[8:16], str(ctx.exception))
+
     def test_cloudflare_1010_is_not_blamed_on_the_token(self):
         """Cloudflare 按 UA 拦截是 403 + `error code: 1010`，和 token 无关。"""
         post, _ = sender(resp(status=403, body="error code: 1010"))
