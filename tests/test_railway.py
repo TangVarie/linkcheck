@@ -223,7 +223,7 @@ class TestVerifiedSignature(unittest.TestCase):
         railway.fetch_logs(cfg(), post=post)
         query = seen["body"]["query"]
         for field in ("timestamp", "message", "severity", "tags",
-                      "serviceId", "deploymentId"):
+                      "serviceId", "deploymentId", "attributes", "key", "value"):
             self.assertIn(field, query)
         for absent in ("level", "text", "podName", "$limit"):
             self.assertNotIn(absent, query)
@@ -366,6 +366,88 @@ class TestEventDetection(unittest.TestCase):
     def test_broken_json_does_not_crash(self):
         post, _ = sender(resp(payload=envelope([log_item('{"run_id": "r1", broken')])))
         self.assertIsNone(railway.fetch_logs(cfg(), post=post)[0].event)
+
+
+def structured(attrs, message="", **kwargs):
+    """Railway 把 JSON 日志拆开之后的样子：正文空、字段全在 attributes 里。"""
+    item = log_item(message, **kwargs)
+    item["attributes"] = [{"key": k, "value": v} for k, v in attrs]
+    return item
+
+
+class TestRailwayStructuredLogs(unittest.TestCase):
+    """Railway 会把一行 JSON 解析成结构化日志：message 字段当正文，其余字段变
+    attributes。RUN_LOG_JSON 的事件没有 message 字段，所以正文是空的。
+    只读正文的话，运行历史永远是「暂时没有可解析的运行记录」（线上踩过）。"""
+
+    def fetch(self, items, secrets=()):
+        post, _ = sender(resp(payload=envelope(items)))
+        return railway.fetch_logs(cfg(), secrets=secrets, post=post)
+
+    def test_json_encoded_attribute_values_rebuild_a_run(self):
+        lines = self.fetch([
+            structured([("run_id", '"1730000000-7"'), ("event", '"run_start"'),
+                        ("ts", "1000.5"), ("mode", '"queue"'),
+                        ("tables", '["A","B"]')], ts="2026-10-23T09:20:01Z"),
+            structured([("run_id", '"1730000000-7"'), ("event", '"table"'),
+                        ("ts", "1001"), ("table", '"A"'), ("rows", "2"),
+                        ("counts", '{"正常":2}'), ("points_balance", "null")],
+                       ts="2026-10-23T09:20:02Z"),
+            structured([("run_id", '"1730000000-7"'), ("event", '"run_end"'),
+                        ("ts", "1002"), ("mode", '"queue"'), ("exit_code", "0"),
+                        ("error", '""'), ("rows", "2")], ts="2026-10-23T09:20:03Z"),
+        ])
+        runs = railway.build_runs(lines)
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual((run.run_id, run.mode, run.exit_code, run.rows),
+                         ("1730000000-7", "queue", 0, 2))
+        self.assertTrue(run.finished)
+        self.assertEqual(run.tables[0].counts, {"正常": 2})
+        self.assertIsNone(run.tables[0].points_balance)
+        # 原始日志那一栏不是一片空白。
+        self.assertIn("run_start", lines[0].message)
+
+    def test_plain_string_attribute_values_work_too(self):
+        """value 的编码没有文档：字符串不带引号也要认。"""
+        lines = self.fetch([
+            structured([("run_id", "1730000000-8"), ("event", "run_end"),
+                        ("ts", "1002"), ("mode", "sweep"), ("exit_code", "0")]),
+        ])
+        self.assertEqual(lines[0].event["run_id"], "1730000000-8")
+        self.assertEqual(lines[0].event["mode"], "sweep")
+        self.assertEqual(lines[0].event["exit_code"], 0)
+
+    def test_flattened_nested_keys_are_rebuilt(self):
+        lines = self.fetch([
+            structured([("run_id", "r"), ("event", "table"), ("table", "A"),
+                        ("counts.正常", "3"), ("counts.风控中", "1"),
+                        ("used_providers.tikhub", "4")]),
+        ])
+        self.assertEqual(lines[0].event["counts"], {"正常": 3, "风控中": 1})
+        self.assertEqual(lines[0].event["used_providers"], {"tikhub": 4})
+
+    def test_attribute_values_are_redacted(self):
+        """run_end 的 error 会原样显示在面板上。"""
+        secret = "sk-0123456789abcdefghijklmnopqrstuvwx"
+        lines = self.fetch([
+            structured([("run_id", "r"), ("event", "run_end"),
+                        ("error", f'"上游回显 {secret}"')]),
+        ], secrets=[secret])
+        self.assertNotIn(secret[8:16], json.dumps(lines[0].event, ensure_ascii=False))
+        self.assertNotIn(secret[8:16], lines[0].message)
+
+    def test_attributes_without_run_id_are_not_ours(self):
+        """Railway 自己也会给普通日志挂 attributes（比如 level）。"""
+        lines = self.fetch([structured([("level", "error")], message="Traceback ...")])
+        self.assertIsNone(lines[0].event)
+        self.assertEqual(lines[0].message, "Traceback ...")
+
+    def test_unparsed_json_message_still_wins(self):
+        """不经过 Railway 解析的部署（VPS、GitHub Actions 的日志）照旧从正文读。"""
+        payload = {"run_id": "r1", "event": "row", "status": "正常"}
+        lines = self.fetch([structured([("level", "info")], message=json.dumps(payload))])
+        self.assertEqual(lines[0].event["status"], "正常")
 
 
 def ev(run_id, event, ts, **extra):
