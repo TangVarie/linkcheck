@@ -151,6 +151,24 @@ class TestTierShiftPreview(unittest.TestCase):
             self._new(**{registry.COL_TIER_HOT: 1}), now=NOW)
         self.assertEqual(shift.changed, 0)
 
+    def test_a_held_flop_is_not_promised_an_upgrade(self):
+        """格子里已经是无水花、评论数没到爆贴：调低评估中门槛下一轮照旧是无水花
+        （analyze.held_tier），预览不能说它会升。到了新的爆贴门槛才算升。"""
+        base = Settings()
+        held = [record("r1", comment_count=15, published_hours_ago=100, tags=["无水花"])]
+        shift = summary.preview_tier_shift(
+            held, base, self._new(**{registry.COL_TIER_EVALUATING: 10}), now=NOW)
+        self.assertEqual(shift.changed, 0)
+        untagged = [record("r1", comment_count=15, published_hours_ago=100)]
+        shift = summary.preview_tier_shift(
+            untagged, base, self._new(**{registry.COL_TIER_EVALUATING: 10}), now=NOW)
+        self.assertEqual(shift.up, 1)
+        shift = summary.preview_tier_shift(
+            held, base, self._new(**{registry.COL_TIER_EVALUATING: 5,
+                                     registry.COL_TIER_HOT: 12}), now=NOW)
+        self.assertEqual(shift.up, 1)
+        self.assertIn("无水花 → 爆贴", shift.examples[0])
+
     def test_flop_hours_affects_young_rows(self):
         base = Settings()
         recs = [record("r1", comment_count=3, published_hours_ago=60)]

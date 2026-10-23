@@ -375,6 +375,28 @@ class TestFirstUrl(unittest.TestCase):
         self.assertEqual(links.first_url("https：//xhslink.com/a/AbC"), "https://xhslink.com/a/AbC")
 
 
+class TestEvalWindowInThePanel(unittest.TestCase):
+    """记了评估基线、还是评估中的行 cron 每 24 小时查一次；面板算到期得用同一份输入，
+    不然「到期待刷 / 预计花费 / 卡住了」按 72 小时算，和 cron 对不上。"""
+
+    def _rec(self, *, baseline):
+        f = Settings().fields
+        extra = ({f.eval_baseline_count: 30,
+                  f.eval_baseline_time: ms(NOW - timedelta(hours=25))} if baseline else {})
+        return record(published_hours_ago=240, checked_hours_ago=25, tags=["评估中"],
+                      comment_count=33, extra=extra)
+
+    def test_the_panel_reads_the_baseline_columns(self):
+        f = Settings().fields
+        wanted = summary.panel_fields(Settings())
+        self.assertIn(f.eval_baseline_count, wanted)
+        self.assertIn(f.eval_baseline_time, wanted)
+
+    def test_a_row_in_the_window_is_due_after_24_hours(self):
+        self.assertEqual(snapshot([self._rec(baseline=True)]).due_rows, 1)
+        self.assertEqual(snapshot([self._rec(baseline=False)]).due_rows, 0)
+
+
 class TestPersonaAndPostLink(unittest.TestCase):
     """待办行上的「素人编号」和「帖子链接」。"""
 

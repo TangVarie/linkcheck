@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from . import feishu, links, rows as rows_mod, runner
+from . import analyze, feishu, links, rows as rows_mod, runner
 from .config import Settings
 
 # 「卡住了」的判据：超过它应有刷新间隔的这么多倍还没被刷到。
@@ -244,6 +244,10 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         # 抖音短链记过的「作品ID」：没有它，面板认不出这一行是哪个作品，
         # 「发布时间」空着时就算不出帖龄、把 cron 早已归档的行报成空转。
         f.resolved_id,
+        # 评估中的增长判据的基线：记了基线的行 cron 每 24 小时查一次
+        # （Row.in_eval_window）。不读回来，面板算到期、花费、「卡住了」
+        # 还按分层的 72 小时，和 cron 对不上。
+        f.eval_baseline_count, f.eval_baseline_time,
     ]
     if show_digest:
         wanted += [f.comment_digest, f.negative_digest]
@@ -868,8 +872,15 @@ def _tier_for(row: rows_mod.Row, count: int, settings: Settings,
 
     评估中的增长判据（满 48 小时后按窗口增长判无水花）要看这一行的基线历史，
     这里不重放：改门槛的预览只回答「按评论数会挪档的有几行」。
+    但「无水花保持」要算进来（analyze.held_tier）：格子里已经是无水花、评论数
+    还没到这套口径的爆贴门槛，下一轮照旧是无水花——调低评估中门槛不会让它升档，
+    预览不能说会。
     """
-    tier = settings.thresholds.heat_tier(count, settings.tags)
+    t = settings.tags
+    if (analyze.held_tier(row.current_tags, settings) == t.flop
+            and count < settings.thresholds.tier_hot):
+        return t.flop
+    tier = settings.thresholds.heat_tier(count, t)
     if tier:
         return tier
     age = row.age_hours(now)
