@@ -1577,7 +1577,15 @@ def _run_row(run, offset_hours: float) -> str:
             "</tr>")
 
 
+class Loading(str):
+    """「还在取，不是取失败」。和错误走同一个参数，渲染成一句普通说明，
+    不带「失败」，也不接「暂时没有可解析的运行记录」那段排查提示。"""
+
+
 def _runs_section(runs, log_error: str, offset_hours: float) -> str:
+    if isinstance(log_error, Loading):
+        return (f"<h2 id=s-runs>运行历史</h2><div class=empty>{_icon('inbox')}"
+                f"{_e(log_error)}</div>")
     note = (f"<div class=note>{_icon('alert-triangle')}"
             f"<span>取 Railway 日志失败：{_e(log_error)}</span></div>"
             if log_error else "")

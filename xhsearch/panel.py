@@ -45,8 +45,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
-from . import (channels as channels_mod, feishu, panel_settings, provision,
-               railway, readout, registry, schema, summary, tablespec)
+from . import (channels as channels_mod, feishu, panel_settings, panel_view,
+               provision, railway, readout, registry, schema, summary, tablespec)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -596,7 +596,108 @@ class Cache:
         self._stop.set()
 
 
-class LogFeed:
+class _SlowFeed:
+    """取一次要好几秒的那几块（Railway 日志、两家余额）共用的缓存。
+
+    以前这几块是「过期了就在请求里当场去取」：TTL 60 秒，而面板常常隔几分钟
+    才有人开一次，于是几乎每次打开页面都要先等 Railway（每个服务各查一次，
+    20 秒超时、最多试三次）和两家余额接口（各 15 秒超时、试两次）全跑完，
+    上游一慢整页就超时。
+
+    现在：过期了在**后台**重取，页面最多等 STALE_WAIT 秒——取完了给新的，
+    没取完先给上一份（和它当时的错误），下一次打开就是新的了。一份都还
+    没有的时候最多等 FIRST_WAIT 秒，再没有就说「正在读取」。同一时刻只有
+    一趟在取：几个人同时开页面也只打一次上游。force=True（点「重新取数」）
+    照旧等到取完。页面先对每一块调 prime()，几块一起取，等的时间不叠加。
+    """
+
+    STALE_WAIT = 0.3
+    FIRST_WAIT = 1.5
+
+    def __init__(self, ttl: float):
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._done = threading.Condition(self._lock)
+        self._items: list = []
+        self._error = ""
+        self._fetched_at = 0.0
+        # 这一轮有没有结果可以端出去（有数据、零条、或者一个错误都算）。
+        # **不能用 `self._items or self._error` 代替**：
+        # 一次成功但零条的拉取会让两个都为假，于是 TTL 内每次开页面都重打
+        # 上游——而新服务、或 RUN_LOG_JSON 还没产出的时候正好就是这个
+        # 状态，缓存在最该生效的空态下失效。
+        self._loaded = False
+        self._running = False
+        # 已经取完了几趟。等的人认「我来之后又取完了一趟」，不认时间。
+        self._finished = 0
+
+    def _fetch_now(self) -> list:
+        raise NotImplementedError
+
+    def _describe(self, exc: Exception) -> str:
+        return f"{type(exc).__name__}: {exc}"
+
+    def _loading_hint(self) -> str:
+        return panel_view.Loading("正在读取，几秒后刷新页面再看")
+
+    def _run(self) -> None:
+        try:
+            items, error = list(self._fetch_now()), ""
+        except Exception as exc:                                # noqa: BLE001
+            # 保留上一批：少一次刷新不该让页面上那一块变空白。
+            items, error = None, self._describe(exc)
+        with self._done:
+            if items is not None:
+                self._items = items
+            self._error = error
+            self._fetched_at = time.time()
+            self._loaded = True
+            self._running = False
+            self._finished += 1
+            self._done.notify_all()
+
+    def _start_locked(self) -> None:
+        if not self._running:
+            self._running = True
+            try:
+                threading.Thread(target=self._run, daemon=True,
+                                 name=f"panel-{type(self).__name__}").start()
+            except RuntimeError:
+                # 起不了线程（极少见）：别让 _running 卡在 True，下次再试。
+                self._running = False
+                raise
+
+    def prime(self) -> None:
+        """没有、或者已经过期，就在后台开始取，不等。
+
+        启动时调一次，第一个打开面板的人就不用等；出页面前对每一块各调一次，
+        几块一起取，而不是取完日志再开始取余额。
+        """
+        with self._done:
+            if not self._loaded or (time.time() - self._fetched_at) >= self._ttl:
+                self._start_locked()
+
+    def _get(self, force: bool) -> tuple[list, str]:
+        with self._done:
+            fresh = self._loaded and (time.time() - self._fetched_at) < self._ttl
+            if fresh and not force:
+                return list(self._items), self._error
+            target = self._finished + 1
+            self._start_locked()
+            budget = (None if force else
+                      self.STALE_WAIT if self._loaded else self.FIRST_WAIT)
+            deadline = None if budget is None else time.monotonic() + budget
+            while self._finished < target:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    break
+                self._done.wait(remaining)
+            if not self._loaded:
+                return [], self._loading_hint()
+            return list(self._items), self._error
+
+
+class LogFeed(_SlowFeed):
     """Railway 日志的缓存。
 
     和聚合缓存分开是有意的：飞书那趟慢、Railway 这趟快，失败模式也不一样
@@ -606,19 +707,9 @@ class LogFeed:
 
     def __init__(self, config: PanelConfig, ttl: float,
                  fetch: Optional[Callable[..., list]] = None):
+        super().__init__(ttl)
         self._config = config
-        self._ttl = ttl
         self._fetch = fetch or railway.fetch_logs
-        self._lock = threading.Lock()
-        self._lines: list = []
-        self._error = ""
-        self._fetched_at = 0.0
-        # 这一轮有没有结果可以端出去（有日志、零日志、或者一个错误都算）。
-        # **不能用 `self._lines or self._error` 代替**：
-        # 一次成功但零行的拉取会让两个都为假，于是 TTL 内每次开页面都重打
-        # Railway——而新服务、或 RUN_LOG_JSON 还没产出的时候正好就是这个
-        # 状态，缓存在最该生效的空态下失效。
-        self._loaded = False
 
     @property
     def enabled(self) -> bool:
@@ -629,55 +720,38 @@ class LogFeed:
         return ("没接 Railway 日志：还差 " + "、".join(gaps) +
                 "。设上就能在这里看到每一轮的真实输出（见 docs/面板.md）")
 
+    def _fetch_now(self) -> list:
+        return self._fetch(self._config.railway, secrets=self._config.secrets)
+
+    def _describe(self, exc: Exception) -> str:
+        if isinstance(exc, railway.RailwayError):
+            return str(exc)
+        return super()._describe(exc)
+
+    def _loading_hint(self) -> str:
+        return panel_view.Loading("正在从 Railway 读取运行记录，几秒后刷新页面再看")
+
     def get(self, *, force: bool = False) -> tuple[list, str]:
         if not self.enabled:
             return [], self._missing_hint()
-        with self._lock:
-            fresh = (time.time() - self._fetched_at) < self._ttl
-            if fresh and not force and self._loaded:
-                return list(self._lines), self._error
-        try:
-            lines = self._fetch(self._config.railway,
-                                secrets=self._config.secrets)
-            with self._lock:
-                self._lines, self._error = lines, ""
-                self._fetched_at = time.time()
-                self._loaded = True
-        except railway.RailwayError as exc:
-            # 保留上一批：日志少一次刷新不该让页面上那一块变空白。
-            with self._lock:
-                self._error = str(exc)
-                self._fetched_at = time.time()
-                self._loaded = True
-        except Exception as exc:                                # noqa: BLE001
-            with self._lock:
-                self._error = f"{type(exc).__name__}: {exc}"
-                self._fetched_at = time.time()
-                self._loaded = True
-        with self._lock:
-            return list(self._lines), self._error
+        return self._get(force)
 
 
-class BalanceFeed:
+class BalanceFeed(_SlowFeed):
     """两家通道余额的缓存。**只打官方标明零费用的端点**（见 balance.py）。
 
     单独一个缓存，和聚合缓存、日志缓存都分开。三者的失败模式互不相干：
     余额接口 401 不该让整个面板空白，也不该让日志那一块跟着消失。
 
     TTL 跟着面板的聚合缓存走。TikHub 那个端点限速 1/second，60 秒一次
-    余量三个数量级；后台单线程刷，不是「谁开页面就打一次」——
-    否则五个人同时刷新页面就是五倍上游请求。
+    余量三个数量级；后台一趟一趟地取（见 _SlowFeed），不是「谁开页面就打
+    一次」——否则五个人同时刷新页面就是五倍上游请求。
     """
 
     def __init__(self, config: PanelConfig, ttl: float, read=None):
+        super().__init__(ttl)
         self._config = config
-        self._ttl = ttl
         self._read = read or balance_mod.read_all
-        self._lock = threading.Lock()
-        self._items: list = []
-        self._error = ""
-        self._fetched_at = 0.0
-        self._loaded = False
 
     @property
     def enabled(self) -> bool:
@@ -689,37 +763,29 @@ class BalanceFeed:
         return ("没配 TIKHUB_API_KEY / SOCIALDATAX_API_KEY，读不到余额。"
                 "这两个端点是免费的，配上不会花钱")
 
+    def _fetch_now(self) -> list:
+        return self._read(
+            self._config.api_keys,
+            tikhub_base=self._config.tikhub_base,
+            socialdatax_base=self._config.socialdatax_base,
+            usd_to_cny=self._config.usd_to_cny)
+
+    def _describe(self, exc: Exception) -> str:
+        # 整块取数炸了和「某一家读不到」是两回事——后者由 Balance.error
+        # 逐家表达，不会走到这里。
+        #
+        # 过一遍脱敏：这句话会渲染到页面上，而异常文本的内容不由我们决定
+        # （第三方库可能把请求头、URL 原样塞进去）。这里的 Key 本来就在
+        # 配置里，多脱一次的代价只是几次字符串替换。
+        return railway.redact(super()._describe(exc), self._config.secrets)
+
+    def _loading_hint(self) -> str:
+        return panel_view.Loading("正在读取两家余额，几秒后刷新页面再看")
+
     def get(self, *, force: bool = False) -> tuple[list, str]:
         if not self.enabled:
             return [], self.why_disabled()
-        with self._lock:
-            fresh = (time.time() - self._fetched_at) < self._ttl
-            if fresh and not force and self._loaded:
-                return list(self._items), self._error
-        try:
-            items = self._read(
-                self._config.api_keys,
-                tikhub_base=self._config.tikhub_base,
-                socialdatax_base=self._config.socialdatax_base,
-                usd_to_cny=self._config.usd_to_cny)
-            with self._lock:
-                self._items, self._error = list(items), ""
-                self._fetched_at = time.time()
-                self._loaded = True
-        except Exception as exc:                                # noqa: BLE001
-            # 保留上一批。整块取数炸了和「某一家读不到」是两回事——
-            # 后者由 Balance.error 逐家表达，不会走到这里。
-            #
-            # 过一遍脱敏：这句话会渲染到页面上，而异常文本的内容不由我们决定
-            # （第三方库可能把请求头、URL 原样塞进去）。这里的 Key 本来就在
-            # 配置里，多脱一次的代价只是几次字符串替换。
-            with self._lock:
-                self._error = railway.redact(f"{type(exc).__name__}: {exc}",
-                                             self._config.secrets)
-                self._fetched_at = time.time()
-                self._loaded = True
-        with self._lock:
-            return list(self._items), self._error
+        return self._get(force)
 
 
 @dataclass
@@ -1675,6 +1741,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         return overview, error, fetched_at
 
     def _page(self) -> str:
+        for feed in (self.deps.logs, self.deps.balances):
+            if feed is not None and feed.enabled:
+                feed.prime()
         overview, error, fetched_at = self._view()
         runs, log_error = self._runs()
         balances, balance_error = self._balances()
@@ -2122,6 +2191,11 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
                           projects=projects, queueing=queueing,
                           settings=resolved, resolutions=resolutions)
     cache.start()
+    # 日志和余额也先在后台取一趟：第一个打开面板的人不用等 Railway 和两家余额接口。
+    if logs.enabled:
+        logs.prime()
+    if balances.enabled:
+        balances.prime()
     if resolutions.enabled:
         # 先把「已解决」读进来，第一个打开面板的人就不用等这一趟飞书。
         threading.Thread(target=resolutions.snapshot, daemon=True).start()
