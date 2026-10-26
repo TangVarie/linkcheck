@@ -191,6 +191,11 @@ def schema_problems(settings: Settings, meta: dict) -> list[str]:
             "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
         )
     problems.extend(_readout_problems(meta))
+    gaps = [c.name for c in _maintenance_missing(meta)]
+    if gaps:
+        problems.append(
+            f"投流维护的列缺了：{'、'.join(gaps)}。人工列，巡查不受影响；在面板「项目」里"
+            "点这张表的「补齐缺的列」就能建上（空的多选，选项填的时候自己长出来）。")
     return problems
 
 
@@ -236,6 +241,29 @@ def _readout_diff(meta) -> tuple[list, list, list]:
                 column=column.name, actual=info.get("formula") or "",
                 expected=column.formula))
     return missing, wrong_types, wrong_formulas
+
+
+# ---------- 投流维护三列：人工列，体检只看在不在 ----------
+#
+# 2026-10-10 加进标准模板，纯人工、机器不读不写。起初只进了建表模板，体检和
+# 「补齐缺的列」都不管它们——结果新加进来的老表缺这三列没人发现（运营反馈）。
+# 现在和截图读数四列一样：每张表都该有，缺了体检会说、面板一键能补。
+# 只看在不在，**不看类型和选项**：选项是运营填的时候自己长出来的，类型
+# 哪天他们觉得日期更顺手改了，也不是机器该拦的事。
+MAINTENANCE_COLUMNS = (
+    ("维护情况", "准备投流 / 已投流"),
+    ("维护时间", "投流的时间"),
+    ("维护效果", "投流后 12 小时的曝光量增长情况"),
+)
+_MULTI = 4
+
+
+def _maintenance_missing(meta) -> list[MissingColumn]:
+    return [MissingColumn(
+                name=name, type_code=_MULTI, type_label="多选",
+                note=f"人工列（{hint}），机器不读不写；建成空的多选，"
+                     "填的时候飞书自动加选项")
+            for name, hint in MAINTENANCE_COLUMNS if name not in (meta or {})]
 
 
 def _readout_problems(meta) -> list[str]:
@@ -432,4 +460,5 @@ def diff(settings: Settings, meta: dict) -> SchemaDiff:
     result.missing_columns.extend(missing)
     result.wrong_types.extend(wrong_types)
     result.wrong_formulas.extend(wrong_formulas)
+    result.missing_columns.extend(_maintenance_missing(meta))
     return result
