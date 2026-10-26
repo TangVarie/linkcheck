@@ -138,7 +138,10 @@ class BuildResult:
             parts.append(f"{len(self.skipped_options)} 处缺选项**没动**（见下）")
         if self.failures:
             parts.append(f"{len(self.failures)} 处失败")
-        return "；".join(parts) or "没有要做的"
+        # 「没有要做的」要说清**查了哪些列**：以前只说这一句，运营以为表里该有的
+        # 都齐了——其实投流维护三列那时根本不在核对范围里（2026-10-26）。
+        return "；".join(parts) or (
+            "没有要做的：巡查要用的列、截图读数四列、投流维护三列都已经在表里了")
 
 
 def build_missing(table: feishu.Bitable, diff: schema.SchemaDiff, *,

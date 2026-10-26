@@ -375,6 +375,12 @@ class TestFullTemplate(unittest.TestCase):
         for column in built:
             self.assertEqual(column.body(), {"field_name": column.name, "type": 4})
 
+    def test_nothing_to_do_says_what_was_checked(self):
+        """只说「没有要做的」会让人以为该有的都齐了。要说清核对的是哪几组列。"""
+        text = provision.BuildResult().summary()
+        for group in ("巡查", "截图读数", "投流维护"):
+            self.assertIn(group, text)
+
     def test_only_presence_is_checked(self):
         """人工列：类型、选项都不管——运营哪天把「维护时间」改成日期也不算问题。"""
         meta = full_meta(self.settings)
