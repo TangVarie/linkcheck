@@ -25,6 +25,10 @@ def full_meta(settings=None, drop=(), retype=None, drop_options=None):
         meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
         if column.formula:
             meta[column.name]["formula"] = column.formula
+    # 投流维护三列同理（人工列，体检看它们在不在）。
+    for name, _hint in schema.MAINTENANCE_COLUMNS:
+        if name not in drop:
+            meta[name] = {"type": 4, "ui_type": "", "options": []}
     for name, code in (retype or {}).items():
         meta[name]["type"] = code
     for name, keep in (drop_options or {}).items():
@@ -279,9 +283,13 @@ class TestCreateMonitoredTable(unittest.TestCase):
                                                template="monitor")
         self.assertEqual(got["target"], "bascnNEW:tblNEW")
         fields = workspace.create_table.call_args[0][2]
-        # 巡查列 + 「数据整理」一次带上；三个拆数公式要引用「数据整理」，建完再补。
-        self.assertEqual(len(fields), len(schema.expected_schema(settings)) + 1)
-        self.assertEqual(fields[-1], {"field_name": "数据整理", "type": 1})
+        # 巡查列 + 「数据整理」+ 投流维护三列一次带上；三个拆数公式要引用
+        # 「数据整理」，建完再补。
+        self.assertEqual(len(fields), len(schema.expected_schema(settings)) + 1
+                         + len(schema.MAINTENANCE_COLUMNS))
+        self.assertIn({"field_name": "数据整理", "type": 1}, fields)
+        self.assertEqual([f["field_name"] for f in fields[-3:]],
+                         ["维护情况", "维护时间", "维护效果"])
         deferred = [c[0][2]["field_name"] for c in workspace.create_field.call_args_list]
         self.assertEqual(deferred, ["曝光量", "阅读量", "互动数"])
         self.assertEqual(got["columns"], len(fields) + len(deferred))
@@ -353,17 +361,40 @@ class TestFullTemplate(unittest.TestCase):
         for body in self.fields[start:start + 3]:
             self.assertEqual(body, {"field_name": body["field_name"], "type": 4})
 
-    def test_the_promotion_columns_are_not_required(self):
-        """它们只进默认模板：只建必备列的模板不带，体检也不因为缺它们报问题
-        （机器不读不写，接管已有表时「补齐缺的列」不补）。"""
+    def test_a_table_without_the_promotion_columns_is_told_and_can_be_fixed(self):
+        """2026-10-26 运营反馈：新加进来的老表缺这三列，体检一个字都没说。
+        现在缺了就报、「补齐缺的列」能建（空的多选），不改巡查。"""
+        names = ("维护情况", "维护时间", "维护效果")
+        meta = full_meta(self.settings, drop=names)
+        problems = " ".join(schema.schema_problems(self.settings, meta))
+        for name in names:
+            self.assertIn(name, problems)
+        self.assertIn("巡查不受影响", problems)
+        built = schema.diff(self.settings, meta).missing_columns
+        self.assertEqual([c.name for c in built], list(names))
+        for column in built:
+            self.assertEqual(column.body(), {"field_name": column.name, "type": 4})
+
+    def test_nothing_to_do_says_what_was_checked(self):
+        """只说「没有要做的」会让人以为该有的都齐了。要说清核对的是哪几组列。"""
+        text = provision.BuildResult().summary()
+        for group in ("巡查", "截图读数", "投流维护"):
+            self.assertIn(group, text)
+
+    def test_only_presence_is_checked(self):
+        """人工列：类型、选项都不管——运营哪天把「维护时间」改成日期也不算问题。"""
+        meta = full_meta(self.settings)
+        meta["维护时间"] = {"type": 5, "ui_type": "", "options": None}
+        self.assertEqual(schema.schema_problems(self.settings, meta), [])
+        self.assertTrue(schema.diff(self.settings, meta).clean)
+
+    def test_the_minimal_template_builds_them_too(self):
+        """自己建的表要过得了自己的体检。"""
         made = provision.create_monitored_table(
             fake_workspace(), self.settings, "只巡查", template="monitor",
             log=lambda *a: None)
         for name in ("维护情况", "维护时间", "维护效果"):
-            self.assertNotIn(name, made["built"])
-        meta = full_meta(self.settings)
-        self.assertEqual(schema.schema_problems(self.settings, meta), [])
-        self.assertTrue(schema.diff(self.settings, meta).clean)
+            self.assertIn(name, made["built"])
 
     def test_columns_follow_the_xiwu_table_in_order(self):
         """顺序也要一样：运营看惯了那个顺序，机器列全堆到末尾反而要重新找。

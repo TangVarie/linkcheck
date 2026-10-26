@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import cli
-from xhsearch import feishu, readout, runner
+from xhsearch import feishu, readout, runner, schema
 from xhsearch.config import Settings
 
 
@@ -674,6 +674,8 @@ class TestSchemaProblems(unittest.TestCase):
         # 截图读数四列每张表都必须有（见 xhsearch/readout.py）。
         for column in readout.COLUMNS:
             meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
+        for name, _hint in schema.MAINTENANCE_COLUMNS:
+            meta[name] = {"type": 4, "ui_type": "", "options": []}
         return meta
 
     def test_healthy_table_has_no_problems(self):

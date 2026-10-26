@@ -138,7 +138,10 @@ class BuildResult:
             parts.append(f"{len(self.skipped_options)} 处缺选项**没动**（见下）")
         if self.failures:
             parts.append(f"{len(self.failures)} 处失败")
-        return "；".join(parts) or "没有要做的"
+        # 「没有要做的」要说清**查了哪些列**：以前只说这一句，运营以为表里该有的
+        # 都齐了——其实投流维护三列那时根本不在核对范围里（2026-10-26）。
+        return "；".join(parts) or (
+            "没有要做的：巡查要用的列、截图读数四列、投流维护三列都已经在表里了")
 
 
 def build_missing(table: feishu.Bitable, diff: schema.SchemaDiff, *,
@@ -328,13 +331,11 @@ FULL_LAYOUT: tuple = (
     "collation_status",
     "collation_comments",
     "collation_interactions",
-    # 投流维护三列（2026-10-10 加，西屋表里原来没有）：纯人工，机器不读不写、
-    # 不进体检，接管已有表时「补齐缺的列」也不补。排在截图读数后面，因为
-    # 「维护效果」记的就是投流后 12 小时的曝光增长。三列都建成空的多选，
-    # 和「作者」一样，填的时候飞书自动加选项——选项名由运营自己定。
-    BusinessColumn("维护情况", MULTI),   # 准备投流 / 已投流
-    BusinessColumn("维护时间", MULTI),   # 投流的时间
-    BusinessColumn("维护效果", MULTI),   # 投流后 12h 的曝光量增长情况
+    # 投流维护三列（2026-10-10 加，西屋表里原来没有）：纯人工，机器不读不写；
+    # 列名在 schema.MAINTENANCE_COLUMNS，体检看它们在不在、缺了能一键补。排在
+    # 截图读数后面，因为「维护效果」记的就是投流后 12 小时的曝光增长。三列都
+    # 建成空的多选，和「作者」一样，填的时候飞书自动加选项——选项名由运营自己定。
+    *(BusinessColumn(name, MULTI) for name, _hint in schema.MAINTENANCE_COLUMNS),
     # 蓝词三件套现在是巡查列（机器回填新蓝词、翻「是否截图」），类型和选项
     # 以 schema.expected_schema 为准；位置沿用西屋表，「是否截图」插在中间。
     # 「蓝词来源」（2026-10-22 加）紧跟在后面：记每个词出自哪条评论、什么时候。
@@ -384,7 +385,8 @@ def template_fields(settings: Settings, template: str = "full"
                     ) -> tuple[list[dict], list[BusinessColumn], list[str]]:
     """把模板翻译成建表请求：(建表时一次带上的列, 建完再补的列, 没建的列)。
 
-    `monitor` = 只建必备的列：巡查列（顺序按 expected_schema）+ 截图读数四列；
+    `monitor` = 只建必备的列：巡查列（顺序按 expected_schema）+ 截图读数四列
+    + 投流维护三列；
     `full` = 按西屋表的结构连业务列一起建。
     """
     if template not in TEMPLATES:
@@ -398,6 +400,9 @@ def template_fields(settings: Settings, template: str = "full"
                   for name, (allowed, options) in expected.items()]
         fields += [schema.create_field_body(c.name, c.type_code)
                    for c in readout.COLUMNS if not c.formula]
+        # 投流维护三列同理：体检要它们，最小模板就得带上。
+        fields += [schema.create_field_body(name, MULTI)
+                   for name, _hint in schema.MAINTENANCE_COLUMNS]
         deferred = [BusinessColumn(c.name, c.type_code, formula=c.formula)
                     for c in readout.COLUMNS if c.formula]
         return fields, deferred, []

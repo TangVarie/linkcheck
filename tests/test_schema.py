@@ -22,6 +22,9 @@ def healthy_meta(settings=None, drop=(), retype=None, drop_options=None):
         meta[column.name] = {"type": column.type_code, "ui_type": "", "options": None}
         if column.formula:
             meta[column.name]["formula"] = column.formula
+    # 投流维护三列同理（人工列，体检看它们在不在）。
+    for name, _hint in schema.MAINTENANCE_COLUMNS:
+        meta[name] = {"type": 4, "ui_type": "", "options": []}
     for name in drop:
         meta.pop(name, None)
     for name, code in (retype or {}).items():
@@ -126,11 +129,13 @@ class TestDiff(unittest.TestCase):
         settings = Settings()
         d = schema.diff(settings, {})
         self.assertEqual(len(d.missing_columns),
-                         len(schema.expected_schema(settings)) + len(readout.COLUMNS))
+                         len(schema.expected_schema(settings)) + len(readout.COLUMNS)
+                         + len(schema.MAINTENANCE_COLUMNS))
 
     def test_none_meta_does_not_crash(self):
         self.assertEqual(len(schema.diff(Settings(), None).missing_columns),
-                         len(schema.expected_schema(Settings())) + len(readout.COLUMNS))
+                         len(schema.expected_schema(Settings())) + len(readout.COLUMNS)
+                         + len(schema.MAINTENANCE_COLUMNS))
 
 
 class TestScreenshotColumns(unittest.TestCase):
