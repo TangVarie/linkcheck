@@ -136,7 +136,7 @@ class FieldNames:
             self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
             self.eval_baseline_count,     # 评估中的增长判据：拿这一轮和基线比
             self.eval_baseline_time,
-            self.resolved_id,             # 抖音短链展开过就不再展开
+            self.resolved_id,             # 短链展开过就不再展开
             self.collation_source,        # 数据整理：判断有没有新的一份整理
             self.collation_status,        # 没变化就不重写
             self.collation_comments,      # 基线：整理那一刻的评论数

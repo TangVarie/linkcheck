@@ -580,6 +580,30 @@ class TestResolvedId(unittest.TestCase):
         self.assertEqual(row.parsed.content_id, "7123456789012345678")
 
 
+class TestResolvedXhsId(unittest.TestCase):
+    SHORT = "xhslink.cn/o/8BQXAJqCggS"
+    NOTE = "6ad8209b000000003300aac2"
+
+    def test_a_known_note_id_turns_the_row_into_id_form(self):
+        row = Row("r", self.SHORT,
+                  resolved_id_cell=rows.format_resolved_id(self.NOTE, self.SHORT))
+        self.assertEqual(row.parsed.content_id, self.NOTE)
+        calls = rows.plan_calls(row, Settings(), NOW)
+        self.assertEqual(calls[0].arguments["note_id"], self.NOTE)
+        self.assertNotIn("url", calls[0].arguments)
+
+    def test_an_id_of_the_wrong_shape_is_ignored(self):
+        """抖音行里存着十六进制、小红书行里存着纯数字：都不认。"""
+        self.assertIsNone(rows.read_resolved_id(
+            rows.format_resolved_id(self.NOTE, SHORT_DY), SHORT_DY, "douyin"))
+        self.assertIsNone(rows.read_resolved_id(
+            rows.format_resolved_id("7123456789012345678", self.SHORT), self.SHORT, "xhs"))
+
+    def test_douyin_reading_is_unchanged(self):
+        cell = rows.format_resolved_id("7123456789012345678", SHORT_DY)
+        self.assertEqual(rows.read_resolved_id(cell, SHORT_DY), "7123456789012345678")
+
+
 class TestResolvedIdIsRemembered(FailoverTest):
     def row(self, cell=""):
         return Row("dy", f"7.86 复制打开抖音，看看作品 {SHORT_DY}",

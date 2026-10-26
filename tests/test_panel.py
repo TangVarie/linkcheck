@@ -7,6 +7,8 @@
 
 import json
 import re
+import threading
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1182,6 +1184,106 @@ class TestLogFeed(unittest.TestCase):
         lines, error = self._feed(fetch).get()
         self.assertEqual(lines, [])
         self.assertIn("没想到的错", error)
+
+
+class TestSlowFeedDoesNotBlockThePage(unittest.TestCase):
+    """以前日志和余额过期了就在请求里当场去取：面板常常隔几分钟才有人开，
+    于是几乎每次打开都要先等 Railway 和两家余额接口跑完，慢的时候整页超时。"""
+
+    def _feed(self, fetch, ttl=0.0):
+        cfg = config()
+        cfg.railway = FakeRailwayConfig(enabled=True)
+        feed = panel.LogFeed(cfg, ttl, fetch=fetch)
+        feed.STALE_WAIT = 0.05
+        feed.FIRST_WAIT = 0.05
+        return feed
+
+    def test_stale_lines_come_back_without_waiting_for_a_slow_fetch(self):
+        release = threading.Event()
+        state = {"n": 0}
+
+        def fetch(cfg, *, secrets=()):
+            state["n"] += 1
+            if state["n"] > 1:
+                release.wait(5)
+            return [railway.LogLine(message=f"第{state['n']}批")]
+        feed = self._feed(fetch)
+        self.assertEqual([l.message for l in feed.get()[0]], ["第1批"])
+        started = time.monotonic()
+        lines, _ = feed.get()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual([l.message for l in lines], ["第1批"])
+        release.set()
+        lines, _ = feed.get(force=True)
+        self.assertEqual([l.message for l in lines], ["第2批"])
+
+    def test_simultaneous_page_loads_share_one_fetch(self):
+        release = threading.Event()
+        calls = []
+
+        def fetch(cfg, *, secrets=()):
+            calls.append(1)
+            release.wait(5)
+            return []
+        feed = self._feed(fetch)
+        threads = [threading.Thread(target=feed.get) for _ in range(5)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(2)
+        release.set()
+        feed.get(force=True)
+        # 五个同时打开的页面只打了一次上游；最后那次 force 是第二次。
+        self.assertLessEqual(len(calls), 2)
+
+    def test_a_slow_first_load_says_it_is_loading(self):
+        release = threading.Event()
+
+        def fetch(cfg, *, secrets=()):
+            release.wait(5)
+            return [railway.LogLine(message="到了")]
+        feed = self._feed(fetch, ttl=999)
+        started = time.monotonic()
+        lines, message = feed.get()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(lines, [])
+        self.assertIn("正在", message)
+        release.set()
+        self.assertEqual([l.message for l in feed.get(force=True)[0]], ["到了"])
+
+    def test_prime_fetches_in_the_background(self):
+        got = threading.Event()
+
+        def fetch(cfg, *, secrets=()):
+            got.set()
+            return [railway.LogLine(message="预取")]
+        feed = self._feed(fetch, ttl=999)
+        feed.prime()
+        self.assertTrue(got.wait(2))
+        feed.FIRST_WAIT = 2.0
+        self.assertEqual([l.message for l in feed.get()[0]], ["预取"])
+
+
+class TestLoadingIsNotAFailure(unittest.TestCase):
+    def test_loading_reads_as_a_note_not_a_failure(self):
+        html = panel_view._runs_section([], panel_view.Loading("正在从 Railway 读取运行记录"), 8)
+        self.assertIn("正在从 Railway 读取运行记录", html)
+        self.assertNotIn("失败", html)
+        self.assertNotIn("RUN_LOG_JSON", html)
+
+    def test_a_real_error_still_says_failed(self):
+        html = panel_view._runs_section([], "Railway 限流了（429）", 8)
+        self.assertIn("取 Railway 日志失败", html)
+
+    def test_the_feed_hands_back_a_loading_marker(self):
+        release = threading.Event()
+        cfg = config()
+        cfg.railway = FakeRailwayConfig(enabled=True)
+        feed = panel.LogFeed(cfg, 999, fetch=lambda *a, **k: release.wait(5) and [])
+        feed.FIRST_WAIT = 0.05
+        _lines, message = feed.get()
+        release.set()
+        self.assertIsInstance(message, panel_view.Loading)
 
 
 class TestSecretsList(unittest.TestCase):

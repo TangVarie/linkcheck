@@ -1,4 +1,12 @@
-"""抖音短链展开：v.douyin.com/xxx → aweme_id。**不花钱**，只跟一次 302。
+"""短链展开：v.douyin.com/xxx → aweme_id，xhslink.cn/o/xxx → 笔记 ID。
+**不花钱**，只跟一次 302。
+
+小红书为什么也要（2026-10）：TikHub 的小红书端点吃分享链接（share_text），
+但那样是**它自己**去跟短链——这一步时好时坏：同一条 App 里能正常打开、
+之前也刷成功过的短链，有几轮被它回 HTTP 400「请求失败，请重试……本次请求
+不会被扣费」，行就成了「刷新失败」。我们自己先跟这一跳（实测一跳就落到
+`www.xiaohongshu.com/discovery/item/<笔记ID>?…`），把笔记 ID 交给 TikHub，
+就和贴了完整链接的那些行走同一条路。下面说的是抖音，道理和护栏两边一样。
 
 为什么需要它：TikHub 的抖音端点只收数字 aweme_id，不收链接；运营从 App 里
 复制出来的分享文案却几乎全是 v.douyin.com 短链。没有这一步，表里的抖音行
@@ -47,9 +55,10 @@ _HEADERS = {
 
 @dataclass(frozen=True)
 class Expansion:
-    """一次展开的结果。aweme_id 为 None 时 reason 说清为什么。"""
+    """一次展开的结果。content_id 为 None 时 reason 说清为什么。"""
 
-    aweme_id: Optional[str]
+    # 抖音是 aweme_id，小红书是笔记 ID。
+    content_id: Optional[str]
     reason: str = ""
     # 实际发出的 HTTP 请求数。免费，但要如实计入 MAX_CALLS_PER_RUN——
     # 那道闸记的是「发出去的请求」，不是「花了钱的请求」。
@@ -59,10 +68,42 @@ class Expansion:
 
     @property
     def ok(self) -> bool:
-        return bool(self.aweme_id)
+        return bool(self.content_id)
+
+    @property
+    def aweme_id(self) -> Optional[str]:
+        """旧名字（只有抖音那会儿叫这个），tools/probe_channel.py 还在用。"""
+        return self.content_id
 
 
 Fetch = Callable[[str, dict[str, str], float], transport.Response]
+
+
+@dataclass(frozen=True)
+class _Platform:
+    name: str
+    ours: Callable[[str], bool]
+    id_in_url: Callable[[str], Optional[str]]
+
+
+_DOUYIN = _Platform("抖音", links.is_douyin_url, links.douyin_id_in_url)
+_XHS = _Platform("小红书", links.is_xhs_url, links.xhs_id_in_url)
+
+
+def _with_scheme(url: str) -> str:
+    """表里常有不带 https:// 的链接（`xhslink.cn/o/abc`）。不补的话 urlsplit
+    取不到 hostname，域名校验一律判「不是我们的」，一跳都不会跟。"""
+    if url and "://" not in url:
+        return "https://" + url.lstrip("/")
+    return url
+
+
+def expand(url: str, *, fetch: Optional[Fetch] = None,
+           timeout: float = TIMEOUT_SECONDS, max_hops: int = MAX_HOPS) -> Expansion:
+    """按域名认平台再展开。两边都不是：不发请求，返回失败。"""
+    current = _with_scheme((url or "").strip())
+    platform = _XHS if links.is_xhs_url(current) else _DOUYIN
+    return _expand(url, platform, fetch=fetch, timeout=timeout, max_hops=max_hops)
 
 
 def expand_douyin(url: str, *, fetch: Optional[Fetch] = None,
@@ -71,16 +112,28 @@ def expand_douyin(url: str, *, fetch: Optional[Fetch] = None,
 
     fetch 默认是 transport.get_no_redirect；测试注入替身。
     """
+    return _expand(url, _DOUYIN, fetch=fetch, timeout=timeout, max_hops=max_hops)
+
+
+def expand_xhs(url: str, *, fetch: Optional[Fetch] = None,
+               timeout: float = TIMEOUT_SECONDS, max_hops: int = MAX_HOPS) -> Expansion:
+    """把一条小红书链接展开到能抠出笔记 ID 为止。和 expand_douyin 同一套规矩。"""
+    return _expand(url, _XHS, fetch=fetch, timeout=timeout, max_hops=max_hops)
+
+
+def _expand(url: str, platform: _Platform, *, fetch: Optional[Fetch],
+            timeout: float, max_hops: int) -> Expansion:
     get = fetch or transport.get_no_redirect
     current = (url or "").strip()
     if not current:
         return Expansion(None, "空链接")
     # 链接本身已经带 ID：不发请求。调用方一般不会走到这里，但别为此发一次网络。
-    found = links.douyin_id_in_url(current)
+    found = platform.id_in_url(current)
     if found:
         return Expansion(found, final_url=current)
-    if not links.is_douyin_url(current):
-        return Expansion(None, f"不是抖音域名，不展开：{current[:120]}")
+    current = _with_scheme(current)
+    if not platform.ours(current):
+        return Expansion(None, f"不是{platform.name}域名，不展开：{current[:120]}")
 
     made = 0
     for _ in range(max(1, max_hops)):
@@ -96,12 +149,12 @@ def expand_douyin(url: str, *, fetch: Optional[Fetch] = None,
                 requests=made, final_url=current,
             )
         target = urllib.parse.urljoin(current, response.location)
-        if not links.is_douyin_url(target):
-            # 跳出了抖音域名：不跟。既是安全边界（不敲陌生主机），也是
+        if not platform.ours(target):
+            # 跳出了自家域名：不跟。既是安全边界（不敲陌生主机），也是
             # 业务信号（正常的分享链接不会跳去别处）。
-            return Expansion(None, f"短链跳到了非抖音域名，不跟：{target[:120]}",
+            return Expansion(None, f"短链跳到了非{platform.name}域名，不跟：{target[:120]}",
                              requests=made, final_url=target)
-        found = links.douyin_id_in_url(target)
+        found = platform.id_in_url(target)
         if found:
             return Expansion(found, requests=made, final_url=target)
         current = target
@@ -140,7 +193,7 @@ class Resolver:
         if self._deadline is not None and time.monotonic() >= self._deadline:
             return Expansion(None, "已到软截止，未展开短链")
         try:
-            result = expand_douyin(key, fetch=self._fetch, timeout=self._timeout)
+            result = expand(key, fetch=self._fetch, timeout=self._timeout)
         except Exception as exc:  # noqa: BLE001 —— 免费的辅助步骤绝不能把一行变成「内部错误」
             result = Expansion(None, f"短链展开异常：{type(exc).__name__}: {exc}"[:200])
         with self._lock:

@@ -85,6 +85,62 @@ class TestExpand(unittest.TestCase):
         self.assertEqual(fetch.urls, [])
 
 
+XHS_SHORT = "xhslink.cn/o/8BQXAJqCggS"     # 表里的原样：不带 https://
+XHS_LANDING = ("https://www.xiaohongshu.com/discovery/item/6ad8209b000000003300aac2"
+               "?app_platform=ios&xsec_source=app_share&type=normal&xsec_token=x")
+
+
+class TestExpandXhs(unittest.TestCase):
+    """2026-10：TikHub 自己跟小红书短链时好时坏，同一条能打开的短链被回 400。
+    我们先免费跟这一跳，把笔记 ID 交给它。"""
+
+    def test_bare_short_link_is_followed_to_the_note_id(self):
+        fetch = _Fetch(redirect(XHS_LANDING))
+        result = shortlink.expand_xhs(XHS_SHORT, fetch=fetch)
+        self.assertEqual(result.content_id, "6ad8209b000000003300aac2")
+        self.assertEqual(fetch.urls, ["https://" + XHS_SHORT])
+        self.assertEqual(result.requests, 1)
+
+    def test_expand_picks_the_platform_from_the_host(self):
+        fetch = _Fetch(redirect(XHS_LANDING))
+        self.assertEqual(shortlink.expand(XHS_SHORT, fetch=fetch).content_id,
+                         "6ad8209b000000003300aac2")
+        fetch = _Fetch(redirect(LANDING))
+        self.assertEqual(shortlink.expand(SHORT, fetch=fetch).content_id,
+                         "7123456789012345678")
+
+    def test_a_redirect_off_xiaohongshu_is_not_followed(self):
+        fetch = _Fetch(redirect("https://evil.example/discovery/item/6ad8209b000000003300aac2"))
+        result = shortlink.expand_xhs(XHS_SHORT, fetch=fetch)
+        self.assertFalse(result.ok)
+        self.assertIn("非小红书域名", result.reason)
+        self.assertEqual(len(fetch.urls), 1)
+
+    def test_a_long_link_with_the_id_sends_nothing(self):
+        fetch = _Fetch()
+        result = shortlink.expand_xhs(XHS_LANDING, fetch=fetch)
+        self.assertEqual(result.content_id, "6ad8209b000000003300aac2")
+        self.assertEqual(fetch.urls, [])
+
+    def test_bare_douyin_short_link_is_followed_too(self):
+        """以前不带 https:// 的抖音短链取不到 hostname，一律判「不是抖音域名」。"""
+        fetch = _Fetch(redirect(LANDING))
+        result = shortlink.expand_douyin("v.douyin.com/iRxYzAb/", fetch=fetch)
+        self.assertEqual(result.content_id, "7123456789012345678")
+        self.assertEqual(fetch.urls, ["https://v.douyin.com/iRxYzAb/"])
+
+    def test_old_name_still_reads(self):
+        fetch = _Fetch(redirect(LANDING))
+        self.assertEqual(shortlink.expand_douyin(SHORT, fetch=fetch).aweme_id,
+                         "7123456789012345678")
+
+    def test_resolver_handles_xiaohongshu(self):
+        fetch = _Fetch(redirect(XHS_LANDING))
+        resolver = shortlink.Resolver(fetch=fetch)
+        self.assertEqual(resolver.resolve(XHS_SHORT).content_id, "6ad8209b000000003300aac2")
+        self.assertEqual(resolver.resolve(XHS_SHORT).requests, 0)
+
+
 class TestExpandFailsCleanly(unittest.TestCase):
     """展开是免费的辅助步骤：失败不抛异常、说清原因，让调用方按原路走。"""
 
