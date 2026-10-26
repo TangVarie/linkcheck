@@ -754,15 +754,26 @@ def _call(
     return last
 
 
-def _expansion_changes_routing(call: ToolCall, keys: dict[str, str], settings: Settings,
-                               disabled: set[str]) -> bool:
-    """把这条链接换成 ID，会不会让某家**此刻可用**的通道从「不能接」变成「能接」。
+def _worth_expanding(call: ToolCall, keys: dict[str, str], settings: Settings,
+                     disabled: set[str]) -> bool:
+    """要不要先花时间（不花钱）把这条短链展开成 ID。
 
-    这是「要不要花时间展开短链」的唯一判据。展开本身不花钱，但每一行都是
-    一次真实的网络往返；只配 SocialDataX 的部署（它直接吃短链）做这一步
-    等于每行白等几百毫秒，还多一个可能出错的环节。
+    展开本身不花钱，但每一行都是一次真实的网络往返；只配 SocialDataX 的部署
+    （它直接吃短链）做这一步等于每行白等几百毫秒，还多一个可能出错的环节。
+
+    * 抖音：换成 ID 会不会让某家**此刻可用**的通道从「不能接」变成「能接」
+      （TikHub 的抖音端点只吃 aweme_id）。
+    * 小红书：TikHub 此刻可用就展开。它吃分享链接，但那样是它自己去跟短链，
+      这一步时好时坏——同一条能打开的短链有几轮被它回 400（见 shortlink.py）。
+      换成笔记 ID 就和贴了完整链接的行走同一条路。
     """
-    if call.platform != "douyin" or call.arguments.get("aweme_id") or not call.arguments.get("url"):
+    args = call.arguments
+    if args.get("aweme_id") or args.get("note_id") or not args.get("url"):
+        return False
+    if call.platform == "xhs":
+        return providers.TIKHUB in providers.usable_order(
+            settings.channels, call.platform, keys, disabled)
+    if call.platform != "douyin":
         return False
     as_id = id_form(call.arguments, "0")
     for name in providers.usable_order(settings.channels, call.platform, keys, disabled):
@@ -802,23 +813,25 @@ def _fetch_one(
         return _Fetched(error=protocol.Err(
             protocol.Failure.UNKNOWN, "bad_link", row.parsed.describe_failure()))
 
-    # —— 抖音短链 → aweme_id（免费）——
-    # 只在「换成 ID 会改变走哪家」时才做：有一家可用通道吃 ID 不吃链接
-    # （TikHub）。只配 SocialDataX 的部署它本来就吃短链，多发一次请求
-    # 纯属浪费；TikHub 本轮已被判死时同理。
+    # —— 短链 → ID（免费）——
+    # 抖音只在「换成 ID 会改变走哪家」时才做：有一家可用通道吃 ID 不吃链接
+    # （TikHub）。小红书在 TikHub 可用时做（它自己跟短链时好时坏）。
+    # 只配 SocialDataX 的部署本来就吃短链，多发一次请求纯属浪费；TikHub
+    # 本轮已被判死时同理。见 _worth_expanding。
     # 「作品ID」里已经记着这条链接的 ID 时，row.parsed 本来就是 ID 形态，
     # 走不到这里。
     expand_failure = ""
     expand_requests = 0
     expanded_id = expanded_url = ""
-    if resolver is not None and _expansion_changes_routing(calls[0], keys, settings, disabled):
+    if resolver is not None and _worth_expanding(calls[0], keys, settings, disabled):
         url = calls[0].arguments.get("url", "")
         expansion = resolver.resolve(url)
         expand_requests = expansion.requests
         if expansion.ok:
-            calls = [ToolCall(c.platform, c.purpose, id_form(c.arguments, expansion.aweme_id))
+            calls = [ToolCall(c.platform, c.purpose,
+                              id_form(c.arguments, expansion.content_id, c.platform))
                      for c in calls]
-            expanded_id, expanded_url = expansion.aweme_id, url
+            expanded_id, expanded_url = expansion.content_id, url
         else:
             expand_failure = expansion.reason
 
@@ -951,10 +964,10 @@ def _fetch_calls(
                 # 就是拿一次上游抖动去杀一条好帖子。
                 out.snapshot = None
                 return done(result)
-            if result.code == "unsupported_link" and expand_failure:
-                # 只配 TikHub、短链又展不开：把展开失败的原因带给运营——
-                # 「不支持这种链接形态」本身没说清为什么这一次连免费的
-                # 那一步都没走通（短链过期？落地页改版？网络？）。
+            if expand_failure and result.code not in ("deadline",):
+                # 短链展不开、请求又失败了：把展开失败的原因带给运营——
+                # 「不支持这种链接形态」或 TikHub 的 400 本身没说清为什么这一次
+                # 连免费的那一步都没走通（短链过期？落地页改版？网络？）。
                 result.message += f"；曾尝试展开短链但失败：{expand_failure}"
             # 评论接口失败 = 这一行的结论；detail 失败只是少几个数字，
             # 已经拿到的评论数据仍然有效，不该整行判死。

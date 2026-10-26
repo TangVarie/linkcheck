@@ -49,11 +49,15 @@ class ToolCall:
     arguments: dict[str, Any]
 
 
-# 「作品ID」那一格的写法：`7584415807459888384 ← https://v.douyin.com/abc/`。
+# 「作品ID」那一格的写法：`7584415807459888384 ← https://v.douyin.com/abc/`
+# （小红书：`6ad8209b000000003300aac2 ← xhslink.cn/o/8BQXAJqCggS`）。
 # 箭头右边是**当时展开的那条短链**：运营哪天把「反馈链接」换成另一条，
 # 两边对不上，这一格就自动作废、下一轮重新展开——存下来的 ID 永远只替
 # 它自己那条链接说话。
-_RESOLVED_RE = re.compile(r"^\s*(\d{6,})\s*←\s*(\S+)\s*$")
+_RESOLVED_RE = re.compile(r"^\s*([0-9a-f]{24}|\d{6,})\s*←\s*(\S+)\s*$", re.I)
+# 存下来的 ID 也要像这个平台的 ID：抖音是一串数字，小红书是 24 位十六进制。
+_RESOLVED_SHAPE = {"douyin": re.compile(r"^\d{6,}$"),
+                   "xhs": re.compile(r"^[0-9a-f]{24}$", re.I)}
 
 
 def format_resolved_id(aweme_id: str, url: str) -> str:
@@ -61,14 +65,19 @@ def format_resolved_id(aweme_id: str, url: str) -> str:
     return f"{aweme_id} ← {url}"
 
 
-def read_resolved_id(cell: str, url: Optional[str]) -> Optional[str]:
-    """「作品ID」那一格存的 ID，**仅当它是从这条链接展开出来的**。"""
+def read_resolved_id(cell: str, url: Optional[str],
+                     platform: str = "douyin") -> Optional[str]:
+    """「作品ID」那一格存的 ID，**仅当它是从这条链接展开出来的**、而且长得像
+    这个平台的 ID。"""
     if not cell or not url:
         return None
     found = _RESOLVED_RE.match(cell)
     if not found:
         return None
     if found.group(2).rstrip("/") != url.strip().rstrip("/"):
+        return None
+    shape = _RESOLVED_SHAPE.get(platform)
+    if shape is None or not shape.match(found.group(1)):
         return None
     return found.group(1)
 
@@ -156,10 +165,10 @@ class Row:
         """
         if self._parsed is None:
             link = parse(self.link_cell)
-            if link.platform == "douyin" and not link.content_id:
-                known = read_resolved_id(self.resolved_id_cell, link.url)
+            if link.platform in ("douyin", "xhs") and not link.content_id:
+                known = read_resolved_id(self.resolved_id_cell, link.url, link.platform)
                 if known:
-                    link = ParsedLink("douyin", known, None, link.raw)
+                    link = ParsedLink(link.platform, known, None, link.raw)
             self._parsed = link
         return self._parsed
 
@@ -468,14 +477,17 @@ def share_key(calls: list[ToolCall]) -> tuple:
                  for c in calls)
 
 
-def id_form(arguments: dict[str, Any], aweme_id: str) -> dict[str, Any]:
-    """把一条抖音调用的参数从「链接形态」改写成「ID 形态」。
+def id_form(arguments: dict[str, Any], content_id: str,
+            platform: str = "douyin") -> dict[str, Any]:
+    """把一条调用的参数从「链接形态」改写成「ID 形态」。
 
-    短链展开成功后用它改写整行的调用计划：去掉 url、放进 aweme_id，
-    其余参数（sort 等）原样保留。两家 provider 的 build 都先看 aweme_id。
+    短链展开成功后用它改写整行的调用计划：去掉 url、放进 aweme_id（抖音）
+    或 note_id（小红书），其余参数（sort 等）原样保留。改写完和贴了完整链接
+    的行一模一样（plan_calls 给那种行的也只有 ID）。两家 provider 的 build
+    都先看 ID。
     """
     args = {k: v for k, v in arguments.items() if k != "url"}
-    args["aweme_id"] = aweme_id
+    args["note_id" if platform == "xhs" else "aweme_id"] = content_id
     return args
 
 

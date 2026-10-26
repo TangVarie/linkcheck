@@ -196,6 +196,16 @@ def is_douyin_url(url: str) -> bool:
     return _host_matches(url, DOUYIN_DOMAINS)
 
 
+def is_xhs_url(url: str) -> bool:
+    """这个 URL 的 hostname 是不是小红书自家域名（或其子域）。用途同 is_douyin_url。"""
+    return _host_matches(url, XHS_DOMAINS)
+
+
+def xhs_id_in_url(url: str) -> Optional[str]:
+    """从一条小红书 URL 里抠笔记 ID；抠不出返回 None。和 parse() 用同一组正则。"""
+    return _match_id(url or "", _XHS_ID_PATTERNS)
+
+
 def douyin_id_in_url(url: str) -> Optional[str]:
     """从一条抖音 URL 里抠 aweme_id；抠不出返回 None。
 

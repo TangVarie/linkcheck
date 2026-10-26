@@ -443,6 +443,83 @@ def tikhub_douyin(i) -> transport.Response:
             "statistics": {"digg_count": 10, "comment_count": 5}}}}), "th-dy2")
 
 
+XHS_SHORT = "xhslink.cn/o/8BQXAJqCggS"
+XHS_NOTE = "6ad8209b000000003300aac2"
+
+
+def xhs_expand_ok(url, headers, timeout=10.0) -> transport.Response:
+    return transport.Response(
+        302, "text/html", "",
+        location=f"https://www.xiaohongshu.com/discovery/item/{XHS_NOTE}?xsec_token=x")
+
+
+class TestXhsShortLinkExpansion(FailoverTest):
+    """2026-10：sportsix 等表里几条小红书短链（App 里能打开、之前也刷成功过）
+    有几轮被 TikHub 回 400「请求失败，请重试……本次请求不会被扣费」。
+    那是 TikHub 自己跟短链（share_text）那一步失败了。现在我们先免费展开，
+    把笔记 ID 交给它，和贴了完整链接的行走同一条路。"""
+
+    def _row(self, cell=""):
+        return Row(record_id="xhs-short", link_cell=XHS_SHORT, resolved_id_cell=cell,
+                   publish_time_ms=int((NOW - timedelta(days=1)).timestamp() * 1000))
+
+    def test_short_link_goes_to_tikhub_as_a_note_id(self):
+        report = self.run_with(
+            on_get=lambda i: [tikhub_ok_comments(), tikhub_ok_detail()][i],
+            on_post=lambda i: self.fail("不该降级"),
+            on_expand=xhs_expand_ok, rows=[self._row()])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(self.expand_calls, ["https://" + XHS_SHORT])
+        for url in self.get_calls:
+            self.assertIn(f"note_id={XHS_NOTE}", url)
+            self.assertNotIn("share_text", url)
+        f = self.settings.fields
+        self.assertEqual(report.outcomes[0].fields[f.resolved_id], f"{XHS_NOTE} ← {XHS_SHORT}")
+
+    def test_next_round_does_not_expand_again(self):
+        report = self.run_with(
+            on_get=lambda i: [tikhub_ok_comments(), tikhub_ok_detail()][i],
+            on_post=lambda i: self.fail("不该降级"),
+            on_expand=lambda *a: self.fail("记过 ID 就不该再展开"),
+            rows=[self._row(f"{XHS_NOTE} ← {XHS_SHORT}")])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertIn(f"note_id={XHS_NOTE}", self.get_calls[0])
+
+    def test_failed_expansion_falls_back_to_share_text_as_before(self):
+        report = self.run_with(
+            on_get=lambda i: [tikhub_ok_comments(), tikhub_ok_detail()][i],
+            on_post=lambda i: self.fail("不该降级"),
+            rows=[self._row()])
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertIn("share_text=", self.get_calls[0])
+        self.assertEqual(report.short_links_failed, 1)
+
+    def test_a_400_after_a_failed_expansion_says_both(self):
+        report = self.run_with(
+            on_get=lambda i: tikhub_err(400, "请求失败，请重试。本次请求不会被扣费。"),
+            on_post=lambda i: self.fail("400 不该换通道"),
+            rows=[self._row()], keys={"tikhub": "t-key"})
+        reason = report.outcomes[0].fields[self.settings.fields.failure_reason]
+        self.assertIn("请求失败", reason)
+        self.assertIn("曾尝试展开短链但失败", reason)
+
+    def test_socialdatax_only_deployment_never_expands(self):
+        report = self.run_with(
+            on_get=lambda i: self.fail("没配 TikHub 的 key"),
+            on_post=lambda i: [sdx_ok_comments(), sdx_ok_detail()][i],
+            on_expand=lambda *a: self.fail("只配 SDX 时不该展开短链"),
+            rows=[self._row()], keys={"socialdatax": "s-key"})
+        self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
+        self.assertEqual(self.expand_calls, [])
+
+    def test_long_links_are_never_expanded(self):
+        self.run_with(
+            on_get=lambda i: [tikhub_ok_comments(), tikhub_ok_detail()][i],
+            on_post=lambda i: self.fail("不该降级"),
+            on_expand=lambda *a: self.fail("完整链接本来就有 ID"))
+        self.assertEqual(self.expand_calls, [])
+
+
 class TestDouyinShortLinkExpansion(FailoverTest):
     """抖音短链开跑时先免费展开成 aweme_id，再挑通道。
 
