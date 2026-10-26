@@ -775,6 +775,52 @@ class TestRiskDetection(unittest.TestCase):
         self.assertIn("疑似限流", tags_)
         self.assertNotIn("风控中", tags_)
 
+    def test_a_tracked_drop_records_the_count_before_it(self):
+        v = self.decide(40, previous_comment_count=100, throttle_tracked=True)
+        self.assertIn("疑似限流", v.tags)
+        self.assertEqual(v.throttle_baseline, 100)
+        self.assertTrue(any("回到 80 条以上" in n for n in v.notes))
+
+    def test_without_the_column_nothing_is_tracked(self):
+        v = self.decide(40, previous_comment_count=100)
+        self.assertIn("疑似限流", v.tags)
+        self.assertIsNone(v.throttle_baseline)
+        self.assertFalse(v.retract)
+
+    def test_recovered_comments_take_the_tag_off(self):
+        """2026-10-26 运营定：评论数恢复之后机器摘「疑似限流」；风控中照旧人摘。"""
+        v = self.decide(85, previous_comment_count=60, throttle_tracked=True,
+                        current_tags=["疑似限流", "风控中", "爆贴"], throttle_baseline=100)
+        self.assertEqual(v.retract, {"疑似限流"})
+        self.assertEqual(v.throttle_baseline, 0)
+        self.assertNotIn("风控中", v.retract)
+        self.assertTrue(any("摘掉「疑似限流」" in n for n in v.notes))
+
+    def test_not_yet_recovered_keeps_it(self):
+        v = self.decide(70, previous_comment_count=60, throttle_tracked=True,
+                        current_tags=["疑似限流"], throttle_baseline=100)
+        self.assertFalse(v.retract)
+        self.assertIsNone(v.throttle_baseline)
+
+    def test_a_hand_set_tag_without_a_baseline_is_left_alone(self):
+        """人手打的（或这一列建之前打的）：机器不知道回到多少算恢复，照旧人摘。"""
+        for baseline in (None, 0):
+            v = self.decide(500, previous_comment_count=480, throttle_tracked=True,
+                            current_tags=["疑似限流"], throttle_baseline=baseline)
+            self.assertFalse(v.retract)
+
+    def test_a_deeper_drop_keeps_the_first_baseline(self):
+        v = self.decide(15, previous_comment_count=40, throttle_tracked=True,
+                        current_tags=["疑似限流"], throttle_baseline=100)
+        self.assertIsNone(v.throttle_baseline)       # 不改：恢复看的还是 100
+        self.assertTrue(any("回到 80 条以上" in n for n in v.notes))
+
+    def test_a_tag_removed_by_hand_stops_the_tracking(self):
+        v = self.decide(30, previous_comment_count=30, throttle_tracked=True,
+                        current_tags=["评估中"], throttle_baseline=100)
+        self.assertEqual(v.throttle_baseline, 0)
+        self.assertFalse(v.retract)
+
     def test_small_baseline_drop_is_noise(self):
         tags_ = self.decide(2, previous_comment_count=8).tags
         self.assertNotIn("疑似限流", tags_)
@@ -909,9 +955,20 @@ class TestRiskDetection(unittest.TestCase):
                            age_hours=10, current_tags=["疑似限流"])
         self.assertIn("疑似限流", v.tags)
 
-    def test_gone_maps_to_risk_only(self):
-        """链接失效 = 风控中的另一种硬证据；「已失效」标签已退役。"""
-        self.assertEqual(analyze.gone_verdict(self.settings).tags, {"风控中"})
+    def test_gone_maps_to_link_dead_not_risk(self):
+        """2026-10-26 运营定：链接失效打「链接失效」，不再打「风控中」——下游参考库
+        把带「风控中」的一律当风控处理，爆过又被删的帖会被撤出参考库。"""
+        self.assertEqual(analyze.gone_verdict(self.settings).tags, {"链接失效"})
+
+    def test_link_dead_comes_off_when_the_link_works_again(self):
+        """「链接失效」是机器的结论：链接又取得到了，机器自己摘；「风控中」照旧不摘。"""
+        from xhsearch import tags as tags_mod
+        t = self.settings.tags
+        merged = tags_mod.merge(["链接失效", "风控中", "爆贴"], {"爆贴"}, t.namespace(),
+                                sticky=t.sticky())
+        self.assertNotIn("链接失效", merged.final)
+        self.assertIn("风控中", merged.final)
+        self.assertIn("链接失效", t.machine_written())
 
     def test_a_clear_jump_is_a_surge(self):
         """起量是掉量的镜像：涨幅够 + 增量够，两个闸门都过才算。"""
@@ -1728,11 +1785,11 @@ class TestGoneKeepsHeatHistory(unittest.TestCase):
     def test_gone_verdict_preserves_the_tier(self):
         settings = Settings()
         verdict = analyze.gone_verdict(settings, "已删除", current_tags=["大爆", "已复盘"])
-        self.assertEqual(verdict.tags, {"风控中", "大爆"})
+        self.assertEqual(verdict.tags, {"链接失效", "大爆"})
 
     def test_gone_verdict_without_history_stays_minimal(self):
         settings = Settings()
-        self.assertEqual(analyze.gone_verdict(settings).tags, {"风控中"})
+        self.assertEqual(analyze.gone_verdict(settings).tags, {"链接失效"})
 
 
 class TestMergeWithMissingOptions(unittest.TestCase):
@@ -2038,6 +2095,17 @@ class TestEvalGrowth(unittest.TestCase):
         self.assertFalse(v.eval_baseline_reset)
         self.assertEqual(self.heat(v), {"评估中"})
 
+    def test_never_flop_before_48h_even_if_eval_start_is_set_lower(self):
+        """运营：不到 48 小时不要往下调到无水花。EVAL_START_HOURS 能配到 1，
+        单靠它挡不住，冷启动窗口（flop_hours）也要满。"""
+        settings = Settings()
+        settings.thresholds.eval_start_hours = 12
+        v = self.decide(31, age=40, base=30, hours_ago=26, settings=settings)
+        self.assertEqual(self.heat(v), {"评估中"})
+        self.assertFalse(v.eval_baseline_reset)
+        v = self.decide(31, age=50, base=30, hours_ago=26, settings=settings)
+        self.assertEqual(self.heat(v), {"无水花"})
+
     def test_gain_of_9_in_24h_is_a_flop(self):
         v = self.decide(39, base=30)
         self.assertEqual(self.heat(v), {"无水花"})
@@ -2206,12 +2274,23 @@ class TestBlueWordExcludes(unittest.TestCase):
     def test_english_terms_match_whole_words_ignoring_case(self):
         self.assertEqual(analyze.excluded_by("sis黑胶", ["sis"]), "sis")
         self.assertEqual(analyze.excluded_by("SiS 能量胶", ["sis"]), "sis")
-        self.assertEqual(analyze.excluded_by("Maurten320", ["maurten"]), None,
-                         "后面挨着数字就不是整词")
         self.assertEqual(analyze.excluded_by("maurten 320", ["MAURTEN"]), "MAURTEN")
         self.assertIsNone(analyze.excluded_by("analysis", ["sis"]))
         self.assertIsNone(analyze.excluded_by("careplus", ["are"]))
         self.assertIsNone(analyze.excluded_by("OliveYoung", ["live"]))
+
+    def test_a_model_number_right_after_the_name_is_still_excluded(self):
+        """2026-10-26 运营定：「Maurten320」「sis2」也排掉。"""
+        self.assertEqual(analyze.excluded_by("Maurten320", ["maurten"]), "maurten")
+        self.assertEqual(analyze.excluded_by("sis2", ["sis"]), "sis")
+        self.assertEqual(analyze.excluded_by("UCAN能量粉", ["ucan"]), "ucan")
+        # 前面挨着字母照旧不算：analysis 不是 sis，basis2 也不是。
+        self.assertIsNone(analyze.excluded_by("basis2", ["sis"]))
+        # 型号后面再接数字就是另一个型号了，不排。
+        self.assertIsNone(analyze.excluded_by("C3000", ["C300"]))
+        self.assertEqual(analyze.excluded_by("C300按摩椅", ["C300"]), "C300")
+        # 后面接字母仍然不算（sister 不是 sis）。
+        self.assertIsNone(analyze.excluded_by("sister", ["sis"]))
 
     def test_mixed_terms_match_as_substrings_ignoring_case(self):
         self.assertEqual(analyze.excluded_by("西屋911gt按摩椅", ["西屋911GT"]), "西屋911GT")

@@ -364,6 +364,11 @@ def build_settings() -> Settings:
     settings.thresholds.eval_window_hours = _numeric_env(
         "EVAL_WINDOW_HOURS", int, settings.thresholds.eval_window_hours,
         minimum=1, maximum=24 * 30)
+    # 机器打的「疑似限流」，评论数回到掉量前的多少算恢复（见 config.Thresholds）。
+    # 下限 0.5：再低就和「掉了一半判限流」那条线重叠，刚打上下一轮就摘。
+    settings.thresholds.throttle_recovery_ratio = _numeric_env(
+        "THROTTLE_RECOVERY_RATIO", float, settings.thresholds.throttle_recovery_ratio,
+        minimum=0.5, maximum=1.0)
 
     # —— 单轮硬预算（0 = 不限）——
     settings.budget = Budget(
@@ -720,6 +725,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
 
     collation_ready = _collation_ready(settings, known_fields)
     eval_unready = _eval_unready(settings, fields_meta)
+    throttle_ready = _throttle_ready(settings, fields_meta)
     report = runner.refresh(
         row_list, api_keys, settings,
         now=now,
@@ -732,6 +738,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                                                     settings.fields.collation_status),
         collation_ready=collation_ready,
         eval_unready=eval_unready,
+        throttle_ready=throttle_ready,
         forced=(record_ids is not None),
         progress=print,
         deadline=deadline,
@@ -785,6 +792,20 @@ def _eval_unready(settings: Settings, fields_meta: dict | None) -> str:
     print(f"ℹ 「评估中 → 无水花」的增长判断没开：{reason}。"
           "面板上点这张表的「补齐缺的列」建上，下一轮就开始记基线")
     return reason
+
+
+def _throttle_ready(settings: Settings, fields_meta: dict | None) -> bool:
+    """「限流前评论数」能不能写。不能写就不跟：机器打的「疑似限流」照旧只能人摘。"""
+    name = settings.fields.throttle_baseline
+    if fields_meta is None:
+        return False
+    info = fields_meta.get(name)
+    if info is not None and info.get("type") == 2:
+        return True
+    why = "表里没建" if info is None else "不是数字列"
+    print(f"ℹ 「疑似限流」恢复后自动摘没开：「{name}」{why}。"
+          "面板上点这张表的「补齐缺的列」建上，之后新打的疑似限流就会跟")
+    return False
 
 
 def _waste_report(rows: list, settings: Settings, now: datetime) -> list[str]:

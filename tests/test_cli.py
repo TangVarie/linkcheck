@@ -186,7 +186,8 @@ class TestNumericEnvBounds(unittest.TestCase):
         for name in ("MAX_CONCURRENCY", "SOFT_DEADLINE_SECONDS", "DETAIL_WITHIN_DAYS",
                      "MAX_RECORDS_PER_RUN", "TIKHUB_BASE", "CHANNEL_ORDER",
                      "DISPLAY_UTC_OFFSET", "TAG_OBSERVING", "EVAL_MIN_GAIN",
-                     "EVAL_START_HOURS", "EVAL_WINDOW_HOURS", "DUE_SLACK_MINUTES"):
+                     "EVAL_START_HOURS", "EVAL_WINDOW_HOURS", "DUE_SLACK_MINUTES",
+                     "THROTTLE_RECOVERY_RATIO"):
             self._saved[name] = os.environ.pop(name, None)
 
     def tearDown(self):
@@ -217,6 +218,20 @@ class TestNumericEnvBounds(unittest.TestCase):
         for name in ("EVAL_MIN_GAIN", "EVAL_START_HOURS", "EVAL_WINDOW_HOURS"):
             with self.subTest(name=name), self.assertRaises(SystemExit):
                 self._settings_with(**{name: "0"})
+
+    def test_throttle_recovery_ratio(self):
+        settings = self._settings_with(THROTTLE_RECOVERY_RATIO="0.9")
+        self.assertEqual(settings.thresholds.throttle_recovery_ratio, 0.9)
+        for value in ("0.4", "1.1"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self._settings_with(THROTTLE_RECOVERY_RATIO=value)
+
+    def test_throttle_tracking_needs_a_number_column(self):
+        f = Settings().fields
+        with mock.patch("builtins.print"):
+            self.assertTrue(cli._throttle_ready(Settings(), {f.throttle_baseline: {"type": 2}}))
+            self.assertFalse(cli._throttle_ready(Settings(), {f.throttle_baseline: {"type": 1}}))
+            self.assertFalse(cli._throttle_ready(Settings(), {}))
 
     def test_due_slack_minutes(self):
         self.assertEqual(self._settings_with(DUE_SLACK_MINUTES="30").refresh.due_slack_minutes, 30)

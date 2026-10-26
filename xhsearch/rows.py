@@ -115,6 +115,8 @@ class Row:
     # 「置顶状态」单选的现值：上一轮是 置顶成功/置顶掉了、这一轮没置顶
     # → 置顶掉了；否则 → 无置顶。「掉了」和「从来没有」的区分全靠它。
     pin_status: str = ""
+    # 「评论状态」现值：手填的（不是机器那两个值）不覆盖。
+    comment_status: str = ""
     # 「起量时间」那一格的现值。None = 还没起过量，这一轮判起量就写；
     # 有值 = 已经记过第一次，之后再猛的一轮也不覆盖它。
     surge_time_ms: Optional[int] = None
@@ -134,6 +136,8 @@ class Row:
     # （见 analyze._eval_growth）。两格都有才算有基线。
     eval_baseline_count: Optional[int] = None
     eval_baseline_ms: Optional[int] = None
+    # 「限流前评论数」那一格（0 / 空 = 没有在跟的掉量），见 Fields.throttle_baseline。
+    throttle_baseline: Optional[int] = None
     # 「巡查状态」的现值。选行只用它认一种情况：熔断记过一次失败的行
     # （刷新失败 + 连续失败次数 ≥ 1），要在 breaker_recheck_hours 之后提前复查，
     # 而不是等分层间隔、也不是排队勾一在就每 5 分钟重刷。

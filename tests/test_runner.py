@@ -369,7 +369,8 @@ class TestDeadPostDetection(RunnerTest):
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_GONE)
         final = outcome.fields[self.settings.fields.traffic_status]
-        self.assertIn("风控中", final)     # 链接失效 = 风控中的硬证据
+        self.assertIn("链接失效", final)   # 2026-10-26 起不再打「风控中」
+        self.assertNotIn("风控中", final)
         self.assertNotIn("已失效", final)  # 该标签已退役，不再产出
         self.assertIn("已复盘", final)     # 人工标签照样保住
         self.assertIn("未找到对应内容", outcome.fields[self.settings.fields.failure_reason])
@@ -380,7 +381,8 @@ class TestDeadPostDetection(RunnerTest):
         report = self.run_with([err(200, 1008, "当前作品已删除。")], [xhs_row()])
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_GONE)
-        self.assertIn("风控中", outcome.fields[self.settings.fields.traffic_status])
+        self.assertIn("链接失效", outcome.fields[self.settings.fields.traffic_status])
+        self.assertNotIn("风控中", outcome.fields[self.settings.fields.traffic_status])
 
     def test_surface_unavailable_is_not_treated_as_dead(self):
         """1007「页面暂时不可访问」是瞬时故障，不是内容没了。
@@ -434,7 +436,8 @@ class TestCircuitBreaker(RunnerTest):
         self.assertEqual(report.breaker_attempted, 0, "第二次看的行不进熔断样本")
         for outcome in report.outcomes:
             self.assertEqual(outcome.status, runner.STATUS_GONE)
-            self.assertIn("风控中", outcome.fields[self.settings.fields.traffic_status])
+            self.assertIn("链接失效", outcome.fields[self.settings.fields.traffic_status])
+            self.assertNotIn("风控中", outcome.fields[self.settings.fields.traffic_status])
             self.assertEqual(outcome.fields[self.settings.fields.consecutive_failures], 2)
 
     def test_first_look_rows_are_still_protected_when_mixed_with_second_looks(self):
@@ -631,6 +634,23 @@ class TestPinnedTracking(RunnerTest):
         fields = self._run(True, self._row(keywords=["艾时达口溶膜"])).outcomes[0].fields
         self.assertEqual(fields[self.settings.fields.comment_status],
                          self.settings.comment_status.not_displayed)
+
+    def test_a_hand_filled_comment_status_is_not_overwritten(self):
+        """2026-10-26 运营定：只覆盖机器自己写的那两个值。手填的「改评发布 /
+        二次评论 / 改评显示」原样保留，诊断信息说一声这一轮判出来是什么。"""
+        f = self.settings.fields
+        row = self._row(keywords=["好用"])
+        row.comment_status = "改评发布"
+        fields = self._run(True, row).outcomes[0].fields
+        self.assertNotIn(f.comment_status, fields)
+        self.assertIn("手填的「改评发布」，不覆盖", fields[f.failure_reason])
+
+    def test_the_machines_own_values_are_still_updated(self):
+        row = self._row(keywords=["好用"])
+        row.comment_status = self.settings.comment_status.not_displayed
+        fields = self._run(True, row).outcomes[0].fields
+        self.assertEqual(fields[self.settings.fields.comment_status],
+                         self.settings.comment_status.displayed)
 
     def test_no_keywords_leaves_comment_status_alone(self):
         """没填关键词的行判不了「显示没显示」，这一列绝不能碰。"""
@@ -1134,6 +1154,42 @@ class TestBlueWordChannel(RunnerTest):
         self.assertNotIn(self.settings.fields.blue_word_sources, report.outcomes[0].fields)
 
 
+class TestThrottleRecoveryWriteBack(RunnerTest):
+    """「疑似限流」恢复后机器自己摘：落表时摘掉标签、「限流前评论数」写回 0；
+    写回前重读现值的那一步（_reconcile_tags）也得认这一轮的「摘」。"""
+
+    def _row(self, *, baseline=100, tags=("疑似限流", "爆贴")):
+        row = xhs_row(age_days=3, tags=list(tags))
+        row.previous_comment_count = 60
+        row.throttle_baseline = baseline
+        return row
+
+    def _run(self, row, count, **kwargs):
+        page = sse(comment_page(count=count, pinned=False))
+        detail = sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})
+        return self.run_with([page, detail], [row], **kwargs).outcomes[0]
+
+    def test_recovered_row_loses_the_tag_and_resets_the_column(self):
+        f = self.settings.fields
+        outcome = self._run(self._row(), 90, throttle_ready=True)
+        self.assertEqual(outcome.fields[f.traffic_status], ["爆贴"])
+        self.assertEqual(outcome.fields[f.throttle_baseline], 0)
+        self.assertNotIn("疑似限流", outcome.tag_plan.sticky)
+
+    def test_without_the_column_the_tag_stays(self):
+        f = self.settings.fields
+        outcome = self._run(self._row(), 90)
+        self.assertNotIn(f.traffic_status, outcome.fields)
+        self.assertNotIn(f.throttle_baseline, outcome.fields)
+
+    def test_a_drop_writes_the_count_before_it(self):
+        f = self.settings.fields
+        row = self._row(baseline=None, tags=("爆贴",))
+        outcome = self._run(row, 20, throttle_ready=True)
+        self.assertIn("疑似限流", outcome.fields[f.traffic_status])
+        self.assertEqual(outcome.fields[f.throttle_baseline], 60)
+
+
 class TestEvalBaselineWriteBack(RunnerTest):
     """评估中的增长判据落表：基线两列只在量到评论数的轮次写，时刻就是「最近检查时间」。"""
 
@@ -1569,7 +1625,8 @@ class TestRateLimitThenGone(RunnerTest):
             report = runner.refresh([xhs_row()], "fake-key", self.settings, now=NOW)
         outcome = report.outcomes[0]
         self.assertEqual(outcome.status, runner.STATUS_GONE)
-        self.assertIn("风控中", outcome.fields[self.settings.fields.traffic_status])
+        self.assertIn("链接失效", outcome.fields[self.settings.fields.traffic_status])
+        self.assertNotIn("风控中", outcome.fields[self.settings.fields.traffic_status])
 
 
 class TestUnknownCommentCount(RunnerTest):
@@ -1918,7 +1975,8 @@ class TestBreakerLeavesAFootprint(RunnerTest):
         for outcome in report.outcomes:
             self.assertEqual(outcome.status, runner.STATUS_GONE)
             self.assertIs(outcome.fields[f.queued], False)
-            self.assertIn("风控中", outcome.fields[f.traffic_status])
+            self.assertIn("链接失效", outcome.fields[f.traffic_status])
+            self.assertNotIn("风控中", outcome.fields[f.traffic_status])
 
     def test_recovery_on_the_second_look_clears_the_strike(self):
         """上游真只是抖了一下：第二次取到了，计数清零，排队勾清掉，一切照常。"""

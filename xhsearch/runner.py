@@ -1017,6 +1017,7 @@ def refresh(
     collation_status_options: Optional[list[str]] = None,
     collation_ready: bool = False,
     eval_unready: str = "",
+    throttle_ready: bool = False,
     forced: bool = False,
     timeout: float = 30.0,
     progress: Optional[Callable[[str], None]] = None,
@@ -1057,6 +1058,9 @@ def refresh(
     eval_unready 非空 = 「评估基线评论数 / 时间」两列不能用（没建、建错类型），
     评估中的增长判据整个跳过，这句话写进走到这条判断的行的诊断信息。
     两列都得能写：只写得进一格的话，基线每轮重记、永远判不出来。
+
+    throttle_ready = 表里有能写的「限流前评论数」。没有就不跟：机器打的
+    「疑似限流」照旧只能人摘（见 analyze.decide）。
 
     now 是**开跑那一刻**，用于筛行（到期、冷却）和算发布时长——整轮一个值，
     行与行之间的判定口径才一致。clock 是**当下**，只用来给每一行盖
@@ -1140,13 +1144,15 @@ def refresh(
         landed_tier: Optional[str] = None
 
         if touch_tags:
+            # sticky 标签机器不摘，除非这一轮的结论明说要摘（恢复了的疑似限流）。
+            sticky = [t for t in settings.tags.sticky() if t not in verdict.retract]
             merged = tags.merge(
                 row.current_tags,
                 verdict.tags,
                 settings.tags.namespace(),
                 known_options=known_options,
                 exclusive=(settings.tags.heat_tiers(),),
-                sticky=settings.tags.sticky(),
+                sticky=sticky,
             )
             # 记下重算所需的材料：写回前会拿**那一刻**的现值再 merge 一次，
             # 这样运行期间运营新加的人工标签不会被旧快照算出的整列值覆盖。
@@ -1157,7 +1163,7 @@ def refresh(
                 known_options=None if known_options is None else list(known_options),
                 exclusive=(tuple(settings.tags.heat_tiers()),),
                 snapshot_tags=list(row.current_tags or []),
-                sticky=list(settings.tags.sticky()),
+                sticky=sticky,
             )
             if merged.dropped_unknown:
                 fields[f.failure_reason] = (
@@ -1189,6 +1195,17 @@ def refresh(
             ):
                 if value is None:
                     continue
+                if column == f.comment_status:
+                    current = (row.comment_status or "").strip()
+                    if current and current not in settings.comment_status.machine_written():
+                        # 手填的值（改评发布 / 二次评论 / 改评显示……）不覆盖。
+                        if current != value:
+                            fields[f.failure_reason] = (
+                                fields[f.failure_reason]
+                                + f"；「{column}」是手填的「{current}」，不覆盖"
+                                f"（本轮判定：{value}）"
+                            )[:500]
+                        continue
                 if options is not None and value not in options:
                     fields[f.failure_reason] = (
                         fields[f.failure_reason]
@@ -1217,6 +1234,8 @@ def refresh(
             if verdict.eval_baseline_reset and snapshot.comment_count is not None:
                 fields[f.eval_baseline_count] = snapshot.comment_count
                 fields[f.eval_baseline_time] = int(checked_at.timestamp() * 1000)
+            if verdict.throttle_baseline is not None and touch_tags:
+                fields[f.throttle_baseline] = verdict.throttle_baseline
             if verdict.surged and row.surge_time_ms is None:
                 fields[f.surge_time] = int(checked_at.timestamp() * 1000)
                 # 补一句「这是第一次」，把这一轮和后面几波区分开。
@@ -1505,6 +1524,8 @@ def refresh(
             eval_baseline_at=_ms_to_utc(row.eval_baseline_ms),
             now=now,
             eval_unready=eval_unready,
+            throttle_baseline=row.throttle_baseline,          # 疑似限流恢复了没有
+            throttle_tracked=throttle_ready,
         )
         if row.publish_time_inferred(now):
             # 刷新节奏是从链接 ID 推出来的：说一声，免得运营以为「发布时间」那一格
@@ -1892,6 +1913,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         last_updated_ms=feishu.read_timestamp_ms(cells.get(f.last_updated)),
         consecutive_failures=feishu.read_int(cells.get(f.consecutive_failures)) or 0,
         pin_status=feishu.read_text(cells.get(f.pinned_status)),
+        comment_status=feishu.read_text(cells.get(f.comment_status)),
         surge_time_ms=feishu.read_timestamp_ms(cells.get(f.surge_time)),
         queued=feishu.read_bool(cells.get(f.queued)),
         refresh_status=feishu.read_text(cells.get(f.refresh_status)),
@@ -1899,6 +1921,7 @@ def row_from_record(record: dict[str, Any], settings: Settings) -> Row:
         blue_word_sources=feishu.read_text(cells.get(f.blue_word_sources)),
         eval_baseline_count=feishu.read_int(cells.get(f.eval_baseline_count)),
         eval_baseline_ms=feishu.read_timestamp_ms(cells.get(f.eval_baseline_time)),
+        throttle_baseline=feishu.read_int(cells.get(f.throttle_baseline)),
         # 这一列不在时按「在管」算：定点读（batch_get）和老快照都可能没有它，
         # 而默认 False 会让日志把一整批正常的行说成「没开巡查」。
         monitoring=(feishu.read_bool(cells.get(f.monitoring))

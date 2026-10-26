@@ -58,6 +58,10 @@ class FieldNames:
     # 轮次也会推进那一格，拿它当基线时刻会把窗口算短。
     eval_baseline_count: str = "评估基线评论数"
     eval_baseline_time: str = "评估基线时间"
+    # 机器打「疑似限流」那一刻，掉量**之前**的评论数（2026-10-26 加）。评论数回到
+    # 它的 Thresholds.throttle_recovery_ratio 以上，机器自己摘「疑似限流」、这一格
+    # 写回 0。「上次评论数」每轮都推进，代替不了它。0 / 空 = 没有在跟的一次掉量。
+    throttle_baseline: str = "限流前评论数"
     # 「点赞数 / 上次点赞数 / 收藏数 / 上次收藏数」四列已经去掉了。
     # 小红书的赞藏只能从 detail 接口拿（评论接口不带），而 detail 占了
     # 月成本的 39%——运营确认这两个数字不看，那就没有理由继续为它付费。
@@ -65,9 +69,10 @@ class FieldNames:
     pinned_status: str = "置顶状态"           # 单选：置顶成功/置顶掉了/无置顶。
                                               # 自家帖子置顶必为我方，只记状态不记内容；
                                               # 抖音接口没有置顶字段，抖音行不写
-    comment_status: str = "评论状态"          # 单选，由关键词命中驱动直接覆盖：
+    comment_status: str = "评论状态"          # 单选，由关键词命中驱动：
                                               # 命中=显示评论，未命中=没有显示；
-                                              # 没填关键词的行不碰
+                                              # 没填关键词的行不碰。只写空格子和
+                                              # 自己写过的那两个值，手填的不覆盖
     comment_digest: str = "评论区快照"        # 命中的那条评论排最前并带「命中」标记，
                                               # 其余按 置顶优先 接在后面
     negative_status: str = "负面状态"         # 单选，由「负面词」命中驱动直接覆盖：
@@ -133,9 +138,11 @@ class FieldNames:
             self.blue_words,              # 回填蓝词要先知道表里已有哪些（只提醒新词）
             self.blue_word_sources,       # 复扫的账本：在哪一档扫过（只扫爆贴/大爆各一次）
             self.pinned_status,           # 「掉了」和「从来没有」的区分全看这列的历史
+            self.comment_status,          # 手填的值（改评发布等）不覆盖，得先知道现值
             self.surge_time,              # 已经写过就不再改，得先知道那一格空不空
             self.eval_baseline_count,     # 评估中的增长判据：拿这一轮和基线比
             self.eval_baseline_time,
+            self.throttle_baseline,       # 疑似限流恢复了没有：拿这一轮和掉量前比
             self.resolved_id,             # 短链展开过就不再展开
             self.collation_source,        # 数据整理：判断有没有新的一份整理
             self.collation_status,        # 没变化就不重写
@@ -162,13 +169,19 @@ class Tags:
     到点之后它会自动升成「无水花」或更高档，不需要任何人去清。
     留空值（`TAG_OBSERVING=`）可以关掉这一档，行为退回从前。
 
-    风控中只认两种**硬证据**：上游返回了审查/受限标记，或链接已失效
-    （两击定罪之后）。评论数的异常都不进风控——腰斩是 疑似限流，
-    起不来是 无水花，口径分开，运营才知道每个标签背后是什么证据。
+    风控中只认**硬证据**：上游返回了审查/受限标记。评论数的异常都不进风控——
+    腰斩是 疑似限流，起不来是 无水花，口径分开，运营才知道每个标签背后是什么证据。
+
+    链接失效（两击定罪之后）打它自己的「链接失效」（2026-10-26 运营定）：以前打
+    「风控中」，而下游参考库把带「风控中」的帖子一律当风控处理，一条爆过、后来
+    被删的帖会因此被撤出参考库。「链接失效」是机器的结论，链接又取得到了，
+    下一轮机器自己摘掉（可撤回，不在 sticky 里）。
 
     **机器只加不减（2026-09-15，Ziao 拍板）**：风控中 / 疑似限流 一旦在行上，
     机器永远不摘——运营人工判定的风控（比如「仅作者可见」这种机器抓不到的），
     不能被下一轮的「无水花」覆盖掉。摘标签是人的事。
+    唯一的例外（2026-10-26 运营定）：机器自己因为评论数腰斩打的「疑似限流」，
+    评论数回到限流前的水平之后机器自己摘（见 analyze.decide 和「限流前评论数」）。
     可撤回的只剩热度档位（含退役的旧档位名）：「观察中」升成「无水花」、
     「爆贴」升成「大爆」时低档让位，那是同一把尺子上的刻度往上走，不是撤回
     一个结论。见 sticky() / retractable()。
@@ -181,6 +194,7 @@ class Tags:
     super_hot: str = "大爆"
     risk: str = "风控中"
     throttled: str = "疑似限流"
+    link_dead: str = "链接失效"
 
     # 已退役的机器标签：不再产出，但仍算机器管辖——留在 namespace 里，
     # 旧行上残留的「已失效」才会在下一轮被自动摘掉（失效现在并入「风控中」）。
@@ -201,7 +215,8 @@ class Tags:
 
         可撤回的只是其中的热度档位（见 retractable / sticky）。
         """
-        return [*self.heat_tiers(), self.risk, self.throttled, *self.retired]
+        return [*self.heat_tiers(), self.risk, self.throttled,
+                *([self.link_dead] if self.link_dead else []), *self.retired]
 
     def retractable(self) -> list[str]:
         """机器可以摘掉的标签：热度档位（升档时低档让位）和退役的旧名字
@@ -218,7 +233,8 @@ class Tags:
 
     def machine_written(self) -> list[str]:
         """机器仍会写的标签。doctor 只要求表里建这些选项，退役的不用建。"""
-        return [*self.heat_tiers(), self.risk, self.throttled]
+        return [*self.heat_tiers(), self.risk, self.throttled,
+                *([self.link_dead] if self.link_dead else [])]
 
     def rank(self, tag: str) -> int:
         """热度档位的高低。不是热度标签返回 -1。"""
@@ -235,8 +251,9 @@ class Tags:
 class CommentStatus:
     """「评论状态」单选列的取值：我们的种子评论有没有显示出来。
 
-    判定完全由「评论关键词」的命中结果驱动，机器**直接覆盖**当前值
-    （单选只显示当前状态，「待评论」这类人工排期旧值一律被结论覆盖）：
+    判定完全由「评论关键词」的命中结果驱动。**只写空格子和机器自己写过的
+    那两个值**（2026-10-26 运营定）：手填的「改评发布 / 二次评论 / 改评显示」
+    这类值原样保留，以前会被下一轮的结论冲掉：
 
         显示评论  —— 任一关键词出现在第一页任一条评论里
         没有显示  —— 配了关键词，但第一页一条都没命中
@@ -386,6 +403,10 @@ class Thresholds:
     risk_drop_ratio: float = 0.5
     # 上次评论数低于这个值时不做掉量判定——从 3 掉到 1 没有意义。
     risk_drop_min_baseline: int = 20
+    # 机器打的「疑似限流」，评论数回到掉量前（「限流前评论数」）的这个比例以上
+    # 就算恢复、机器自己摘（2026-10-26 运营定「评论数恢复之后机器删除」）。
+    # 不要求回到 100%：运营控评本来就会删几条。环境变量 THROTTLE_RECOVERY_RATIO。
+    throttle_recovery_ratio: float = 0.8
 
     # —— 起量：掉量那一对的镜像，两个闸门都要过 ——
     # 涨幅比例够 + 绝对增量够，才算「这一轮起来了」，时刻写进「起量时间」。
