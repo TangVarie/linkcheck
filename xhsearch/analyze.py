@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -79,8 +80,8 @@ class Snapshot:
 
     # 上游自己给的审核/封禁标记（小红书 in_censor、抖音 is_prohibited/in_reviewing）。
     # 只有 TikHub 通道拿得到，SocialDataX 那边没有这个字段，所以永远可能是 None。
-    # 运营定的口径：它返回 True 就打「风控中」——风控中只认两种硬证据
-    # （审查标记、链接失效），评论数异常一律走 疑似限流 / 无水花，不进风控。
+    # 运营定的口径：它返回 True 就打「风控中」——风控中只认这一种硬证据
+    # （链接失效另打「链接失效」），评论数异常一律走 疑似限流 / 无水花，不进风控。
     # 字段语义还没在真实被封的帖子上验过（只见过 false），所以打标签的同时
     # 仍在诊断信息里请人工确认，见 docs/待验证清单.md。
     censored: Optional[bool] = None
@@ -411,9 +412,12 @@ def excluded_by(word: str, excludes) -> Optional[str]:
 
     * 带中文（或任何非 ASCII 字符）的按**子串**、不分大小写：「奥佳华」排得掉
       「奥佳华7598vpro」；
-    * 纯英文 / 数字的按**整词**、不分大小写，前后挨着的不能是字母或数字：
+    * 纯英文 / 数字的按**整词**、不分大小写，前面挨着的不能是字母或数字：
       「sis」排得掉「sis黑胶」「SiS 能量胶」，排不掉「analysis」。英文按子串
       会误伤——这正是不拿每行的「负面词」来排的原因（careplus 里有 are）。
+      以字母结尾的词后面**紧跟型号数字也算**（2026-10-26 运营定）：「Maurten」
+      排得掉「Maurten320」，「sis」排得掉「sis2」；以数字结尾的（「C300」）
+      后面再接数字就是另一个型号了（「C3000」），不排。
 
     不到 2 个字的排除词不生效（registry.read_blue_word_excludes 已经报过）。
     """
@@ -422,7 +426,8 @@ def excluded_by(word: str, excludes) -> Optional[str]:
         if len(term) < 2:
             continue
         if term.isascii():
-            pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
+            after = "[A-Za-z]" if term[-1].isalpha() else "[A-Za-z0-9]"
+            pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?!{after})"
             if re.search(pattern, word, re.IGNORECASE):
                 return term
         elif term.casefold() in word.casefold():
@@ -752,6 +757,12 @@ class Verdict:
     # 「评估中」增长判据：这一轮要不要把（本轮评论数, 本轮时刻）记成新基线——
     # 第一次进入判断、或者这个窗口涨够了。写不写由 runner 定（两列在不在）。
     eval_baseline_reset: bool = False
+    # 这一轮要从行上**摘掉**的 sticky 标签。sticky 的意思是「机器不摘」，唯一的
+    # 例外是机器自己打的「疑似限流」评论数恢复了（2026-10-26 运营定）。
+    retract: set[str] = field(default_factory=set)
+    # 「限流前评论数」要写成什么：None = 不动；正数 = 这次掉量之前的评论数；
+    # 0 = 不再跟了（恢复了，或者人已经把标签摘了）。
+    throttle_baseline: Optional[int] = None
 
 
 def held_tier(current_tags: Optional[list[str]], settings: Settings) -> Optional[str]:
@@ -790,7 +801,10 @@ def _eval_growth(verdict: Verdict, settings: Settings, *, count: int,
     """
     t = settings.tags
     th = settings.thresholds
-    in_eval = (age_hours is not None and age_hours >= th.eval_start_hours
+    # 不满冷启动窗口（flop_hours，默认 48 小时）绝不往下判无水花（2026-10-26
+    # 运营再次确认）。EVAL_START_HOURS 最低能配到 1，单靠它挡不住。
+    in_eval = (age_hours is not None
+               and age_hours >= max(th.eval_start_hours, th.flop_hours)
                and count < th.tier_hot
                and (count_tier == t.evaluating or held == t.evaluating)
                and held != t.flop
@@ -837,6 +851,8 @@ def decide(
     eval_baseline_at: Optional[datetime] = None,
     now: Optional[datetime] = None,
     eval_unready: str = "",
+    throttle_baseline: Optional[int] = None,
+    throttle_tracked: bool = False,
 ) -> Verdict:
     """算出这一行本次应有的机器标签和置顶判定。
 
@@ -846,6 +862,9 @@ def decide(
     eval_baseline_count / eval_baseline_at 是「评估基线评论数 / 时间」那两格，
     now 是这一轮的时刻（窗口满没满拿它比）；eval_unready 非空 = 那两列不能用，
     增长判据整个跳过，这句话就是原因（写进诊断信息）。
+
+    throttle_baseline 是「限流前评论数」那一格；throttle_tracked = 表里有这一列
+    （没有就不跟，机器打的疑似限流照旧只能人摘）。
     """
     t = settings.tags
     th: Thresholds = settings.thresholds
@@ -951,6 +970,8 @@ def decide(
     # —— 掉量：评论被平台悄悄批量删除，往往比笔记整个失效早得多 ——
     # 打「疑似限流」而不是「风控中」：风控中只认硬证据（审查标记、链接失效），
     # 数字异常是软证据，口径分开运营才知道该去查什么。
+    throttled_now = t.throttled in (current_tags or [])
+    following = throttle_baseline if (throttle_baseline or 0) > 0 else None
     if (
         count is not None
         and previous_comment_count is not None
@@ -958,10 +979,31 @@ def decide(
         and count <= previous_comment_count * (1 - th.risk_drop_ratio)
     ):
         verdict.tags.add(t.throttled)
-        verdict.notes.append(
-            f"⚠ 评论数从 {previous_comment_count} 掉到 {count}，"
-            f"跌幅超过 {int(th.risk_drop_ratio * 100)}% → {t.throttled}（也可能是删评/折叠）"
-        )
+        note = (f"⚠ 评论数从 {previous_comment_count} 掉到 {count}，"
+                f"跌幅超过 {int(th.risk_drop_ratio * 100)}% → {t.throttled}（也可能是删评/折叠）")
+        if throttle_tracked:
+            if not throttled_now:
+                # 这一次是机器新打的：记下掉量前的数，恢复了机器自己摘。
+                following = previous_comment_count
+                verdict.throttle_baseline = following
+            # 已经挂着：在跟的（又掉了一截）沿用最早那个数；没在跟的是人手打的、
+            # 或这一列建之前打的——不接手，照旧人摘。
+            if following is not None:
+                note += (f"；评论数回到 {math.ceil(following * th.throttle_recovery_ratio)} 条"
+                         f"以上（掉量前 {following} 条的 {th.throttle_recovery_ratio:.0%}）"
+                         "机器自己摘")
+        verdict.notes.append(note)
+    elif throttle_tracked and following is not None:
+        if not throttled_now:
+            # 人已经把「疑似限流」摘了：这次掉量不用再跟。
+            verdict.throttle_baseline = 0
+        elif count is not None and count >= following * th.throttle_recovery_ratio:
+            # —— 疑似限流恢复：机器自己打的，评论数回来了，机器自己摘 ——
+            # 只摘有「限流前评论数」的：人手打的、或这一列建之前打的，机器不知道
+            # 回到多少才算恢复，照旧人摘。
+            verdict.retract.add(t.throttled)
+            verdict.throttle_baseline = 0
+            verdict.notes.append(f"评论数回到 {count}（掉量前 {following}）→ 摘掉「{t.throttled}」")
 
     # —— 起量：掉量的镜像。这一轮涨得够猛，记下**发现**它的时刻 ——
     # 判据在 Thresholds.surged（两个闸门 + 第一次量到不算）。这里只下结论、
@@ -1095,14 +1137,17 @@ def gone_verdict(settings: Settings, reason: str = "",
                  current_tags: Optional[list[str]] = None) -> Verdict:
     """帖子确认取不到时的结论（已经过两击确认，不是第一次失败就走这里）。
 
-    打「风控中」——链接失效是风控中认可的两种硬证据之一（另一种是上游
-    审查标记）。事实细节（几次没取到、上游原话）在「巡查状态=已失效」
-    和诊断信息里，流量状态这列只留运营真正会去筛的那一个词。
+    打「链接失效」（2026-10-26 运营定，以前打「风控中」——下游参考库把带
+    「风控中」的帖子一律当风控处理，爆过又被删的帖会因此被撤出参考库）。
+    事实细节（几次没取到、上游原话）在「巡查状态=已失效」和诊断信息里，
+    流量状态这列只留运营真正会去筛的那一个词。行上已有的「风控中」不动
+    （sticky，人摘）。链接又取得到时，下一轮机器自己摘掉「链接失效」。
     已有的热度档位原样保留：「爆过就是爆过」的棘轮不因帖子死了而清史——
     一条大爆过的帖子被删，恰恰是最需要留着「大爆」标签供复盘的那种。
     """
     verdict = Verdict()
-    verdict.tags.add(settings.tags.risk)
+    if settings.tags.link_dead:
+        verdict.tags.add(settings.tags.link_dead)
     best = held_tier(current_tags, settings)
     if best:
         verdict.tags.add(best)

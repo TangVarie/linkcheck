@@ -367,6 +367,8 @@ FULL_LAYOUT: tuple = (
     # 评估中增长判据的基线两列（2026-10-22 加，机器写）：系统列，排在最后。
     "eval_baseline_count",
     "eval_baseline_time",
+    # 疑似限流的掉量前评论数（2026-10-26 加，机器写）：同样是系统列。
+    "throttle_baseline",
 )
 
 # 模板里有但刻意不建的列。现在是空的：西屋表的列全部建得出来。

@@ -73,6 +73,9 @@ def expected_schema(settings: Settings) -> list[tuple]:
         (f.eval_baseline_time, (5,), "日期", None,
          "机器写：上面那个基线是什么时候记的。普通日期字段，不能用「最近检查时间」代替——"
          "巡查失败的轮次也会推进那一格"),
+        (f.throttle_baseline, (2,), "数字", None,
+         "机器写：打「疑似限流」时记下掉量前的评论数；评论数回到它的 80% 以上，机器自己"
+         "摘「疑似限流」并把这一格写回 0。没这一列，机器打的疑似限流只能人摘"),
         (f.pinned_status, (3,), "单选", settings.pin_status.machine_written(),
          "机器直接覆盖写入当前状态；抖音行不写这一列"),
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
