@@ -982,12 +982,16 @@ def decide(
         note = (f"⚠ 评论数从 {previous_comment_count} 掉到 {count}，"
                 f"跌幅超过 {int(th.risk_drop_ratio * 100)}% → {t.throttled}（也可能是删评/折叠）")
         if throttle_tracked:
-            # 新的一次掉量记下掉量前的数；已经在跟的（又掉了一截）沿用最早那个。
-            if following is None or not throttled_now:
+            if not throttled_now:
+                # 这一次是机器新打的：记下掉量前的数，恢复了机器自己摘。
                 following = previous_comment_count
                 verdict.throttle_baseline = following
-            note += (f"；评论数回到 {math.ceil(following * th.throttle_recovery_ratio)} 条"
-                     f"以上（掉量前 {following} 条的 {th.throttle_recovery_ratio:.0%}）机器自己摘")
+            # 已经挂着：在跟的（又掉了一截）沿用最早那个数；没在跟的是人手打的、
+            # 或这一列建之前打的——不接手，照旧人摘。
+            if following is not None:
+                note += (f"；评论数回到 {math.ceil(following * th.throttle_recovery_ratio)} 条"
+                         f"以上（掉量前 {following} 条的 {th.throttle_recovery_ratio:.0%}）"
+                         "机器自己摘")
         verdict.notes.append(note)
     elif throttle_tracked and following is not None:
         if not throttled_now:

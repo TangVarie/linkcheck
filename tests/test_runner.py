@@ -1190,6 +1190,65 @@ class TestThrottleRecoveryWriteBack(RunnerTest):
         self.assertEqual(outcome.fields[f.throttle_baseline], 60)
 
 
+class TestThrottleBaselineFollowsTheTag(RunnerTest):
+    """「限流前评论数」跟着标签那一列走：标签没写成，它也不单独写——
+    否则标签还挂着、恢复的依据却清零了，之后再也摘不掉。"""
+
+    class _FakeTable:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.updates = None
+
+        def batch_get(self, record_ids):
+            if self.fail:
+                raise RuntimeError("重读失败")
+            return [{"record_id": rid, "fields": {}} for rid in record_ids]
+
+        def batch_update(self, updates, errors=None):
+            self.updates = updates
+            return len(updates)
+
+    def _recovered(self):
+        row = xhs_row(age_days=3, tags=["疑似限流", "爆贴"])
+        row.previous_comment_count = 60
+        row.throttle_baseline = 100
+        return self.run_with(
+            [sse(comment_page(count=90, pinned=False)),
+             sse({"like_count": 1, "points": {"cost": 10, "balance": 1}})],
+            [row], throttle_ready=True)
+
+    def test_a_failed_reread_keeps_the_baseline_too(self):
+        f = self.settings.fields
+        report = self._recovered()
+        table = self._FakeTable(fail=True)
+        runner.write_back(table, report)
+        written = table.updates[0]["fields"]
+        self.assertNotIn(f.traffic_status, written)
+        self.assertNotIn(f.throttle_baseline, written)
+        self.assertIn(f.refresh_status, written)       # 其余列照常写
+
+    def test_a_mistyped_tag_column_keeps_the_baseline_too(self):
+        f = self.settings.fields
+        report = self._recovered()
+        table = self._FakeTable()
+        report.outcomes[0].tag_plan.snapshot_tags = []      # 跳过重读那一步的短路
+        runner.write_back(table, report, field_types={f.traffic_status: 3,
+                                                      f.throttle_baseline: 2})
+        written = table.updates[0]["fields"]
+        self.assertNotIn(f.traffic_status, written)
+        self.assertNotIn(f.throttle_baseline, written)
+
+    def test_a_clean_write_carries_both(self):
+        f = self.settings.fields
+        report = self._recovered()
+        table = self._FakeTable()
+        report.outcomes[0].tag_plan.snapshot_tags = []
+        runner.write_back(table, report)
+        written = table.updates[0]["fields"]
+        self.assertEqual(written[f.traffic_status], ["爆贴"])
+        self.assertEqual(written[f.throttle_baseline], 0)
+
+
 class TestEvalBaselineWriteBack(RunnerTest):
     """评估中的增长判据落表：基线两列只在量到评论数的轮次写，时刻就是「最近检查时间」。"""
 

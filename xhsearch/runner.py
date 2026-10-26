@@ -59,6 +59,10 @@ class TagPlan:
     snapshot_tags: list[str] = field(default_factory=list)
     # 永远不摘的机器标签（风控中 / 疑似限流），见 config.Tags.sticky。
     sticky: list[str] = field(default_factory=list)
+    # 只有这一列的标签真写进去才该写的列（「限流前评论数」：摘/打疑似限流那一轮）。
+    # 标签那一列没写成（重读失败、类型不对），这些列也不写，下一轮整组重来——
+    # 否则标签还挂着、恢复的依据却清零了，之后再也摘不掉。
+    coupled: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1236,6 +1240,10 @@ def refresh(
                 fields[f.eval_baseline_time] = int(checked_at.timestamp() * 1000)
             if verdict.throttle_baseline is not None and touch_tags:
                 fields[f.throttle_baseline] = verdict.throttle_baseline
+                # 摘（恢复）或新打（记掉量前的数）都是跟着标签那一列走的。
+                if (tag_plan is not None and f.traffic_status in fields
+                        and (verdict.retract or verdict.throttle_baseline > 0)):
+                    tag_plan.coupled = [f.throttle_baseline]
             if verdict.surged and row.surge_time_ms is None:
                 fields[f.surge_time] = int(checked_at.timestamp() * 1000)
                 # 补一句「这是第一次」，把这一轮和后面几波区分开。
@@ -2095,6 +2103,8 @@ def _reconcile_tags(
             "本轮不改这一列，避免覆盖运营刚打的人工标签；下一轮会自动补上")
         for outcome in targets:
             outcome.fields.pop(outcome.tag_plan.field_name, None)
+            for column in outcome.tag_plan.coupled:
+                outcome.fields.pop(column, None)
         return
 
     changed_rows = 0
@@ -2268,6 +2278,8 @@ def write_back(
         fields = o.fields
         if not fields:
             continue
+        plan = o.tag_plan
+        tags_planned = plan is not None and plan.field_name in fields
         if known_fields is not None:
             missing = set(fields) - known_fields
             if missing:
@@ -2281,6 +2293,9 @@ def write_back(
                 if mistyped_fields is not None:
                     mistyped_fields |= bad
                 fields = {k: v for k, v in fields.items() if k not in bad}
+        if tags_planned and plan.field_name not in fields and plan.coupled:
+            # 标签那一列被挡下了：跟着它的列也别单独写（见 TagPlan.coupled）。
+            fields = {k: v for k, v in fields.items() if k not in plan.coupled}
         if fields:
             updates.append({"record_id": o.record_id, "fields": fields})
     return table.batch_update(updates, errors=errors) if updates else 0

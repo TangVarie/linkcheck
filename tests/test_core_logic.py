@@ -809,6 +809,15 @@ class TestRiskDetection(unittest.TestCase):
                             current_tags=["疑似限流"], throttle_baseline=baseline)
             self.assertFalse(v.retract)
 
+    def test_a_new_drop_does_not_take_over_a_hand_set_tag(self):
+        """已经挂着「疑似限流」、却没有掉量前的数（人手打的、或这一列建之前打的）：
+        又掉了一次也不接手——不然之后评论数回来，机器会摘掉一个人打的标签。"""
+        v = self.decide(40, previous_comment_count=100, throttle_tracked=True,
+                        current_tags=["疑似限流"], throttle_baseline=None)
+        self.assertIn("疑似限流", v.tags)
+        self.assertIsNone(v.throttle_baseline)
+        self.assertFalse(any("机器自己摘" in n for n in v.notes))
+
     def test_a_deeper_drop_keeps_the_first_baseline(self):
         v = self.decide(15, previous_comment_count=40, throttle_tracked=True,
                         current_tags=["疑似限流"], throttle_baseline=100)
