@@ -1307,6 +1307,19 @@ _SCRIPT = r"""
     reportFeatures.title = reportCompetitors.title = workProject.value ? "仅保存在此浏览器" : "选择单个项目后补充";
     var button = document.getElementById("draftReport");
     if (button) button.disabled = !workProject.value;
+    syncDraftState();
+  }
+  // 把某一期 AI 的状态显示出来。切项目/切日期都走这里，别让上一期的话留着。
+  function syncDraftState(){
+    var known = draftState[reportKey()];
+    if (!workProject || !workProject.value) {
+      setDraftState("选择单个项目后由 AI 自动归纳。", ""); return;
+    }
+    if (!known) { setDraftState("日报载入后自动归纳，也可以手动生成。", ""); return; }
+    if (known.status === "loading") { setDraftState("DeepSeek 正在归纳本期内容特征…", ""); return; }
+    setDraftState(draftMessage(known),
+      known.status === "ok" ? "ok" : (known.status === "unavailable" ||
+        known.status === "insufficient_evidence" ? "" : "err"));
   }
   function applyDraft(draft, replace){
     var features = String(draft.features || "").trim();
@@ -1314,21 +1327,31 @@ _SCRIPT = r"""
       return item && typeof item === "object" ? String(item.name || "") : String(item || "");
     }).filter(function(name){ return name.trim(); });
     // 只填空，不覆盖人已经写的。重新生成也一样：清空运营的判断比漏填更糟。
-    if (features && (replace || !reportFeatures.value.trim())) reportFeatures.value = features;
-    if (names.length && (replace || !reportCompetitors.value.trim()))
-      reportCompetitors.value = names.join("、");
+    var filledFeatures = false, filledCompetitors = false;
+    if (features && (replace || !reportFeatures.value.trim())) {
+      reportFeatures.value = features; filledFeatures = true;
+    }
+    if (names.length && (replace || !reportCompetitors.value.trim())) {
+      reportCompetitors.value = names.join("、"); filledCompetitors = true;
+    }
     saveNotes(); composeReport();
+    return {features: filledFeatures, competitors: filledCompetitors, kept: !filledFeatures};
   }
-  function draftMessage(draft){
+  function draftMessage(draft, applied){
     if (draft.status === "ok") {
       var bits = [];
       if (draft.evidence_count) bits.push(draft.evidence_count + " 条预警评论");
       if (draft.title_count) bits.push(draft.title_count + " 个预警帖子标题");
       var scope = bits.length ? "依据 " + bits.join(" + ") : "已生成";
       if (draft.sampled) scope += "（超出上限，抽样）";
-      if (!(draft.competitors || []).length) scope += "；未发现可核验竞品，留空";
-      return "AI 草稿已填入，可直接修改：" + scope + "。";
+      var tail = [];
+      if (!(draft.competitors || []).length) tail.push("未发现可核验竞品");
+      if (applied && !applied.features) tail.push("内容特征栏已有文字，保留原样");
+      if (applied && !applied.competitors && (draft.competitors || []).length)
+        tail.push("竞品栏已有文字，保留原样");
+      return "AI 草稿：" + scope + (tail.length ? "；" + tail.join("；") : "") + "。";
     }
+    if (draft.status === "cached") return "用的是刚才那份草稿，没有重新请求。";
     return draft.error || "AI 暂不可用，可人工填写。";
   }
   function requestDraft(force){
@@ -1336,7 +1359,7 @@ _SCRIPT = r"""
     if (!table) { setDraftState("选择单个项目后由 AI 自动归纳。", ""); return; }
     if (!reportDate) return;
     var known = draftState[key];
-    if (!force && known && (known.status === "ok" || known.status === "loading")) return;
+    if (!force && known) return;
     draftState[key] = {status: "loading"};
     var epoch = ++draftEpoch;
     setDraftState("DeepSeek 正在归纳本期内容特征…", "");
@@ -1351,13 +1374,19 @@ _SCRIPT = r"""
       .then(function(j){
         if (epoch !== draftEpoch || key !== reportKey()) return;
         draftState[key] = j;
-        if (j.status === "ok") { applyDraft(j, force); setDraftState(draftMessage(j), "ok"); }
-        else setDraftState(draftMessage(j), j.status === "error" ? "err" : "");
+        if (j.status === "ok") {
+          var applied = applyDraft(j, force);
+          setDraftState(draftMessage(j, applied), "ok");
+        } else setDraftState(draftMessage(j),
+          j.status === "unavailable" || j.status === "insufficient_evidence" ? "" : "err");
       })
       .catch(function(err){
         if (epoch !== draftEpoch || key !== reportKey()) return;
-        draftState[key] = {status: "error"};
-        setDraftState("AI 草稿没生成出来：" + (err.message || err) + "。可人工填写或重试。", "err");
+        // 失败记成终态：轮询只填空的这一期，不能每分钟重打一次付费接口。
+        // 要重试就点「重新生成」（force），服务端另有 30 秒冷却。
+        draftState[key] = {status: "error", error: String(err.message || err)};
+        setDraftState("AI 草稿没生成出来：" + (err.message || err) +
+                      "。可人工填写，或点「重新生成」再试。", "err");
       })
       .then(function(){
         if (button) { button.disabled = !workProject.value; button.textContent = "重新生成"; }
@@ -1366,8 +1395,9 @@ _SCRIPT = r"""
   function maybeDraft(){
     if (!workbench || !workProject || !workProject.value) return;
     if (!reportLoaded || !reportText || !reportText.value) return;
-    var known = draftState[reportKey()];
-    if (known && (known.status === "ok" || known.status === "loading")) return;
+    // 这一期只要动过手（生成过 / 失败过 / 没证据 / 没配 Key），就不再自动来第二次。
+    // 否则一次 429 会在页面开着的时候每分钟重打一次付费接口。
+    if (draftState[reportKey()]) return;
     requestDraft(false);
   }
   function composeReport(){
@@ -1484,7 +1514,6 @@ _SCRIPT = r"""
       if (!label && activeTab()) showTab(activeTab().dataset.tab, false);
       panels.forEach(function(p){ if (panelHasTable(p, workProject.value)) showTab(p.dataset.tab, false); });
       loadNotes(); renderWorkStats(); applyWorkFilter(); loadReports();
-      if (!workProject.value) setDraftState("选择单个项目后由 AI 自动归纳。", "");
     });
     if (reasonFilter) reasonFilter.addEventListener("change", applyWorkFilter);
     reportDate.addEventListener("change", function(){ if (!reportDate.value) reportDate.value = dayInShanghai(); loadNotes(); loadReports(); });
@@ -2220,7 +2249,8 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
         more = (f"<span class=more title='另有 {len(old)} 行已归档的老帖有异常，"
                 f"在这一页底下收着'>+{len(old)}</span>" if old else "")
         tabs.append(
-            f"<button type=button role=tab class='tab{' on' if first else ''}' "
+            f"<button type=button role=tab id='tab-{tid}' "
+            f"class='tab{' on' if first else ''}' "
             f"aria-selected={'true' if first else 'false'} data-tab='{tid}' "
             f"data-project='{_e(label)}' aria-controls='todos-{tid}'>"
             f"{_e(label)} <span class='{cnt_cls}'>{len(items)}</span>{more}</button>")
@@ -2234,6 +2264,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
                     "底下收着的是已归档的老帖。</div>")
         panels.append(
             f"<div class=tabpanel id='todos-{tid}' role=tabpanel data-tab='{tid}' "
+            f"aria-labelledby='tab-{tid}' "
             f"data-project='{_e(label)}'{'' if first else ' hidden'}>"
             f"{main}{_fold(old, offset_hours, show_digest, resolvable=resolvable)}</div>")
     # #todos 包住所有 tab 页：脚本里「所有待办行」仍然是 `#todos tbody tr`，

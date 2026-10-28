@@ -131,6 +131,19 @@ class TestReportAIRoute(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("具体项目", body["error"])
 
+    def test_cold_start_does_not_look_like_an_ai_failure(self):
+        """overview 还没读到时 DailyReports.get 会早退。早退也必须遵守
+        with_events 的形状，否则这一屏会报一个假的「生成失败」。"""
+        projects = mock.Mock()
+        projects.settings = panel.Settings()
+        reports = panel.DailyReports(projects, journal=mock.Mock(read_window=lambda *a: []))
+        payload = reports.get(None, date="2026-10-28", table_id="tbl1")
+        self.assertIsInstance(payload, dict)
+        shaped, events = reports.get(None, date="2026-10-28", table_id="tbl1", with_events=True)
+        self.assertEqual(shaped["reports"], [])
+        self.assertEqual(events, [])
+        self.assertIn("还未就绪", shaped["error"])
+
 
 class TestPanelWiring(unittest.TestCase):
     def test_the_key_is_scrubbed_from_log_text(self):

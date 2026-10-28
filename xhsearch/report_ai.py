@@ -22,7 +22,11 @@ MAX_COMMENTS = 32
 MAX_COMMENT_CHARS = 200
 MAX_EVIDENCE_CHARS = 8_000
 MAX_RESPONSE_BYTES = 1_000_000
+# 内容特征的长度：提示词和落库校验用同一个数，别一边说 240 一边放到 600。
+MAX_FEATURES_CHARS = 300
 CACHE_SECONDS = 15 * 60
+# 「重新生成」的服务端冷却。口令是运营共用的，连点不能变成连续计费。
+FORCE_COOLDOWN_SECONDS = 30
 
 _SYSTEM = """你是内容运营日报分析员。只根据用户给出的本期预警帖子标题与第一页预警评论工作。
 “主要内容特征”要覆盖这些帖子在讲什么内容、什么人群场景、以及预警评论暴露的情绪与问题类型。
@@ -31,7 +35,7 @@ _SYSTEM = """你是内容运营日报分析员。只根据用户给出的本期�
 不得使用外部常识补充品牌，不得把普通负面词、作者自称、平台名或泛称认成竞品。
 竞品名称必须逐字出现在证据中；没有明确名称就返回空数组，不要为了填满而猜测。
 输出简短、客观的中文 JSON，不要 Markdown，不要解释推理过程。
-JSON 格式：{"features":"2—4句，240字以内","competitors":[{"name":"证据中的准确名称"}]}。
+JSON 格式：{"features":"2—4句，300字以内","competitors":[{"name":"证据中的准确名称"}]}。
 """
 
 _USER_TEMPLATE = """请分析项目「{label}」在 {start}—{end}（北京时间）的日报证据。
@@ -76,7 +80,12 @@ def _stamp(ms: Any) -> str:
 
 
 def alert_titles_for(overview, table_id: str, limit: int = 20) -> list[str]:
-    """本期有问题的帖子标题。运营写的内容标题，不含作者或评论者身份。"""
+    """**当前**有问题的帖子标题。运营写的内容标题，不含作者或评论者身份。
+
+    ⚠️ 它读的是此刻的待办，所以只对**当前窗口**成立。历史窗口拿它当证据，
+    等于把今天的问题写成那一天的「主要内容特征」——那正是这个项目一直
+    不做的「用现在冒充过去」（见 docs/日报与工作台.md）。
+    """
     titles: list[str] = []
     for project in getattr(overview, "projects", []) or []:
         if project.table_id != table_id:
@@ -88,6 +97,14 @@ def alert_titles_for(overview, table_id: str, limit: int = 20) -> list[str]:
             if len(titles) >= limit:
                 return titles
     return titles
+
+
+def is_current_window(report: dict) -> bool:
+    """这个日报是不是「此刻」的窗口。只有此刻，待办标题才和它同一时段。"""
+    snapshot = report.get("current_snapshot") or {}
+    return (report.get("display_mode") == "snapshot"
+            and bool(snapshot.get("window_is_current")))
+
 
 
 def evidence_for_prompt(events: list[dict], report: dict,
@@ -168,9 +185,12 @@ def normalize_draft(value: Any, evidence: dict) -> dict:
     """只接受约定 JSON，并逐条核验竞品名确实出现在证据中。"""
     if not isinstance(value, dict):
         raise ReportAIError("DeepSeek 返回的分析结构不正确")
-    features = _clean_text(value.get("features"), 600)
+    features = _clean_text(value.get("features"), MAX_FEATURES_CHARS + 200)
     if not features:
         raise ReportAIError("DeepSeek 没有返回可用的内容特征")
+    if len(features) > MAX_FEATURES_CHARS:
+        # 模型偶尔超长。截在半句上比整段丢掉好，但要让人看得见被截了。
+        features = features[:MAX_FEATURES_CHARS].rstrip("，,、；; ") + "…"
     texts = [item["content"] for item in evidence["comments"]]
     texts.extend(evidence.get("titles") or [])
     texts.extend(str(item.get("word") or "") for item in evidence["keywords"]
@@ -206,6 +226,7 @@ class ReportDrafts:
         self._wall = wall
         self._cache: dict[str, tuple[float, dict]] = {}
         self._locks: dict[str, threading.Lock] = {}
+        self._force_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def _key_lock(self, key: str) -> threading.Lock:
@@ -261,10 +282,16 @@ class ReportDrafts:
                     "error": payload.get("error") or "本期没有可分析的日报数据",
                     "features": "", "competitors": []}
         report = reports[0]
-        evidence = evidence_for_prompt(events, report, alert_titles_for(overview, table_id))
+        # 历史窗口不拿「此刻的待办标题」当证据；那一刻的标题没被留痕，
+        # 拿现在的顶上去就是把今天写成那一天。
+        titles = alert_titles_for(overview, table_id) if is_current_window(report) else []
+        evidence = evidence_for_prompt(events, report, titles)
         if not evidence["comments"] and not evidence["titles"]:
             return {"status": "insufficient_evidence",
-                    "error": "本期没有可分析的帖子标题或预警评论，未调用 AI；人工仍可补充。",
+                    "error": ("本期没有可追溯的预警评论，未调用 AI；"
+                              "历史窗口不能拿现有的帖子顶替。人工仍可补充。"
+                              if not is_current_window(report) else
+                              "本期没有可分析的帖子标题或预警评论，未调用 AI；人工仍可补充。"),
                     "features": "", "competitors": [], "evidence_count": 0}
         fingerprint = hashlib.sha256(json.dumps(
             evidence, ensure_ascii=False, sort_keys=True,
@@ -274,14 +301,38 @@ class ReportDrafts:
             cached = self._cache.get(cache_key)
             if not force and cached and self._wall() - cached[0] < CACHE_SECONDS:
                 return {**cached[1], "cached": True}
+        # 「重新生成」的服务端冷却：面板口令是运营共用的，浏览器上的确认框
+        # 挡不住直接打接口，更不能让连点变成连续计费。缓存里已有结果就先给结果；
+        # 上一次失败了（没缓存）也只等这几十秒，不会长时间卡死重试。
+        throttle_key = f"{table_id}:{date}"
+        if force:
+            with self._lock:
+                last = self._force_at.get(throttle_key)
+                wait = (FORCE_COOLDOWN_SECONDS - (self._wall() - last)
+                        if last is not None else 0.0)
+                if wait > 0:
+                    cached = self._cache.get(cache_key)
+                    if cached:
+                        return {**cached[1], "cached": True,
+                                "notice": "刚刚生成过，这是同一份证据的最近结果，没有再次计费。"}
+                    return {"status": "throttled", "features": "", "competitors": [],
+                            "error": f"刚刚请求过，{int(wait) + 1} 秒后可以再试；期间不重复请求模型。"}
         lock = self._key_lock(cache_key)
         with lock:
             with self._lock:
                 cached = self._cache.get(cache_key)
                 if not force and cached and self._wall() - cached[0] < CACHE_SECONDS:
                     return {**cached[1], "cached": True}
+                # 冷却从**这一次真实外呼**开始算，不是从「点重新生成」开始算：
+                # 自动生成完立刻连点，同样要挡住。
+                self._force_at[throttle_key] = self._wall()
+                while len(self._force_at) > 64:
+                    self._force_at.pop(next(iter(self._force_at)))
             parsed = self._call(prompt_messages(evidence))
             draft = normalize_draft(parsed, evidence)
+            basis = [name for name, present in (("预警帖子标题", bool(evidence["titles"])),
+                                                ("第一页预警评论", bool(evidence["comments"])))
+                     if present]
             result = {
                 "status": "ok", "features": draft["features"],
                 "competitors": draft["competitors"],
@@ -289,7 +340,8 @@ class ReportDrafts:
                 "title_count": len(evidence["titles"]),
                 "sampled": evidence["sampled"],
                 "model": MODEL, "draft_id": fingerprint[:16], "cached": False,
-                "notice": "AI 草稿：基于本期预警帖子标题与第一页预警评论归纳，请复核后使用。",
+                "notice": (f"AI 草稿：基于本期{'与'.join(basis) or '已有数据'}归纳，"
+                           "请复核后使用。"),
             }
             with self._lock:
                 self._cache[cache_key] = (self._wall(), result)

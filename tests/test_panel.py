@@ -141,7 +141,12 @@ def _imported_modules(module) -> set:
 
 class TestNeverSpends(unittest.TestCase):
     def test_panel_calls_nothing_that_spends_money(self):
-        """面板永远不发付费请求。按 AST 逐个调用节点查，不是字符串搜。
+        """面板不调巡检供应商那一层。按 AST 逐个调用节点查，不是字符串搜。
+
+        唯一的例外是**按需的日报 AI 草稿**：它在 `report_ai.py` 里发请求，
+        `panel.py` 只调用 `report_ai` 的入口，从不直接调 transport/providers。
+        这条不变量守的正是那条线——面板一旦自己伸手去调供应商，就不是
+        「读表 + 渲染」那个小东西了。
 
         只认**带点号的全名**和几个不会撞车的裸名字：光看裸名字的话，
         `Cache.refresh`（重新读一遍飞书）会被当成 `runner.refresh`（真花钱）。
@@ -2371,14 +2376,18 @@ class TestTodosAreSplitByProject(unittest.TestCase):
         return page[start:page.index("<h2 id=s-proj>", start)]
 
     def _tabs(self, page):
+        # tab 上的 id 是无障碍关联（aria-controls / aria-labelledby）用的，
+        # 用非捕获组匹配，捕获顺序与断言里的下标保持原样。
         return re.findall(
-            r"<button type=button role=tab class='tab( on)?' aria-selected=(true|false) "
+            r"<button type=button role=tab (?:id='tab-p\d+' )?class='tab( on)?' "
+            r"aria-selected=(true|false) "
             r"data-tab='(p\d+)' data-project='([^']*)' aria-controls='todos-\3'>"
             r"\4 <span class='(cnt[^']*)'>(\d+)</span></button>", page)
 
     def _panels(self, page):
         return re.findall(
             r"<div class=tabpanel id='todos-(p\d+)' role=tabpanel data-tab='\1' "
+            r"aria-labelledby='tab-\1' "
             r"data-project='([^']*)'( hidden)?>", page)
 
     def test_one_tab_and_one_panel_per_project_with_todos(self):

@@ -342,10 +342,36 @@ class TestReportDraftIsAutomaticButHarmless(unittest.TestCase):
         self.assertIn("key !== reportKey()", body)
         self.assertIn("epoch !== draftEpoch", body)
 
+    def test_a_failed_draft_is_not_retried_by_polling(self):
+        """**踩过的坑**：失败只记成 undefined，60 秒轮询会每分钟再打一次付费接口。
+        现在只要这一期动过手就不再自动来第二次，重试只能靠「重新生成」。"""
+        body = self.js[self.js.index("function maybeDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("if (draftState[reportKey()]) return;", body)
+        self.assertNotIn('known.status === "ok"', body,
+                         "还在按状态挑着重试——失败态会漏过去")
+        retry = self.js[self.js.index("function requestDraft("):]
+        retry = retry[:retry.index("var epoch = ++draftEpoch")]
+        self.assertIn("if (!force && known) return;", retry)
+
     def test_failure_keeps_the_fields_editable_and_says_what_happened(self):
-        self.assertIn("可人工填写或重试", self.js)
+        self.assertIn("可人工填写，或点「重新生成」再试", self.js)
         self.assertIn("AI 草稿没生成出来", self.js)
-        self.assertIn("未发现可核验竞品", self.js)
+
+    def test_the_status_line_reflects_the_current_window_only(self):
+        """切项目/切日期要换文案，别把上一期的话留着。"""
+        body = self.js[self.js.index("function syncDraftState("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("draftState[reportKey()]", body)
+        load = self.js[self.js.index("function loadNotes("):]
+        load = load[:load.index("\n  }")]
+        self.assertIn("syncDraftState()", load)
+
+    def test_the_draft_message_admits_when_it_kept_human_text(self):
+        body = self.js[self.js.index("function draftMessage("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("保留原样", body)
+        self.assertNotIn("留空", body, "人写的竞品不会被清掉，说「留空」是假的")
 
     def test_the_old_placeholder_does_not_survive_next_to_the_draft(self):
         """日报正文曾是「待人工复核填写」，和 AI 草稿同时出现会自相矛盾。"""

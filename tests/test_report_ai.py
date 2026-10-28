@@ -29,6 +29,9 @@ def scan(at=START + 1000, *, post="xhs:one", hits=None, table=TABLE, **kw):
 def report(**changes):
     base = {"table_id": TABLE, "label": "途鸽",
             "window": {"start_ms": START, "end_ms": END, "as_of_ms": END},
+            # 默认就是「此刻」这一期：只有此刻，待办标题才和它同一时段。
+            "display_mode": "snapshot",
+            "current_snapshot": {"available": True, "window_is_current": True},
             "keywords": [{"word": "不舒服", "count": 1}]}
     base.update(changes)
     return base
@@ -182,8 +185,9 @@ def overview_with(*titles):
 
 
 class TestGenerate(unittest.TestCase):
-    def make(self, responses, events=None, error="", timeout=5.0):
-        reports = FakeReports(events if events is not None else [scan()], error=error)
+    def make(self, responses, events=None, error="", timeout=5.0, report_payload=None):
+        reports = FakeReports(events if events is not None else [scan()], error=error,
+                              report_payload=report_payload)
         seen = []
 
         def opener(request, timeout=None):
@@ -238,6 +242,8 @@ class TestGenerate(unittest.TestCase):
         drafts = self.make([answer({"features": "第一次", "competitors": []}),
                             answer({"features": "第二次", "competitors": []})])
         drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE)
+        # 冷却过了才算「真的想再来一次」（冷却本身另有专门用例）
+        drafts._wall = lambda: 1000.0 + report_ai.FORCE_COOLDOWN_SECONDS + 1
         again = drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE, force=True)
         self.assertEqual(again["features"], "第二次")
         self.assertEqual(len(drafts.seen), 2)
@@ -295,6 +301,75 @@ class TestGenerate(unittest.TestCase):
         drafts = self.make([answer({"features": "x", "competitors": []})])
         with self.assertRaises(ValueError):
             drafts.generate(overview_with(), date="2026-10-28", table_id="")
+
+    def test_a_historical_window_never_borrows_todays_titles(self):
+        """历史窗口那一刻的标题没被留痕。拿此刻的顶上去 = 把今天写成那一天。"""
+        drafts = self.make([answer({"features": "不该被调用", "competitors": []})],
+                           events=[], report_payload=report(
+                               display_mode="journal",
+                               current_snapshot={"available": False,
+                                                 "window_is_current": False}))
+        result = drafts.generate(overview_with("今天才上榜的帖子"),
+                                 date="2026-10-20", table_id=TABLE)
+        self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertIn("历史窗口", result["error"])
+        self.assertEqual(drafts.seen, [], "没有证据就不该花钱")
+
+    def test_a_historical_window_with_comments_omits_titles(self):
+        drafts = self.make([answer({"features": "只依据评论。", "competitors": []})],
+                           report_payload=report(
+                               display_mode="journal",
+                               current_snapshot={"available": False,
+                                                 "window_is_current": False}))
+        result = drafts.generate(overview_with("今天才上榜的帖子"),
+                                 date="2026-10-20", table_id=TABLE)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["title_count"], 0)
+        user = json.loads(drafts.seen[0][0].data.decode("utf-8"))["messages"][1]["content"]
+        self.assertNotIn("今天才上榜的帖子", user)
+
+    def test_the_current_window_does_send_titles(self):
+        drafts = self.make([answer({"features": "x", "competitors": []})])
+        result = drafts.generate(overview_with("露营装备清单"), date="2026-10-28",
+                                 table_id=TABLE)
+        self.assertEqual(result["title_count"], 1)
+        user = json.loads(drafts.seen[0][0].data.decode("utf-8"))["messages"][1]["content"]
+        self.assertIn("露营装备清单", user)
+
+    def test_force_is_cooled_down_server_side(self):
+        """口令是共用的，浏览器上的 confirm 挡不住直接打接口。"""
+        drafts = self.make([answer({"features": "第一次", "competitors": []}),
+                            answer({"features": "第二次", "competitors": []})])
+        drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE)
+        # 立刻 force：还在冷却里，直接给缓存结果，不再计费
+        again = drafts.generate(overview_with(), date="2026-10-28",
+                                table_id=TABLE, force=True)
+        self.assertEqual(again["features"], "第一次")
+        self.assertTrue(again["cached"])
+        self.assertEqual(len(drafts.seen), 1)
+        # 冷却过去之后 force 才真的再请求一次
+        drafts._wall = lambda: 1000.0 + report_ai.FORCE_COOLDOWN_SECONDS + 1
+        third = drafts.generate(overview_with(), date="2026-10-28",
+                                table_id=TABLE, force=True)
+        self.assertEqual(third["features"], "第二次")
+        self.assertEqual(len(drafts.seen), 2)
+
+    def test_a_failed_force_is_also_cooled_down(self):
+        """失败没有缓存可回，但也不能让连点变成连续计费。"""
+        drafts = self.make([TimeoutError("boom"), answer({"features": "x", "competitors": []})])
+        with self.assertRaises(report_ai.ReportAIError):
+            drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE, force=True)
+        blocked = drafts.generate(overview_with(), date="2026-10-28",
+                                  table_id=TABLE, force=True)
+        self.assertEqual(blocked["status"], "throttled")
+        self.assertEqual(len(drafts.seen), 1, "冷却期内没有第二次请求")
+
+    def test_overlong_features_are_clipped_visibly(self):
+        long_text = "长" * (report_ai.MAX_FEATURES_CHARS + 120)
+        drafts = self.make([answer({"features": long_text, "competitors": []})])
+        result = drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE)
+        self.assertLessEqual(len(result["features"]), report_ai.MAX_FEATURES_CHARS + 1)
+        self.assertTrue(result["features"].endswith("…"))
 
     def test_failed_request_is_not_cached(self):
         drafts = self.make([TimeoutError("boom"), answer({"features": "重试成功", "competitors": []})])

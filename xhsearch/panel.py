@@ -1229,7 +1229,10 @@ class DailyReports:
         if start_ms >= int(now * 1000):
             raise ValueError("这个日报周期还未开始；请在北京时间 16 点后查看下一期")
         if overview is None:
-            return {"reports": [], "error": "监控数据还未就绪，请稍后再试", "as_of": now}
+            payload = {"reports": [], "error": "监控数据还未就绪，请稍后再试", "as_of": now}
+            # with_events 的调用方（AI 草稿）按元组解包，早退也必须同一个形状，
+            # 否则冷启动时打开日报会变成一个「AI 生成失败」的假错误。
+            return (payload, []) if with_events else payload
         projects = [p for p in overview.projects if not table_id or p.table_id == table_id]
         if table_id and not projects:
             raise ValueError("项目不在当前监控清单里")
