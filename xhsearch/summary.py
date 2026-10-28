@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -160,6 +161,11 @@ class ProjectSnapshot:
     # adhoc_todos 按条数上限截掉了多少条（for_display 填）。和 todos_dropped
     # 分开记：那个说的是项目卡上「要人管」准不准，这个不进项目卡。
     adhoc_dropped: int = 0
+    # 后端统计专用，包含正常行并在显示截断前采集；不保存正文或个人信息。
+    # None 表示不是完整业务表采集结果，不能据此把缺失数据报成零。
+    report_rows: Optional[list["ReportRow"]] = None
+    report_checked_available: bool = True
+    report_negative_available: bool = True
 
     @property
     def needs_attention(self) -> int:
@@ -173,6 +179,19 @@ class ProjectSnapshot:
     @property
     def healthy(self) -> bool:
         return not self.error and not self.health
+
+
+@dataclass
+class ReportRow:
+    record_id: str
+    post_key: str
+    last_checked_ms: Optional[int]
+    successfully_checked: bool
+    negative_found: bool
+    negative_digest_count: Optional[int]
+    negative_count_lower_bound: bool
+    reasons: list[str] = field(default_factory=list)
+    adhoc: bool = False
 
 
 # 「哪一条」优先去这些列里找。第一个命中的就用，所以顺序 = 优先级。
@@ -245,6 +264,8 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         f.last_updated, f.consecutive_failures, f.pinned_status,
         f.platform, f.refresh_status, f.failure_reason,
         f.comment_status, f.negative_status, f.alive_confirmed,
+        # 仅在后端数预警评论，原始正文仍受 show_digest 控制，不送浏览器。
+        f.negative_digest,
         f.collation_status,
         # 抖音短链记过的「作品ID」：没有它，面板认不出这一行是哪个作品，
         # 「发布时间」空着时就算不出帖龄、把 cron 早已归档的行报成空转。
@@ -351,6 +372,7 @@ def build_snapshot(
         label=label, app_token=app_token, table_id=table_id, route=route,
         table_url=table_url(feishu_base, app_token, table_id, route=route),
         health=list(health or []),
+        report_rows=[],
     )
 
     due: list[rows_mod.Row] = []
@@ -421,6 +443,7 @@ def build_snapshot(
         reasons = _todo_reasons(
             row, settings, refresh_status=refresh_status,
             negative_status=negative_status, stale=stale)
+        snap.report_rows.append(_report_row(row, cells, settings, reasons=reasons))
         if reasons:
             # **全部收进来，排完序再截断**（见函数末尾）。在这里按飞书返回的
             # 记录顺序截，一次大面积事故就能用低优先级的「卡住了」占满前
@@ -457,6 +480,64 @@ _REASON_RANK = {
 }
 
 
+def _post_key(row: rows_mod.Row) -> str:
+    parsed = row.parsed
+    if parsed.content_id:
+        return f"{parsed.platform}:{parsed.content_id}"
+    if not (parsed.url or row.link_cell):
+        return f"row:{row.record_id}"
+    return f"{parsed.platform}:url:" + hashlib.sha256(
+        (parsed.url or row.link_cell).encode("utf-8")).hexdigest()
+
+
+def negative_digest_count(text: str, settings: Settings) -> tuple[Optional[int], bool]:
+    """只识别机器的编号格式，不保留正文；返回命中条数及是否仅为下界。
+
+    快照最多写 max_comments 条，满额时原格式没有省略提示，因此必须报至少。
+    总字符截断会写明剩余条数，这种情况下可以恢复该次全部命中数。
+    """
+    indices = [int(n) for n in re.findall(r"(?m)^\s*(\d+)\.\s*\[命中「", text or "")]
+    omitted = re.search(r"(?m)^…（还有 (\d+) 条未显示）\s*$", text or "")
+    if indices != list(range(1, len(indices) + 1)):
+        return None, True
+    if omitted:
+        return len(indices) + int(omitted.group(1)), False
+    if not indices:
+        return None, True
+    return len(indices), len(indices) >= settings.digest.max_comments
+
+
+def _report_row(row: rows_mod.Row, cells: dict, settings: Settings, *,
+                reasons: list[str], adhoc: bool = False) -> ReportRow:
+    f = settings.fields
+    negative = feishu.read_text(cells.get(f.negative_status)) == settings.negative_status.found
+    count, lower = (negative_digest_count(feishu.read_text(cells.get(f.negative_digest)), settings)
+                    if negative else (0, False))
+    return ReportRow(
+        record_id=row.record_id, post_key=_post_key(row), last_checked_ms=row.last_updated_ms,
+        successfully_checked=feishu.read_text(cells.get(f.refresh_status)) == runner.STATUS_OK,
+        negative_found=negative, negative_digest_count=count,
+        negative_count_lower_bound=lower, reasons=list(reasons), adhoc=adhoc)
+
+
+def build_report_rows(records: list[dict], settings: Settings, *,
+                      now: Optional[datetime] = None, adhoc: bool = False) -> list[ReportRow]:
+    """为临时检查记录生成同口径的统计数据；未巡查行只保留最近 24 小时查过的。"""
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for record in records:
+        cells = record.get("fields") or {}
+        row = runner.row_from_record(record, settings)
+        if adhoc and not _checked_recently(row, now):
+            continue
+        reasons = _todo_reasons(
+            row, settings, refresh_status=feishu.read_text(cells.get(settings.fields.refresh_status)),
+            negative_status=feishu.read_text(cells.get(settings.fields.negative_status)),
+            stale=False if adhoc else _is_stale(row, settings, now))
+        out.append(_report_row(row, cells, settings, reasons=reasons, adhoc=adhoc))
+    return out
+
+
 def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
                reasons: list[str], refresh_status: str, project: str,
                app_token: str, table_id: str, feishu_base: str, route: str,
@@ -464,10 +545,7 @@ def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
                archived: bool = False, adhoc: bool = False,
                recent: bool = False) -> TodoRow:
     f = settings.fields
-    parsed = row.parsed
-    post_key = (f"{parsed.platform}:{parsed.content_id}" if parsed.content_id else
-                f"{parsed.platform}:url:" + hashlib.sha256(
-                    (parsed.url or row.link_cell).encode("utf-8")).hexdigest())
+    post_key = _post_key(row)
     return TodoRow(
         post_key=post_key,
         archived=archived,
@@ -791,6 +869,108 @@ def work_stats(overview: Overview, resolved: dict, settings: Settings) -> list[d
         result.append({"table_id": project.table_id, "label": project.label, **counts,
                        "error": project.error})
     return result
+
+
+def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
+                    start_ms: int, end_ms: int, as_of_ms: int) -> list[dict]:
+    """现有业务表快照的可确认数据。当前状态与本窗口最近检查分开，不回造历史。
+
+    当前负面含在管的归档行和最近临时检查行，与完整待办范围一致；同帖重复行
+    去重后采用尚未完成的状态，防止一行的已处理掩盖另一行的未处理。
+    """
+    if end_ms <= start_ms:
+        raise ValueError("日报结束时间必须晚于开始时间")
+    states = ("pending", "processing", "resolved")
+    sticky = sticky_reasons(settings)
+    out = []
+    for project in overview.projects:
+        available = not project.error and project.report_rows is not None
+        item = {"table_id": project.table_id, "label": project.label, "source": "current_table",
+                "available": available, "as_of_ms": as_of_ms, "historical": False,
+                "checked_posts": None, "window_checked_posts": None,
+                "negative_posts": None, "negative_comments": None,
+                "negative_comments_lower_bound": False, "negative_comments_estimated": True,
+                "post_states": dict.fromkeys(states), "comment_states": dict.fromkeys(states),
+                "window_negative_posts": None, "window_negative_comments": None,
+                "window_negative_comments_lower_bound": False,
+                "window_negative_comments_estimated": True,
+                "window_post_states": dict.fromkeys(states), "window_comment_states": dict.fromkeys(states),
+                "scope": "在管帖子（含归档）及最近24小时临时检查帖子",
+                "error": project.error}
+        if not available:
+            out.append(item)
+            continue
+        groups: dict[str, list[ReportRow]] = {}
+        for row in project.report_rows:
+            groups.setdefault(row.post_key or f"row:{row.record_id}", []).append(row)
+        checked = {key for key, rows in groups.items()
+                   if any(row.successfully_checked and row.last_checked_ms is not None
+                          and start_ms <= row.last_checked_ms < min(end_ms, as_of_ms)
+                          for row in rows)}
+
+        def row_state(row: ReportRow) -> str:
+            entry = resolved.get(resolution_key(project.table_id, row.record_id))
+            todo = TodoRow(record_id=row.record_id, project=project.label, record_url="", link_cell="",
+                           reasons=row.reasons, checked_at_ms=row.last_checked_ms, post_key=row.post_key)
+            if (isinstance(entry, dict) and entry.get("state") == "processing"
+                    and (not entry.get("post_key") or entry["post_key"] == todo.post_key)
+                    and isinstance(entry.get("reasons"), list)
+                    and set(todo.reasons) <= set(entry["reasons"])):
+                return "processing"
+            return "resolved" if still_resolved(todo, entry, sticky) else "pending"
+
+        negatives = {}
+        for key, rows in groups.items():
+            negative_rows = [row for row in rows if row.negative_found]
+            if not negative_rows:
+                continue
+            state = min((row_state(row) for row in negative_rows), key=states.index)
+            # 重复行可能有不同关键词配置；没有评论 ID，不将数量相加冒充去重。
+            counts = [row.negative_digest_count for row in negative_rows
+                      if row.negative_digest_count is not None]
+            count = max(counts) if counts else None
+            lower = (any(row.negative_count_lower_bound for row in negative_rows)
+                     or any(row.negative_digest_count is None for row in negative_rows)
+                     or len(negative_rows) > 1)
+            negatives[key] = {"state": state, "count": count, "lower": lower}
+
+        def totals(selected):
+            posts = dict.fromkeys(states, 0)
+            comments = {}
+            for value in selected:
+                posts[value["state"]] += 1
+            for state in states:
+                values = [value for value in selected if value["state"] == state]
+                counts = [value["count"] for value in values if value["count"] is not None]
+                comments[state] = sum(counts) if counts or not values else None
+            counts = [value["count"] for value in selected if value["count"] is not None]
+            count = sum(counts) if counts or not selected else None
+            return len(selected), count, any(value["lower"] for value in selected), posts, comments
+
+        current = totals(list(negatives.values()))
+        window = totals([value for key, value in negatives.items() if key in checked])
+        item.update({"checked_posts": len(checked), "window_checked_posts": len(checked),
+                     "negative_posts": current[0], "negative_comments": current[1],
+                     "negative_comments_lower_bound": current[2],
+                     "post_states": current[3], "comment_states": current[4],
+                     "window_negative_posts": window[0], "window_negative_comments": window[1],
+                     "window_negative_comments_lower_bound": window[2],
+                     "window_post_states": window[3], "window_comment_states": window[4]})
+        if not project.report_checked_available:
+            item.update({"checked_posts": None, "window_checked_posts": None,
+                         "window_negative_posts": None, "window_negative_comments": None,
+                         "window_post_states": dict.fromkeys(states),
+                         "window_comment_states": dict.fromkeys(states)})
+            item["error"] = "缺少最近检查时间或巡查状态，无法确认本期检查数量"
+        if not project.report_negative_available:
+            item.update({"negative_posts": None, "negative_comments": None,
+                         "post_states": dict.fromkeys(states), "comment_states": dict.fromkeys(states),
+                         "window_negative_posts": None, "window_negative_comments": None,
+                         "window_post_states": dict.fromkeys(states),
+                         "window_comment_states": dict.fromkeys(states)})
+            item["error"] = "缺少负面状态，无法确认负面及处置数量"
+        out.append(item)
+    return out
 
 
 def trim_resolutions(overview: Overview, resolved: dict) -> dict[str, Optional[list]]:

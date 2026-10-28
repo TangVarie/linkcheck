@@ -1,6 +1,8 @@
 """项目工作台的服务端边界：状态、快照身份、未加载态及不可信日报文本。"""
 
 import json
+import shutil
+import subprocess
 import unittest
 from html.parser import HTMLParser
 
@@ -117,6 +119,77 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertIn("disabled", dom.by_id("copyReport"))
         self.assertEqual(dom.by_id("reportText")["placeholder"], "日报载入后显示在这里，可直接复制。")
         self.assertIn("readonly", dom.by_id("reportText"))
+
+    def test_snapshot_metrics_and_optional_details_start_compact(self):
+        dom = Elements(self.page())
+        for name in ("metricChecked", "metricNegative", "metricPending",
+                     "metricProcessing", "metricResolved"):
+            dom.by_id(name)
+        self.assertNotIn("open", dom.by_id("reportNotes"))
+        self.assertNotIn("open", dom.by_id("reportMethod"))
+        self.assertIn("全部异常待办 · 行", self.page())
+
+
+@unittest.skipUnless(shutil.which("node"), "浏览器脚本行为检查需要 Node")
+class TestLiveReportNumbers(unittest.TestCase):
+    """执行实际数字渲染函数，防止空留痕覆盖业务表已有数字。"""
+
+    def render(self, report):
+        start = panel_view._SCRIPT.index("  function renderReports(){")
+        end = panel_view._SCRIPT.index("  function loadReports(){", start)
+        function = panel_view._SCRIPT[start:end]
+        script = """
+var values = {}, nodes = {};
+var document = {
+  getElementById:function(id){ return nodes[id] || (nodes[id] = {
+    textContent:'', appendChild:function(child){} }); },
+  createElement:function(){ return {textContent:''}; }
+};
+var reportLoaded = true;
+function setText(id, value){ values[id] = String(value); }
+function chinaTime(){ return '14:00'; }
+function composeReport(){}
+var currentReports = REPORT;
+FUNCTION
+renderReports();
+process.stdout.write(JSON.stringify(values));
+""".replace("REPORT", json.dumps([report], ensure_ascii=False)).replace("FUNCTION", function)
+        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True,
+                                text=True, check=True)
+        return json.loads(result.stdout)
+
+    def report(self, **snapshot):
+        return {"label": "途鸽", "display_mode": "snapshot", "scanned_posts": 0,
+                "negative_posts": 0, "post_states": {"pending": 0},
+                "window": {"coverage_started_at_ms": None, "coverage_complete": False},
+                "current_snapshot": {"available": True, "window_is_current": True,
+                    "window_checked_posts": 120, "negative_posts": 9,
+                    "negative_comments": None,
+                    "post_states": {"pending": 7, "processing": 2, "resolved": 0}, **snapshot}}
+
+    def test_existing_table_counts_survive_empty_journal(self):
+        numbers = self.render(self.report())
+        self.assertEqual(numbers["metricChecked"], "120")
+        self.assertEqual(numbers["metricNegative"], "9")
+        self.assertEqual(numbers["metricPending"], "7")
+        self.assertEqual(numbers["metricProcessing"], "2")
+        self.assertEqual(numbers["metricResolved"], "0")
+        self.assertEqual(numbers["metricComments"], "评论条数待核实")
+        self.assertEqual(numbers["workSource"], "现有表快照")
+
+    def test_unknown_history_does_not_invent_zero_or_use_current_check_count(self):
+        report = self.report(window_is_current=False)
+        report["display_mode"] = "unavailable"
+        numbers = self.render(report)
+        self.assertEqual(numbers["metricChecked"], "—")
+        self.assertEqual(numbers["metricPending"], "7", "明确标识的当前处置仍可查看")
+        self.assertIn("当前快照", numbers["workSummary"])
+
+    def test_unavailable_current_table_keeps_counts_unknown(self):
+        numbers = self.render(self.report(available=False))
+        for name in ("metricChecked", "metricNegative", "metricPending",
+                     "metricProcessing", "metricResolved"):
+            self.assertEqual(numbers[name], "—")
 
 
 if __name__ == "__main__":

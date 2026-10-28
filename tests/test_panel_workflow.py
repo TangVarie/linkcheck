@@ -246,7 +246,9 @@ class TestDailyReportRequests(unittest.TestCase):
         self.journal = mock.Mock()
         self.journal.read_window.return_value = []
         self.clock = [NOW.timestamp()]
-        self.reports = panel.DailyReports(mock.Mock(), journal=self.journal,
+        self.projects = mock.Mock()
+        self.projects.settings = Settings()
+        self.reports = panel.DailyReports(self.projects, journal=self.journal,
                                          wall=lambda: self.clock[0])
 
     def test_window_is_1600_beijing_and_preview_reads_only_until_now(self):
