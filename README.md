@@ -244,7 +244,7 @@ TikHub 那边是上游原始透传，条目里多了 `label_type` / `label_text`
 在每张表里都只有零星几行，埋在几百行里——**没有跨表视图，就只能一张张点**。
 
 ```bash
-python3 cli.py serve      # 常驻、只读、一个付费请求都不发
+python3 cli.py serve      # 常驻、只读、不刷表（日报 AI 草稿按需调用，可选）
 ```
 
 面板是 Railway 上的**第二个服务**，最上面是跨表待办：所有项目里要处理的行
@@ -511,8 +511,9 @@ xhsearch/
   provision.py   接管一张表：免费体检 → 建缺的列（只追加，绝不改已有列）；
                  从零建表的标准模板；建完给人和群开权限
   summary.py     跨表聚合：一批 record → 一个项目的快照。纯函数
-  panel.py       监控面板的 HTTP 服务。**只读，一个付费请求都不发**
+  panel.py       监控面板的 HTTP 服务。**只读、不刷表**（日报 AI 草稿按需）
   panel_view.py  面板的单文件 HTML（内联样式和脚本，零外部资源）
+  report_ai.py   日报 AI 草稿：DeepSeek Flash，证据最小化、竞品必须可核验
   panel_settings.py  面板上点出来的设置（存在注册表那个 base 里的一张键值表）
 cli.py           命令行入口
 tools/

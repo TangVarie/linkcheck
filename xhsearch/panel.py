@@ -1,10 +1,14 @@
 """监控面板：一个只读的常驻 HTTP 服务。
 
-**这个进程一个付费请求都不发。** 它只做三件事：读飞书表、聚合、渲染。
+**这个进程不发巡检付费请求。** 它只做三件事：读飞书表、聚合、渲染。
 巡检仍然只有那一个 Railway cron service 在跑——`xhsearch/runlock.py` 是
 文件锁，跨容器挡不住第二个付费执行者，所以面板从设计上就不许成为执行者。
 代码层面的保证：这个模块不 import 供应商那一层，也不调用任何会发付费请求的
 函数——有一条测试按 AST 逐个节点检查，不是靠字符串搜。
+
+唯一的计费外呼是**运营打开单个项目日报时的 DeepSeek 草稿**（POST
+`/api/report-ai`，见 `report_ai.py`）：按需、有短缓存、有超时，不参与任何轮询，
+也不碰业务表。不配 `DEEPSEEK_API_KEY` 就整块降级成人工填写。
 
 ## 为什么敢用标准库的 http.server
 
@@ -46,7 +50,8 @@ from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
 from . import (channels as channels_mod, feishu, panel_settings, panel_view,
-               provision, railway, readout, registry, schema, summary, tablespec)
+               provision, railway, readout, registry, report_ai as report_ai_mod,
+               schema, summary, tablespec)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -127,6 +132,9 @@ class PanelConfig:
     # 读不到就是空串，页脚整块不显示（本地跑、别的平台跑都不该硬编一个假值）。
     commit: str = ""
     api_keys: dict = field(default_factory=dict)
+    # DeepSeek 只用于用户打开单项目日报后的按需草稿，不在轮询或巡检中调用。
+    deepseek_api_key: str = ""
+    deepseek_timeout: float = 20.0
     railway: railway.RailwayConfig = field(
         default_factory=lambda: railway.RailwayConfig(token="", environment_id=""))
     # 送到浏览器的日志文本要按这一组逐个脱敏。**别只放上游 Key**：
@@ -178,6 +186,8 @@ class PanelConfig:
                                         14.0, 0.5, 3650.0),
             runway_alert_days=_float_env(env, "PANEL_RUNWAY_ALERT_DAYS",
                                          5.0, 0.5, 3650.0),
+            deepseek_api_key=(env.get("DEEPSEEK_API_KEY") or "").strip(),
+            deepseek_timeout=_float_env(env, "DEEPSEEK_TIMEOUT_SECONDS", 20.0, 5.0, 60.0),
             railway=railway.RailwayConfig.from_env(env),
             secrets=_secrets(env),
         )
@@ -243,7 +253,7 @@ def _secrets(env) -> tuple:
     # 每一个凭据环境变量都必须出现在这个名单里。
     names = ("TIKHUB_API_KEY", "SOCIALDATAX_API_KEY", "FEISHU_APP_SECRET",
              "FEISHU_APP_ID", "RAILWAY_PROJECT_TOKEN", "RAILWAY_API_TOKEN",
-             "PANEL_PASSWORD", "PANEL_SECRET")
+             "PANEL_PASSWORD", "PANEL_SECRET", "DEEPSEEK_API_KEY")
     out = [v for v in ((env.get(n) or "").strip() for n in names) if v]
     # 管理员的手机号 / 邮箱不是密钥，但同样不该出现在这个共用口令的页面上。
     # `provision.redact` 已经在源头抹过一遍；这里是第二道——运行日志是 cron
@@ -1202,7 +1212,7 @@ class DailyReports:
         return self._journal_value
 
     def get(self, overview: Optional[summary.Overview], *, date: str = "",
-            table_id: str = "") -> dict:
+            table_id: str = "", with_events: bool = False):
         from . import daily_report
         now = self._wall()
         tz = timezone(timedelta(hours=8))
@@ -1219,7 +1229,10 @@ class DailyReports:
         if start_ms >= int(now * 1000):
             raise ValueError("这个日报周期还未开始；请在北京时间 16 点后查看下一期")
         if overview is None:
-            return {"reports": [], "error": "监控数据还未就绪，请稍后再试", "as_of": now}
+            payload = {"reports": [], "error": "监控数据还未就绪，请稍后再试", "as_of": now}
+            # with_events 的调用方（AI 草稿）按元组解包，早退也必须同一个形状，
+            # 否则冷启动时打开日报会变成一个「AI 生成失败」的假错误。
+            return (payload, []) if with_events else payload
         projects = [p for p in overview.projects if not table_id or p.table_id == table_id]
         if table_id and not projects:
             raise ValueError("项目不在当前监控清单里")
@@ -1261,7 +1274,9 @@ class DailyReports:
         reports = [daily_report.present_report(report, snapshots.get(report["table_id"]),
                                                int(now * 1000), journal_error=journal_error)
                    for report in reports]
-        return {"reports": reports, "error": self.warning, "as_of": events_wall}
+        payload = {"reports": reports, "error": self.warning, "as_of": events_wall}
+        # 原始留痕只供服务端 AI 证据抽取；普通日报 API 永远不返回它。
+        return (payload, events) if with_events else payload
 
     def record_status(self, table_id: str, record_id: str, state: str, *,
                       at_ms: Optional[int] = None) -> None:
@@ -1674,6 +1689,7 @@ class _Deps:
     queueing: Optional["Queueing"] = None
     resolutions: Optional["Resolutions"] = None
     reports: Optional["DailyReports"] = None
+    report_drafts: Optional["report_ai_mod.ReportDrafts"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -1798,6 +1814,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             return None
         if path.startswith("/api/projects/"):
             return self._project_action(path.rsplit("/", 1)[-1])
+        if path == "/api/report-ai":
+            return self._report_ai_action()
         if path == "/api/queue":
             return self._queue_action()
         if path == "/api/resolve":
@@ -1812,6 +1830,41 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self.deps.balances.get(force=True)
             return self._send_json(200, self._overview_payload())
         return self._send_json(404, {"error": "not found"})
+
+    def _report_ai_action(self):
+        """按需生成单项目日报草稿。AI 调用是 POST + CSRF，不进入任何轮询。"""
+        if self.deps.reports is None:
+            return self._send_json(400, {"error": "日报留痕尚未接入；需配置 FEISHU_REGISTRY"})
+        if self.deps.report_drafts is None:
+            return self._send_json(200, {
+                "status": "unavailable", "error": "未配置 DEEPSEEK_API_KEY",
+                "features": "", "competitors": []})
+        body = self._read_body()
+        if body is None:
+            return None
+        try:
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            date = payload.get("date") or ""
+            table_id = payload.get("table_id") or ""
+            force = payload.get("force", False)
+            if not isinstance(date, str) or len(date) > 10:
+                raise ValueError("date 格式不正确")
+            if not isinstance(table_id, str) or not _ID_RE.fullmatch(table_id):
+                raise ValueError("请选择一个具体项目")
+            if not isinstance(force, bool):
+                raise ValueError("force 必须是布尔值")
+            overview, _, _ = self.deps.cache.view()
+            result = self.deps.report_drafts.generate(
+                overview, date=date, table_id=table_id, force=force)
+            return self._send_json(200, result)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        except report_ai_mod.ReportAIError as exc:
+            return self._send_json(502, {"error": str(exc), "status": "error"})
+        except Exception:                                       # noqa: BLE001
+            return self._send_json(500, {"error": "AI 草稿生成失败，请稍后重试", "status": "error"})
 
     # —— 登录 ——
     def _do_login(self):
@@ -2404,13 +2457,14 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
                  settings: Optional[Settings] = None,
                  resolutions: Optional[Resolutions] = None,
                  reports: Optional["DailyReports"] = None,
+                 report_drafts: Optional["report_ai_mod.ReportDrafts"] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
         config=config, cache=cache, settings=settings, logs=logs,
         balances=balances, projects=projects, queueing=queueing,
-        resolutions=resolutions, reports=reports,
+        resolutions=resolutions, reports=reports, report_drafts=report_drafts,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -2441,6 +2495,9 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     reports = DailyReports(projects) if projects.enabled else None
     if reports is not None:
         reports.resolutions = resolutions
+    report_drafts = (report_ai_mod.ReportDrafts(
+        config.deepseek_api_key, reports, timeout=config.deepseek_timeout)
+        if reports is not None and config.deepseek_api_key else None)
     cache = Cache(reconciling(produce, resolutions), config.cache_seconds,
                   idle_seconds=config.idle_minutes * 60 or None)
     logs = LogFeed(config, config.cache_seconds)
@@ -2448,7 +2505,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     queueing = Queueing(config, resolved) if config.app_id else None
     server = build_server(config, cache, logs=logs, balances=balances,
                           projects=projects, queueing=queueing,
-                          settings=resolved, resolutions=resolutions, reports=reports)
+                          settings=resolved, resolutions=resolutions, reports=reports,
+                          report_drafts=report_drafts)
     cache.start()
     # 日志和余额也先在后台取一趟：第一个打开面板的人不用等 Railway 和两家余额接口。
     if logs.enabled:
@@ -2472,8 +2530,10 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
         print("在面板上加表删表：已就绪", flush=True)
     else:
         print(f"在面板上加表删表：未就绪（{projects.why_disabled()}）", flush=True)
-    print("⚠ 这个进程不发任何付费请求：要刷新就在飞书表里勾「排队刷新」，"
+    print("⚠ 这个进程不发巡检付费请求：要刷新就在飞书表里勾「排队刷新」，"
           "由 cron 那个服务处理", flush=True)
+    print("DeepSeek 日报草稿：" + ("已接入 deepseek-flash（仅打开单项目日报时调用）"
+          if report_drafts is not None else "未配置 DEEPSEEK_API_KEY"), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

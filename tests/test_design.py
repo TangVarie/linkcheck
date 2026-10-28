@@ -283,6 +283,114 @@ class TestQueueingIsHonest(unittest.TestCase):
         self.assertIsNotNone(rule, "没有激活 tab 的样式")
         self.assertIn("var(--primary)", rule.group(1))
 
+    def test_refresh_failure_is_visible_and_keeps_the_current_snapshot(self):
+        self.assertIn('refreshSay("更新失败："', self.js)
+        self.assertIn("仍显示当前快照", self.js)
+        self.assertIn('role=status aria-live=polite', render())
+
+    def test_editing_thresholds_after_preview_requires_another_preview(self):
+        self.assertIn('ev.target.matches(".thr input[data-col]")', self.js)
+        self.assertIn('saveBtn.disabled = true', self.js)
+        self.assertIn("值已变化，请重新点", self.js)
+
+    def test_dynamic_single_quoted_attributes_use_attribute_escaping(self):
+        """文本转义不含单引号；持久化项目名和飞书群名必须走 attr()。"""
+        for fragment in ("data-label='\" + attr(e.label)",
+                         "data-name='\" + attr(c.name)",
+                         "data-rec='\" + attr(e.record_id)"):
+            self.assertIn(fragment, self.js)
+
+    def test_a_dynamically_restored_checkbox_keeps_its_name_and_solo_hint(self):
+        """归档 → 主列表会新建复选框，不能丢掉名称与「全选不带」提示。"""
+        self.assertIn('pickBox.setAttribute("aria-label"', self.js)
+        self.assertIn('pickBox.setAttribute("title", "「全选」不会带上它', self.js)
+        self.assertIn('pickBox.removeAttribute("title")', self.js)
+
+
+class TestReportDraftIsAutomaticButHarmless(unittest.TestCase):
+    """AI 草稿是「自动填、人工改」，所以两条硬约束：按需触发、不覆盖人写的东西。"""
+
+    def setUp(self):
+        self.js = panel_view._SCRIPT
+
+    def test_the_polling_path_never_calls_the_model_directly(self):
+        """轮询每 60 秒跑一次 loadReports；模型调用只能挂在它的成功回调之后，
+        而且由 draftState 挡住重复请求。"""
+        body = self.js[self.js.index("function requestDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("/api/report-ai", body)
+        self.assertNotIn("/api/report-ai", self.js[:self.js.index("function requestDraft(")])
+
+    def test_only_one_project_triggers_a_draft(self):
+        body = self.js[self.js.index("function maybeDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("workProject.value", body)
+        self.assertIn("reportLoaded", body)
+        self.assertIn("draftState", body)
+
+    def test_existing_human_text_is_never_overwritten(self):
+        body = self.js[self.js.index("function applyDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("replace || !reportFeatures.value.trim()", body)
+        self.assertIn("replace || !reportCompetitors.value.trim()", body)
+        # 竞品为空时不许把人工写的清掉
+        self.assertNotIn("reportCompetitors.value = \"\"", body)
+
+    def test_a_slow_response_for_another_window_is_discarded(self):
+        body = self.js[self.js.index("function requestDraft("):]
+        body = body[:body.index("\n  }\n") + 4]
+        self.assertIn("key !== reportKey()", body)
+        self.assertIn("epoch !== draftEpoch", body)
+
+    def test_a_failed_draft_is_not_retried_by_polling(self):
+        """**踩过的坑**：失败只记成 undefined，60 秒轮询会每分钟再打一次付费接口。
+        现在只要这一期动过手就不再自动来第二次，重试只能靠「重新生成」。"""
+        body = self.js[self.js.index("function maybeDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("if (draftState[reportKey()]) return;", body)
+        self.assertNotIn('known.status === "ok"', body,
+                         "还在按状态挑着重试——失败态会漏过去")
+        retry = self.js[self.js.index("function requestDraft("):]
+        retry = retry[:retry.index("var epoch = ++draftEpoch")]
+        self.assertIn("if (!force && known) return;", retry)
+
+    def test_failure_keeps_the_fields_editable_and_says_what_happened(self):
+        self.assertIn("可人工填写，或点「重新生成」再试", self.js)
+        self.assertIn("AI 草稿没生成出来", self.js)
+
+    def test_the_status_line_reflects_the_current_window_only(self):
+        """切项目/切日期要换文案，别把上一期的话留着。"""
+        body = self.js[self.js.index("function syncDraftState("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("draftState[reportKey()]", body)
+        load = self.js[self.js.index("function loadNotes("):]
+        load = load[:load.index("\n  }")]
+        self.assertIn("syncDraftState()", load)
+
+    def test_the_draft_message_admits_when_it_kept_human_text(self):
+        body = self.js[self.js.index("function draftMessage("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("保留原样", body)
+        self.assertNotIn("留空", body, "人写的竞品不会被清掉，说「留空」是假的")
+
+    def test_the_old_placeholder_does_not_survive_next_to_the_draft(self):
+        """日报正文曾是「待人工复核填写」，和 AI 草稿同时出现会自相矛盾。"""
+        from xhsearch import daily_report as d
+        events = [{"type": "scan", "at": 1, "table_id": "tbl1", "record_id": "r1",
+                   "post_key": "xhs:one", "negative_checked": True,
+                   "hits": [{"id": "c1", "content": "x", "keywords": ["踩雷"]}]}]
+        start, end = d.window_for_date("2026-10-28")
+        report = d.aggregate([{**events[0], "at": start + 1000}], start, end,
+                             "tbl1", "途鸽", as_of_ms=end)
+        self.assertNotIn("待人工复核填写", report["text"])
+        self.assertIn("主要命中词", report["text"])
+
+    def test_the_ai_block_is_visible_and_has_a_retry(self):
+        html = render()
+        self.assertIn("id=draftState", html)
+        self.assertIn("id=draftReport", html)
+        self.assertIn("AI 归纳，可改", html)
+
 
 def css_without_comments() -> str:
     """去掉 CSS 注释再查。注释里本来就写着「border-radius: 0」这种句子

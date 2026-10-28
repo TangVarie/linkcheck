@@ -141,7 +141,12 @@ def _imported_modules(module) -> set:
 
 class TestNeverSpends(unittest.TestCase):
     def test_panel_calls_nothing_that_spends_money(self):
-        """面板永远不发付费请求。按 AST 逐个调用节点查，不是字符串搜。
+        """面板不调巡检供应商那一层。按 AST 逐个调用节点查，不是字符串搜。
+
+        唯一的例外是**按需的日报 AI 草稿**：它在 `report_ai.py` 里发请求，
+        `panel.py` 只调用 `report_ai` 的入口，从不直接调 transport/providers。
+        这条不变量守的正是那条线——面板一旦自己伸手去调供应商，就不是
+        「读表 + 渲染」那个小东西了。
 
         只认**带点号的全名**和几个不会撞车的裸名字：光看裸名字的话，
         `Cache.refresh`（重新读一遍飞书）会被当成 `runner.refresh`（真花钱）。
@@ -701,17 +706,17 @@ class TestRendering(unittest.TestCase):
         self.assertNotIn("<img src=x onerror", page)
         self.assertIn("&lt;script&gt;", page)
 
-    def test_persona_and_post_link_have_their_own_columns(self):
-        """素人编号、帖子链接各占一栏，和评论数一样一眼看得到；帖子链接点开就是帖子。"""
+    def test_persona_and_post_link_stay_with_post_identity(self):
+        """素人编号、原帖入口收进帖子身份栏的第二行；信息保留，但不挤占问题与处理列。"""
         url = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b?xsec_token=AB"
         todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
                                record_url="https://x/base/t?table=tb&record=r1",
                                reasons=["风控中"], persona="SR-012", post_url=url)
         page = self._page(self._snap(todos=[todo]))
-        self.assertIn("<th>素人编号</th><th>帖子链接</th>", page)
-        self.assertIn("<td class='nowrap persona'>SR-012</td>", page)
-        link = re.search(r"<td class='nowrap post'><a href='([^']*)' title='[^']*' "
-                         r"target=_blank rel='noopener noreferrer'>([^<]*)</a></td>", page)
+        self.assertIn("<th>帖子 / 素人</th><th>为什么</th>", page)
+        self.assertIn("<span class=persona>SR-012</span>", page)
+        link = re.search(r"<span class=post><a href='([^']*)' title='[^']*' "
+                         r"target=_blank rel='noopener noreferrer'>([^<]*)</a></span>", page)
         self.assertIsNotNone(link)
         self.assertEqual(link.group(1), url.replace("&", "&amp;"))
         self.assertTrue(link.group(2).startswith("xiaohongshu.com/explore/"))
@@ -724,7 +729,7 @@ class TestRendering(unittest.TestCase):
                                post_url="javascript:alert(1)")
         page = self._page(self._snap(todos=[todo]))
         self.assertNotIn("javascript:alert(1)", page)
-        self.assertIn("<td class='nowrap post'><span class=muted>—</span></td>", page)
+        self.assertIn("<span class=post><span class=muted>—</span></span>", page)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
 
     def test_the_which_one_cell_is_clipped_but_keeps_the_full_text_on_hover(self):
@@ -735,7 +740,7 @@ class TestRendering(unittest.TestCase):
                                record_url="https://x/base/t?table=tb&record=r1",
                                label=long, reasons=["风控中"])
         page = self._page(self._snap(todos=[todo]))
-        cell = re.search(r"<td class=which title='([^']*)'>([^<]*)</td>", page)
+        cell = re.search(r"<td class=which title='([^']*)'><span class=todo-title>([^<]*)</span>", page)
         self.assertIsNotNone(cell, "待办表里没有「哪一条」那一栏")
         self.assertEqual(cell.group(1), long)
         self.assertTrue(cell.group(2).endswith("…"))
@@ -748,7 +753,7 @@ class TestRendering(unittest.TestCase):
                                record_url="https://x/base/t?table=tb&record=r1",
                                label="", reasons=["风控中"])
         page = self._page(self._snap(todos=[todo]))
-        self.assertIn("<td class=which title=''>—</td>", page)
+        self.assertIn("<td class=which title=''><span class=todo-title>—</span>", page)
 
     def test_the_commit_comes_from_the_variable_railway_injects(self):
         """Railway 自己注入 RAILWAY_GIT_COMMIT_SHA，不用额外配。取前 7 位。"""
@@ -2371,14 +2376,18 @@ class TestTodosAreSplitByProject(unittest.TestCase):
         return page[start:page.index("<h2 id=s-proj>", start)]
 
     def _tabs(self, page):
+        # tab 上的 id 是无障碍关联（aria-controls / aria-labelledby）用的，
+        # 用非捕获组匹配，捕获顺序与断言里的下标保持原样。
         return re.findall(
-            r"<button type=button role=tab class='tab( on)?' aria-selected=(true|false) "
+            r"<button type=button role=tab (?:id='tab-p\d+' )?class='tab( on)?' "
+            r"aria-selected=(true|false) "
             r"data-tab='(p\d+)' data-project='([^']*)' aria-controls='todos-\3'>"
             r"\4 <span class='(cnt[^']*)'>(\d+)</span></button>", page)
 
     def _panels(self, page):
         return re.findall(
             r"<div class=tabpanel id='todos-(p\d+)' role=tabpanel data-tab='\1' "
+            r"aria-labelledby='tab-\1' "
             r"data-project='([^']*)'( hidden)?>", page)
 
     def test_one_tab_and_one_panel_per_project_with_todos(self):
@@ -2433,7 +2442,7 @@ class TestTodosAreSplitByProject(unittest.TestCase):
         page = self._page([self._snap("甲", "ta", [["有负面"]])])
         block = self._todos_block(page)
         self.assertNotIn("<th>项目</th>", block)
-        self.assertIn("<th>哪一条</th>", block)
+        self.assertIn("<th>帖子 / 素人</th>", block)
         self.assertIn("class=todoAll title='全选这一页", block)
 
     def test_every_page_gets_its_own_select_all(self):

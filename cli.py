@@ -1364,7 +1364,10 @@ def cmd_chats() -> int:
 
 
 def cmd_serve(selected: list[str] | None = None) -> int:
-    """起监控面板。**常驻进程，但一个付费请求都不发。**
+    """起监控面板。**常驻进程，但不刷表、不发巡检付费请求。**
+
+    唯一的计费外呼是按需的日报 AI 草稿（选中单个项目时一次，见 report_ai），
+    不参与任何轮询；不配 `DEEPSEEK_API_KEY` 就完全不会发生。
 
     它和 cron 那个服务是两个独立的 Railway service，彼此不通信——
     只通过飞书表间接耦合。面板挂了巡检照跑；面板重启，状态从表里重新读一遍就有。

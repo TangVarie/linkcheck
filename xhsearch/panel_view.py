@@ -120,10 +120,12 @@ _STYLE = """
 *{box-sizing:border-box;border-radius:0}
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text-dark);
-  font:14px/1.6 var(--font-sans);-webkit-font-smoothing:antialiased}
+  font:14px/1.6 var(--font-sans);-webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 svg{display:block;flex:none}
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
 .num{font-family:var(--font-num);font-variant-numeric:tabular-nums;
   letter-spacing:-.01em}
 .muted{color:var(--text-light);font-size:12px}
@@ -147,11 +149,15 @@ svg{display:block;flex:none}
   font-family:'Arial Black','Helvetica Neue',Futura,var(--font-sans)}
 .side .brand span{font-size:12px;color:var(--text-faint)}
 .side nav{padding:8px 0 24px}
-.side .grp{font-size:12px;color:var(--text-faint);padding:0 16px;
-  margin:24px 0 6px}
+.side .grp{font-size:11px;color:var(--text-faint);padding:0 16px;
+  margin:24px 0 6px;letter-spacing:.08em}
+.side .grp:first-child{margin-top:10px}
 .side nav a{display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;
-  font-size:14px;font-weight:500;color:var(--text);text-decoration:none}
+  font-size:14px;font-weight:500;color:var(--text);text-decoration:none;
+  transition:background-color .16s ease-out,color .16s ease-out}
+.side nav a .icon{color:var(--text-faint);transition:color .16s ease-out}
 .side nav a:hover{background:var(--fill);text-decoration:none}
+.side nav a:hover .icon,.side nav a.on .icon{color:var(--primary)}
 /* 激活态是主浅调底 + 主色字，不是深青底白字（03 场景点名的高发 bug） */
 .side nav a.on{background:var(--tint-primary);color:var(--primary);
   font-weight:600}
@@ -167,7 +173,8 @@ svg{display:block;flex:none}
 .content{padding:24px;max-width:1440px;margin:0 auto}
 
 /* ---------- 标题与编辑式导语 ---------- */
-h1{font-size:24px;font-weight:700;margin:0 0 6px;color:var(--text-dark)}
+h1{font-size:24px;font-weight:700;margin:0 0 6px;color:var(--text-dark);
+  letter-spacing:-.02em}
 /* 导语：15px 基色 50%，重点词 90% + semibold（DESIGN.md §3） */
 .lede{font-size:15px;color:var(--text-light);margin:0 0 24px;max-width:78ch}
 .lede b{color:var(--text-dark);font-weight:600}
@@ -189,11 +196,13 @@ h2 .n{font-weight:400;color:var(--text-faint)}
 .kpi>*{padding:16px 18px;min-height:112px;display:flex;flex-direction:column;
   justify-content:space-between}
 .kpi .lead{background:var(--block-primary);color:#fff}
-.kpi .lead .k{font-size:13px;color:rgba(255,255,255,.85)}
+.kpi .lead .k{font-size:13px;color:rgba(255,255,255,.85);letter-spacing:.02em}
 .kpi .lead .n{font-size:40px;font-weight:600;line-height:1.05}
 .kpi .lead .s{font-size:12px;color:rgba(255,255,255,.85)}
-.kpi .box{background:var(--surface);border:1px solid var(--border)}
-.kpi .box .k{font-size:13px;color:var(--text-light)}
+.kpi .box{background:var(--surface);border:1px solid var(--border);
+  border-top:2px solid transparent}
+.kpi .box.warn{border-top-color:var(--danger)}
+.kpi .box .k{font-size:13px;color:var(--text-light);letter-spacing:.02em}
 .kpi .box .n{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
 .kpi .box .s{font-size:12px;color:var(--text-light)}
 .kpi .box.warn .n{color:var(--danger-deep)}
@@ -204,14 +213,16 @@ h2 .n{font-weight:400;color:var(--text-faint)}
 /* 表格自己横向滚动，不把整页撑宽。七列在手机上放不下是必然的，
  * 让页面横滚会把侧栏和顶栏一起推走。 */
 .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.side,.tabs,.tablewrap{scrollbar-width:thin;scrollbar-color:var(--border-strong) transparent}
 table{width:100%;border-collapse:collapse;background:var(--surface);
   border:1px solid var(--border)}
 .tablewrap table{min-width:720px}
-.tablewrap table.todos{min-width:900px}
+.tablewrap table.todos{min-width:780px}
 th{height:44px;background:var(--bg);font-size:13px;font-weight:500;
   color:var(--text-light);text-align:left;padding:0 12px;white-space:nowrap}
 td{padding:12px;border-top:1px solid var(--border);font-size:14px;
   vertical-align:top;color:var(--text)}
+tbody tr{transition:background-color .14s ease-out}
 tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
 td.right{text-align:right}
@@ -219,8 +230,16 @@ td.right{text-align:right}
  * 而模板里通用的 a 是 accent 赭石——仲裁顺序中**场景文件规则高于模板**，
  * 这一处听场景的。 */
 td a.act{font-size:13px;color:var(--primary)}
-/* 「哪一条」：运营扫这一栏在飞书表里定位，所以要比周围重一点。 */
-td.which{color:var(--text-dark);max-width:15em}
+/* 帖子身份合成一栏：标题用于定位，素人编号和原帖入口退到第二行。
+ * 信息没少，但不再用两个独立列把「为什么」和处置动作挤到屏幕外。 */
+td.which{color:var(--text-dark);min-width:190px;max-width:260px}
+.todo-title{display:block;font-weight:600;line-height:1.45;margin-bottom:5px}
+.todo-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  font-size:12px;color:var(--text-light);line-height:1.45}
+.todo-meta .persona{font-family:var(--font-num);color:var(--text-light)}
+.todo-meta a{font-size:12px;white-space:nowrap}
+.todos td.acts{min-width:168px}
+.todos td.diagnosis{min-width:180px;max-width:320px}
 tr.fresh td:nth-child(2){border-left:3px solid var(--primary)}
 tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary);
   margin-left:6px;font-weight:600}
@@ -245,6 +264,14 @@ tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary
 .card .rows div:first-child{border-top:0}
 .card .rows .lbl{color:var(--text-light)}
 .card .big{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
+.project-detail{margin-top:10px;border-top:1px solid var(--border)}
+.project-detail>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:10px 0 4px;color:var(--text);font-size:13px}
+.project-detail>summary .detail-link{margin-left:auto;color:var(--primary);font-size:12px}
+.project-detail .rows{margin-top:6px}
+.project-snapshot{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:13px;
+  color:var(--text-light)}
+.project-snapshot b{font-family:var(--font-num);font-weight:600;color:var(--text-dark)}
 
 /* ---------- 横幅：浅调底 + 文字色阶（禁彩字配浅底） ---------- */
 .problem,.note{padding:10px 12px;margin:12px 0;font-size:13px;
@@ -279,8 +306,10 @@ input[type=password],input[type=search],input[type=text],input[type=number]{
   color:var(--text-dark);width:100%}
 input:focus-visible,button:focus-visible,a:focus-visible,
 summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
-:where(button,input,a){transition:background-color .12s ease-out,
-  transform .12s ease-out}
+:where(button,input,a,select,summary){transition:background-color .14s ease-out,
+  color .14s ease-out,border-color .14s ease-out,transform .12s ease-out}
+:where(body,.side,.top,.card,.workbench,.kpi>*,table,th,td){
+  transition:background-color .18s ease-out,color .18s ease-out,border-color .18s ease-out}
 
 /* ---------- 登录：品牌时刻，这套面板唯一的一块品牌面色 ---------- */
 /* 登录页是 BRAND.md §2 点名的「品牌时刻」（接收层，BRAND-LANGUAGE §二），
@@ -324,6 +353,8 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 .stagger-in>*:nth-child(n+5){animation-delay:.22s}
 @keyframes fade-up{from{opacity:0;transform:translateY(8px)}
   to{opacity:1;transform:none}}
+@keyframes detail-in{from{opacity:0;transform:translateY(-4px)}
+  to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms!important;
     animation-iteration-count:1!important;transition-duration:.01ms!important}
@@ -331,11 +362,24 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 
 /* ---------- 其余定式 ---------- */
 .tools{display:flex;gap:10px;align-items:center}
-.tools input{width:220px;height:36px}
+.tools .searchbox{position:relative;display:flex;align-items:center}
+.tools .searchbox>.icon{position:absolute;left:10px;top:10px;z-index:1;
+  color:var(--text-faint);pointer-events:none}
+.tools input{width:236px;height:36px;padding-left:32px}
 .tools button{height:36px}
+input::placeholder,textarea::placeholder{color:var(--text-faint)}
 .queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
   margin-bottom:12px;background:var(--surface);border:1px solid var(--border);
-  padding:12px}
+  padding:10px 12px}
+.queuebar .queue-help{font-size:12px;color:var(--text-light)}
+#queueOut{flex:1;min-width:220px}
+.top-status{position:absolute;top:52px;right:24px;z-index:8;max-width:min(520px,90vw);
+  padding:8px 12px;background:var(--surface);border:1px solid var(--border);
+  color:var(--text);font-size:12px}
+.top-status:empty{display:none}
+.top-status:not(:empty){animation:detail-in .18s ease-out both}
+.top-status[data-state=error]{background:var(--tint-danger);color:var(--danger-deep);
+  border-color:var(--danger)}
 /* ---------- 待办按项目分页的 tab 条 ---------- */
 /* 设计系统只定了一条：激活 Tab 用主色（DESIGN.md §2）。其余按后台轨控件
  * 规格来：高 40、14/500、直角、发丝线承重；激活 = 主色字 + 2px 主色底线。
@@ -345,16 +389,20 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 .tabs .tab{height:40px;padding:0 12px;background:none;border:0;
   border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:500;
   color:var(--text);white-space:nowrap;display:inline-flex;align-items:center;
-  gap:8px;flex:none}
+  gap:8px;flex:none;transition:background-color .16s ease-out,color .16s ease-out,
+  border-color .16s ease-out}
 .tabs .tab:hover:not(:disabled){background:var(--fill)}
 .tabs .tab.on{color:var(--primary);border-bottom-color:var(--primary);
   font-weight:600}
 /* tab 上的条数：颜色说的是这个项目最坏的一档（同徽标的加深档），
  * 所以严重度色要压过激活态的主色——信息先于装饰。 */
-.tabs .cnt{font-size:12px;font-family:var(--font-num);color:var(--text-faint)}
-.tabs .tab.on .cnt{color:var(--primary)}
-.tabs .tab .cnt.r{color:var(--danger-deep)}
-.tabs .tab .cnt.a{color:var(--warning-deep)}
+.tabs .cnt{display:inline-flex;align-items:center;justify-content:center;min-width:22px;
+  height:20px;padding:0 5px;font-size:12px;font-family:var(--font-num);
+  color:var(--text-light);background:var(--fill);transition:background-color .16s ease-out,
+  color .16s ease-out}
+.tabs .tab.on .cnt{color:var(--primary);background:var(--tint-primary)}
+.tabs .tab .cnt.r{color:var(--danger-deep);background:var(--tint-danger)}
+.tabs .tab .cnt.a{color:var(--warning-deep);background:var(--tint-warning)}
 .proj{display:flex;gap:12px;align-items:flex-start;padding:12px 0;
   border-top:1px solid var(--border);flex-wrap:wrap}
 .proj:first-child{border-top:0}
@@ -381,7 +429,11 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 code{background:var(--fill);padding:2px 6px;font-size:13px;
   font-family:var(--font-num)}
 details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
-  padding:8px 0}
+  padding:8px 0;user-select:none}
+details[open]>:not(summary){animation:detail-in .18s ease-out both}
+.work-details>summary:hover,.daily>summary:hover,.fold>summary:hover,
+.project-detail>summary:hover{background:var(--fill)}
+.diagnostic>summary:hover{color:var(--primary)}
 /* ---------- 每个项目那一页底下的归档折叠区 ----------
  * **默认收起**，但要让人知道有这一块：以前是一行灰色小字，运营根本看不到。
  * 现在是一条白底、警示色左边线的条（同 .note 的语义色用法），条上写着几行、
@@ -397,7 +449,8 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
 .fold-hint{margin-left:auto;font-size:13px;color:var(--primary);white-space:nowrap}
 .fold-hint::after{content:"";display:inline-block;width:6px;height:6px;
   margin:0 2px 2px 8px;border-right:1.5px solid currentColor;
-  border-bottom:1.5px solid currentColor;transform:rotate(45deg)}
+  border-bottom:1.5px solid currentColor;transform:rotate(45deg);
+  transition:transform .18s ease-out}
 .fold[open] .fold-hint::after{transform:rotate(-135deg);margin-bottom:-2px}
 .fold .fold-close,.fold[open] .fold-open{display:none}
 .fold[open] .fold-close{display:inline}
@@ -414,8 +467,8 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
 .chip.o{background:none;border:1px solid var(--border-strong);line-height:18px;
   color:var(--text-light)}
 /* 行操作里的文字按钮（「已解决」「撤销」）：和「去这一行」同款 13px 主色字。 */
-button.link{height:auto;padding:0;margin-left:12px;background:none;
-  font-size:13px;font-weight:400;color:var(--primary)}
+button.link{height:auto;min-height:26px;display:inline-flex;align-items:center;
+  padding:0;margin-left:12px;background:none;font-size:13px;font-weight:400;color:var(--primary)}
 button.link:hover:not(:disabled){background:none;text-decoration:underline}
 tr.resolvedNote td{font-size:13px;color:var(--success-deep);
   background:var(--tint-success)}
@@ -423,12 +476,21 @@ tr.resolvedNote button.link{margin-left:8px}
 .resolved{margin-top:12px}
 .resolved .tablewrap{margin-top:4px}
 #projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
-/* 项目工作台：处理进度常显，日报按需展开，共用项目上下文。 */
-.workbench{background:var(--surface);border:1px solid var(--border);margin:24px 0}
-.work-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:16px 18px;
-  border-bottom:1px solid var(--border)}
-.work-head h2{margin:0;font-size:16px}
-.work-head select{min-width:180px;max-width:100%}
+/* 待办工作台：项目、问题层级和处理状态常显；统计与日报按需展开。
+ * 首屏的任务是处置，不是先读两排指标。所有指标仍保留原 DOM 和统计口径。 */
+.workbench{background:var(--surface);border:1px solid var(--border);margin:16px 0 12px}
+.work-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 14px}
+.work-head h2{margin:0;font-size:16px;margin-right:2px}
+.work-head select{min-width:150px;max-width:100%}
+.work-head .field-label{display:flex;align-items:center;gap:6px;font-size:12px;
+  color:var(--text-light)}
+.work-head .field-label select{color:var(--text-dark)}
+.work-context{padding:10px 14px 0;font-size:12px;color:var(--text-light)}
+.work-details{border-top:1px solid var(--border)}
+.work-details>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:10px 14px;color:var(--text);font-size:13px;font-weight:500}
+.work-details>summary::after{content:'展开';margin-left:auto;color:var(--primary);font-size:12px}
+.work-details[open]>summary::after{content:'收起'}
 select,input[type=date],textarea{font:14px/1.5 var(--font-sans);color:var(--text-dark);
   border:1px solid var(--border-strong);background:var(--surface);padding:8px 10px}
 select,input[type=date]{height:36px}
@@ -445,7 +507,7 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:5px}
 .work-metric .metric-note{display:block;font-size:12px;color:var(--text-light);margin-top:2px}
 .work-source{font-size:12px;color:var(--primary);background:var(--tint-primary);padding:3px 7px}
-.work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 18px 8px}
+.work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 14px 12px}
 .work-states .caption{font-size:12px;color:var(--text-light);margin-right:4px}
 .work-states button{height:32px;font-size:13px;font-weight:500;padding:0 10px;background:none;
   border:1px solid var(--border)}
@@ -473,10 +535,18 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .daily-fold>summary{font-size:13px;color:var(--text-light)}
 .daily-fold .daily-extra{margin-top:10px}
 .daily-fold p{font-size:12px;margin:8px 0;color:var(--text-light)}
+.draft-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  margin:12px 0 4px;padding:8px 10px;background:var(--bg)}
+.draft-state{font-size:12px;color:var(--text-light);flex:1;min-width:180px}
+.draft-state[data-state=ok]{color:var(--success-deep)}
+.draft-state[data-state=err]{color:var(--danger-deep)}
+.draft-bar button{flex:none}
 .diagnostic>summary{font-size:13px;color:var(--text);max-width:26em}
 .diagnostic .diagnostic-body{margin-top:8px;font-size:13px;white-space:pre-wrap;max-width:40em}
-.work-state{display:block;font-size:12px;color:var(--text-light);margin-bottom:4px}
-.work-state.processing{color:var(--primary);font-weight:600}
+.work-state{display:block;width:max-content;min-width:44px;text-align:center;
+  padding:0 6px;line-height:20px;font-size:12px;color:var(--text-light);
+  background:var(--fill);margin-bottom:6px}
+.work-state.processing{color:var(--primary);font-weight:600;background:var(--tint-primary)}
 button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-decoration:underline}
 .work-error{display:block;font-size:12px;color:var(--danger-deep);max-width:22em;white-space:normal}
 .monitor-help{margin:8px 0 14px;font-size:13px;color:var(--text-light)}
@@ -487,21 +557,27 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .app{grid-template-columns:minmax(0,1fr)}
   .side{position:static;height:auto;border-right:0;
     border-bottom:1px solid var(--border)}
-  .side nav{display:flex;flex-wrap:wrap;padding:8px}
-  .side nav a{height:36px;padding:0 12px}
+  .side nav{display:flex;flex-wrap:nowrap;overflow-x:auto;padding:8px;
+    -webkit-overflow-scrolling:touch}
+  .side nav a{height:36px;padding:0 12px;flex:none}
   .side .grp,.side .foot{display:none}
   .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .grid{grid-template-columns:minmax(0,1fr)}
   .content{padding:16px}
   /* 顶栏在窄屏会溢出：固定 220px 的搜索框 + 按钮 + 时间戳 + 退出，
    * 加左右各 24px padding，375px 宽根本排不下，时间戳和退出会被挤出屏幕。
    * 搜索框改成可伸缩、时间戳藏起来（那个宽度下它不是决策信息）。 */
   .top{padding:0 16px;gap:8px}
   .tools{flex:1;min-width:0}
+  .tools .searchbox{flex:1;min-width:0}
   .tools input{width:auto;flex:1;min-width:0}
   .top .when{display:none}
-  .work-head{padding:14px}
-  .work-head select{flex:1;min-width:120px}
+  .work-head{padding:12px}
+  .work-head h2{width:100%}
+  .work-head .field-label{flex:1;min-width:140px}
+  .work-head select{flex:1;min-width:0;width:100%}
   .work-live{width:100%;margin-left:0}
+  .top-status{right:16px;max-width:calc(100vw - 32px)}
   .work-metrics{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px 0;row-gap:14px}
   .work-metric{padding:0 14px}
   .work-metric:nth-child(2n){border-right:0}
@@ -512,6 +588,33 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .daily-body{padding:0 14px 14px}
   .daily-extra{grid-template-columns:1fr}
   .daily-tools .copy{margin-left:0}
+}
+/* 手机上的待办不是一张必须横滑才能处理的表，而是一组处置卡。
+ * 所有字段与按钮都保留；桌面表格的 DOM、勾选逻辑和 API 完全不变。 */
+@media (max-width:700px){
+  .tablewrap{overflow-x:visible}
+  .tablewrap table.todos{min-width:0;border:0;background:transparent}
+  .todos thead{display:none}
+  .todos tbody{display:grid;gap:10px}
+  .todos tbody tr{display:grid;grid-template-columns:24px minmax(0,1fr);gap:0 8px;
+    background:var(--surface);border:1px solid var(--border);padding:12px}
+  .todos tbody td{display:block;grid-column:2;border:0;padding:4px 0;
+    min-width:0;max-width:none}
+  .todos tbody td:first-child{grid-column:1;grid-row:1;padding-top:5px}
+  .todos tbody td.which{grid-column:2;grid-row:1;padding-top:0}
+  .todos tbody td.reasons{padding-top:8px}
+  .todos tbody td.comments::before{content:'评论数';color:var(--text-light);
+    font-size:12px;margin-right:10px}
+  .todos tbody td.when::before{content:'最近检查';color:var(--text-light);
+    font-size:12px;margin-right:10px}
+  .todos tbody td.acts{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;
+    border-top:1px solid var(--border);margin-top:6px;padding-top:10px;white-space:normal}
+  .todos tbody td.acts .work-state{flex-basis:auto;margin-bottom:0}
+  .todos tbody td.acts button.link{margin-left:0;min-height:32px}
+  .todos .diagnostic>summary,.todos .diagnostic .diagnostic-body{max-width:none}
+  .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
+  .fold-t tbody tr{grid-template-columns:minmax(0,1fr)}
+  .fold-t tbody td,.fold-t tbody td.which{grid-column:1}
 }
 """
 
@@ -578,15 +681,25 @@ _SCRIPT = r"""
     paint();
   }
   var btn = document.getElementById("refresh");
+  var refreshStatus = document.getElementById("refreshStatus");
+  function refreshSay(message, state){
+    if (!refreshStatus) return;
+    refreshStatus.textContent = message;
+    refreshStatus.dataset.state = state || "";
+  }
   if (btn) btn.addEventListener("click", function(){
-    btn.disabled = true; btn.textContent = "取数中…";
+    btn.disabled = true; btn.textContent = "取数中…"; refreshSay("正在重新读取飞书快照…", "busy");
     var requestEpoch = overviewEpoch;
     fetch("/api/refresh", {method:"POST", headers:{"X-Panel-Token": token}})
       .then(function(r){ return r.json().then(function(j){
         if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
         if (requestEpoch === overviewEpoch) applyOverview(j); return loadReports();
-      }); }).then(function(){ btn.disabled = false; btn.textContent = "重新取数"; })
-      .catch(function(){ btn.disabled = false; btn.textContent = "重新取数"; });
+      }); }).then(function(){
+        btn.disabled = false; btn.textContent = "重新取数"; refreshSay("待办与汇总已更新。", "ok");
+      }).catch(function(err){
+        btn.disabled = false; btn.textContent = "重新取数";
+        refreshSay("更新失败：" + String(err.message || err) + "；仍显示当前快照。", "error");
+      });
   });
   // ---- 待办：按项目分页 ----
   // 每个项目一个 tab。tab 上的数字是这一页里当前没被筛掉的行数。
@@ -648,6 +761,11 @@ _SCRIPT = r"""
       p.hidden = !on;
     });
     var t = activeTab();
+    if (t && t.parentNode) {
+      var strip = t.parentNode, left = t.offsetLeft, right = left + t.offsetWidth;
+      if (left < strip.scrollLeft) strip.scrollLeft = left;
+      else if (right > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = right - strip.clientWidth;
+    }
     if (!remember || !t) return;
     try { localStorage.setItem(TAB, t.dataset.project || ""); } catch (e) {}
     syncProjectContext(t);
@@ -863,6 +981,7 @@ _SCRIPT = r"""
   // ---- 项目工作台 / 日报。轮询只读缓存，不触发付费扫描。 ----
   var workbench = document.getElementById("s-work");
   var workProject = document.getElementById("workProject");
+  var reasonFilter = document.getElementById("reasonFilter");
   var workLive = document.getElementById("workLive");
   var workStats = [], workFilter = "all", overviewEpoch = 0, overviewBusy = false;
   var persistentWarning = "";
@@ -882,6 +1001,12 @@ _SCRIPT = r"""
   function reasonClass(r){ return ["风控中", "已失效", "刷新失败"].indexOf(r) >= 0 ? "r" :
     (["有负面", "疑似限流", "疑似受限", "卡住了"].indexOf(r) >= 0 ? "a" : ""); }
   function reasonChip(r){ return '<span class="chip ' + reasonClass(r) + '">' + esc(r) + '</span>'; }
+  function rowSeverity(tr){
+    var reasons = []; try { reasons = JSON.parse(tr.dataset.reasons || "[]"); } catch (e) {}
+    var worst = "";
+    reasons.forEach(function(r){ var cls = reasonClass(r); if (cls === "r" || (!worst && cls)) worst = cls; });
+    return worst;
+  }
   function safeUrl(t){ return /^https?:\/\//i.test(t || "") ? t : ""; }
   function setText(id, value){ var el = document.getElementById(id); if (el) el.textContent = value; }
   function projectLabel(){
@@ -922,7 +1047,10 @@ _SCRIPT = r"""
       var owner = panelOf(tr);
       if (workProject && workProject.value && owner && owner.dataset.project === projectLabel() &&
           tr.dataset.tbl !== workProject.value) hit = false;
-      tr.style.display = hit && (workFilter === "all" || state === workFilter) ? "" : "none";
+      var severity = rowSeverity(tr), wantedSeverity = reasonFilter ? reasonFilter.value : "all";
+      var severityHit = wantedSeverity === "all" ||
+        (wantedSeverity === "other" ? !severity : severity === wantedSeverity);
+      tr.style.display = hit && severityHit && (workFilter === "all" || state === workFilter) ? "" : "none";
       tr.hidden = state === "resolved" || tr.dataset.obsolete === "true";
     });
     var wanted = workProject ? projectLabel() : "", matched = false;
@@ -939,6 +1067,9 @@ _SCRIPT = r"""
     if (resolvedList) resolvedList.querySelectorAll("tbody tr[data-rec]").forEach(function(tr){
       var hit = (!workProject || !workProject.value || tr.dataset.tbl === workProject.value) &&
         (!q || tr.textContent.toLowerCase().indexOf(q) >= 0);
+      var severity = rowSeverity(tr), wantedSeverity = reasonFilter ? reasonFilter.value : "all";
+      hit = hit && (wantedSeverity === "all" ||
+        (wantedSeverity === "other" ? !severity : severity === wantedSeverity));
       tr.hidden = !hit; if (hit) count++;
     });
     if (resolvedList) {
@@ -966,8 +1097,8 @@ _SCRIPT = r"""
   }
   function rowHtml(t, main){
     var state = t.work_state || "pending", url = safeUrl(t.post_url), link = safeUrl(t.record_url);
-    var pick = main ? '<td class="nowrap"><input type="checkbox" class="todoPick' +
-      (t.archived || t.adhoc ? ' solo' : '') + '"></td>' : '';
+    var pick = main ? '<td class="nowrap"><input type="checkbox" aria-label="选择 ' + attr(t.label || t.record_id) +
+      ' 排队刷新" class="todoPick' + (t.archived || t.adhoc ? ' solo' : '') + '"></td>' : '';
     var diagnostic = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
     var controls = workbench && workbench.dataset.resolvable === "true" ?
       '<span class="work-state"></span><button type="button" class="link processing">正在处理</button>' +
@@ -976,14 +1107,16 @@ _SCRIPT = r"""
       '" data-tbl="' + attr(t.table_id) + '" data-project="' + attr(t.project) +
       '" data-key="' + attr(t.key) + '" data-work-state="' + attr(state) +
       '" data-reasons="' + attr(JSON.stringify(t.reasons || [])) + '" data-checked="' + attr(t.checked_at_ms || '') + '">' + pick +
-      '<td class="which" title="' + attr(t.label || t.record_id) + '">' + esc((t.label || t.record_id).slice(0, 24)) + '</td>' +
-      '<td class="nowrap persona">' + esc(t.persona || '—') + '</td><td class="nowrap post">' +
-      (url ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(url) + '">查看帖子</a>' : '—') + '</td>' +
+      '<td class="which" title="' + attr(t.label || t.record_id) + '"><span class="todo-title">' +
+      esc((t.label || t.record_id).slice(0, 24)) + '</span><div class="todo-meta"><span class="persona">' +
+      esc(t.persona || '—') + '</span><span class="post">' +
+      (url ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(url) + '">查看帖子</a>' : '—') +
+      '</span></div></td>' +
       '<td class="reasons">' + (t.reasons || []).map(reasonChip).join('') +
       (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : '')) + '</td>' +
       '<td class="diagnosis"><details class="diagnostic"><summary>' + esc(diagnostic.slice(0, 48) || '查看诊断与评论摘要') +
       '</summary><div class="diagnostic-body">' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></details></td>' +
-      '<td>' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
+      '<td class="comments">' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
       chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '') + '</td>' +
       '<td class="nowrap acts">' + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去这一行</a>' : '') + controls + '</td></tr>';
   }
@@ -995,14 +1128,15 @@ _SCRIPT = r"""
     if (!p) {
       var id = "live-" + panels.length, tab = document.createElement("button");
       tab.type = "button"; tab.className = "tab"; tab.setAttribute("role", "tab");
-      tab.dataset.tab = id; tab.dataset.project = t.project;
+      tab.id = "tab-" + id; tab.dataset.tab = id; tab.dataset.project = t.project;
       tab.setAttribute("aria-controls", "todos-" + id); tab.setAttribute("aria-selected", "false"); tab.tabIndex = -1;
       tab.appendChild(document.createTextNode(t.project + " "));
       var n = document.createElement("span"); n.className = "cnt"; n.textContent = "0"; tab.appendChild(n);
       host.querySelector(".tabs").appendChild(tab);
       p = document.createElement("div"); p.className = "tabpanel"; p.dataset.tab = id;
       p.dataset.project = t.project; p.dataset.tableId = t.table_id;
-      p.id = "todos-" + id; p.setAttribute("role", "tabpanel"); p.hidden = true;
+      p.id = "todos-" + id; p.setAttribute("role", "tabpanel");
+      p.setAttribute("aria-labelledby", "tab-" + id); p.hidden = true;
       host.appendChild(p); tabs.push(tab); panels.push(p);
       tab.addEventListener("click", function(){ showTab(id, true); sync(); });
       if (!activeTab() || (workProject && workProject.value === t.table_id)) showTab(id, false);
@@ -1011,7 +1145,7 @@ _SCRIPT = r"""
     if (!table) {
       table = document.createElement("table"); table.className = "todos" + (archived ? " fold-t" : "");
       table.innerHTML = '<thead><tr>' + (archived ? '' : '<th><input type="checkbox" class="todoAll" aria-label="全选这一页"></th>') +
-        '<th>哪一条</th><th>素人编号</th><th>帖子链接</th><th>为什么</th><th>诊断信息</th><th>评论数</th><th>最近检查</th><th></th></tr></thead><tbody></tbody>';
+        '<th>帖子 / 素人</th><th>为什么</th><th>诊断信息</th><th>评论数</th><th>最近检查</th><th>处理</th></tr></thead><tbody></tbody>';
       var wrap = document.createElement("div"); wrap.className = "tablewrap"; wrap.appendChild(table);
       if (archived) { var fold = document.createElement("details"); fold.className = "fold";
         fold.innerHTML = '<summary>已归档的异常帖子 <b class="foldN">0</b> 帖</summary>'; fold.appendChild(wrap); p.appendChild(fold);
@@ -1047,7 +1181,12 @@ _SCRIPT = r"""
       }
     }
     var pickBox = tr.querySelector(".todoPick");
-    if (pickBox) pickBox.classList.toggle("solo", !!(t.archived || t.adhoc));
+    if (pickBox) {
+      pickBox.classList.toggle("solo", !!(t.archived || t.adhoc));
+      pickBox.setAttribute("aria-label", "选择 " + (t.label || t.record_id) + " 排队刷新");
+      if (t.archived || t.adhoc) pickBox.setAttribute("title", "「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾");
+      else pickBox.removeAttribute("title");
+    }
     delete tr.dataset.obsolete;
     if (tr.dataset.key && t.key && tr.dataset.key !== t.key) tr.classList.add("fresh");
     if (!archived && t.key) tr.dataset.key = t.key;
@@ -1057,15 +1196,16 @@ _SCRIPT = r"""
     var when = tr.querySelector("td.when");
     if (when) when.innerHTML = chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '');
     var cells = tr.children, offset = tr.querySelector(".todoPick") ? 1 : 0;
-    var which = tr.querySelector("td.which");
-    if (which) { which.textContent = (t.label || t.record_id).slice(0, 24); which.title = t.label || t.record_id; }
-    var persona = tr.querySelector("td.persona"); if (persona) persona.textContent = t.persona || "—";
-    var post = tr.querySelector("td.post"), postUrl = safeUrl(t.post_url);
+    var which = tr.querySelector("td.which"), title = tr.querySelector(".todo-title");
+    if (title) title.textContent = (t.label || t.record_id).slice(0, 24);
+    if (which) which.title = t.label || t.record_id;
+    var persona = tr.querySelector(".persona"); if (persona) persona.textContent = t.persona || "—";
+    var post = tr.querySelector(".post"), postUrl = safeUrl(t.post_url);
     if (post && (!post.querySelector("a") || post.querySelector("a").getAttribute("href") !== postUrl))
       post.innerHTML = postUrl ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(postUrl) + '">查看帖子</a>' : '—';
-    if (cells[offset + 3]) cells[offset + 3].innerHTML = (t.reasons || []).map(reasonChip).join('') +
+    if (cells[offset + 1]) cells[offset + 1].innerHTML = (t.reasons || []).map(reasonChip).join('') +
       (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : ''));
-    if (cells[offset + 5]) cells[offset + 5].textContent = t.comment_count == null ? "—" : t.comment_count;
+    if (cells[offset + 3]) cells[offset + 3].textContent = t.comment_count == null ? "—" : t.comment_count;
     var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
     if (d) { var nextDetail = detail + (digest ? "\n" + digest : ""); if (d.textContent !== nextDetail) d.textContent = nextDetail;
       tr.querySelector(".diagnostic>summary").textContent = detail.slice(0, 48) || "查看诊断与评论摘要"; }
@@ -1085,8 +1225,31 @@ _SCRIPT = r"""
       '<button type="button" class="link unresolve">撤销</button></td>';
     var main = findTodo(t.table_id, t.record_id, false); if (main && !main.dataset.busy) updateRowState(main, "resolved");
   }
+  function updateKpi(label, value, sub, warn){
+    document.querySelectorAll(".kpi .box").forEach(function(card){
+      var key = card.querySelector(".k"); if (!key || key.textContent !== label) return;
+      var n = card.querySelector(".n"), s = card.querySelector(".s");
+      if (n) n.textContent = value; if (s) s.textContent = sub;
+      card.classList.toggle("warn", !!warn);
+    });
+  }
+  function updateOverviewSummary(j){
+    var projects = j.projects || [], total = 0, queued = 0, due = 0, dueRows = 0, stale = 0, blocked = 0;
+    projects.forEach(function(p){
+      total += Number(p.total_rows || 0); queued += Number(p.queued_rows || 0);
+      due += Number(p.due_yuan || 0); dueRows += Number(p.due_rows || 0);
+      stale += Number(p.stale_rows || 0); if (p.estimate_blocked) blocked++;
+    });
+    setText("totalRows", total); setText("projectCount", projects.length); setText("queuedRows", queued);
+    updateKpi("下一轮预计花费", "¥" + due.toFixed(2) + (blocked ? "+" : ""),
+      blocked ? blocked + " 张表算不出，这是下界" : dueRows + " 行到期待刷", false);
+    updateKpi("卡住了", String(stale), stale ? "早该刷到却一直没轮到" : "没有积压", stale > 0);
+    if (typeof j.fetched_at === "number" && j.fetched_at > 0)
+      setText("dataWhen", "数据于 " + chinaTime(j.fetched_at * 1000, true) + " 取得");
+  }
   function applyOverview(j){
     if (j.error) throw new Error(j.error);
+    updateOverviewSummary(j);
     if (j.work_stats) workStats = j.work_stats;
     if (typeof j.todos_hidden === "number") {
       var todoCount = String((j.todos || []).length) + (j.todos_hidden ? "+" : "");
@@ -1123,6 +1286,18 @@ _SCRIPT = r"""
   }
   function reportKey(){ return (workProject ? workProject.value : "") + "/" + (reportDate ? reportDate.value : ""); }
   function notesKey(){ return "linkcheck.daily-notes." + reportKey(); }
+  var draftState = {}, draftEpoch = 0;
+  function draftNode(){ return document.getElementById("draftState"); }
+  function setDraftState(text, state){
+    var el = draftNode(); if (!el) return;
+    el.textContent = text; el.dataset.state = state || "";
+  }
+  function saveNotes(){
+    if (!reportFeatures || !reportCompetitors) return;
+    try { localStorage.setItem(notesKey(), JSON.stringify({
+      features:reportFeatures.value, competitors:reportCompetitors.value})); }
+    catch (e) { if (reportMessage) reportMessage.textContent = "浏览器未允许本地保存；本次填写仍可复制。"; }
+  }
   function loadNotes(){
     if (!reportFeatures) return;
     var notes = {};
@@ -1130,6 +1305,100 @@ _SCRIPT = r"""
     reportFeatures.value = notes.features || ""; reportCompetitors.value = notes.competitors || "";
     reportFeatures.disabled = reportCompetitors.disabled = !workProject.value;
     reportFeatures.title = reportCompetitors.title = workProject.value ? "仅保存在此浏览器" : "选择单个项目后补充";
+    var button = document.getElementById("draftReport");
+    if (button) button.disabled = !workProject.value;
+    syncDraftState();
+  }
+  // 把某一期 AI 的状态显示出来。切项目/切日期都走这里，别让上一期的话留着。
+  function syncDraftState(){
+    var known = draftState[reportKey()];
+    if (!workProject || !workProject.value) {
+      setDraftState("选择单个项目后由 AI 自动归纳。", ""); return;
+    }
+    if (!known) { setDraftState("日报载入后自动归纳，也可以手动生成。", ""); return; }
+    if (known.status === "loading") { setDraftState("DeepSeek 正在归纳本期内容特征…", ""); return; }
+    setDraftState(draftMessage(known),
+      known.status === "ok" ? "ok" : (known.status === "unavailable" ||
+        known.status === "insufficient_evidence" ? "" : "err"));
+  }
+  function applyDraft(draft, replace){
+    var features = String(draft.features || "").trim();
+    var names = (draft.competitors || []).map(function(item){
+      return item && typeof item === "object" ? String(item.name || "") : String(item || "");
+    }).filter(function(name){ return name.trim(); });
+    // 只填空，不覆盖人已经写的。重新生成也一样：清空运营的判断比漏填更糟。
+    var filledFeatures = false, filledCompetitors = false;
+    if (features && (replace || !reportFeatures.value.trim())) {
+      reportFeatures.value = features; filledFeatures = true;
+    }
+    if (names.length && (replace || !reportCompetitors.value.trim())) {
+      reportCompetitors.value = names.join("、"); filledCompetitors = true;
+    }
+    saveNotes(); composeReport();
+    return {features: filledFeatures, competitors: filledCompetitors, kept: !filledFeatures};
+  }
+  function draftMessage(draft, applied){
+    if (draft.status === "ok") {
+      var bits = [];
+      if (draft.evidence_count) bits.push(draft.evidence_count + " 条预警评论");
+      if (draft.title_count) bits.push(draft.title_count + " 个预警帖子标题");
+      var scope = bits.length ? "依据 " + bits.join(" + ") : "已生成";
+      if (draft.sampled) scope += "（超出上限，抽样）";
+      var tail = [];
+      if (!(draft.competitors || []).length) tail.push("未发现可核验竞品");
+      if (applied && !applied.features) tail.push("内容特征栏已有文字，保留原样");
+      if (applied && !applied.competitors && (draft.competitors || []).length)
+        tail.push("竞品栏已有文字，保留原样");
+      return "AI 草稿：" + scope + (tail.length ? "；" + tail.join("；") : "") + "。";
+    }
+    if (draft.status === "cached") return "用的是刚才那份草稿，没有重新请求。";
+    return draft.error || "AI 暂不可用，可人工填写。";
+  }
+  function requestDraft(force){
+    var key = reportKey(), table = workProject ? workProject.value : "";
+    if (!table) { setDraftState("选择单个项目后由 AI 自动归纳。", ""); return; }
+    if (!reportDate) return;
+    var known = draftState[key];
+    if (!force && known) return;
+    draftState[key] = {status: "loading"};
+    var epoch = ++draftEpoch;
+    setDraftState("DeepSeek 正在归纳本期内容特征…", "");
+    var button = document.getElementById("draftReport");
+    if (button) { button.disabled = true; button.textContent = "生成中…"; }
+    fetch("/api/report-ai", {method: "POST",
+      headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
+      body: JSON.stringify({date: reportDate.value, table_id: table, force: !!force})})
+      .then(function(r){ return r.json().then(function(j){
+        if (!r.ok) { var err = new Error(j.error || ("HTTP " + r.status)); throw err; }
+        return j; }); })
+      .then(function(j){
+        if (epoch !== draftEpoch || key !== reportKey()) return;
+        draftState[key] = j;
+        if (j.status === "ok") {
+          var applied = applyDraft(j, force);
+          setDraftState(draftMessage(j, applied), "ok");
+        } else setDraftState(draftMessage(j),
+          j.status === "unavailable" || j.status === "insufficient_evidence" ? "" : "err");
+      })
+      .catch(function(err){
+        if (epoch !== draftEpoch || key !== reportKey()) return;
+        // 失败记成终态：轮询只填空的这一期，不能每分钟重打一次付费接口。
+        // 要重试就点「重新生成」（force），服务端另有 30 秒冷却。
+        draftState[key] = {status: "error", error: String(err.message || err)};
+        setDraftState("AI 草稿没生成出来：" + (err.message || err) +
+                      "。可人工填写，或点「重新生成」再试。", "err");
+      })
+      .then(function(){
+        if (button) { button.disabled = !workProject.value; button.textContent = "重新生成"; }
+      });
+  }
+  function maybeDraft(){
+    if (!workbench || !workProject || !workProject.value) return;
+    if (!reportLoaded || !reportText || !reportText.value) return;
+    // 这一期只要动过手（生成过 / 失败过 / 没证据 / 没配 Key），就不再自动来第二次。
+    // 否则一次 429 会在页面开着的时候每分钟重打一次付费接口。
+    if (draftState[reportKey()]) return;
+    requestDraft(false);
   }
   function composeReport(){
     if (!reportText) return;
@@ -1228,6 +1497,7 @@ _SCRIPT = r"""
       if (j.error && !(j.reports || []).length) throw new Error(j.error);
       currentReports = j.reports || []; reportCache[key] = currentReports; reportLoaded = true;
       renderReports(); reportMessage.textContent = j.error || "统计同步于 " + chinaTime(Date.now(), false);
+      maybeDraft();
     }).catch(function(e){
       if (epoch !== reportEpoch || key !== reportKey()) return;
       reportMessage.textContent = "日报同步延迟：" + e.message + (reportLoaded ? "；已保留上次结果。" : "；暂时无法取得统计。");
@@ -1245,6 +1515,7 @@ _SCRIPT = r"""
       panels.forEach(function(p){ if (panelHasTable(p, workProject.value)) showTab(p.dataset.tab, false); });
       loadNotes(); renderWorkStats(); applyWorkFilter(); loadReports();
     });
+    if (reasonFilter) reasonFilter.addEventListener("change", applyWorkFilter);
     reportDate.addEventListener("change", function(){ if (!reportDate.value) reportDate.value = dayInShanghai(); loadNotes(); loadReports(); });
     document.getElementById("reportNext").addEventListener("click", function(){
       var d = new Date(reportDate.value + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1);
@@ -1257,10 +1528,16 @@ _SCRIPT = r"""
       });
     });
     [reportFeatures, reportCompetitors].forEach(function(input){ input.addEventListener("input", function(){
-      try { localStorage.setItem(notesKey(), JSON.stringify({features:reportFeatures.value, competitors:reportCompetitors.value})); }
-      catch (e) { reportMessage.textContent = "浏览器未允许本地保存；本次填写仍可复制。"; }
-      composeReport();
+      saveNotes(); composeReport();
     }); });
+    var draftButton = document.getElementById("draftReport");
+    if (draftButton) draftButton.addEventListener("click", function(){
+      if (!workProject.value) return;
+      var filled = reportFeatures.value.trim() || reportCompetitors.value.trim();
+      if (filled && !confirm("重新生成会用 AI 结果替换这两栏里已有的内容（AI 没给的项保持不动）。\n\n" +
+                            "要保留现在这些字就先取消，自己复制一份。")) return;
+      requestDraft(true);
+    });
     document.getElementById("copyReport").addEventListener("click", function(){
       var copy = this;
       if (!reportText.value) return;
@@ -1308,10 +1585,10 @@ _SCRIPT = r"""
     var inputs = cols.map(function(c){
       var v = e.thresholds && e.thresholds[c] != null ? e.thresholds[c] : "";
       return "<label class=muted style='display:inline-block;margin:0 10px 6px 0'>" +
-        esc(c) + " <input type=number min=1 style='width:90px' data-col='" + esc(c) +
-        "' value='" + esc(String(v)) + "' placeholder='默认'></label>";
+        esc(c) + " <input type=number min=1 style='width:90px' data-col='" + attr(c) +
+        "' value='" + attr(String(v)) + "' placeholder='默认'></label>";
     }).join("");
-    return "<div class=thr data-rec='" + esc(e.record_id) + "' hidden style='flex-basis:100%;margin-top:8px'>" +
+    return "<div class=thr data-rec='" + attr(e.record_id) + "' hidden style='flex-basis:100%;margin-top:8px'>" +
       "<div class=muted style='margin-bottom:6px'>空着 = 用全局默认。" +
       "熔断比例、两击定罪、冷却、单轮预算<b>不能逐表</b>——它们有跨表语义，" +
       "逐表不同会让「这一轮该不该熔」说不清。</div>" +
@@ -1347,10 +1624,10 @@ _SCRIPT = r"""
           "<div class=who><b>" + esc(e.label) + "</b> " + bits.join("") +
           "<div class=muted>" + esc(e.target) + "</div></div>" +
           "<div class=acts>" +
-          "<button type=button data-act=build data-app='" + esc(e.app_token) + "' data-tbl='" + esc(e.table_id) + "'>补齐缺的列</button>" +
-          "<button type=button data-act=enable data-rec='" + esc(e.record_id) + "' data-on='" + (e.enabled ? "0" : "1") + "'>" + (e.enabled ? "停用" : "启用") + "</button>" +
-          "<button type=button data-act=thresholds data-rec='" + esc(e.record_id) + "'>阈值</button>" +
-          "<button type=button data-act=remove data-rec='" + esc(e.record_id) + "' data-label='" + esc(e.label) + "'>移除</button>" +
+          "<button type=button data-act=build data-app='" + attr(e.app_token) + "' data-tbl='" + attr(e.table_id) + "'>补齐缺的列</button>" +
+          "<button type=button data-act=enable data-rec='" + attr(e.record_id) + "' data-on='" + (e.enabled ? "0" : "1") + "'>" + (e.enabled ? "停用" : "启用") + "</button>" +
+          "<button type=button data-act=thresholds data-rec='" + attr(e.record_id) + "'>阈值</button>" +
+          "<button type=button data-act=remove data-rec='" + attr(e.record_id) + "' data-label='" + attr(e.label) + "'>移除</button>" +
           "</div><div class='out rowOut' style='flex-basis:100%'></div>" +
           thresholdForm(e) + "</div>";
       }).join("");
@@ -1358,6 +1635,13 @@ _SCRIPT = r"""
   }
   if (list) {
     load();
+    list.addEventListener("input", function(ev){
+      if (!ev.target.matches || !ev.target.matches(".thr input[data-col]")) return;
+      var panelBox = ev.target.closest(".thr"), saveBtn = panelBox.querySelector("[data-thr=save]");
+      var out2 = panelBox.querySelector(".thrOut");
+      saveBtn.disabled = true;
+      if (out2) out2.textContent = "值已变化，请重新点「先算给我看」再保存。";
+    });
     list.addEventListener("click", function(ev){
       var b = ev.target.closest ? ev.target.closest("button[data-act],button[data-thr]") : null;
       if (!b) return;
@@ -1480,7 +1764,7 @@ _SCRIPT = r"""
       : "<span class='chip r'>没配</span> <span class=muted>建出来的表没人能管——去 Railway 给面板服务配 <code>FEISHU_TABLE_MANAGERS</code>（手机号或邮箱），重启生效</span>";
     var groups = s.editor_chats.map(chatChip).join(" ") || "<span class=muted>还没选群</span>";
     var opts = entriesCache.filter(function(e){ return e.app_token; }).map(function(e){
-      return "<option value='" + esc(e.app_token) + "'>" + esc(e.label) + "</option>"; }).join("");
+      return "<option value='" + attr(e.app_token) + "'>" + esc(e.label) + "</option>"; }).join("");
     shareBox.innerHTML =
       "<div><b>新建的表给谁开权限</b> <span class=muted>每张「直接新建」的表建完自动加上。</span></div>" +
       "<div class=srow><span class=lbl>可管理</span>" + people + "</div>" +
@@ -1522,7 +1806,7 @@ _SCRIPT = r"""
           shareState.editor_chats.forEach(function(c){ chosen[c.chat_id] = true; });
           pick.innerHTML = "<div class=muted style='margin-bottom:4px'>勾上要开「可编辑」的群（群里所有人都能编辑新建的表）：</div>" +
             j.chats.map(function(c){
-              return "<label><input type=checkbox data-chat='" + esc(c.chat_id) + "' data-name='" + esc(c.name) + "'" +
+              return "<label><input type=checkbox data-chat='" + attr(c.chat_id) + "' data-name='" + attr(c.name) + "'" +
                 (chosen[c.chat_id] ? " checked" : "") + "> " + esc(c.name || c.chat_id) + "</label>";
             }).join("") +
             "<div style='margin-top:8px'><button type=button class=sm data-share=save-chats>保存</button> " +
@@ -1571,7 +1855,7 @@ _SCRIPT = r"""
     post("create", {name: name, template: full ? "full" : "monitor"}).then(function(j){
       var c = j.created;
       document.getElementById("addTarget").value = c.target;
-      var lines = ["建好了：<a href='" + esc(c.url) + "' target=_blank rel='noopener noreferrer'>打开它</a>（" + c.columns + " 列）",
+      var lines = ["建好了：<a href='" + attr(safeUrl(c.url)) + "' target=_blank rel='noopener noreferrer'>打开它</a>（" + c.columns + " 列）",
                    "链接已经填进上面的输入框，点「体检一下」再入册。"];
       if (c.shared && c.shared.length) lines.push("协作者：" + c.shared.map(esc).join("；"));
       var bad = (c.share_failures || []).concat(c.column_failures || []);
@@ -1625,6 +1909,8 @@ _ICON_PATHS = {
                '-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
     "history": ('<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>'
                 '<path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>'),
+    "search": ('<circle cx="11" cy="11" r="8"/>'
+               '<path d="m21 21-4.3-4.3"/>'),
     "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
 }
 
@@ -1693,7 +1979,8 @@ def login_page(message: str = "") -> str:
     <p class=muted>小红书 / 抖音笔记巡检</p>
     {error}
     <form method=post action=/login>
-      <input type=password name=password placeholder=口令 autofocus
+      <label class=sr-only for=loginPassword>面板口令</label>
+      <input id=loginPassword type=password name=password placeholder=口令 autofocus
              autocomplete=current-password>
       <p></p>
       <button type=submit class=primary>进去</button>
@@ -1813,11 +2100,12 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
                  f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
     pick = ""
     if main:
+        pick_label = f"选择 {_clip(todo.label, 30)} 排队刷新"
         if todo.archived or todo.adhoc:
-            pick = ("<td class=nowrap><input type=checkbox class='todoPick solo' "
+            pick = (f"<td class=nowrap><input type=checkbox class='todoPick solo' aria-label='{_e(pick_label)}' "
                     "title='「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾'></td>")
         else:
-            pick = "<td class=nowrap><input type=checkbox class=todoPick></td>"
+            pick = f"<td class=nowrap><input type=checkbox class=todoPick aria-label='{_e(pick_label)}'></td>"
     # data-key 只给主列表：「新」标记说的是「这一屏多了一件要做的事」，
     # 折叠区里的老帖不算。
     key = f" data-key='{_e(todo.key)}'" if main else ""
@@ -1840,12 +2128,12 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         f"data-reasons='{_e(json.dumps(todo.reasons, ensure_ascii=False))}' "
         f"data-checked='{checked}' data-project='{_e(todo.project)}' data-work-state='{_e(state)}'>"
         f"{pick}"
-        f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
-        f"<td class='nowrap persona'>{_e(todo.persona) or '<span class=muted>—</span>'}</td>"
-        f"<td class='nowrap post'>{_post_link(todo.post_url)}</td>"
-        f"<td>{_chips(todo.reasons, _REASON_CLASS)}{_scope_chip(todo) if main else ''}</td>"
+        f"<td class=which title='{_e(todo.label)}'><span class=todo-title>{_e(_clip(todo.label))}</span>"
+        f"<div class=todo-meta><span class=persona>{_e(todo.persona) or '—'}</span>"
+        f"<span class=post>{_post_link(todo.post_url)}</span></div></td>"
+        f"<td class=reasons>{_chips(todo.reasons, _REASON_CLASS)}{_scope_chip(todo) if main else ''}</td>"
         f"<td class=diagnosis>{diagnosis}</td>"
-        f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
+        f"<td class='nowrap comments'>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
         # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
         # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
         # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT，按 td.when 找格子）。
@@ -1856,8 +2144,8 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         "</tr>")
 
 
-_TODO_COLUMNS = ("<th>哪一条</th><th>素人编号</th><th>帖子链接</th><th>为什么</th>"
-                 "<th>诊断信息</th><th>评论数</th><th>最近检查</th><th></th>")
+_TODO_COLUMNS = ("<th>帖子 / 素人</th><th>为什么</th>"
+                 "<th>诊断信息</th><th>评论数</th><th>最近检查</th><th>处理</th>")
 
 
 def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) -> str:
@@ -1937,8 +2225,8 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
                 "没有需要处理的行。"
                 "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
                 "刷新失败 / 卡住了 / 需重新整理 —— 一条都没有。</div></div>"
-                "<div class=queuebar id=queueBar hidden><button type=button id=btnQueue disabled>"
-                "勾「排队刷新」（<span id=pickN>0</span>）</button><span id=queueOut class=muted></span></div>"
+                "<div class=queuebar id=queueBar hidden><button type=button class=primary id=btnQueue disabled>"
+                "排队刷新（<span id=pickN>0</span>）</button><span id=queueOut class=muted></span></div>"
                 "<div id=todos><div class=tabs role=tablist aria-label='按项目分开看'></div></div>"
                 + _resolved_list(resolved, offset_hours))
     groups: dict = {}
@@ -1952,7 +2240,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
     # 页内不再有「项目」列——整页都是同一个项目，那一栏只会占宽度。
     # 「新」标记（tr.fresh td:nth-child(2)）随之落到「哪一条」上，正好在标识旁边。
     head = ("<tr><th><input type=checkbox class=todoAll "
-            "title='全选这一页（已归档 / 没勾巡查的行不带）'></th>" + _TODO_COLUMNS + "</tr>")
+            "title='全选这一页（已归档 / 没勾巡查的行不带）' aria-label='全选这一页'></th>" + _TODO_COLUMNS + "</tr>")
     tabs, panels = [], []
     for index, (label, (items, old)) in enumerate(groups.items()):
         tid = f"p{index}"
@@ -1961,7 +2249,8 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
         more = (f"<span class=more title='另有 {len(old)} 行已归档的老帖有异常，"
                 f"在这一页底下收着'>+{len(old)}</span>" if old else "")
         tabs.append(
-            f"<button type=button role=tab class='tab{' on' if first else ''}' "
+            f"<button type=button role=tab id='tab-{tid}' "
+            f"class='tab{' on' if first else ''}' "
             f"aria-selected={'true' if first else 'false'} data-tab='{tid}' "
             f"data-project='{_e(label)}' aria-controls='todos-{tid}'>"
             f"{_e(label)} <span class='{cnt_cls}'>{len(items)}</span>{more}</button>")
@@ -1975,15 +2264,15 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
                     "底下收着的是已归档的老帖。</div>")
         panels.append(
             f"<div class=tabpanel id='todos-{tid}' role=tabpanel data-tab='{tid}' "
+            f"aria-labelledby='tab-{tid}' "
             f"data-project='{_e(label)}'{'' if first else ' hidden'}>"
             f"{main}{_fold(old, offset_hours, show_digest, resolvable=resolvable)}</div>")
     # #todos 包住所有 tab 页：脚本里「所有待办行」仍然是 `#todos tbody tr`，
     # 「新」标记、筛选、勾选计数都不用知道有几页。
     return (f"""<div class=queuebar id=queueBar>
-  <button type=button id=btnQueue disabled>勾「排队刷新」（<span id=pickN>0</span>）</button>
-  <span class=muted>面板不发付费请求——勾上之后由 cron 在五分钟内接手，
-  和你在飞书里手工勾是同一条路。</span>
-  <span id=queueOut class=muted></span>
+  <button type=button class=primary id=btnQueue disabled>排队刷新（<span id=pickN>0</span>）</button>
+  <span class=queue-help>只处理当前项目已勾选行，后台 cron 五分钟内接手。</span>
+  <span id=queueOut class=muted role=status aria-live=polite></span>
 </div>
 <div id=todos><div class=tabs role=tablist aria-label='按项目分开看'>{''.join(tabs)}</div>"""
             f"{''.join(panels)}</div>{_resolved_list(resolved, offset_hours)}")
@@ -2035,20 +2324,24 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
   <div class=muted><a href='{_e(p.table_url)}' target=_blank
      rel='noopener noreferrer' class=enter>打开这张表</a></div>
   {health}
-  <div class=rows>
-    <div><span class=lbl>在管</span><span>{p.total_rows} 行
-      {f'<span class=muted>（{p.archived_rows} 已归档）</span>' if p.archived_rows else ''}</span></div>
-    <div><span class=lbl>要人管</span><span>{p.needs_attention} 行{dropped}</span></div>
-    <div><span class=lbl>到期待刷</span><span>{due_text}</span></div>
-    <div><span class=lbl>排队中</span><span>{p.queued_rows} 行</span></div>
-    <div><span class=lbl>卡住了</span><span>{p.stale_rows} 行
-      {f'<span class=muted>（{p.never_checked_rows} 从没刷过）</span>' if p.never_checked_rows else ''}</span></div>
-    <div><span class=lbl>最旧检查</span><span>{_e(_stamp(p.oldest_checked_ms, offset_hours))}</span></div>
-    {no_publish}
-    {coverage}
-  </div>
-  <div style='margin-top:9px'>{_counts_chips(p.traffic_tag_counts)}</div>
-  <div style='margin-top:5px'>{_counts_chips(p.refresh_status_counts)}</div>
+  <div class=project-snapshot>
+    <span>在管 <b>{p.total_rows}</b> 行</span><span>要人管 <b>{p.needs_attention}</b> 行{dropped}</span>
+    <span>卡住 <b>{p.stale_rows}</b> 行</span></div>
+  <details class=project-detail{' open' if problems else ''}>
+    <summary>费用、巡检与字段详情<span class=detail-link>查看</span></summary>
+    <div class=rows>
+      <div><span class=lbl>在管 / 已归档</span><span>{p.total_rows} / {p.archived_rows} 行</span></div>
+      <div><span class=lbl>到期待刷</span><span>{due_text}</span></div>
+      <div><span class=lbl>排队中</span><span>{p.queued_rows} 行</span></div>
+      <div><span class=lbl>卡住了</span><span>{p.stale_rows} 行
+        {f'<span class=muted>（{p.never_checked_rows} 从没刷过）</span>' if p.never_checked_rows else ''}</span></div>
+      <div><span class=lbl>最旧检查</span><span>{_e(_stamp(p.oldest_checked_ms, offset_hours))}</span></div>
+      {no_publish}
+      {coverage}
+    </div>
+    <div style='margin-top:9px'>{_counts_chips(p.traffic_tag_counts)}</div>
+    <div style='margin-top:5px'>{_counts_chips(p.refresh_status_counts)}</div>
+  </details>
 </div>"""
 
 
@@ -2138,7 +2431,9 @@ def _projects_section(config) -> str:
 <div class=addbox>
   <div style='font-weight:600;margin-bottom:8px'>加一张表</div>
   <div class=row>
+    <label class=sr-only for=addLabel>项目名</label>
     <input type=text id=addLabel placeholder='项目名，比如 途鸽三期'>
+    <label class=sr-only for=addTarget>飞书表格链接</label>
     <input type=text id=addTarget placeholder='粘表格链接（/base/ 或 /wiki/ 都行）'>
     <button type=button id=btnCheck>体检一下</button>
   </div>
@@ -2300,59 +2595,72 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
     return f"""<section class=workbench id=s-work data-resolvable={'true' if resolvable else 'false'}
   data-reports='{initial}'>
   <div class=work-head>
-    <h2>项目工作台</h2>
-    <label class=sr-only for=workProject>查看项目</label>
-    <select id=workProject><option value=''>全部项目</option>{options}</select>
+    <h2>待办工作台</h2>
+    <label class=field-label for=workProject>项目
+      <select id=workProject><option value=''>全部项目</option>{options}</select></label>
+    <label class=field-label for=reasonFilter>问题层级
+      <select id=reasonFilter>
+        <option value=all>全部问题</option><option value=r>紧急 · 风控 / 失效 / 失败</option>
+        <option value=a>预警 · 负面 / 限流</option><option value=other>其他待办</option>
+      </select></label>
     <span class=work-source id=workSource>正在读取</span>
     <span class=work-live id=workLive role=status aria-live=polite>正在同步处理进度…</span>
   </div>
-  <div class=work-metrics aria-label='负面帖子处理概览' aria-live=polite>
-    <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
-      <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
-      <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
-    <div class=work-metric><span class=metric-label id=metricNegativeLabel>当前负面帖子</span>
-      <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
-      <span class=metric-note id=metricComments>评论条数待核实</span></div>
-    <div class=work-metric><span class=metric-label>待处理</span>
-      <span class=metric-value><span id=metricPending>—</span><small class=metric-unit>篇</small></span></div>
-    <div class=work-metric><span class=metric-label>正在处理</span>
-      <span class=metric-value><span id=metricProcessing>—</span><small class=metric-unit>篇</small></span></div>
-    <div class=work-metric><span class=metric-label>已处理</span>
-      <span class=metric-value><span id=metricResolved>—</span><small class=metric-unit>篇</small></span></div>
-  </div>
-  <div class=work-summary id=workSummary aria-live=polite>正在读取现有数据…</div>
   <div class=work-states role=group aria-label='按待办处理状态筛选'>
-    <span class=caption>全部异常待办 · 行</span>
+    <span class=caption>全部异常待办 · 行（含归档 / 临时检查）</span>
     <button type=button data-work-filter=all aria-pressed=true>全部</button>
     <button type=button data-work-filter=pending aria-pressed=false>待处理<b id=workPending>—</b></button>
     <button type=button data-work-filter=processing aria-pressed=false>正在处理<b id=workProcessing>—</b></button>
     <button type=button data-work-filter=resolved aria-pressed=false>已处理<b id=workResolved>—</b></button>
   </div>
-  <details class=daily id=dailyPanel>
-    <summary>每日汇报<span class=muted id=reportPeriod>每日 16:00 结算 · 北京时间</span></summary>
-    <div class=daily-body>
-      <div class=daily-tools>
-        <label for=reportDate>汇报结束日期</label><input type=date id=reportDate>
-        <button type=button class=sm id=reportNext>下个周期</button>
-        <button type=button class='sm primary copy' id=copyReport disabled>复制汇报</button>
-      </div>
-      <label class=sr-only for=reportText>汇报正文</label>
-      <textarea id=reportText class=daily-text readonly placeholder='日报载入后显示在这里，可直接复制。'></textarea>
-      <div class=daily-message id=reportMessage role=status aria-live=polite></div>
-      <details class=daily-fold id=reportNotes><summary>补充内容特征与疑似竞品</summary>
-        <div class=daily-extra>
-          <div><label for=reportFeatures>主要内容特征</label>
-            <textarea id=reportFeatures placeholder='填写复核后的主要内容特征，复制时加入汇报。'></textarea></div>
-          <div><label for=reportCompetitors>疑似竞品</label>
-            <textarea id=reportCompetitors placeholder='填写已核实的品牌或产品线索。'></textarea></div>
-        </div>
-        <p>补充仅保存在此浏览器，按项目和日期区分。</p>
-      </details>
-      <details class=daily-fold id=reportMethod><summary>统计说明与数据明细</summary>
-        <div class=daily-evidence id=reportEvidence></div>
-        <ul class=daily-limits id=reportLimits hidden></ul>
-      </details>
+  <details class=work-details id=workDetails>
+    <summary>项目数据与每日汇报<span class=muted>当前负面按帖子去重</span></summary>
+    <div class=work-context>当前负面处理概览按帖子去重；上方全部异常按表行计数，两者不是同一口径。</div>
+    <div class=work-metrics aria-label='负面帖子处理概览' aria-live=polite>
+      <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
+        <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
+        <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
+      <div class=work-metric><span class=metric-label id=metricNegativeLabel>当前负面帖子</span>
+        <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
+        <span class=metric-note id=metricComments>评论条数待核实</span></div>
+      <div class=work-metric><span class=metric-label>待处理</span>
+        <span class=metric-value><span id=metricPending>—</span><small class=metric-unit>篇</small></span></div>
+      <div class=work-metric><span class=metric-label>正在处理</span>
+        <span class=metric-value><span id=metricProcessing>—</span><small class=metric-unit>篇</small></span></div>
+      <div class=work-metric><span class=metric-label>已处理</span>
+        <span class=metric-value><span id=metricResolved>—</span><small class=metric-unit>篇</small></span></div>
     </div>
+    <div class=work-summary id=workSummary aria-live=polite>正在读取现有数据…</div>
+    <details class=daily id=dailyPanel>
+      <summary>每日汇报<span class=muted id=reportPeriod>每日 16:00 结算 · 北京时间</span></summary>
+      <div class=daily-body>
+        <div class=daily-tools>
+          <label for=reportDate>汇报结束日期</label><input type=date id=reportDate>
+          <button type=button class=sm id=reportNext>下个周期</button>
+          <button type=button class='sm primary copy' id=copyReport disabled>复制汇报</button>
+        </div>
+        <label class=sr-only for=reportText>汇报正文</label>
+        <textarea id=reportText class=daily-text readonly placeholder='日报载入后显示在这里，可直接复制。'></textarea>
+        <div class=daily-message id=reportMessage role=status aria-live=polite></div>
+        <details class=daily-fold id=reportNotes><summary>内容特征与疑似竞品<span class=muted>AI 归纳，可改</span></summary>
+          <div class=draft-bar>
+            <span class=draft-state id=draftState role=status aria-live=polite>选择单个项目后由 AI 自动归纳。</span>
+            <button type=button class=sm id=draftReport disabled>重新生成</button>
+          </div>
+          <div class=daily-extra>
+            <div><label for=reportFeatures>主要内容特征</label>
+              <textarea id=reportFeatures placeholder='AI 会按本期预警帖子标题与评论自动填入，可直接修改。'></textarea></div>
+            <div><label for=reportCompetitors>疑似竞品</label>
+              <textarea id=reportCompetitors placeholder='AI 只列证据中出现过的名称，没有就留空。'></textarea></div>
+          </div>
+          <p>AI 基于本期预警帖子标题与第一页预警评论归纳，未发送作者、昵称或 IP；修改保存在此浏览器，按项目和日期区分。</p>
+        </details>
+        <details class=daily-fold id=reportMethod><summary>统计说明与数据明细</summary>
+          <div class=daily-evidence id=reportEvidence></div>
+          <ul class=daily-limits id=reportLimits hidden></ul>
+        </details>
+      </div>
+    </details>
   </details>
 </section>"""
 
@@ -2473,9 +2781,9 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                  f"（另有 <b>{todos_hidden}</b> 行因条数上限没列出来）"
                  if todos_hidden else
                  f"<b>{len(todos)}</b> 行现在需要人看一眼")
-    lede = (f"在管 <b>{overview.total_rows}</b> 行，分在 "
-            f"<b>{len(projects)}</b> 个项目里；其中 <span id=todoLede>{todo_text}</span>，"
-            f"<b>{overview.queued_rows}</b> 行已排队等下一轮刷新。")
+    lede = (f"在管 <b id=totalRows>{overview.total_rows}</b> 行，分在 "
+            f"<b id=projectCount>{len(projects)}</b> 个项目里；其中 <span id=todoLede>{todo_text}</span>，"
+            f"<b id=queuedRows>{overview.queued_rows}</b> 行已排队等下一轮刷新。")
 
     nav = _sidebar_nav(
         # 侧栏那个数字和 KPI 走同一个口径：截断了就带 `+`，不装成精确值。
@@ -2497,10 +2805,12 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 <div class=main>
   <div class=top>
     <span class=tools>
-      <input id=filter type=search placeholder='筛待办…' aria-label='筛待办'>
+      <span class=searchbox>{_icon('search')}<input id=filter type=search
+        placeholder='搜索帖子、问题或编号' aria-label='搜索待办'></span>
       <button id=refresh type=button class=sm>重新取数</button>
     </span>
-    <span class=when>数据于 {_e(when)} 取得</span>
+    <span class=when id=dataWhen>数据于 {_e(when)} 取得</span>
+    <span id=refreshStatus class=top-status role=status aria-live=polite></span>
     <form method=post action=/logout style='margin:0 0 0 12px'>
       <button type=submit class=sm>退出</button></form>
   </div>
@@ -2543,22 +2853,26 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
     带上每一项的条数：侧栏在这个面板里不只是跳转，它是**第二处**告诉你
     「哪儿有事」的地方——收着的时候也能一眼看出待办有多少。
     """
-    items = [
-        ("s-work", "layout-grid", "项目工作台", ""),
+    operational = [
+        ("s-work", "layout-grid", "待办工作台", ""),
         ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
         ("s-proj", "layout-grid", "各项目", str(projects)),
-        ("s-manage", "folder", "加表 / 改配置", ""),
     ]
+    system = [("s-manage", "folder", "加表 / 改配置", "")]
     if balances:
-        items.append(("s-balance", "wallet", "余额", ""))
-    items.append(("s-runs", "history", "运行历史", str(runs) if runs else ""))
-    links = "".join(
-        f"<a href='#{anchor}' data-sec='{anchor}'>"
-        f"{_icon(icon, 'icon')}<span>{_e(label)}</span>"
-        + (f"<span class=cnt>{_e(count)}</span>" if count else "")
-        + "</a>"
-        for anchor, icon, label, count in items)
-    return f"<nav>{links}</nav>"
+        system.append(("s-balance", "wallet", "余额", ""))
+    system.append(("s-runs", "history", "运行历史", str(runs) if runs else ""))
+
+    def links_for(items):
+        return "".join(
+            f"<a href='#{anchor}' data-sec='{anchor}'>"
+            f"{_icon(icon, 'icon')}<span>{_e(label)}</span>"
+            + (f"<span class=cnt>{_e(count)}</span>" if count else "")
+            + "</a>"
+            for anchor, icon, label, count in items)
+
+    return (f"<nav><div class=grp>运营</div>{links_for(operational)}"
+            f"<div class=grp>系统与配置</div>{links_for(system)}</nav>")
 
 
 def _kpi_lead(value, key: str, sub: str = "") -> str:
