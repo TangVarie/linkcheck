@@ -29,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from xhsearch import (feishu, providers, rows as rows_mod, runlock, runner,
+from xhsearch import (daily_report, feishu, providers, rows as rows_mod, runlock, runner,
                       schema, tablespec)
 from xhsearch.config import Budget, Channels, Settings
 from xhsearch.envfile import load_dotenv
@@ -208,6 +208,42 @@ def _registry_table(app_id: str, app_secret: str) -> feishu.Bitable | None:
         sys.exit(f"FEISHU_REGISTRY 看不懂：{exc}")
     return feishu.Bitable(app_id=app_id, app_secret=app_secret,
                           app_token=target.app_token, table_id=target.table_id)
+
+
+def _daily_journal():
+    """与面板共用注册表 base 的留痕表；没有注册表时不猜业务表写入位置。"""
+    if not os.environ.get("FEISHU_REGISTRY", "").strip():
+        print("⚠ 未配置 FEISHU_REGISTRY：本轮照常巡检，但不保存日报留痕，历史不可追溯")
+        return None
+    app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
+    registry_table = _registry_table(app_id, app_secret)
+    workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
+    return daily_report.Journal(workspace, lambda app_token, table_id: feishu.Bitable(
+        app_id=app_id, app_secret=app_secret, app_token=app_token, table_id=table_id),
+        registry_table.app_token)
+
+
+def _journal_report(journal, table, report, run_id: str, *, started: bool = True) -> bool:
+    """先保存成功扫描，再闭合批次；失败不挡业务表写回，但必须返回失败。"""
+    if journal is None:
+        return True
+    try:
+        events = [{**out.scan_event, "table_id": table.table_id}
+                  for out in (report.outcomes if report is not None else [])
+                  if out.scan_event is not None]
+        if events:
+            journal.append(events)
+        # 若预先写 run_start 失败，留下明确 gap，而不是用 run_end 假装本轮完整。
+        journal.append([{"type": "run_end" if started else "gap",
+                         "at": int(time.time() * 1000), "table_id": table.table_id,
+                         "run_id": run_id, "reason": "本轮开始留痕失败" if not started else ""}])
+        if events:
+            print(f"🧾 已留痕 {len(events)} 条成功扫描；日报按帖子和评论分别去重")
+        return started
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ 日报留痕写入失败：{type(exc).__name__}: {exc}；"
+              "本轮业务结果继续写回，日报统计可能不全，请检查「巡检留痕」及运行日志")
+        return False
 
 
 class NoTables(RuntimeError):
@@ -568,7 +604,8 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                    stop: threading.Event | None = None,
                    share: runner.FetchShare | None = None,
                    watch: runner.ContractWatch | None = None,
-                   estimate_seen: set | None = None):
+                   estimate_seen: set | None = None,
+                   before_scan=None):
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
@@ -726,6 +763,8 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     collation_ready = _collation_ready(settings, known_fields)
     eval_unready = _eval_unready(settings, fields_meta)
     throttle_ready = _throttle_ready(settings, fields_meta)
+    if before_scan is not None:
+        before_scan()
     report = runner.refresh(
         row_list, api_keys, settings,
         now=now,
@@ -1093,6 +1132,15 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     pending: list[tuple[str, feishu.Bitable, runner.RunReport,
                        set[str] | None, Settings]] = []
     channels_dead = False
+    journal = None
+    journal_run_id = feishu.idempotency_key()
+    journal_started: dict[str, bool] = {}
+    if mode != "estimate":
+        try:
+            journal = _daily_journal()
+        except Exception as exc:  # noqa: BLE001
+            print(f"❌ 日报留痕初始化失败：{type(exc).__name__}: {exc}；本轮照常巡检，日报覆盖不完整")
+            worst = 1
     try:
         for index, (label, table) in enumerate(tables):
             if multi:
@@ -1110,12 +1158,25 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             # 就地改会让第一张表的阈值串味到后面所有表，而那种 bug 只在
             # 多表部署上出现，看起来像「判定口径莫名其妙」。
             per_table = settings_for_table(settings, table)
+            def begin_journal():
+                nonlocal worst
+                try:
+                    journal_at = int(time.time() * 1000)
+                    journal.start(table.table_id, journal_at)
+                    journal.append([{"type": "run_start", "at": journal_at,
+                                     "table_id": table.table_id, "run_id": journal_run_id}])
+                    journal_started[table.table_id] = True
+                except Exception as exc:  # noqa: BLE001
+                    journal_started[table.table_id] = False
+                    worst = 1
+                    print(f"❌ 日报批次开始留痕失败：{type(exc).__name__}: {exc}；本轮照常巡检，日报覆盖不完整")
+            journal_kwargs = {"before_scan": begin_journal} if journal is not None else {}
             try:
                 code, found, row_count, yuan, prep = _refresh_table(
                     mode, record_ids, per_table, api_keys, table, now,
                     quiet_missing=multi, deadline=deadline, disabled=disabled,
                     budget=budget, stop=stop, share=share, watch=watch,
-                    estimate_seen=estimate_seen)
+                    estimate_seen=estimate_seen, **journal_kwargs)
             except feishu.FeishuError as exc:
                 # 一张表的表级故障（权限被收回、表被删）不该拖垮其余表的巡查。
                 print(f"❌ 这张表读写失败（表级错误）：{exc}；继续处理其余表")
@@ -1144,6 +1205,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                     _write_back_table(table, report, fields_meta, per_table, label)
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
+                _journal_report(journal, table, report, journal_run_id,
+                                started=journal_started.get(table.table_id, False))
         _finish(1, error=type(sys.exc_info()[1]).__name__)
         raise
 
@@ -1162,6 +1225,12 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     # 结论，而那正好发生在上游故障、最不该误报的时候。
     for label, _table, report, _meta, _cfg in pending:
         runner.emit_run_events(report, on_event, table=label, mode=mode)
+
+    # 与业务表写回解耦：真实取得的扫描结果要留痕，留痕失败也不能丢掉已付费结果。
+    for _label, table, report, _meta, _cfg in pending:
+        if not _journal_report(journal, table, report, journal_run_id,
+                               started=journal_started.get(table.table_id, False)):
+            worst = 1
 
     for label, table, report, fields_meta, per_table in pending:
         if multi:

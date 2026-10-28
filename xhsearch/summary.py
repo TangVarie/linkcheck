@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -78,6 +79,10 @@ class TodoRow:
     negative_digest: str = ""
     # 只在 Overview.resolved 里的行有：运营什么时候点的「已解决」（毫秒）。
     resolved_at_ms: Optional[int] = None
+    # 帖子级运营进度；正在处理保留在主列表，刷新不会清掉人工进行中的工作。
+    work_state: str = "pending"
+    working_at_ms: Optional[int] = None
+    post_key: str = ""
 
     @property
     def key(self) -> str:
@@ -459,7 +464,12 @@ def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
                archived: bool = False, adhoc: bool = False,
                recent: bool = False) -> TodoRow:
     f = settings.fields
+    parsed = row.parsed
+    post_key = (f"{parsed.platform}:{parsed.content_id}" if parsed.content_id else
+                f"{parsed.platform}:url:" + hashlib.sha256(
+                    (parsed.url or row.link_cell).encode("utf-8")).hexdigest())
     return TodoRow(
+        post_key=post_key,
         archived=archived,
         adhoc=adhoc,
         recent=recent,
@@ -723,6 +733,10 @@ def still_resolved(todo: TodoRow, entry: Any, sticky: set[str]) -> bool:
     """这一行按那条「已解决」记录该不该继续收着。**纯函数。**"""
     if not isinstance(entry, dict):
         return False
+    if entry.get("state", "resolved") != "resolved":
+        return False
+    if entry.get("post_key") and entry["post_key"] != todo.post_key:
+        return False
     marked = entry.get("reasons")
     if not isinstance(marked, list) or not set(todo.reasons) <= set(marked):
         return False                       # 有没标过的新问题
@@ -743,18 +757,40 @@ def apply_resolutions(overview: Overview, resolved: dict,
     sticky = sticky_reasons(settings)
     hidden: list[TodoRow] = []
 
-    def keep(todo: TodoRow) -> bool:
+    def apply(todo: TodoRow) -> Optional[TodoRow]:
         entry = resolved.get(resolution_key(todo.table_id, todo.record_id))
+        if (isinstance(entry, dict) and entry.get("state") == "processing"
+                and (not entry.get("post_key") or entry["post_key"] == todo.post_key)
+                and isinstance(entry.get("reasons"), list)
+                and set(todo.reasons) <= set(entry["reasons"])):
+            return replace(todo, work_state="processing",
+                           working_at_ms=_int_ms(entry.get("at")))
         if entry is None or not still_resolved(todo, entry, sticky):
-            return True
-        hidden.append(replace(todo, resolved_at_ms=_int_ms(entry.get("at"))))
-        return False
+            return todo
+        hidden.append(replace(todo, resolved_at_ms=_int_ms(entry.get("at")),
+                              work_state="resolved"))
+        return None
 
-    projects = [replace(p, todos=[t for t in p.todos if keep(t)],
-                        adhoc_todos=[t for t in p.adhoc_todos if keep(t)])
+    projects = [replace(p, todos=[out for t in p.todos if (out := apply(t)) is not None],
+                        adhoc_todos=[out for t in p.adhoc_todos
+                                     if (out := apply(t)) is not None])
                 for p in overview.projects]
     hidden.sort(key=lambda t: -(t.resolved_at_ms or 0))
     return replace(overview, projects=projects, resolved=hidden)
+
+
+def work_stats(overview: Overview, resolved: dict, settings: Settings) -> list[dict]:
+    """完整待办进度；不受页面条数上限、搜索词或项目标签影响。单位是帖子行。"""
+    shown = apply_resolutions(overview, resolved, settings)
+    result = []
+    for project in shown.projects:
+        counts = {"pending": 0, "processing": 0, "resolved": 0}
+        for todo in (*project.todos, *project.adhoc_todos):
+            counts[todo.work_state] += 1
+        counts["resolved"] = sum(t.table_id == project.table_id for t in shown.resolved)
+        result.append({"table_id": project.table_id, "label": project.label, **counts,
+                       "error": project.error})
+    return result
 
 
 def trim_resolutions(overview: Overview, resolved: dict) -> dict[str, Optional[list]]:
@@ -780,6 +816,8 @@ def trim_resolutions(overview: Overview, resolved: dict) -> dict[str, Optional[l
         todo = rows_of[table_id].get(record_id)
         marked = entry.get("reasons") if isinstance(entry.get("reasons"), list) else []
         kept = [r for r in marked if todo is not None and r in todo.reasons]
+        if todo is not None and entry.get("post_key") and entry["post_key"] != todo.post_key:
+            kept = []
         if kept != marked:
             edits[key] = kept or None
     return edits

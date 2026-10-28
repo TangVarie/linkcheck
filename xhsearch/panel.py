@@ -39,7 +39,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
@@ -1172,6 +1172,96 @@ class Projects:
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+class DailyReports:
+    """日报免费读取与短缓存；与主页面读表解耦，不在请求中触发巡检。"""
+
+    def __init__(self, projects: Projects, *, journal=None,
+                 wall: Callable[[], float] = time.time):
+        self.projects = projects
+        self._journal_value = journal
+        self._wall = wall
+        self._cache: dict = {}
+        self._lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._version = 0
+        self.warning = ""
+        self.resolutions = None
+
+    def _journal(self):
+        if self._journal_value is None:
+            from .daily_report import Journal
+            target = tablespec.parse_target(self.projects.config.registry_target,
+                                            default_label="registry")
+            self._journal_value = Journal(self.projects._workspace(),
+                                          self.projects._bitable, target.app_token,
+                                          allow_create=False)
+        return self._journal_value
+
+    def get(self, overview: Optional[summary.Overview], *, date: str = "",
+            table_id: str = "") -> dict:
+        from . import daily_report
+        now = self._wall()
+        tz = timezone(timedelta(hours=8))
+        today = datetime.fromtimestamp(now, tz).date()
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d").date() if date else today
+        except ValueError as exc:
+            raise ValueError("date 请使用 YYYY-MM-DD，表示日报截止日") from exc
+        if not today - timedelta(days=90) <= day <= today + timedelta(days=1):
+            raise ValueError("可查看最近 90 天及当前周期的日报")
+        end = datetime(day.year, day.month, day.day, 16, tzinfo=tz)
+        start_ms = int((end - timedelta(days=1)).timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+        if start_ms >= int(now * 1000):
+            raise ValueError("这个日报周期还未开始；请在北京时间 16 点后查看下一期")
+        if overview is None:
+            return {"reports": [], "error": "监控数据还未就绪，请稍后再试", "as_of": now}
+        projects = [p for p in overview.projects if not table_id or p.table_id == table_id]
+        if table_id and not projects:
+            raise ValueError("项目不在当前监控清单里")
+        if self.resolutions is not None:
+            self.resolutions.flush_journal(self)
+        # 同一时间窗只读一次留痕；并发浏览器不各扫一遍飞书。
+        with self._read_lock:
+            with self._lock:
+                version = self._version
+                cached = self._cache.get(start_ms)
+            if cached and cached[0] == version and now - cached[1] < 60:
+                events = cached[2]
+                events_wall = cached[1]
+            else:
+                events = self._journal().read_window(start_ms, min(end_ms, int(now * 1000)))
+                events_wall = now
+                with self._lock:
+                    if version == self._version:
+                        self._cache[start_ms] = (version, now, events)
+                        while len(self._cache) > 8:
+                            self._cache.pop(next(iter(self._cache)))
+        reports = [daily_report.aggregate(events, start_ms, end_ms, p.table_id, p.label,
+                                          as_of_ms=int(events_wall * 1000)) for p in projects]
+        for report, project in zip(reports, projects):
+            if project.error:
+                report["limitations"].append("当前业务表读取失败：" + project.error)
+            if self.warning:
+                report["limitations"].append(self.warning)
+                report["window"]["coverage_complete"] = False
+                report["text"] = "部分处理状态留痕待同步，本报可能不完整。" + report["text"]
+        return {"reports": reports, "error": self.warning, "as_of": events_wall}
+
+    def record_status(self, table_id: str, record_id: str, state: str, *,
+                      at_ms: Optional[int] = None) -> None:
+        self.record_events([{"type": "status", "at": (int(self._wall() * 1000)
+                                                       if at_ms is None else at_ms),
+                             "table_id": table_id, "record_id": record_id, "state": state}])
+
+    def record_events(self, events: list[dict]) -> None:
+        self._journal().append(events)
+        with self._lock:
+            self._version += 1
+            self._cache.clear()
+        self.warning = ""
+
+
 class Resolutions:
     """运营在面板上点的「已解决」。**不写业务表**——存在注册表 base 的「面板设置」
     表（键 todo.resolved，见 panel_settings），出页面之前按它把行收起来；
@@ -1192,6 +1282,7 @@ class Resolutions:
     # 整份存在一格文本里，不能无限长。超了先丢最早点的。
     MAX_ENTRIES = 500
     RETRY_SECONDS = 60.0
+    OUTBOX = "__journal_outbox__"
 
     def __init__(self, projects: Projects, *, log: Callable[[str], None] = print,
                  clock: Callable[[], float] = time.monotonic,
@@ -1206,6 +1297,8 @@ class Resolutions:
         # 写飞书 + 换内存那一份，整段串起来：两个请求同时点，飞书那边有锁按顺序
         # 写进去了，但先写完的那个要是晚一步换内存，就会把后一个的结果盖回旧的。
         self._commit_lock = threading.Lock()
+        self._transition_lock = threading.Lock()
+        self._last_transition_ms = 0
         self._data: dict = {}
         self._loaded_at: Optional[float] = None
         self._failed_at: Optional[float] = None
@@ -1292,19 +1385,107 @@ class Resolutions:
             self._reading = False
 
     def mark(self, table_id: str, record_id: str, reasons: list,
-             seen: Optional[int]) -> None:
+             seen: Optional[int], *, state: str = "resolved",
+             at_ms: Optional[int] = None, post_key: str = "") -> None:
         """记下「这一行的这几个问题处理完了」。seen = 点的时候看到的那一次检查。"""
         key = summary.resolution_key(table_id, record_id)
-        at = int(self._wall() * 1000)
+        if state not in ("processing", "resolved"):
+            raise ValueError("state 只认 processing / resolved")
+        at = int(self._wall() * 1000) if at_ms is None else at_ms
 
         def change(current):
             data = self._pruned(current, at, room=1)
             data.pop(key, None)
             data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
+            if state == "processing":
+                data[key]["state"] = state
+            if post_key:
+                data[key]["post_key"] = post_key
             return data
 
         self._commit(change)
-        self.log(f"✓ 已解决 {key}：{'、'.join(reasons)}")
+        self.log(f"✓ {'正在处理' if state == 'processing' else '已解决'} {key}：{'、'.join(reasons)}")
+
+    def transition(self, table_id: str, record_id: str, reasons: list,
+                   seen: Optional[int], state: str, reports=None, *, post_key: str = "") -> str:
+        """同一个转换串行保存显示状态和日报留痕，共用时间戳，保持并发顺序。"""
+        with self._transition_lock:
+            self.snapshot()
+            with self._lock:
+                stamped = [v.get("at", 0) for v in self._data.values() if isinstance(v, dict)]
+                stamped.extend(e.get("at", 0) for e in (self._data.get(self.OUTBOX) or [])
+                               if isinstance(e, dict))
+            previous = max((v for v in stamped if isinstance(v, int)), default=0)
+            at = max(int(self._wall() * 1000), self._last_transition_ms + 1, previous + 1)
+            self._last_transition_ms = at
+            if reports is None:
+                if state == "pending":
+                    self.unmark(table_id, record_id)
+                else:
+                    self.mark(table_id, record_id, reasons, seen, state=state, at_ms=at,
+                              post_key=post_key)
+                return ""
+            key = summary.resolution_key(table_id, record_id)
+            event = {"type": "status", "at": at, "table_id": table_id,
+                     "record_id": record_id, "state": state}
+            if post_key:
+                event["post_key"] = post_key
+
+            def change(current):
+                data = self._pruned(current, at, room=int(state != "pending"))
+                outbox = list(data.get(self.OUTBOX) or [])
+                if len(outbox) >= 1000:
+                    raise ValueError("日报留痕积压，待恢复同步后再操作")
+                outbox.append(event)
+                if len(json.dumps(outbox, ensure_ascii=False)) > 20_000:
+                    raise ValueError("日报留痕积压，待恢复同步后再操作")
+                data[self.OUTBOX] = outbox
+                data.pop(key, None)
+                if state != "pending":
+                    data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
+                    if state == "processing":
+                        data[key]["state"] = state
+                    if post_key:
+                        data[key]["post_key"] = post_key
+                return data
+
+            # 显示状态与待补写事件同一格原子保存。远程留痕失败后重启也能重试。
+            self._commit(change)
+            return self._flush_journal(reports)
+
+    def flush_journal(self, reports) -> str:
+        self.snapshot()
+        with self._lock:
+            unreadable = self._failed_at is not None
+        if unreadable:
+            reports.warning = "处理状态暂时读取失败，待补写记录可能尚未同步；日报可能不完整。"
+            return reports.warning
+        with self._transition_lock:
+            return self._flush_journal(reports)
+
+    def _flush_journal(self, reports) -> str:
+        with self._lock:
+            events = list(self._data.get(self.OUTBOX) or [])
+        if not events:
+            return ""
+        try:
+            reports.record_events(events)
+            def acknowledge(current):
+                data = dict(current) if isinstance(current, dict) else {}
+                pending = [e for e in (data.get(self.OUTBOX) or []) if e not in events]
+                if pending:
+                    data[self.OUTBOX] = pending
+                else:
+                    data.pop(self.OUTBOX, None)
+                return data
+            self._commit(acknowledge)
+        except Exception as exc:                                # noqa: BLE001
+            warning = "状态已保存，日报留痕待同步；系统会自动重试。"
+            reports.warning = warning
+            self.log(f"⚠ 日报状态留痕待同步：{exc}")
+            return warning
+        reports.warning = ""
+        return ""
 
     def unmark(self, table_id: str, record_id: str) -> None:
         key = summary.resolution_key(table_id, record_id)
@@ -1328,7 +1509,10 @@ class Resolutions:
                 and v["at"] >= since]
         kept.sort(key=lambda kv: kv[1]["at"])
         limit = self.MAX_ENTRIES - room
-        return dict(kept[-limit:]) if limit > 0 else {}
+        data = dict(kept[-limit:]) if limit > 0 else {}
+        if isinstance(current.get(self.OUTBOX), list) and current[self.OUTBOX]:
+            data[self.OUTBOX] = list(current[self.OUTBOX])
+        return data
 
     def _commit(self, change) -> None:
         with self._commit_lock:
@@ -1474,6 +1658,7 @@ class _Deps:
     projects: Optional["Projects"] = None
     queueing: Optional["Queueing"] = None
     resolutions: Optional["Resolutions"] = None
+    reports: Optional["DailyReports"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -1514,6 +1699,22 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._send_json(200, self._overview_payload())
+        if path == "/api/daily-report":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            reports = self.deps.reports
+            if reports is None:
+                return self._send_json(200, {"reports": [], "error": "日报留痕尚未接入；需配置 FEISHU_REGISTRY"})
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                overview, _, _ = self.deps.cache.view()
+                return self._send_json(200, reports.get(
+                    overview, date=(query.get("date") or [""])[0],
+                    table_id=(query.get("table_id") or [""])[0]))
+            except ValueError as exc:
+                return self._send_json(400, {"reports": [], "error": str(exc)})
+            except Exception as exc:                            # noqa: BLE001
+                return self._send_json(503, {"reports": [], "error": f"读取日报失败：{exc}"})
         if path == "/api/logs":
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
@@ -1811,7 +2012,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             record_id = str(payload.get("record_id") or "")
             if not (_ID_RE.match(table_id) and _ID_RE.match(record_id)):
                 raise ValueError("table_id / record_id 不对")
-            undo = payload.get("undo") is True
+            state = "pending" if payload.get("undo") is True else payload.get("state", "resolved")
+            if state not in ("pending", "processing", "resolved"):
+                raise ValueError("state 只认 pending / processing / resolved")
+            undo = state == "pending"
             reasons = [] if undo else _clean_reasons(payload.get("reasons"))
             if not undo and not reasons:
                 raise ValueError("reasons 不能是空的")
@@ -1820,16 +2024,33 @@ class PanelHandler(BaseHTTPRequestHandler):
                 raise ValueError("checked_at_ms 要是整数")
         except (ValueError, TypeError) as exc:
             return self._send_json(400, {"error": f"请求体不对：{exc}"})
+        # 只操作服务端完整快照中确有的记录；不信任浏览器伪造的理由或检查时刻。
+        overview, error, _ = self.deps.cache.view()
+        if overview is None:
+            return self._send_json(409, {"error": error or "监控数据还未就绪，请稍后再试"})
+        project = next((p for p in overview.projects if p.table_id == table_id), None)
+        if project is None or project.error:
+            return self._send_json(409, {"error": "项目已移除或暂时读取失败，请刷新后再试"})
+        todo = next((t for t in (*project.todos, *project.adhoc_todos)
+                     if t.record_id == record_id), None)
+        stored = resolutions.snapshot().get(summary.resolution_key(table_id, record_id))
+        if todo is None and not (undo and isinstance(stored, dict)):
+            return self._send_json(409, {"error": "这条记录已不在待办中，请刷新后再试"})
+        if not undo:
+            if (set(reasons) != set(todo.reasons)
+                    or (seen is not None and seen != todo.checked_at_ms)):
+                return self._send_json(409, {"error": "扫描结果已更新，请查看最新问题后再标记"})
+            reasons, seen = todo.reasons, todo.checked_at_ms
         try:
-            if undo:
-                resolutions.unmark(table_id, record_id)
-            else:
-                resolutions.mark(table_id, record_id, reasons, seen)
+            warning = resolutions.transition(table_id, record_id, reasons, seen, state,
+                                              self.deps.reports,
+                                              post_key=todo.post_key if todo else "")
         except feishu.FeishuError as exc:
             return self._send_json(400, {"error": f"没存上：{exc.msg}", "hint": exc.hint})
         except Exception as exc:                                # noqa: BLE001
             return self._send_json(500, {"error": f"没存上：{type(exc).__name__}: {exc}"})
-        return self._send_json(200, {"ok": True, "undo": undo})
+        return self._send_json(200, {"ok": True, "undo": undo, "state": state,
+                                     "work_stats": self._work_stats(), "warning": warning})
 
     def _queue_action(self):
         """把选中的行勾上「排队刷新」。**面板对业务表数据唯一的写路径。**
@@ -2057,7 +2278,20 @@ class PanelHandler(BaseHTTPRequestHandler):
             "projects": [_project_json(p) for p in (overview.projects if overview else [])],
             "todos": [_todo_json(t) for t in (overview.todos() if overview else [])],
             "resolved": [_todo_json(t) for t in (overview.resolved if overview else [])],
+            "archived_todos": [_todo_json(t) for t in (overview.archived_todos() if overview else [])],
+            "work_stats": self._work_stats(),
+            "revision": self.deps.resolutions._version if self.deps.resolutions else 0,
+            "todos_hidden": (overview.todos_dropped + overview.todos_dropped_by()
+                              if overview else 0),
         }
+
+    def _work_stats(self) -> list[dict]:
+        overview, _, _ = self.deps.cache.view()
+        if overview is None:
+            return []
+        resolutions = self.deps.resolutions
+        return summary.work_stats(overview, resolutions.snapshot() if resolutions else {},
+                                  self.deps.settings or Settings())
 
 
 def _entry_json(entry) -> dict:
@@ -2101,7 +2335,8 @@ def _run_json(run) -> dict:
 
 def _project_json(p: summary.ProjectSnapshot) -> dict:
     return {
-        "label": p.label, "table_url": p.table_url, "error": p.error,
+        "label": p.label, "table_id": p.table_id, "app_token": p.app_token,
+        "table_url": p.table_url, "error": p.error,
         "health": p.health, "total_rows": p.total_rows,
         "archived_rows": p.archived_rows, "queued_rows": p.queued_rows,
         "due_rows": p.due_rows, "due_yuan": round(p.due_yuan, 2),
@@ -2124,11 +2359,16 @@ def _todo_json(t: summary.TodoRow) -> dict:
         "record_id": t.record_id, "project": t.project, "record_url": t.record_url,
         "app_token": t.app_token, "table_id": t.table_id, "key": t.key,
         "link_cell": t.link_cell, "reasons": t.reasons,
+        "label": t.label, "persona": t.persona, "post_url": t.post_url,
+        "post_key": t.post_key,
+        "archived": t.archived, "adhoc": t.adhoc, "recent": t.recent,
         "refresh_status": t.refresh_status, "diagnosis": t.diagnosis,
         "comment_count": t.comment_count, "traffic_tags": t.traffic_tags,
         "seed_keywords": t.seed_keywords, "negative_keywords": t.negative_keywords,
         "checked_at_ms": t.checked_at_ms, "queued": t.queued,
         "digest": t.digest, "negative_digest": t.negative_digest,
+        "work_state": t.work_state, "working_at_ms": t.working_at_ms,
+        "resolved_at_ms": t.resolved_at_ms,
     }
 
 
@@ -2148,13 +2388,14 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
                  queueing: Optional[Queueing] = None,
                  settings: Optional[Settings] = None,
                  resolutions: Optional[Resolutions] = None,
+                 reports: Optional["DailyReports"] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
     deps = _Deps(
         config=config, cache=cache, settings=settings, logs=logs,
         balances=balances, projects=projects, queueing=queueing,
-        resolutions=resolutions,
+        resolutions=resolutions, reports=reports,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -2182,6 +2423,9 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     resolved = settings or Settings()
     projects = Projects(config, resolved)
     resolutions = Resolutions(projects)
+    reports = DailyReports(projects) if projects.enabled else None
+    if reports is not None:
+        reports.resolutions = resolutions
     cache = Cache(reconciling(produce, resolutions), config.cache_seconds,
                   idle_seconds=config.idle_minutes * 60 or None)
     logs = LogFeed(config, config.cache_seconds)
@@ -2189,7 +2433,7 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     queueing = Queueing(config, resolved) if config.app_id else None
     server = build_server(config, cache, logs=logs, balances=balances,
                           projects=projects, queueing=queueing,
-                          settings=resolved, resolutions=resolutions)
+                          settings=resolved, resolutions=resolutions, reports=reports)
     cache.start()
     # 日志和余额也先在后台取一趟：第一个打开面板的人不用等 Railway 和两家余额接口。
     if logs.enabled:

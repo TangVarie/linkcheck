@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import threading
 import time
 import traceback
@@ -128,6 +129,9 @@ class Outcome:
     checked_at: Optional[datetime] = None
     # 结论是拿同一篇内容另一行本轮的上游回答判的（FetchShare）：熔断样本里不重复算。
     shared: bool = False
+    # 真正拿到评论页的一次观测，由调用方补 table_id 后写入持久留痕表。
+    # 失败/跳过/只有 detail 数字的空壳没有扫描事件。
+    scan_event: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -405,6 +409,7 @@ class _Fetched:
         钱已经记在第一行头上了，再记一遍账面就比账单多。快照深拷贝：
         判定逐行做，谁也不该改到别人的那一份。"""
         return _Fetched(snapshot=copy.deepcopy(self.snapshot), error=self.error,
+                        expanded_id=self.expanded_id, expanded_url=self.expanded_url,
                         shared=True)
 
 
@@ -1360,9 +1365,29 @@ def refresh(
                 f"🔵 到了{scan.stage}，蓝词复扫一次" if scan.rescan
                 else f"🔵 评论里出现新蓝词：{'、'.join(fresh)}")
 
+        scan_event = None
+        if status == STATUS_OK and snapshot is not None and analyze.saw_comment_page(snapshot):
+            parsed = row.parsed
+            identity = parsed.content_id
+            post_key = (f"{parsed.platform}:{identity}" if identity else
+                        f"{parsed.platform}:url:" + hashlib.sha256(
+                            (parsed.url or row.link_cell).encode("utf-8")).hexdigest())
+            scan_event = {
+                "type": "scan", "at": int(checked_at.timestamp() * 1000),
+                "record_id": row.record_id, "post_key": post_key,
+                "post_key_estimated": not bool(identity),
+                "negative_checked": bool(verdict.negative_checked),
+                "visible_comments": len(snapshot.comments),
+                "hits": [{"id": hit.comment.comment_id,
+                          "content": hit.comment.content,
+                          "created_at_ms": hit.comment.created_at_ms,
+                          "keywords": [hit.keyword]}
+                         for hit in verdict.negative_hits],
+            }
+
         return Outcome(row.record_id, status, fields, "；".join(log_notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at,
-                       blue_word_plan=blue_word_plan)
+                       blue_word_plan=blue_word_plan, scan_event=scan_event)
 
     def work(row: Row) -> Outcome:
         platform = row.parsed.platform or ""
@@ -1455,6 +1480,9 @@ def refresh(
                 value = format_resolved_id(fetched.expanded_id, fetched.expanded_url)
                 if value != row.resolved_id_cell:
                     outcome.fields[f.resolved_id] = value
+                if outcome.scan_event is not None:
+                    outcome.scan_event["post_key"] = f"{platform}:{fetched.expanded_id}"
+                    outcome.scan_event["post_key_estimated"] = False
             if fetched.shared:
                 # 熔断的样本里只算一次：同一份上游回答抄给了几行，它仍然只是
                 # **一次**观测（见 _apply_circuit_breaker）。

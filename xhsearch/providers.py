@@ -523,6 +523,8 @@ def _xhs_comment_items(comments: list[Any]) -> list[dict[str, Any]]:
         user = c.get("user") if isinstance(c.get("user"), dict) else {}
         items.append({
             "content": c.get("content") or "",
+            "comment_id": c.get("id") or c.get("comment_id") or "",
+            "create_time": c.get("create_time") or c.get("timestamp"),
             "like_count": c.get("like_count") or 0,
             "is_pinned": "user_top" in types,
             "is_author_comment": "is_author" in types,
@@ -627,6 +629,8 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
             user = c.get("user") if isinstance(c.get("user"), dict) else {}
             items.append({
                 "content": c.get("text") or "",
+                "comment_id": c.get("cid") or c.get("comment_id") or "",
+                "create_time": c.get("create_time") or c.get("timestamp"),
                 "like_count": c.get("digg_count") or 0,
                 # 抖音一律不判置顶——接口里那个 label_type 的语义没验过，
                 # 而错判置顶比不判置顶伤害大得多。见 config.CommentStatus。
