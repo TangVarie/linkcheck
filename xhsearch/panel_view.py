@@ -435,6 +435,16 @@ select,input[type=date]{height:36px}
 select:focus-visible,textarea:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 textarea{width:100%;resize:vertical;min-height:72px}
 .work-live{margin-left:auto;font-size:12px;color:var(--text-light)}
+.work-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));
+  gap:0;padding:18px 0 12px}
+.work-metric{padding:0 18px;border-right:1px solid var(--border);min-width:0}
+.work-metric:last-child{border-right:0}
+.work-metric .metric-label{display:block;font-size:13px;color:var(--text-light)}
+.work-metric .metric-value{display:block;font:600 30px/1.35 var(--font-num);
+  color:var(--text-dark);margin-top:5px}
+.work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:5px}
+.work-metric .metric-note{display:block;font-size:12px;color:var(--text-light);margin-top:2px}
+.work-source{font-size:12px;color:var(--primary);background:var(--tint-primary);padding:3px 7px}
 .work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 18px 8px}
 .work-states .caption{font-size:12px;color:var(--text-light);margin-right:4px}
 .work-states button{height:32px;font-size:13px;font-weight:500;padding:0 10px;background:none;
@@ -442,7 +452,7 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .work-states button[aria-pressed=true]{color:var(--primary);background:var(--tint-primary);
   border-color:var(--primary)}
 .work-states b{font-family:var(--font-num);margin-left:6px}
-.work-summary{padding:4px 18px 14px;color:var(--text);font-size:13px}
+.work-summary{padding:0 18px 10px;color:var(--text-light);font-size:12px}
 .daily{border-top:1px solid var(--border)}
 .daily>summary{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
   color:var(--text-dark);font-weight:500}
@@ -452,13 +462,17 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .daily-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:2px 0 14px}
 .daily-tools label{font-size:13px;color:var(--text-light)}
 .daily-tools .copy{margin-left:auto}
-.daily-text{min-height:150px;line-height:1.8;font-size:13px}
+.daily-text{min-height:140px;line-height:1.65;font-size:14px}
 .daily-extra{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
 .daily-extra label{font-size:13px;display:block;color:var(--text);margin-bottom:6px}
 .daily-extra .muted{font-weight:400;margin-left:6px}
 .daily-evidence{font-size:13px;line-height:1.8;margin:12px 0;color:var(--text)}
 .daily-limits{font-size:12px;color:var(--warning-deep);margin:8px 0;padding-left:18px}
 .daily-message{font-size:12px;color:var(--text-light);min-height:20px;margin-top:8px}
+.daily-fold{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}
+.daily-fold>summary{font-size:13px;color:var(--text-light)}
+.daily-fold .daily-extra{margin-top:10px}
+.daily-fold p{font-size:12px;margin:8px 0;color:var(--text-light)}
 .diagnostic>summary{font-size:13px;color:var(--text);max-width:26em}
 .diagnostic .diagnostic-body{margin-top:8px;font-size:13px;white-space:pre-wrap;max-width:40em}
 .work-state{display:block;font-size:12px;color:var(--text-light);margin-bottom:4px}
@@ -488,6 +502,10 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .work-head{padding:14px}
   .work-head select{flex:1;min-width:120px}
   .work-live{width:100%;margin-left:0}
+  .work-metrics{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px 0;row-gap:14px}
+  .work-metric{padding:0 14px}
+  .work-metric:nth-child(2n){border-right:0}
+  .work-metric .metric-value{font-size:28px}
   .work-states{padding:12px 14px 6px}
   .work-summary{padding:4px 14px 12px}
   .daily>summary{padding:12px 14px}
@@ -1115,27 +1133,44 @@ _SCRIPT = r"""
   }
   function composeReport(){
     if (!reportText) return;
-    var text = currentReports.map(function(r){ return r.text || (r.label + "：本期扫描 " + r.scanned_posts +
-      " 篇，发现 " + r.negative_posts + " 篇有负面评论，共计 " + r.negative_comments + " 条。"); }).join("\n\n");
+    var text = currentReports.filter(function(r){ return r.display_mode !== "unavailable" && r.text; })
+      .map(function(r){ return r.text; }).join("\n\n");
+    reportText.placeholder = currentReports.length && !text ?
+      (currentReports[0].unavailable_reason || "所选周期暂无可用汇报记录。") : "日报载入后显示在这里，可直接复制。";
     if (workProject && workProject.value && text) {
-      text += "\n主要内容特征：" + (reportFeatures.value.trim() || "待人工补充") +
-        "\n主要出现的疑似竞品：" + (reportCompetitors.value.trim() || "待人工核实");
+      if (reportFeatures.value.trim()) text += "\n主要内容特征：" + reportFeatures.value.trim();
+      if (reportCompetitors.value.trim()) text += "\n主要出现的疑似竞品：" + reportCompetitors.value.trim();
     }
     reportText.value = text;
     var copy = document.getElementById("copyReport"); if (copy) copy.disabled = !reportLoaded || !text;
   }
   function renderReports(){
-    var totals = {scanned_posts:0, scan_count:0, negative_posts:0, negative_comments:0}, estimated = false;
-    var evidence = [], limitations = [], incomplete = false, noCoverage = 0;
+    var totals = {checked:0, negative:0, pending:0, processing:0, resolved:0};
+    var known = {checked:0, negative:0, pending:0, processing:0, resolved:0};
+    var evidence = [], limitations = [], snapshotCount = 0, journalCount = 0, missing = 0;
+    var currentWindow = false, checkedFromJournal = false;
+    var comments = 0, commentKnown = 0, commentsEstimated = false, commentsLowerBound = false;
+    function add(key, value){
+      if (typeof value === "number" && isFinite(value)) { totals[key] += value; known[key]++; }
+    }
     currentReports.forEach(function(r){
-      Object.keys(totals).forEach(function(k){ totals[k] += Number(r[k] || 0); });
-      estimated = estimated || r.comment_count_estimated;
-      incomplete = incomplete || !!(r.window && r.window.coverage_complete === false);
-      if (r.window && r.window.coverage_started_at_ms === null) noCoverage++;
-      var p = r.post_states || {}, c = r.comment_states || {};
-      evidence.push(r.label + " · 本期检出预警：待处理 " + (p.pending || 0) + " 篇 / " + (c.pending || 0) +
-        " 条评论；正在处理 " + (p.processing || 0) + " 篇 / " + (c.processing || 0) + " 条评论；已处理 " +
-        (p.resolved || 0) + " 篇 / " + (c.resolved || 0) + " 条评论" + (r.comment_count_estimated ? "（评论条数含估算）" : ""));
+      var s = r.current_snapshot, mode = r.display_mode || (s && s.available ? "snapshot" :
+        (r.window && r.window.coverage_started_at_ms !== null ? "journal" : "unavailable"));
+      var p = {}, count = null;
+      if (s && s.available) {
+        snapshotCount++;
+        if (s.window_is_current !== false) {
+          currentWindow = true;
+          add("checked", s.window_checked_posts == null ? s.checked_posts : s.window_checked_posts);
+        } else if (mode === "journal") { add("checked", r.scanned_posts); checkedFromJournal = true; }
+        add("negative", s.negative_posts); p = s.post_states || {}; count = s.negative_comments;
+        commentsEstimated = commentsEstimated || !!s.negative_comments_estimated;
+        commentsLowerBound = commentsLowerBound || !!s.negative_comments_lower_bound;
+      } else { missing++; if (mode === "journal") { add("checked", r.scanned_posts); checkedFromJournal = true; } }
+      if (mode === "journal") journalCount++;
+      ["pending", "processing", "resolved"].forEach(function(k){ add(k, p[k]); });
+      if (typeof count === "number" && isFinite(count)) { comments += count; commentKnown++; }
+      if (mode === "journal") evidence.push(r.label + " · 成功扫描观测 " + r.scan_count + " 次，按作品与评论 ID 去重。");
       if (r.peak && r.peak.count) evidence.push(r.label + " · 检测集中时段：" + chinaTime(r.peak.start_ms, true) +
         "—" + chinaTime(r.peak.end_ms, false) + "（" + r.peak.count + " 条）");
       if (r.keywords && r.keywords.length) evidence.push(r.label + " · 命中词：" + r.keywords.map(function(k){
@@ -1145,11 +1180,23 @@ _SCRIPT = r"""
         (r.operations_unit || "行") + "；退回待处理 " + (r.operations.pending || 0) + " " + (r.operations_unit || "行"));
       (r.limitations || []).forEach(function(s){ limitations.push(r.label + "：" + s); });
     });
-    setText("workSummary", !reportLoaded ? "正在读取本期扫描与负面记录…" : (currentReports.length ?
-      (noCoverage ? (noCoverage === currentReports.length ? "尚未开始日报留痕，历史数据不可回算。已记录 " :
-        "部分项目尚未开始日报留痕 · 已记录 ") : (incomplete ? "留痕不完整 · 已记录 " : "本期 · 已扫描 ")) +
-      totals.scanned_posts + " 篇（" + totals.scan_count + " 次检查） · " + totals.negative_posts +
-      " 篇检出预警 · " + (estimated ? "约 " : "") + totals.negative_comments + " 条命中评论" : "本期暂无可用记录。"));
+    var ids = {checked:"metricChecked", negative:"metricNegative", pending:"metricPending",
+      processing:"metricProcessing", resolved:"metricResolved"};
+    Object.keys(ids).forEach(function(k){
+      setText(ids[k], !reportLoaded || !known[k] ? "—" :
+        (known[k] < currentReports.length ? "≥ " : "") + totals[k]);
+    });
+    setText("metricCheckedLabel", checkedFromJournal ? "本期已扫描" : (currentWindow ? "本期已检查" : "所选周期检查"));
+    setText("metricNegativeLabel", "当前负面帖子");
+    setText("metricComments", commentKnown ? (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
+      (commentsEstimated ? "约 " : "")) + comments + " 条预警评论" : "评论条数待核实");
+    var source = !reportLoaded ? "正在读取" : (snapshotCount ? "现有表快照" : "当前表暂不可用");
+    setText("workSource", source);
+    setText("workSummary", !reportLoaded ? "正在读取现有数据…" : (snapshotCount ?
+      (checkedFromJournal ? "扫描数按所选周期统计；负面处置为当前快照。" :
+        (currentWindow ? "检查数来自本期最近检查记录；处理进度仅计当前负面帖子。" :
+          "所选历史周期检查数暂无记录；负面处置为当前快照。")) + (missing ? "部分项目暂未取得数据。" : "") :
+      "当前业务表暂不可用，未知项不能按 0 计算。"));
     var w = currentReports.length ? currentReports[0].window : null;
     setText("reportPeriod", w ? chinaTime(w.start_ms, true) + "—" + chinaTime(w.end_ms, true) +
       " · " + (w.complete ? "已结算" : "预览，截至 " + chinaTime(w.as_of_ms, false)) + " · 北京时间" : "每日 16:00 结算 · 北京时间");
@@ -2248,16 +2295,30 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
     <h2>项目工作台</h2>
     <label class=sr-only for=workProject>查看项目</label>
     <select id=workProject><option value=''>全部项目</option>{options}</select>
+    <span class=work-source id=workSource>正在读取</span>
     <span class=work-live id=workLive role=status aria-live=polite>正在同步处理进度…</span>
   </div>
+  <div class=work-metrics aria-label='负面帖子处理概览' aria-live=polite>
+    <div class=work-metric><span class=metric-label id=metricCheckedLabel>本期已检查</span>
+      <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span></div>
+    <div class=work-metric><span class=metric-label id=metricNegativeLabel>当前负面帖子</span>
+      <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
+      <span class=metric-note id=metricComments>评论条数待核实</span></div>
+    <div class=work-metric><span class=metric-label>待处理</span>
+      <span class=metric-value><span id=metricPending>—</span><small class=metric-unit>篇</small></span></div>
+    <div class=work-metric><span class=metric-label>正在处理</span>
+      <span class=metric-value><span id=metricProcessing>—</span><small class=metric-unit>篇</small></span></div>
+    <div class=work-metric><span class=metric-label>已处理</span>
+      <span class=metric-value><span id=metricResolved>—</span><small class=metric-unit>篇</small></span></div>
+  </div>
+  <div class=work-summary id=workSummary aria-live=polite>正在读取现有数据…</div>
   <div class=work-states role=group aria-label='按待办处理状态筛选'>
-    <span class=caption>当前处理进度 · 行</span>
+    <span class=caption>全部异常待办 · 行</span>
     <button type=button data-work-filter=all aria-pressed=true>全部</button>
     <button type=button data-work-filter=pending aria-pressed=false>待处理<b id=workPending>—</b></button>
     <button type=button data-work-filter=processing aria-pressed=false>正在处理<b id=workProcessing>—</b></button>
     <button type=button data-work-filter=resolved aria-pressed=false>已处理<b id=workResolved>—</b></button>
   </div>
-  <div class=work-summary id=workSummary aria-live=polite>正在读取本期扫描与负面记录…</div>
   <details class=daily id=dailyPanel>
     <summary>每日汇报<span class=muted id=reportPeriod>每日 16:00 结算 · 北京时间</span></summary>
     <div class=daily-body>
@@ -2266,18 +2327,22 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
         <button type=button class=sm id=reportNext>下个周期</button>
         <button type=button class='sm primary copy' id=copyReport disabled>复制汇报</button>
       </div>
-      <div class=daily-evidence id=reportEvidence></div>
       <label class=sr-only for=reportText>汇报正文</label>
       <textarea id=reportText class=daily-text readonly placeholder='日报载入后显示在这里，可直接复制。'></textarea>
-      <ul class=daily-limits id=reportLimits hidden></ul>
-      <div class=daily-extra>
-        <div><label for=reportFeatures>主要内容特征<span class=muted>人工补充</span></label>
-          <textarea id=reportFeatures placeholder='补充本期观察到的主要内容特征；未填写则不作判断。'></textarea></div>
-        <div><label for=reportCompetitors>疑似竞品<span class=muted>人工核实</span></label>
-          <textarea id=reportCompetitors placeholder='填入已核实的品牌或产品线索，保留“疑似”表述。'></textarea></div>
-      </div>
       <div class=daily-message id=reportMessage role=status aria-live=polite></div>
-      <p class=muted>补充内容仅保存在此浏览器，按项目和汇报日期分别记录。扫描记录覆盖第一页评论；关键词命中仍需人工核实。</p>
+      <details class=daily-fold id=reportNotes><summary>补充内容特征与疑似竞品</summary>
+        <div class=daily-extra>
+          <div><label for=reportFeatures>主要内容特征</label>
+            <textarea id=reportFeatures placeholder='填写复核后的主要内容特征，复制时加入汇报。'></textarea></div>
+          <div><label for=reportCompetitors>疑似竞品</label>
+            <textarea id=reportCompetitors placeholder='填写已核实的品牌或产品线索。'></textarea></div>
+        </div>
+        <p>补充仅保存在此浏览器，按项目和日期区分。</p>
+      </details>
+      <details class=daily-fold id=reportMethod><summary>统计说明与数据明细</summary>
+        <div class=daily-evidence id=reportEvidence></div>
+        <ul class=daily-limits id=reportLimits hidden></ul>
+      </details>
     </div>
   </details>
 </section>"""

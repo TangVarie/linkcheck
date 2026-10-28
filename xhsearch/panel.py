@@ -424,11 +424,15 @@ def _collect_one(label, table, settings, api_keys, *,
         # 待办全留着，截断放到出页面那一步——先按「已解决」拿掉再截（summary.for_display）。
         # 「已解决」记录的收拾（Resolutions.reconcile）也要靠这份没截过的全集。
         truncate=False)
+    snap.report_checked_available = f.last_updated in known and f.refresh_status in known
+    snap.report_negative_available = f.negative_status in known
     snap.adhoc_todos = summary.adhoc_todos(
         label=label, app_token=table.app_token, table_id=table.table_id,
         records=unmonitored, settings=settings, now=now, feishu_base=feishu_base,
         show_digest=show_digest, scrub=scrub, route=route, label_column=picked,
         max_todos=None)
+    snap.report_rows.extend(summary.build_report_rows(
+        unmonitored, settings, now=now, adhoc=True))
     # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
     # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
     # 缺列的情况体检那边已经在报，这里不重复。
@@ -1221,6 +1225,10 @@ class DailyReports:
             raise ValueError("项目不在当前监控清单里")
         if self.resolutions is not None:
             self.resolutions.flush_journal(self)
+        resolved = self.resolutions.snapshot() if self.resolutions is not None else {}
+        snapshots = {item["table_id"]: item for item in summary.snapshot_report(
+            overview, resolved, self.projects.settings, start_ms, end_ms, int(now * 1000))}
+        journal_error = ""
         # 同一时间窗只读一次留痕；并发浏览器不各扫一遍飞书。
         with self._read_lock:
             with self._lock:
@@ -1230,10 +1238,14 @@ class DailyReports:
                 events = cached[2]
                 events_wall = cached[1]
             else:
-                events = self._journal().read_window(start_ms, min(end_ms, int(now * 1000)))
+                try:
+                    events = self._journal().read_window(start_ms, min(end_ms, int(now * 1000)))
+                except Exception as exc:                        # noqa: BLE001
+                    events = []
+                    journal_error = str(exc)
                 events_wall = now
                 with self._lock:
-                    if version == self._version:
+                    if version == self._version and not journal_error:
                         self._cache[start_ms] = (version, now, events)
                         while len(self._cache) > 8:
                             self._cache.pop(next(iter(self._cache)))
@@ -1246,6 +1258,9 @@ class DailyReports:
                 report["limitations"].append(self.warning)
                 report["window"]["coverage_complete"] = False
                 report["text"] = "部分处理状态留痕待同步，本报可能不完整。" + report["text"]
+        reports = [daily_report.present_report(report, snapshots.get(report["table_id"]),
+                                               int(now * 1000), journal_error=journal_error)
+                   for report in reports]
         return {"reports": reports, "error": self.warning, "as_of": events_wall}
 
     def record_status(self, table_id: str, record_id: str, state: str, *,

@@ -227,6 +227,87 @@ def _stamp(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, SHANGHAI).strftime("%m月%d日 %H:%M")
 
 
+def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
+                   *, journal_error: str = "") -> dict:
+    """展示与复制层：优先交代可确认的数字，不把缺失留痕写成零工作量。"""
+    shown = dict(report)
+    window = report["window"]
+    live = window["start_ms"] <= now_ms < window["end_ms"]
+    snapshot = dict(current_snapshot or {"available": False})
+    snapshot["window_is_current"] = live
+    snapshot["reason"] = snapshot.get("error") or (
+        "现有业务表尚未读取完成" if not snapshot.get("available") else "")
+    shown["current_snapshot"] = snapshot
+    shown["journal_error"] = journal_error
+    if live and snapshot.get("available"):
+        mode = "snapshot"
+    elif not journal_error and (window.get("coverage_complete") or report.get("scan_count")):
+        mode = "journal"
+    else:
+        mode = "unavailable"
+    shown["display_mode"] = mode
+    shown["source_label"] = {"snapshot": "现有表快照", "journal": "巡检记录",
+                              "unavailable": "尚无完整记录"}[mode]
+    shown["limitations"] = list(report.get("limitations") or [])
+    if mode == "snapshot":
+        shown["limitations"].insert(0, "本期已检查按现有表最近一次成功检查统计；负面快照及处理状态为当前值，不是逐次扫描历史。")
+    if journal_error:
+        shown["limitations"].append("巡检明细暂未同步，现有表的当前统计仍可查看。")
+    period = f"{_stamp(window['start_ms'])}—{_stamp(window['end_ms'])}"
+    if mode == "unavailable":
+        shown["text"] = ""
+        shown["unavailable_reason"] = ("所选周期没有可追溯的巡检记录，不能据此认定没有扫描或负面。"
+                                         if not live else "巡检记录和现有表数据暂未就绪，请稍后再试。")
+        return shown
+    lines = [f"{shown['label']}｜{period}（北京时间）"]
+    if mode == "snapshot":
+        lines[0] += "，截至 " + datetime.fromtimestamp(now_ms / 1000, SHANGHAI).strftime("%H:%M")
+        checked = snapshot.get("window_checked_posts")
+        negative = snapshot.get("window_negative_posts")
+        comments = snapshot.get("window_negative_comments")
+        lower = snapshot.get("window_negative_comments_lower_bound")
+        if checked is not None:
+            lines.append(f"本期已检查 {checked} 篇帖子。")
+        else:
+            lines.append("本期检查数量待核实。")
+        if negative is not None:
+            lines[-1] += f"其中 {negative} 篇有负面预警。"
+        states = snapshot.get("window_post_states") or {}
+        if comments is not None:
+            lines.append(f"快照可见{'至少 ' if lower else ' '}{comments} 条预警评论。")
+        elif negative:
+            lines.append("负面评论条数待核实。")
+        if negative is not None:
+            lines.append("上述帖子：" + "，".join(
+                (f"{label} {states[state]} 篇" if states.get(state) is not None else f"{label}待核实")
+                for state, label in (("resolved", "已处理"), ("processing", "正在处理"),
+                                     ("pending", "待处理"))) + "。")
+        else:
+            lines.append("本期负面数量及处理进度待核实。")
+        lines.append("按现有表最近检查及评论快照统计。")
+    else:
+        prefix = "已扫描" if window.get("coverage_complete") else "已记录扫描"
+        lines.append(f"{prefix} {report['scanned_posts']} 篇帖子，{report['negative_posts']} 篇检出预警，"
+                     f"共{'约 ' if report.get('comment_count_estimated') else ' '}{report['negative_comments']} 条评论。")
+        states = report.get("post_states") or {}
+        lines.append("负面帖子：" + "，".join(
+            f"{label} {states.get(state, 0)} 篇" for state, label in
+            (("resolved", "已处理"), ("processing", "正在处理"), ("pending", "待处理"))) + "。")
+        peak = report.get("peak")
+        if peak:
+            lines.append(f"检出集中时段：{_stamp(peak['start_ms'])}—{_stamp(peak['end_ms'])}。")
+        words = [item["word"] for item in report.get("keywords", [])[:5]]
+        if words:
+            lines.append("主要命中词：" + "、".join(words) + "。")
+        if not window.get("coverage_complete"):
+            lines.append("本期记录覆盖不完整。")
+    operations = report.get("operations") or {}
+    if operations.get("resolved"):
+        lines.append(f"本期完成处理操作 {operations['resolved']} {report.get('operations_unit', '行')}（含存量问题）。")
+    shown["text"] = "\n".join(lines)
+    return shown
+
+
 def aggregate(events: list[dict], start: int, end: int, table_id: str, label: str,
               as_of: Optional[int] = None, *, as_of_ms: Optional[int] = None) -> dict:
     """由结构化事实生成可公开的汇总，不返回评论正文或原始事件。"""
