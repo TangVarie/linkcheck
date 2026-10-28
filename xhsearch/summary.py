@@ -887,7 +887,7 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
         available = not project.error and project.report_rows is not None
         item = {"table_id": project.table_id, "label": project.label, "source": "current_table",
                 "available": available, "as_of_ms": as_of_ms, "historical": False,
-                "checked_posts": None, "window_checked_posts": None,
+                "checked_posts": None, "window_checked_posts": None, "monitoring_posts": None,
                 "negative_posts": None, "negative_comments": None,
                 "negative_comments_lower_bound": False, "negative_comments_estimated": True,
                 "post_states": dict.fromkeys(states), "comment_states": dict.fromkeys(states),
@@ -903,6 +903,9 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
         groups: dict[str, list[ReportRow]] = {}
         for row in project.report_rows:
             groups.setdefault(row.post_key or f"row:{row.record_id}", []).append(row)
+        item["monitoring_posts"] = sum(
+            key.startswith(("xhs:", "douyin:")) and any(not row.adhoc for row in rows)
+            for key, rows in groups.items())
         checked = {key for key, rows in groups.items()
                    if any(row.successfully_checked and row.last_checked_ms is not None
                           and start_ms <= row.last_checked_ms < min(end_ms, as_of_ms)

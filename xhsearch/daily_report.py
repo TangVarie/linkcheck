@@ -253,7 +253,9 @@ def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
         shown["limitations"].insert(0, "本期已检查按现有表最近一次成功检查统计；负面快照及处理状态为当前值，不是逐次扫描历史。")
     if journal_error:
         shown["limitations"].append("巡检明细暂未同步，现有表的当前统计仍可查看。")
-    period = f"{_stamp(window['start_ms'])}—{_stamp(window['end_ms'])}"
+    actual_end = min(window["end_ms"], now_ms if mode == "snapshot" else
+                     window.get("as_of_ms", now_ms), now_ms)
+    period = f"{_stamp(window['start_ms'])}—{_stamp(actual_end)}"
     if mode == "unavailable":
         shown["text"] = ""
         shown["unavailable_reason"] = ("所选周期没有可追溯的巡检记录，不能据此认定没有扫描或负面。"
@@ -261,15 +263,17 @@ def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
         return shown
     lines = [f"{shown['label']}｜{period}（北京时间）"]
     if mode == "snapshot":
-        lines[0] += "，截至 " + datetime.fromtimestamp(now_ms / 1000, SHANGHAI).strftime("%H:%M")
         checked = snapshot.get("window_checked_posts")
+        monitoring = snapshot.get("monitoring_posts")
         negative = snapshot.get("window_negative_posts")
         comments = snapshot.get("window_negative_comments")
         lower = snapshot.get("window_negative_comments_lower_bound")
         if checked is not None:
-            lines.append(f"本期已检查 {checked} 篇帖子。")
+            scope = (f"项目已纳入监测 {monitoring} 篇帖子；"
+                     if monitoring is not None and monitoring >= checked else "")
+            lines.append(scope + f"上述时段已检查 {checked} 篇帖子。")
         else:
-            lines.append("本期检查数量待核实。")
+            lines.append("所选时段的检查数量待核实。")
         if negative is not None:
             lines[-1] += f"其中 {negative} 篇有负面预警。"
         states = snapshot.get("window_post_states") or {}
@@ -283,7 +287,7 @@ def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
                 for state, label in (("resolved", "已处理"), ("processing", "正在处理"),
                                      ("pending", "待处理"))) + "。")
         else:
-            lines.append("本期负面数量及处理进度待核实。")
+            lines.append("所选时段的负面数量及处理进度待核实。")
         lines.append("按现有表最近检查及评论快照统计。")
     else:
         prefix = "已扫描" if window.get("coverage_complete") else "已记录扫描"
@@ -300,10 +304,11 @@ def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
         if words:
             lines.append("主要命中词：" + "、".join(words) + "。")
         if not window.get("coverage_complete"):
-            lines.append("本期记录覆盖不完整。")
+            lines.append("该时段记录覆盖不完整。")
+    lines.insert(2, "巡检按发布时间分批进行：新帖高频检查，历史帖分批复查。")
     operations = report.get("operations") or {}
     if operations.get("resolved"):
-        lines.append(f"本期完成处理操作 {operations['resolved']} {report.get('operations_unit', '行')}（含存量问题）。")
+        lines.append(f"时段内完成处理操作 {operations['resolved']} {report.get('operations_unit', '行')}（含存量问题）。")
     shown["text"] = "\n".join(lines)
     return shown
 

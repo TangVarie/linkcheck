@@ -91,6 +91,10 @@ class TestExistingTableFallback(unittest.TestCase):
         report = self.reports.get(business_overview())["reports"][0]
         self.assertLess(len(report["text"]), 450)
         self.assertGreaterEqual(len(report["text"].splitlines()), 3)
+        self.assertIn("项目已纳入监测 4 篇", report["text"])
+        self.assertIn("10月27日 16:00—10月28日 14:40", report["text"])
+        self.assertIn("新帖高频检查，历史帖分批复查", report["text"])
+        self.assertNotIn("本期", report["text"])
         for jargon in ("批次闭合", "留痕分片", "同一行可有状态流转"):
             self.assertNotIn(jargon, report["text"])
 

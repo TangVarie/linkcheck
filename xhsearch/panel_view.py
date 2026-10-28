@@ -1148,7 +1148,7 @@ _SCRIPT = r"""
     var totals = {checked:0, negative:0, pending:0, processing:0, resolved:0};
     var known = {checked:0, negative:0, pending:0, processing:0, resolved:0};
     var evidence = [], limitations = [], snapshotCount = 0, journalCount = 0, missing = 0;
-    var currentWindow = false, checkedFromJournal = false;
+    var currentWindow = false, checkedFromJournal = false, monitoring = 0, monitoringKnown = 0;
     var comments = 0, commentKnown = 0, commentsEstimated = false, commentsLowerBound = false;
     function add(key, value){
       if (typeof value === "number" && isFinite(value)) { totals[key] += value; known[key]++; }
@@ -1159,6 +1159,7 @@ _SCRIPT = r"""
       var p = {}, count = null;
       if (s && s.available) {
         snapshotCount++;
+        if (typeof s.monitoring_posts === "number") { monitoring += s.monitoring_posts; monitoringKnown++; }
         if (s.window_is_current !== false) {
           currentWindow = true;
           add("checked", s.window_checked_posts == null ? s.checked_posts : s.window_checked_posts);
@@ -1186,16 +1187,23 @@ _SCRIPT = r"""
       setText(ids[k], !reportLoaded || !known[k] ? "—" :
         (known[k] < currentReports.length ? "≥ " : "") + totals[k]);
     });
-    setText("metricCheckedLabel", checkedFromJournal ? "本期已扫描" : (currentWindow ? "本期已检查" : "所选周期检查"));
+    setText("metricCheckedLabel", checkedFromJournal ? "时段内已扫描" : "时段内已检查");
+    var range = currentReports.length ? currentReports[0].window : null;
+    var snapshotEnd = currentReports.length && currentReports[0].current_snapshot &&
+      currentReports[0].current_snapshot.as_of_ms;
+    setText("metricCheckedPeriod", range && range.start_ms != null && range.end_ms != null ?
+      chinaTime(range.start_ms, true) + "—" + chinaTime(Math.min(range.end_ms,
+        currentWindow ? (snapshotEnd || Date.now()) : (range.as_of_ms || Date.now())), true) : "北京时间");
     setText("metricNegativeLabel", "当前负面帖子");
     setText("metricComments", commentKnown ? (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
       (commentsEstimated ? "约 " : "")) + comments + " 条预警评论" : "评论条数待核实");
     var source = !reportLoaded ? "正在读取" : (snapshotCount ? "现有表快照" : "当前表暂不可用");
     setText("workSource", source);
     setText("workSummary", !reportLoaded ? "正在读取现有数据…" : (snapshotCount ?
-      (checkedFromJournal ? "扫描数按所选周期统计；负面处置为当前快照。" :
-        (currentWindow ? "检查数来自本期最近检查记录；处理进度仅计当前负面帖子。" :
-          "所选历史周期检查数暂无记录；负面处置为当前快照。")) + (missing ? "部分项目暂未取得数据。" : "") :
+      (monitoringKnown === currentReports.length ? "已纳入监测 " + monitoring + " 篇帖子。" : "") +
+      "按发布时间分批巡检：新帖高频检查，历史帖分批复查。" +
+      (!currentWindow && !checkedFromJournal ? "所选历史时段的检查数暂无记录；负面处置为当前快照。" : "") +
+      (missing ? "部分项目暂未取得数据。" : "") :
       "当前业务表暂不可用，未知项不能按 0 计算。"));
     var w = currentReports.length ? currentReports[0].window : null;
     setText("reportPeriod", w ? chinaTime(w.start_ms, true) + "—" + chinaTime(w.end_ms, true) +
@@ -2299,8 +2307,9 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
     <span class=work-live id=workLive role=status aria-live=polite>正在同步处理进度…</span>
   </div>
   <div class=work-metrics aria-label='负面帖子处理概览' aria-live=polite>
-    <div class=work-metric><span class=metric-label id=metricCheckedLabel>本期已检查</span>
-      <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span></div>
+    <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
+      <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
+      <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
     <div class=work-metric><span class=metric-label id=metricNegativeLabel>当前负面帖子</span>
       <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
       <span class=metric-note id=metricComments>评论条数待核实</span></div>
