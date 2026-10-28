@@ -129,6 +129,36 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertNotIn("open", dom.by_id("reportMethod"))
         self.assertIn("全部异常待办 · 行", self.page())
 
+    def test_analysis_is_collapsed_while_operational_filters_stay_available(self):
+        """首屏先给处置上下文；五指标与日报需要时再展开。"""
+        dom = Elements(self.page())
+        self.assertNotIn("open", dom.by_id("workDetails"))
+        self.assertNotIn("open", dom.by_id("dailyPanel"))
+        dom.by_id("workProject")
+        self.assertEqual(dom.by_id("reasonFilter")["id"], "reasonFilter")
+        options = [a.get("value") for tag, a in dom.tags
+                   if tag == "option" and a.get("value") in ("all", "r", "a", "other")]
+        self.assertEqual(options, ["all", "r", "a", "other"])
+
+    def test_compact_todo_row_keeps_all_fields_and_names_the_checkbox(self):
+        row = self.todo(persona="S-01", post_url="https://example.com/post/1")
+        dom = Elements(panel_view._todo_row(row, 8, False, main=True, resolvable=True))
+        cells = [a for tag, a in dom.tags if tag == "td"]
+        self.assertEqual(len(cells), 7, "勾选 + 帖子 / 问题 / 诊断 / 评论 / 时间 / 处理")
+        checkbox = next(a for tag, a in dom.tags if tag == "input" and a.get("class") == "todoPick")
+        self.assertIn("排队刷新", checkbox["aria-label"])
+        self.assertTrue(any(a.get("class") == "persona" for _, a in dom.tags))
+        self.assertTrue(any(a.get("class") == "post" for _, a in dom.tags))
+        self.assertTrue(any("comments" in a.get("class", "").split() for a in cells))
+
+    def test_narrow_screen_rows_become_cards_without_hiding_actions(self):
+        css = panel_view._STYLE
+        narrow = css[css.index("@media (max-width:700px)"):]
+        self.assertIn("grid-template-columns:24px minmax(0,1fr)", narrow)
+        self.assertIn("td.acts", narrow)
+        self.assertIn("flex-wrap:wrap", narrow)
+        self.assertNotIn("display:none}\n  .todos tbody td.acts", narrow)
+
 
 @unittest.skipUnless(shutil.which("node"), "浏览器脚本行为检查需要 Node")
 class TestLiveReportNumbers(unittest.TestCase):

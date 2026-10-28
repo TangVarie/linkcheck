@@ -701,17 +701,17 @@ class TestRendering(unittest.TestCase):
         self.assertNotIn("<img src=x onerror", page)
         self.assertIn("&lt;script&gt;", page)
 
-    def test_persona_and_post_link_have_their_own_columns(self):
-        """素人编号、帖子链接各占一栏，和评论数一样一眼看得到；帖子链接点开就是帖子。"""
+    def test_persona_and_post_link_stay_with_post_identity(self):
+        """素人编号、原帖入口收进帖子身份栏的第二行；信息保留，但不挤占问题与处理列。"""
         url = "https://www.xiaohongshu.com/explore/65a1b2c3d4e5f60718293a4b?xsec_token=AB"
         todo = summary.TodoRow(record_id="r1", project="A", link_cell="",
                                record_url="https://x/base/t?table=tb&record=r1",
                                reasons=["风控中"], persona="SR-012", post_url=url)
         page = self._page(self._snap(todos=[todo]))
-        self.assertIn("<th>素人编号</th><th>帖子链接</th>", page)
-        self.assertIn("<td class='nowrap persona'>SR-012</td>", page)
-        link = re.search(r"<td class='nowrap post'><a href='([^']*)' title='[^']*' "
-                         r"target=_blank rel='noopener noreferrer'>([^<]*)</a></td>", page)
+        self.assertIn("<th>帖子 / 素人</th><th>为什么</th>", page)
+        self.assertIn("<span class=persona>SR-012</span>", page)
+        link = re.search(r"<span class=post><a href='([^']*)' title='[^']*' "
+                         r"target=_blank rel='noopener noreferrer'>([^<]*)</a></span>", page)
         self.assertIsNotNone(link)
         self.assertEqual(link.group(1), url.replace("&", "&amp;"))
         self.assertTrue(link.group(2).startswith("xiaohongshu.com/explore/"))
@@ -724,7 +724,7 @@ class TestRendering(unittest.TestCase):
                                post_url="javascript:alert(1)")
         page = self._page(self._snap(todos=[todo]))
         self.assertNotIn("javascript:alert(1)", page)
-        self.assertIn("<td class='nowrap post'><span class=muted>—</span></td>", page)
+        self.assertIn("<span class=post><span class=muted>—</span></span>", page)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
 
     def test_the_which_one_cell_is_clipped_but_keeps_the_full_text_on_hover(self):
@@ -735,7 +735,7 @@ class TestRendering(unittest.TestCase):
                                record_url="https://x/base/t?table=tb&record=r1",
                                label=long, reasons=["风控中"])
         page = self._page(self._snap(todos=[todo]))
-        cell = re.search(r"<td class=which title='([^']*)'>([^<]*)</td>", page)
+        cell = re.search(r"<td class=which title='([^']*)'><span class=todo-title>([^<]*)</span>", page)
         self.assertIsNotNone(cell, "待办表里没有「哪一条」那一栏")
         self.assertEqual(cell.group(1), long)
         self.assertTrue(cell.group(2).endswith("…"))
@@ -748,7 +748,7 @@ class TestRendering(unittest.TestCase):
                                record_url="https://x/base/t?table=tb&record=r1",
                                label="", reasons=["风控中"])
         page = self._page(self._snap(todos=[todo]))
-        self.assertIn("<td class=which title=''>—</td>", page)
+        self.assertIn("<td class=which title=''><span class=todo-title>—</span>", page)
 
     def test_the_commit_comes_from_the_variable_railway_injects(self):
         """Railway 自己注入 RAILWAY_GIT_COMMIT_SHA，不用额外配。取前 7 位。"""
@@ -2433,7 +2433,7 @@ class TestTodosAreSplitByProject(unittest.TestCase):
         page = self._page([self._snap("甲", "ta", [["有负面"]])])
         block = self._todos_block(page)
         self.assertNotIn("<th>项目</th>", block)
-        self.assertIn("<th>哪一条</th>", block)
+        self.assertIn("<th>帖子 / 素人</th>", block)
         self.assertIn("class=todoAll title='全选这一页", block)
 
     def test_every_page_gets_its_own_select_all(self):

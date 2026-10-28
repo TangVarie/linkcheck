@@ -453,7 +453,9 @@ def aggregate(events: list[dict], start: int, end: int, table_id: str, label: st
     else:
         body += "暂无可统计的负面检出集中时段。"
     features = "、".join(f"{k['word']}（{k['count']}条）" for k in report["keywords"])
-    body += f"主要命中词：{features or '暂无'}；主要内容特征及疑似竞品：待人工复核填写。"
+    # 内容特征与疑似竞品由面板 AI 草稿 + 人工修订补在正文之后（见 panel_view
+    # composeReport）。这里再写一句「待人工填写」会和草稿同时出现，自相矛盾。
+    body += f"主要命中词：{features or '暂无'}。"
     body += "统计仅覆盖成功取得的第一页评论；评论按检出时间归属，不代表本期新增。"
     if estimated:
         body += "部分评论缺少 ID，按正文去重，评论数为估计。"
