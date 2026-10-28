@@ -118,6 +118,7 @@ _STYLE = """
 }
 
 *{box-sizing:border-box;border-radius:0}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text-dark);
   font:14px/1.6 var(--font-sans);-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none}
@@ -422,6 +423,52 @@ tr.resolvedNote button.link{margin-left:8px}
 .resolved{margin-top:12px}
 .resolved .tablewrap{margin-top:4px}
 #projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
+/* 项目工作台：处理进度常显，日报按需展开，共用项目上下文。 */
+.workbench{background:var(--surface);border:1px solid var(--border);margin:24px 0}
+.work-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:16px 18px;
+  border-bottom:1px solid var(--border)}
+.work-head h2{margin:0;font-size:16px}
+.work-head select{min-width:180px;max-width:100%}
+select,input[type=date],textarea{font:14px/1.5 var(--font-sans);color:var(--text-dark);
+  border:1px solid var(--border-strong);background:var(--surface);padding:8px 10px}
+select,input[type=date]{height:36px}
+select:focus-visible,textarea:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+textarea{width:100%;resize:vertical;min-height:72px}
+.work-live{margin-left:auto;font-size:12px;color:var(--text-light)}
+.work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 18px 8px}
+.work-states .caption{font-size:12px;color:var(--text-light);margin-right:4px}
+.work-states button{height:32px;font-size:13px;font-weight:500;padding:0 10px;background:none;
+  border:1px solid var(--border)}
+.work-states button[aria-pressed=true]{color:var(--primary);background:var(--tint-primary);
+  border-color:var(--primary)}
+.work-states b{font-family:var(--font-num);margin-left:6px}
+.work-summary{padding:4px 18px 14px;color:var(--text);font-size:13px}
+.daily{border-top:1px solid var(--border)}
+.daily>summary{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+  color:var(--text-dark);font-weight:500}
+.daily>summary::after{content:'展开';margin-left:auto;font-size:12px;color:var(--primary)}
+.daily[open]>summary::after{content:'收起'}
+.daily-body{padding:0 18px 18px}
+.daily-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:2px 0 14px}
+.daily-tools label{font-size:13px;color:var(--text-light)}
+.daily-tools .copy{margin-left:auto}
+.daily-text{min-height:150px;line-height:1.8;font-size:13px}
+.daily-extra{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+.daily-extra label{font-size:13px;display:block;color:var(--text);margin-bottom:6px}
+.daily-extra .muted{font-weight:400;margin-left:6px}
+.daily-evidence{font-size:13px;line-height:1.8;margin:12px 0;color:var(--text)}
+.daily-limits{font-size:12px;color:var(--warning-deep);margin:8px 0;padding-left:18px}
+.daily-message{font-size:12px;color:var(--text-light);min-height:20px;margin-top:8px}
+.diagnostic>summary{font-size:13px;color:var(--text);max-width:26em}
+.diagnostic .diagnostic-body{margin-top:8px;font-size:13px;white-space:pre-wrap;max-width:40em}
+.work-state{display:block;font-size:12px;color:var(--text-light);margin-bottom:4px}
+.work-state.processing{color:var(--primary);font-weight:600}
+button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-decoration:underline}
+.work-error{display:block;font-size:12px;color:var(--danger-deep);max-width:22em;white-space:normal}
+.monitor-help{margin:8px 0 14px;font-size:13px;color:var(--text-light)}
+.monitor-help p{margin:8px 0}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media (max-width:900px){
   .app{grid-template-columns:minmax(0,1fr)}
   .side{position:static;height:auto;border-right:0;
@@ -438,6 +485,15 @@ tr.resolvedNote button.link{margin-left:8px}
   .tools{flex:1;min-width:0}
   .tools input{width:auto;flex:1;min-width:0}
   .top .when{display:none}
+  .work-head{padding:14px}
+  .work-head select{flex:1;min-width:120px}
+  .work-live{width:100%;margin-left:0}
+  .work-states{padding:12px 14px 6px}
+  .work-summary{padding:4px 14px 12px}
+  .daily>summary{padding:12px 14px}
+  .daily-body{padding:0 14px 14px}
+  .daily-extra{grid-template-columns:1fr}
+  .daily-tools .copy{margin-left:0}
 }
 """
 
@@ -506,8 +562,12 @@ _SCRIPT = r"""
   var btn = document.getElementById("refresh");
   if (btn) btn.addEventListener("click", function(){
     btn.disabled = true; btn.textContent = "取数中…";
+    var requestEpoch = overviewEpoch;
     fetch("/api/refresh", {method:"POST", headers:{"X-Panel-Token": token}})
-      .then(function(){ location.reload(); })
+      .then(function(r){ return r.json().then(function(j){
+        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        if (requestEpoch === overviewEpoch) applyOverview(j); return loadReports();
+      }); }).then(function(){ btn.disabled = false; btn.textContent = "重新取数"; })
       .catch(function(){ btn.disabled = false; btn.textContent = "重新取数"; });
   });
   // ---- 待办：按项目分页 ----
@@ -532,6 +592,14 @@ _SCRIPT = r"""
       var tab = document.querySelector("#todos .tab[data-tab='" + p.dataset.tab + "']");
       var cnt = tab ? tab.querySelector(".cnt") : null;
       if (cnt) cnt.textContent = countShown(p.querySelectorAll("table.todos:not(.fold-t) tr[data-rec]"));
+      if (cnt) {
+        var worst = "";
+        p.querySelectorAll("table.todos:not(.fold-t) tr[data-rec]").forEach(function(tr){
+          if (!shown(tr)) return;
+          var reasons = []; try { reasons = JSON.parse(tr.dataset.reasons || "[]"); } catch (e) {}
+          reasons.forEach(function(r){ var cls = reasonClass(r); if (cls === "r" || (!worst && cls)) worst = cls; });
+        }); cnt.className = "cnt" + (worst ? " " + worst : "");
+      }
       // 底下归档折叠区的条数，和 tab 上那个淡色的 +N
       var old = countShown(p.querySelectorAll(".fold tr[data-rec]"));
       var foldN = p.querySelector(".foldN");
@@ -564,6 +632,7 @@ _SCRIPT = r"""
     var t = activeTab();
     if (!remember || !t) return;
     try { localStorage.setItem(TAB, t.dataset.project || ""); } catch (e) {}
+    syncProjectContext(t);
   }
 
   var box = document.getElementById("filter");
@@ -575,6 +644,7 @@ _SCRIPT = r"""
       rows[i].style.display = hit ? "" : "none";
     }
     // 筛「风控」时别的项目命中了几行，在各自 tab 上就看得见，不用一页页翻。
+    applyWorkFilter();
     recount();
     sync();
   });
@@ -595,6 +665,7 @@ _SCRIPT = r"""
     return !(p && p.hidden);
   }
   function selected(){
+    picks = document.querySelectorAll("#todos .todoPick");
     var out = [];
     for (var i = 0; i < picks.length; i++) {
       if (!picks[i].checked) continue;
@@ -694,12 +765,8 @@ _SCRIPT = r"""
       .catch(function(err){ if (qOut) qOut.textContent = String(err); btnQ.disabled = false; });
   });
 
-  // ---- 待办：「已解决」 ----
-  // 问题处理完了，不用等下一次刷新就先收起来。存在注册表 base 的「面板设置」里，
-  // **不写业务表**；什么时候再冒出来由服务端定（summary.apply_resolutions）。
-  // 带上「当时看到的是哪几个问题、哪一次检查的结果」：之后刷出了新的问题、
-  // 或者又刷了一次还是这个问题，这一行就会回来。
-  function resolveCall(tr, undo){
+  // 帖子处理进度是共享状态；保存成功后同步顶部，失败不改变原状态。
+  function resolveCall(tr, state){
     var reasons = [];
     try { reasons = JSON.parse(tr.dataset.reasons || "[]"); } catch (e) {}
     return fetch("/api/resolve", {method: "POST",
@@ -707,55 +774,55 @@ _SCRIPT = r"""
       body: JSON.stringify({table_id: tr.dataset.tbl, record_id: tr.dataset.rec,
         reasons: reasons,
         checked_at_ms: tr.dataset.checked ? Number(tr.dataset.checked) : null,
-        undo: !!undo})})
+        state: state, undo: state === "pending"})})
       .then(function(r){ return r.json().then(function(j){
-        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        if (!r.ok) { var e = new Error(j.error || ("HTTP " + r.status)); e.status = r.status; throw e; }
         return j; }); });
   }
   document.addEventListener("click", function(ev){
-    var b = ev.target.closest ? ev.target.closest("button.resolve, button.undo, button.unresolve") : null;
+    var b = ev.target.closest ? ev.target.closest("button.resolve, button.processing, button.unresolve") : null;
     if (!b) return;
     var tr = b.closest("tr");
     if (!tr) return;
-    b.disabled = true;
-    if (b.classList.contains("resolve")) {
-      b.textContent = "标记中…";
-      resolveCall(tr, false).then(function(){
-        var pk = tr.querySelector(".todoPick");
-        if (pk) pk.checked = false;
-        tr.hidden = true;
-        var note = document.createElement("tr");
-        note.className = "resolvedNote";
-        var td = document.createElement("td");
-        td.colSpan = tr.children.length;
-        var which = tr.querySelector("td.which");
-        td.innerHTML = "已标记解决：「" + esc(which ? which.textContent : "") +
-          "」先收起来了，下次刷新又查出问题会自动回来。" +
-          "<button type=button class='link undo'>撤销</button>";
-        note.appendChild(td);
-        tr.parentNode.insertBefore(note, tr.nextSibling);
-        b.disabled = false; b.textContent = "已解决";
-        recount(); sync();
-      }).catch(function(err){
-        b.disabled = false; b.textContent = "没标上，再点一次"; b.title = String(err.message || err);
-      });
-      return;
-    }
-    if (b.classList.contains("undo")) {
-      // 就地撤销：note 的上一行就是被收起来的那一行
-      var row = tr.previousElementSibling;
-      if (!row) return;
-      resolveCall(row, true).then(function(){
-        tr.parentNode.removeChild(tr);
-        row.hidden = false;
-        recount(); sync();
-      }).catch(function(err){ b.disabled = false; b.textContent = "没撤销成，再点一次"; b.title = String(err.message || err); });
-      return;
-    }
-    // 底下「已解决」清单里的撤销：撤完重载，这一行回到它该在的那一页
-    b.textContent = "撤销中…";
-    resolveCall(tr, true).then(function(){ location.reload(); })
-      .catch(function(err){ b.disabled = false; b.textContent = "没撤销成，再点一次"; b.title = String(err.message || err); });
+    if (tr.dataset.busy) return;
+    var next = b.classList.contains("resolve") ? "resolved" :
+      (b.classList.contains("unresolve") || tr.dataset.workState === "processing" ? "pending" : "processing");
+    var original = b.textContent;
+    tr.dataset.busy = "true";
+    tr.querySelectorAll("button").forEach(function(x){ x.disabled = true; });
+    b.textContent = "保存中…";
+    var errorBox = tr.querySelector(".work-error");
+    if (!errorBox) { errorBox = document.createElement("span"); errorBox.className = "work-error";
+      errorBox.setAttribute("role", "status"); b.parentNode.appendChild(errorBox); }
+    errorBox.textContent = "";
+    overviewEpoch++; reportEpoch++;
+    resolveCall(tr, next).then(function(j){
+      overviewEpoch++; reportEpoch++;
+      updateRowState(tr, j.state || next);
+      var main = findTodo(tr.dataset.tbl, tr.dataset.rec, false);
+      if (main && main !== tr) updateRowState(main, j.state || next);
+      if (j.work_stats) { workStats = j.work_stats; renderWorkStats(); }
+      if (j.warning) {
+        persistentWarning = String(j.warning);
+        if (qOut) qOut.textContent = persistentWarning;
+      } else { persistentWarning = "";
+        if (qOut) qOut.textContent = next === "processing" ? "已标记正在处理。" : "已退回待处理。"; }
+      if (next === "resolved" && panelOf(tr)) {
+        if (qOut) qOut.textContent = persistentWarning || "已处理，记录收在下方「已处理记录」中，可撤销。";
+      }
+      applyWorkFilter(); recount(); sync();
+      refreshWork(); loadReports();
+    }).catch(function(err){
+      errorBox.textContent = String(err.message || err);
+      if (err.status === 409) refreshWork();
+    }).then(function(){
+      delete tr.dataset.busy;
+      b.textContent = original;
+      tr.querySelectorAll("button").forEach(function(x){ x.disabled = false; });
+      updateRowState(tr, tr.dataset.workState || "pending");
+      if (tr.closest("#resolvedList") && tr.dataset.workState !== "resolved") tr.remove();
+      applyWorkFilter();
+    });
   });
 
   // 「问题发现」的关键是新增，不是总量。上次看到的存在浏览器本地，
@@ -774,6 +841,385 @@ _SCRIPT = r"""
     if (fresh && qOut) qOut.textContent = fresh + " 条是上次看过之后新出现的（标了「新」）";
     localStorage.setItem(SEEN, JSON.stringify(now.slice(0, 2000)));
   } catch (e) { /* 隐私模式/禁用存储：高亮没了而已，不影响别的 */ }
+
+  // ---- 项目工作台 / 日报。轮询只读缓存，不触发付费扫描。 ----
+  var workbench = document.getElementById("s-work");
+  var workProject = document.getElementById("workProject");
+  var workLive = document.getElementById("workLive");
+  var workStats = [], workFilter = "all", overviewEpoch = 0, overviewBusy = false;
+  var persistentWarning = "";
+  var reportDate = document.getElementById("reportDate");
+  var reportText = document.getElementById("reportText");
+  var reportMessage = document.getElementById("reportMessage");
+  var reportFeatures = document.getElementById("reportFeatures");
+  var reportCompetitors = document.getElementById("reportCompetitors");
+  var reportCache = {}, currentReports = [], reportEpoch = 0, reportLoaded = false;
+  function dayInShanghai(){ return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); }
+  function chinaTime(ms, withDate){
+    if (ms == null || !isFinite(Number(ms))) return "—";
+    var s = new Date(Number(ms) + 8 * 3600000).toISOString();
+    return (withDate ? s.slice(5, 10).replace("-", "/") + " " : "") + s.slice(11, 16);
+  }
+  function attr(t){ return esc(t).split(String.fromCharCode(34)).join("&quot;").split(String.fromCharCode(39)).join("&#39;"); }
+  function reasonClass(r){ return ["风控中", "已失效", "刷新失败"].indexOf(r) >= 0 ? "r" :
+    (["有负面", "疑似限流", "疑似受限", "卡住了"].indexOf(r) >= 0 ? "a" : ""); }
+  function reasonChip(r){ return '<span class="chip ' + reasonClass(r) + '">' + esc(r) + '</span>'; }
+  function safeUrl(t){ return /^https?:\/\//i.test(t || "") ? t : ""; }
+  function setText(id, value){ var el = document.getElementById(id); if (el) el.textContent = value; }
+  function projectLabel(){
+    if (!workProject || !workProject.value) return "";
+    return workProject.options[workProject.selectedIndex].textContent;
+  }
+  function panelHasTable(p, id){
+    if (p.dataset.tableId) return p.dataset.tableId === id;
+    return Array.prototype.some.call(p.querySelectorAll("tr[data-tbl]"), function(tr){ return tr.dataset.tbl === id; });
+  }
+  function syncProjectContext(tab){
+    if (!workProject || !tab) return;
+    var table = "";
+    panels.forEach(function(p){ if (p.dataset.tab === tab.dataset.tab) {
+      var row = p.querySelector("tr[data-tbl]"); table = p.dataset.tableId || (row ? row.dataset.tbl : "");
+    } });
+    for (var i = 1; i < workProject.options.length; i++) {
+      if (workProject.options[i].value === table) {
+        workProject.selectedIndex = i; loadNotes(); renderWorkStats(); loadReports(); applyWorkFilter(); break;
+      }
+    }
+  }
+  function renderWorkStats(){
+    var totals = {pending:0, processing:0, resolved:0};
+    workStats.forEach(function(s){
+      if (workProject && workProject.value && s.table_id !== workProject.value) return;
+      Object.keys(totals).forEach(function(k){ totals[k] += Number(s[k] || 0); });
+    });
+    setText("workPending", totals.pending); setText("workProcessing", totals.processing);
+    setText("workResolved", totals.resolved);
+    if (workLive && persistentWarning) workLive.textContent = persistentWarning;
+  }
+  function applyWorkFilter(){
+    var q = box ? box.value.trim().toLowerCase() : "";
+    document.querySelectorAll("#todos tr[data-rec]").forEach(function(tr){
+      var state = tr.dataset.workState || "pending";
+      var hit = !q || tr.textContent.toLowerCase().indexOf(q) >= 0;
+      var owner = panelOf(tr);
+      if (workProject && workProject.value && owner && owner.dataset.project === projectLabel() &&
+          tr.dataset.tbl !== workProject.value) hit = false;
+      tr.style.display = hit && (workFilter === "all" || state === workFilter) ? "" : "none";
+      tr.hidden = state === "resolved" || tr.dataset.obsolete === "true";
+    });
+    var wanted = workProject ? projectLabel() : "", matched = false;
+    if (wanted) {
+      panels.forEach(function(p){ if (panelHasTable(p, workProject.value)) matched = true; });
+      if (!matched) panels.forEach(function(p){ p.hidden = true; });
+    }
+    var scopeEmpty = document.getElementById("scopeEmpty");
+    if (!scopeEmpty && document.getElementById("todos")) { scopeEmpty = document.createElement("div");
+      scopeEmpty.id = "scopeEmpty"; scopeEmpty.className = "tab-empty"; document.getElementById("todos").appendChild(scopeEmpty); }
+    if (scopeEmpty) { scopeEmpty.hidden = !wanted || matched;
+      if (!scopeEmpty.hidden) scopeEmpty.textContent = "「" + wanted + "」当前暂无待办。"; }
+    var resolvedList = document.getElementById("resolvedList"), count = 0;
+    if (resolvedList) resolvedList.querySelectorAll("tbody tr[data-rec]").forEach(function(tr){
+      var hit = (!workProject || !workProject.value || tr.dataset.tbl === workProject.value) &&
+        (!q || tr.textContent.toLowerCase().indexOf(q) >= 0);
+      tr.hidden = !hit; if (hit) count++;
+    });
+    if (resolvedList) {
+      resolvedList.hidden = !count || (workFilter !== "all" && workFilter !== "resolved");
+      if (workFilter === "resolved" && count) resolvedList.open = true;
+      setText("resolvedCount", "已处理记录 · " + count + " 行（可撤销）");
+    }
+    recount(); sync();
+  }
+  function updateRowState(tr, state){
+    tr.dataset.workState = state;
+    if (state === "resolved") { var pk = tr.querySelector(".todoPick"); if (pk) pk.checked = false; }
+    var badge = tr.querySelector(".work-state");
+    if (badge) { badge.textContent = state === "processing" ? "正在处理" : (state === "resolved" ? "已处理" : "待处理");
+      badge.className = "work-state" + (state === "processing" ? " processing" : ""); }
+    var b = tr.querySelector("button.processing");
+    if (b) { b.setAttribute("aria-pressed", state === "processing" ? "true" : "false");
+      b.title = state === "processing" ? "再次点击退回待处理" : "标记这篇帖子正在处理"; }
+  }
+  function findTodo(table, rec, resolved){
+    var found = null;
+    document.querySelectorAll((resolved ? "#resolvedList" : "#todos") + " tr[data-rec]").forEach(function(tr){
+      if (tr.dataset.tbl === table && tr.dataset.rec === rec) found = tr;
+    }); return found;
+  }
+  function rowHtml(t, main){
+    var state = t.work_state || "pending", url = safeUrl(t.post_url), link = safeUrl(t.record_url);
+    var pick = main ? '<td class="nowrap"><input type="checkbox" class="todoPick' +
+      (t.archived || t.adhoc ? ' solo' : '') + '"></td>' : '';
+    var diagnostic = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
+    var controls = workbench && workbench.dataset.resolvable === "true" ?
+      '<span class="work-state"></span><button type="button" class="link processing">正在处理</button>' +
+      '<button type="button" class="link resolve">已处理</button>' : '';
+    return '<tr data-rec="' + attr(t.record_id) + '" data-app="' + attr(t.app_token) +
+      '" data-tbl="' + attr(t.table_id) + '" data-project="' + attr(t.project) +
+      '" data-key="' + attr(t.key) + '" data-work-state="' + attr(state) +
+      '" data-reasons="' + attr(JSON.stringify(t.reasons || [])) + '" data-checked="' + attr(t.checked_at_ms || '') + '">' + pick +
+      '<td class="which" title="' + attr(t.label || t.record_id) + '">' + esc((t.label || t.record_id).slice(0, 24)) + '</td>' +
+      '<td class="nowrap persona">' + esc(t.persona || '—') + '</td><td class="nowrap post">' +
+      (url ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(url) + '">查看帖子</a>' : '—') + '</td>' +
+      '<td class="reasons">' + (t.reasons || []).map(reasonChip).join('') +
+      (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : '')) + '</td>' +
+      '<td class="diagnosis"><details class="diagnostic"><summary>' + esc(diagnostic.slice(0, 48) || '查看诊断与评论摘要') +
+      '</summary><div class="diagnostic-body">' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></details></td>' +
+      '<td>' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
+      chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '') + '</td>' +
+      '<td class="nowrap acts">' + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去这一行</a>' : '') + controls + '</td></tr>';
+  }
+  function ensurePanel(t, archived){
+    var p = null;
+    panels.forEach(function(x){ if (panelHasTable(x, t.table_id)) p = x; });
+    var host = document.getElementById("todos");
+    if (!host) return null;
+    if (!p) {
+      var id = "live-" + panels.length, tab = document.createElement("button");
+      tab.type = "button"; tab.className = "tab"; tab.setAttribute("role", "tab");
+      tab.dataset.tab = id; tab.dataset.project = t.project;
+      tab.setAttribute("aria-controls", "todos-" + id); tab.setAttribute("aria-selected", "false"); tab.tabIndex = -1;
+      tab.appendChild(document.createTextNode(t.project + " "));
+      var n = document.createElement("span"); n.className = "cnt"; n.textContent = "0"; tab.appendChild(n);
+      host.querySelector(".tabs").appendChild(tab);
+      p = document.createElement("div"); p.className = "tabpanel"; p.dataset.tab = id;
+      p.dataset.project = t.project; p.dataset.tableId = t.table_id;
+      p.id = "todos-" + id; p.setAttribute("role", "tabpanel"); p.hidden = true;
+      host.appendChild(p); tabs.push(tab); panels.push(p);
+      tab.addEventListener("click", function(){ showTab(id, true); sync(); });
+      if (!activeTab() || (workProject && workProject.value === t.table_id)) showTab(id, false);
+    }
+    var table = p.querySelector(archived ? ".fold table" : "table.todos:not(.fold-t)");
+    if (!table) {
+      table = document.createElement("table"); table.className = "todos" + (archived ? " fold-t" : "");
+      table.innerHTML = '<thead><tr>' + (archived ? '' : '<th><input type="checkbox" class="todoAll" aria-label="全选这一页"></th>') +
+        '<th>哪一条</th><th>素人编号</th><th>帖子链接</th><th>为什么</th><th>诊断信息</th><th>评论数</th><th>最近检查</th><th></th></tr></thead><tbody></tbody>';
+      var wrap = document.createElement("div"); wrap.className = "tablewrap"; wrap.appendChild(table);
+      if (archived) { var fold = document.createElement("details"); fold.className = "fold";
+        fold.innerHTML = '<summary>已归档的异常帖子 <b class="foldN">0</b> 帖</summary>'; fold.appendChild(wrap); p.appendChild(fold);
+      } else { p.insertBefore(wrap, p.firstChild); var empty = p.querySelector(".tab-empty"); if (empty) empty.hidden = true; }
+      var all = table.querySelector(".todoAll");
+      if (all) all.addEventListener("change", function(){
+        table.querySelectorAll(".todoPick:not(.solo)").forEach(function(x){ if (shown(x.closest("tr"))) x.checked = all.checked; }); sync();
+      });
+    }
+    var empty = document.getElementById("todoEmpty"); if (empty) empty.hidden = true;
+    var bar = document.getElementById("queueBar"); if (bar) bar.hidden = false;
+    return table.querySelector("tbody");
+  }
+  function upsertTodo(t, archived){
+    var tr = findTodo(t.table_id, t.record_id, false);
+    if (tr && tr.dataset.busy) return;
+    if (!tr) { var body = ensurePanel(t, archived); if (!body) return;
+      var fragment = document.createElement("tbody"); fragment.innerHTML = rowHtml(t, !archived);
+      tr = fragment.firstElementChild; body.appendChild(tr);
+      tr.classList.add("fresh");
+      var pick = tr.querySelector(".todoPick"); if (pick) pick.addEventListener("change", sync);
+    }
+    var isFolded = !!tr.closest(".fold");
+    if (isFolded !== archived) {
+      var destination = ensurePanel(t, archived);
+      if (destination) {
+        var checkbox = tr.querySelector(".todoPick");
+        if (archived && checkbox) checkbox.closest("td").remove();
+        if (!archived && !checkbox) { var cell = document.createElement("td"); cell.className = "nowrap";
+          cell.innerHTML = '<input type="checkbox" class="todoPick">'; tr.insertBefore(cell, tr.firstChild);
+          cell.querySelector("input").addEventListener("change", sync); }
+        destination.appendChild(tr);
+      }
+    }
+    var pickBox = tr.querySelector(".todoPick");
+    if (pickBox) pickBox.classList.toggle("solo", !!(t.archived || t.adhoc));
+    delete tr.dataset.obsolete;
+    if (tr.dataset.key && t.key && tr.dataset.key !== t.key) tr.classList.add("fresh");
+    if (!archived && t.key) tr.dataset.key = t.key;
+    tr.dataset.checked = t.checked_at_ms == null ? "" : String(t.checked_at_ms);
+    tr.dataset.reasons = JSON.stringify(t.reasons || []);
+    updateRowState(tr, t.work_state || "pending");
+    var when = tr.querySelector("td.when");
+    if (when) when.innerHTML = chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '');
+    var cells = tr.children, offset = tr.querySelector(".todoPick") ? 1 : 0;
+    var which = tr.querySelector("td.which");
+    if (which) { which.textContent = (t.label || t.record_id).slice(0, 24); which.title = t.label || t.record_id; }
+    var persona = tr.querySelector("td.persona"); if (persona) persona.textContent = t.persona || "—";
+    var post = tr.querySelector("td.post"), postUrl = safeUrl(t.post_url);
+    if (post && (!post.querySelector("a") || post.querySelector("a").getAttribute("href") !== postUrl))
+      post.innerHTML = postUrl ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(postUrl) + '">查看帖子</a>' : '—';
+    if (cells[offset + 3]) cells[offset + 3].innerHTML = (t.reasons || []).map(reasonChip).join('') +
+      (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : ''));
+    if (cells[offset + 5]) cells[offset + 5].textContent = t.comment_count == null ? "—" : t.comment_count;
+    var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
+    if (d) { var nextDetail = detail + (digest ? "\n" + digest : ""); if (d.textContent !== nextDetail) d.textContent = nextDetail;
+      tr.querySelector(".diagnostic>summary").textContent = detail.slice(0, 48) || "查看诊断与评论摘要"; }
+  }
+  function upsertResolved(t){
+    var list = document.getElementById("resolvedList"); if (!list) return;
+    var tr = findTodo(t.table_id, t.record_id, true);
+    if (tr && (tr.dataset.busy || tr.contains(document.activeElement))) return;
+    if (!tr) { tr = document.createElement("tr"); list.querySelector("tbody").appendChild(tr); }
+    tr.dataset.tbl = t.table_id; tr.dataset.rec = t.record_id; tr.dataset.project = t.project;
+    tr.dataset.reasons = JSON.stringify(t.reasons || []); tr.dataset.checked = t.checked_at_ms || ""; tr.dataset.workState = "resolved";
+    var link = safeUrl(t.record_url);
+    tr.innerHTML = '<td class="nowrap">' + esc(t.project) + '</td><td class="which">' + esc(t.label || t.record_id) +
+      '</td><td>' + esc((t.reasons || []).join('、')) + '</td><td class="nowrap">' +
+      chinaTime(t.resolved_at_ms, true) + '</td><td class="nowrap acts">' +
+      (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去这一行</a> ' : '') +
+      '<button type="button" class="link unresolve">撤销</button></td>';
+    var main = findTodo(t.table_id, t.record_id, false); if (main && !main.dataset.busy) updateRowState(main, "resolved");
+  }
+  function applyOverview(j){
+    if (j.error) throw new Error(j.error);
+    if (j.work_stats) workStats = j.work_stats;
+    if (typeof j.todos_hidden === "number") {
+      var todoCount = String((j.todos || []).length) + (j.todos_hidden ? "+" : "");
+      var lead = document.querySelector(".kpi .lead .n"); if (lead) lead.textContent = todoCount;
+      var titleCount = document.querySelector("#s-todo .n"); if (titleCount) titleCount.textContent = todoCount;
+      var navCount = document.querySelector(".side a[data-sec='s-todo'] .cnt"); if (navCount) navCount.textContent = todoCount;
+      var ledeCount = document.getElementById("todoLede");
+      if (ledeCount) ledeCount.innerHTML = '<b>' + (j.todos || []).length + '</b> 行现在需要人看一眼' +
+        (j.todos_hidden ? '（另有 <b>' + j.todos_hidden + '</b> 行因条数上限没列出来）' : '');
+    }
+    var live = {}, done = {};
+    (j.todos || []).forEach(function(t){ live[t.table_id + "/" + t.record_id] = true; upsertTodo(t, false); });
+    (j.archived_todos || []).forEach(function(t){ live[t.table_id + "/" + t.record_id] = true; upsertTodo(t, true); });
+    (j.resolved || []).forEach(function(t){ done[t.table_id + "/" + t.record_id] = true; upsertResolved(t); });
+    document.querySelectorAll("#todos tr[data-rec]").forEach(function(tr){
+      var k = tr.dataset.tbl + "/" + tr.dataset.rec;
+      if (tr.dataset.busy || live[k] || done[k]) return;
+      var selected = tr.querySelector(".todoPick:checked");
+      if (!selected && !tr.contains(document.activeElement)) tr.dataset.obsolete = "true";
+    });
+    document.querySelectorAll("#resolvedList tr[data-rec]").forEach(function(tr){
+      if (!tr.dataset.busy && !done[tr.dataset.tbl + "/" + tr.dataset.rec]) tr.remove();
+    });
+    picks = document.querySelectorAll("#todos .todoPick"); alls = document.querySelectorAll("#todos .todoAll");
+    renderWorkStats(); applyWorkFilter();
+    if (workLive) workLive.textContent = persistentWarning || "处理进度同步于 " + chinaTime(Date.now(), false);
+  }
+  function refreshWork(){
+    if (!workbench || document.hidden || overviewBusy) return Promise.resolve();
+    overviewBusy = true; var epoch = overviewEpoch;
+    return getJson("/api/overview").then(function(j){ if (epoch === overviewEpoch) applyOverview(j); })
+      .catch(function(e){ if (workLive) workLive.textContent = "同步延迟：" + e.message; })
+      .then(function(){ overviewBusy = false; });
+  }
+  function reportKey(){ return (workProject ? workProject.value : "") + "/" + (reportDate ? reportDate.value : ""); }
+  function notesKey(){ return "linkcheck.daily-notes." + reportKey(); }
+  function loadNotes(){
+    if (!reportFeatures) return;
+    var notes = {};
+    try { notes = JSON.parse(localStorage.getItem(notesKey()) || "{}"); } catch (e) {}
+    reportFeatures.value = notes.features || ""; reportCompetitors.value = notes.competitors || "";
+    reportFeatures.disabled = reportCompetitors.disabled = !workProject.value;
+    reportFeatures.title = reportCompetitors.title = workProject.value ? "仅保存在此浏览器" : "选择单个项目后补充";
+  }
+  function composeReport(){
+    if (!reportText) return;
+    var text = currentReports.map(function(r){ return r.text || (r.label + "：本期扫描 " + r.scanned_posts +
+      " 篇，发现 " + r.negative_posts + " 篇有负面评论，共计 " + r.negative_comments + " 条。"); }).join("\n\n");
+    if (workProject && workProject.value && text) {
+      text += "\n主要内容特征：" + (reportFeatures.value.trim() || "待人工补充") +
+        "\n主要出现的疑似竞品：" + (reportCompetitors.value.trim() || "待人工核实");
+    }
+    reportText.value = text;
+    var copy = document.getElementById("copyReport"); if (copy) copy.disabled = !reportLoaded || !text;
+  }
+  function renderReports(){
+    var totals = {scanned_posts:0, scan_count:0, negative_posts:0, negative_comments:0}, estimated = false;
+    var evidence = [], limitations = [], incomplete = false, noCoverage = 0;
+    currentReports.forEach(function(r){
+      Object.keys(totals).forEach(function(k){ totals[k] += Number(r[k] || 0); });
+      estimated = estimated || r.comment_count_estimated;
+      incomplete = incomplete || !!(r.window && r.window.coverage_complete === false);
+      if (r.window && r.window.coverage_started_at_ms === null) noCoverage++;
+      var p = r.post_states || {}, c = r.comment_states || {};
+      evidence.push(r.label + " · 本期检出预警：待处理 " + (p.pending || 0) + " 篇 / " + (c.pending || 0) +
+        " 条评论；正在处理 " + (p.processing || 0) + " 篇 / " + (c.processing || 0) + " 条评论；已处理 " +
+        (p.resolved || 0) + " 篇 / " + (c.resolved || 0) + " 条评论" + (r.comment_count_estimated ? "（评论条数含估算）" : ""));
+      if (r.peak && r.peak.count) evidence.push(r.label + " · 检测集中时段：" + chinaTime(r.peak.start_ms, true) +
+        "—" + chinaTime(r.peak.end_ms, false) + "（" + r.peak.count + " 条）");
+      if (r.keywords && r.keywords.length) evidence.push(r.label + " · 命中词：" + r.keywords.map(function(k){
+        return k.word + "（" + k.count + "）"; }).join("、"));
+      if (r.operations) evidence.push(r.label + " · 本期运营操作（含存量）：已处理 " + (r.operations.resolved || 0) +
+        " " + (r.operations_unit || "行") + "；标为正在处理 " + (r.operations.processing || 0) + " " +
+        (r.operations_unit || "行") + "；退回待处理 " + (r.operations.pending || 0) + " " + (r.operations_unit || "行"));
+      (r.limitations || []).forEach(function(s){ limitations.push(r.label + "：" + s); });
+    });
+    setText("workSummary", !reportLoaded ? "正在读取本期扫描与负面记录…" : (currentReports.length ?
+      (noCoverage ? (noCoverage === currentReports.length ? "尚未开始日报留痕，历史数据不可回算。已记录 " :
+        "部分项目尚未开始日报留痕 · 已记录 ") : (incomplete ? "留痕不完整 · 已记录 " : "本期 · 已扫描 ")) +
+      totals.scanned_posts + " 篇（" + totals.scan_count + " 次检查） · " + totals.negative_posts +
+      " 篇检出预警 · " + (estimated ? "约 " : "") + totals.negative_comments + " 条命中评论" : "本期暂无可用记录。"));
+    var w = currentReports.length ? currentReports[0].window : null;
+    setText("reportPeriod", w ? chinaTime(w.start_ms, true) + "—" + chinaTime(w.end_ms, true) +
+      " · " + (w.complete ? "已结算" : "预览，截至 " + chinaTime(w.as_of_ms, false)) + " · 北京时间" : "每日 16:00 结算 · 北京时间");
+    var out = document.getElementById("reportEvidence");
+    if (out) { out.textContent = ""; evidence.forEach(function(s){ var div = document.createElement("div"); div.textContent = s; out.appendChild(div); }); }
+    var ul = document.getElementById("reportLimits");
+    if (ul) { ul.textContent = ""; ul.hidden = !limitations.length;
+      limitations.forEach(function(s){ var li = document.createElement("li"); li.textContent = s; ul.appendChild(li); }); }
+    composeReport();
+  }
+  function loadReports(){
+    if (!workbench || document.hidden) return Promise.resolve();
+    var key = reportKey(), epoch = ++reportEpoch;
+    currentReports = reportCache[key] || []; reportLoaded = Object.prototype.hasOwnProperty.call(reportCache, key);
+    renderReports();
+    if (reportMessage) reportMessage.textContent = "正在同步日报…";
+    var url = "/api/daily-report?date=" + encodeURIComponent(reportDate.value);
+    if (workProject.value) url += "&table_id=" + encodeURIComponent(workProject.value);
+    return getJson(url).then(function(j){
+      if (epoch !== reportEpoch || key !== reportKey()) return;
+      if (j.error && !(j.reports || []).length) throw new Error(j.error);
+      currentReports = j.reports || []; reportCache[key] = currentReports; reportLoaded = true;
+      renderReports(); reportMessage.textContent = j.error || "统计同步于 " + chinaTime(Date.now(), false);
+    }).catch(function(e){
+      if (epoch !== reportEpoch || key !== reportKey()) return;
+      reportMessage.textContent = "日报同步延迟：" + e.message + (reportLoaded ? "；已保留上次结果。" : "；暂时无法取得统计。");
+      if (!reportLoaded) setText("workSummary", "本期统计暂不可用，请稍后重试。");
+    });
+  }
+  if (workbench) {
+    reportDate.value = dayInShanghai();
+    try { var initialReports = JSON.parse(workbench.dataset.reports || "[]");
+      if (initialReports.length) reportCache[reportKey()] = initialReports;
+    } catch (e) {}
+    workProject.addEventListener("change", function(){
+      var label = projectLabel();
+      if (!label && activeTab()) showTab(activeTab().dataset.tab, false);
+      panels.forEach(function(p){ if (panelHasTable(p, workProject.value)) showTab(p.dataset.tab, false); });
+      loadNotes(); renderWorkStats(); applyWorkFilter(); loadReports();
+    });
+    reportDate.addEventListener("change", function(){ if (!reportDate.value) reportDate.value = dayInShanghai(); loadNotes(); loadReports(); });
+    document.getElementById("reportNext").addEventListener("click", function(){
+      var d = new Date(reportDate.value + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1);
+      reportDate.value = d.toISOString().slice(0, 10); loadNotes(); loadReports();
+    });
+    workbench.querySelectorAll("button[data-work-filter]").forEach(function(b){
+      b.addEventListener("click", function(){ workFilter = b.dataset.workFilter;
+        workbench.querySelectorAll("button[data-work-filter]").forEach(function(x){ x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
+        applyWorkFilter();
+      });
+    });
+    [reportFeatures, reportCompetitors].forEach(function(input){ input.addEventListener("input", function(){
+      try { localStorage.setItem(notesKey(), JSON.stringify({features:reportFeatures.value, competitors:reportCompetitors.value})); }
+      catch (e) { reportMessage.textContent = "浏览器未允许本地保存；本次填写仍可复制。"; }
+      composeReport();
+    }); });
+    document.getElementById("copyReport").addEventListener("click", function(){
+      var copy = this;
+      if (!reportText.value) return;
+      if (!navigator.clipboard || !navigator.clipboard.writeText) { reportText.focus(); reportText.select();
+        reportMessage.textContent = "请复制已选中的汇报正文。"; return; }
+      navigator.clipboard.writeText(reportText.value).then(function(){ copy.textContent = "已复制";
+        setTimeout(function(){ copy.textContent = "复制汇报"; }, 1800);
+      }).catch(function(){ reportText.focus(); reportText.select(); reportMessage.textContent = "请复制已选中的汇报正文。"; });
+    });
+    loadNotes(); refreshWork(); loadReports();
+    setInterval(function(){ if (!document.hidden) refreshWork(); }, 15000);
+    setInterval(function(){ if (!document.hidden) loadReports(); }, 60000);
+    document.addEventListener("visibilitychange", function(){ if (!document.hidden) { refreshWork(); loadReports(); } });
+  }
 
   // ---- 项目管理 ----
   var list = document.getElementById("projects");
@@ -1321,20 +1767,29 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
     # 折叠区里的老帖不算。
     key = f" data-key='{_e(todo.key)}'" if main else ""
     checked = "" if todo.checked_at_ms is None else str(todo.checked_at_ms)
-    resolve = (" <button type=button class='link resolve' title='问题处理完了就点："
-               "先收起来，不用等下一次刷新。下次刷新又查出问题会自动回来'>已解决</button>"
+    state = getattr(todo, "work_state", "pending")
+    working = state == "processing"
+    resolve = (f"<span class='work-state{' processing' if working else ''}'>"
+               f"{'正在处理' if working else '待处理'}</span>"
+               f" <button type=button class='link processing' aria-pressed={'true' if working else 'false'} "
+               "title='标记这篇帖子正在处理；再次点击退回待处理'>正在处理</button>"
+               " <button type=button class='link resolve' title='标记这篇帖子的问题已处理'>已处理</button>"
                if resolvable else "")
+    diagnosis = ("<details class=diagnostic><summary>"
+                 f"{_e(_clip(todo.diagnosis or '查看诊断与评论摘要', 48))}</summary>"
+                 f"<div class=diagnostic-body>{_e(todo.diagnosis)}{extra}</div></details>"
+                 if todo.diagnosis or extra else "<span class=muted>—</span>")
     return (
         f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
         f"data-tbl='{_e(todo.table_id)}'{key} "
         f"data-reasons='{_e(json.dumps(todo.reasons, ensure_ascii=False))}' "
-        f"data-checked='{checked}'>"
+        f"data-checked='{checked}' data-project='{_e(todo.project)}' data-work-state='{_e(state)}'>"
         f"{pick}"
         f"<td class=which title='{_e(todo.label)}'>{_e(_clip(todo.label))}</td>"
         f"<td class='nowrap persona'>{_e(todo.persona) or '<span class=muted>—</span>'}</td>"
         f"<td class='nowrap post'>{_post_link(todo.post_url)}</td>"
         f"<td>{_chips(todo.reasons, _REASON_CLASS)}{_scope_chip(todo) if main else ''}</td>"
-        f"<td>{_e(todo.diagnosis) or '<span class=muted>—</span>'}{extra}</td>"
+        f"<td class=diagnosis>{diagnosis}</td>"
         f"<td class=nowrap>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
         # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
         # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
@@ -1384,10 +1839,11 @@ def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) ->
 
 def _resolved_list(rows, offset_hours: float) -> str:
     """标了「已解决」、暂时收起来的行。收着放在待办底下，点了「撤销」就回来。"""
-    if not rows:
-        return ""
     body = "".join(
-        f"<tr data-tbl='{_e(t.table_id)}' data-rec='{_e(t.record_id)}'>"
+        f"<tr data-tbl='{_e(t.table_id)}' data-rec='{_e(t.record_id)}' "
+        f"data-project='{_e(t.project)}' data-work-state='resolved' "
+        f"data-reasons='{_e(json.dumps(t.reasons, ensure_ascii=False))}' "
+        f"data-checked='{t.checked_at_ms if t.checked_at_ms is not None else ''}'>"
         f"<td class=nowrap>{_e(t.project)}</td>"
         f"<td class=which title='{_e(t.label)}'>{_e(_clip(t.label))}</td>"
         f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
@@ -1397,10 +1853,9 @@ def _resolved_list(rows, offset_hours: float) -> str:
         "<button type=button class='link unresolve'>撤销</button></td></tr>"
         for t in rows)
     return (
-        "<details class=resolved>"
-        f"<summary>{len(rows)} 行标了「已解决」，暂时收起来了——"
-        "下次刷新又查出问题会自动回来</summary>"
-        "<div class=tablewrap><table><thead><tr><th>项目</th><th>哪一条</th>"
+        f"<details class=resolved id=resolvedList{'' if rows else ' hidden'}>"
+        f"<summary><span id=resolvedCount>{str(len(rows)) + ' 行标了「已解决」' if rows else '已处理记录'}</span></summary>"
+        "<div class=tablewrap><table><thead><tr><th>所属项目</th><th>哪一条</th>"
         "<th>当时的问题</th><th>标记于</th><th></th></tr></thead>"
         f"<tbody>{body}</tbody></table></div></details>")
 
@@ -1423,10 +1878,13 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
     收起来（见 `_fold`）。tab 上在条数后面跟一个淡色的 +N。
     """
     if not todos and not folded:
-        return ("<div class=empty>" + _icon("check-circle") +
+        return ("<div class=empty id=todoEmpty>" + _icon("check-circle") +
                 "没有需要处理的行。"
                 "<div class=two>风控中 / 有负面 / 置顶掉了 / 已失效 / "
                 "刷新失败 / 卡住了 / 需重新整理 —— 一条都没有。</div></div>"
+                "<div class=queuebar id=queueBar hidden><button type=button id=btnQueue disabled>"
+                "勾「排队刷新」（<span id=pickN>0</span>）</button><span id=queueOut class=muted></span></div>"
+                "<div id=todos><div class=tabs role=tablist aria-label='按项目分开看'></div></div>"
                 + _resolved_list(resolved, offset_hours))
     groups: dict = {}
     for label in project_order:
@@ -1466,7 +1924,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
             f"{main}{_fold(old, offset_hours, show_digest, resolvable=resolvable)}</div>")
     # #todos 包住所有 tab 页：脚本里「所有待办行」仍然是 `#todos tbody tr`，
     # 「新」标记、筛选、勾选计数都不用知道有几页。
-    return (f"""<div class=queuebar>
+    return (f"""<div class=queuebar id=queueBar>
   <button type=button id=btnQueue disabled>勾「排队刷新」（<span id=pickN>0</span>）</button>
   <span class=muted>面板不发付费请求——勾上之后由 cron 在五分钟内接手，
   和你在飞书里手工勾是同一条路。</span>
@@ -1779,12 +2237,58 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
             "看余额本身不花钱。</div>")
 
 
+def _workbench(projects, *, resolvable: bool, reports=None) -> str:
+    """轻量项目工作区。日报异步加载，初始页面不等待历史查询。"""
+    options = "".join(f"<option value='{_e(p.table_id)}'>{_e(p.label)}</option>"
+                      for p in projects)
+    initial = _e(json.dumps(reports or [], ensure_ascii=False))
+    return f"""<section class=workbench id=s-work data-resolvable={'true' if resolvable else 'false'}
+  data-reports='{initial}'>
+  <div class=work-head>
+    <h2>项目工作台</h2>
+    <label class=sr-only for=workProject>查看项目</label>
+    <select id=workProject><option value=''>全部项目</option>{options}</select>
+    <span class=work-live id=workLive role=status aria-live=polite>正在同步处理进度…</span>
+  </div>
+  <div class=work-states role=group aria-label='按待办处理状态筛选'>
+    <span class=caption>当前处理进度 · 行</span>
+    <button type=button data-work-filter=all aria-pressed=true>全部</button>
+    <button type=button data-work-filter=pending aria-pressed=false>待处理<b id=workPending>—</b></button>
+    <button type=button data-work-filter=processing aria-pressed=false>正在处理<b id=workProcessing>—</b></button>
+    <button type=button data-work-filter=resolved aria-pressed=false>已处理<b id=workResolved>—</b></button>
+  </div>
+  <div class=work-summary id=workSummary aria-live=polite>正在读取本期扫描与负面记录…</div>
+  <details class=daily id=dailyPanel>
+    <summary>每日汇报<span class=muted id=reportPeriod>每日 16:00 结算 · 北京时间</span></summary>
+    <div class=daily-body>
+      <div class=daily-tools>
+        <label for=reportDate>汇报结束日期</label><input type=date id=reportDate>
+        <button type=button class=sm id=reportNext>下个周期</button>
+        <button type=button class='sm primary copy' id=copyReport disabled>复制汇报</button>
+      </div>
+      <div class=daily-evidence id=reportEvidence></div>
+      <label class=sr-only for=reportText>汇报正文</label>
+      <textarea id=reportText class=daily-text readonly placeholder='日报载入后显示在这里，可直接复制。'></textarea>
+      <ul class=daily-limits id=reportLimits hidden></ul>
+      <div class=daily-extra>
+        <div><label for=reportFeatures>主要内容特征<span class=muted>人工补充</span></label>
+          <textarea id=reportFeatures placeholder='补充本期观察到的主要内容特征；未填写则不作判断。'></textarea></div>
+        <div><label for=reportCompetitors>疑似竞品<span class=muted>人工核实</span></label>
+          <textarea id=reportCompetitors placeholder='填入已核实的品牌或产品线索，保留“疑似”表述。'></textarea></div>
+      </div>
+      <div class=daily-message id=reportMessage role=status aria-live=polite></div>
+      <p class=muted>补充内容仅保存在此浏览器，按项目和汇报日期分别记录。扫描记录覆盖第一页评论；关键词命中仍需人工核实。</p>
+    </div>
+  </details>
+</section>"""
+
+
 def overview_page(*, overview: Optional[summary.Overview], error: str,
                   fetched_at: float, config, csrf: str = "",
                   runs=None, log_error: str = "",
                   balances=None, balance_error: str = "", runway=None,
                   outages=None, offset_hours: float = 8.0,
-                  resolvable: bool = False) -> str:
+                  resolvable: bool = False, reports=None) -> str:
     # resolvable = 面板接上了注册表、「已解决」有地方存（见 panel.Resolutions）。
     if overview is None:
         # 四态里的「骨架加载」。给骨架而不是一句「正在取数」，是因为这一屏
@@ -1896,7 +2400,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                  if todos_hidden else
                  f"<b>{len(todos)}</b> 行现在需要人看一眼")
     lede = (f"在管 <b>{overview.total_rows}</b> 行，分在 "
-            f"<b>{len(projects)}</b> 个项目里；其中 {todo_text}，"
+            f"<b>{len(projects)}</b> 个项目里；其中 <span id=todoLede>{todo_text}</span>，"
             f"<b>{overview.queued_rows}</b> 行已排队等下一轮刷新。")
 
     nav = _sidebar_nav(
@@ -1932,11 +2436,13 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     {_outage_note(outages or [])}{stale_note}{domain_note}
     <div class='kpi stagger-in'>{bar}</div>
 
+    {_workbench(projects, resolvable=resolvable, reports=reports)}
+
     <h2 id=s-todo>要人管的行 <span class=n>{len(todos)}{'+' if todos_hidden else ''}</span></h2>
-    <p class=sub>按项目分开看：每个项目一个标签，标签上的数字是这个项目要人管的行数
+    <details class=monitor-help><summary>查看与处理说明</summary><p>按项目分开看：每个项目一个标签，标签上的数字是这个项目要人管的行数
       （红 = 有风控 / 失效 / 刷新失败），每一页里按严重度排序；筛选时各标签上显示命中数。
       点「去这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做{resolve_hint}。
-      已归档的老帖收在各自项目那一页的底下。{hidden_note}</p>
+      已归档的老帖收在各自项目那一页的底下。{hidden_note}</p></details>
     {_todo_table(todos, offset_hours, config.show_digest,
                  project_order=[p.label for p in projects],
                  folded=overview.archived_todos(), resolved=overview.resolved,
@@ -1964,6 +2470,7 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
     「哪儿有事」的地方——收着的时候也能一眼看出待办有多少。
     """
     items = [
+        ("s-work", "layout-grid", "项目工作台", ""),
         ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
         ("s-proj", "layout-grid", "各项目", str(projects)),
         ("s-manage", "folder", "加表 / 改配置", ""),

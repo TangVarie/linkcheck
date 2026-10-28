@@ -40,6 +40,9 @@ class CommentView:
     is_author: bool = False
     ip_location: str = ""
     author_name: str = ""
+    # 留痕按平台评论 ID 去重；创建时间只是上游事实，不用发现时间代填。
+    comment_id: str = ""
+    created_at_ms: Optional[int] = None
 
     def one_line(self, fmt: DigestFormat, extra_mark: str = "") -> str:
         text = re.sub(r"\s+", " ", self.content or "").strip()
@@ -228,6 +231,25 @@ def saw_comment_page(snapshot: Snapshot) -> bool:
             or comments_hidden(snapshot))
 
 
+def _comment_created_at_ms(value: Any) -> Optional[int]:
+    """供应商的秒/毫秒 epoch 统一成毫秒。缺失和坏值保留为未知。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        stamp = float(value)
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(stamp) or stamp <= 0:
+        return None
+    millis = stamp * 1000 if stamp < 100_000_000_000 else stamp
+    # 不把错塞进时间列的评论数或微秒数变成一个看似有效的时间。
+    return int(millis) if millis <= 4_102_444_800_000 else None
+
+
+def _comment_id(value: Any) -> str:
+    return str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+
+
 def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     """解析评论接口的一页返回。
 
@@ -261,6 +283,9 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
                     is_author=bool(item.get("is_author_comment")),
                     ip_location=str(item.get("ip_location") or ""),
                     author_name=_author_name(item.get("author")),
+                    comment_id=_comment_id(item.get("comment_id") or item.get("cid") or item.get("id")),
+                    created_at_ms=_comment_created_at_ms(
+                        item.get("created_at_ms") or item.get("create_time") or item.get("timestamp")),
                 )
             )
 
