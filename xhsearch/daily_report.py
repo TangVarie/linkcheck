@@ -172,7 +172,8 @@ class Journal:
                                     (_history_id(e), e) for e in batch)
 
     def _read_kind(self, kind: str, start_ms: Optional[int], end_ms: int,
-                   table_id: str = "") -> list[dict]:
+                   table_id: str = "", whole: Optional[set] = None) -> list[dict]:
+        """`whole` 给了就把这次完整读回来的分片键放进去（历史缓存靠它清掉旧缺口）。"""
         found = self._find()
         if not found:
             return []
@@ -226,6 +227,8 @@ class Journal:
                     raise ValueError("事件与分片索引不一致")
                 events.extend(e for e in parsed if e["at"] < end_ms
                               and (start_ms is None or e["at"] >= start_ms))
+                if whole is not None:
+                    whole.add(key)
             except (ValueError, TypeError):
                 events.append({"type": "gap", "at": max(start_ms or 0, group["at"]),
                                "table_id": group["project"], "chunk": key,
@@ -262,14 +265,19 @@ class Journal:
         now = self._wall()
         through = int(now * 1000) + 86_400_000      # 时钟偏一点的未来事件也收进来
         cached = self._history.get((kind, table_id))
+        whole: set[str] = set()
         if cached is None or now - cached["full_at"] > HISTORY_FULL_SECONDS:
-            fresh = self._read_kind(kind, None, through, table_id)
+            fresh = self._read_kind(kind, None, through, table_id, whole)
             cached = {"events": {}, "full_at": now}
             self._history[(kind, table_id)] = cached
         else:
             fresh = self._read_kind(kind, cached["through"] - HISTORY_OVERLAP_MS,
-                                    through, table_id)
+                                    through, table_id, whole)
         cached["events"].update((_history_id(e), e) for e in fresh)
+        # 上次没读全、记成缺口的分片，这次完整读回来了：缺口作废（比如上次正赶上
+        # 写到一半）。不清掉的话，日报要一直标「不完整」到下一次整段重读。
+        for key in whole:
+            cached["events"].pop("gap:" + key, None)
         cached["through"] = through
         return [e for e in cached["events"].values() if e["at"] < end_ms]
 
@@ -438,8 +446,11 @@ def aggregate(events: list[dict], start: int, end: int, table_id: str, label: st
 
     legacy_statuses: dict[str, dict] = {}
     post_statuses: dict[str, dict] = {}
+    # resync 是面板补写时按当前显示重建的状态（留痕积压丢了最新那条）：
+    # 算「此刻是什么状态」，不算运营又点了一次。
     operation_events = [e for e in selected if e.get("type") == "status"
-                        and e.get("state") in STATES and start <= e["at"]]
+                        and e.get("state") in STATES and start <= e["at"]
+                        and not e.get("resync")]
     operations_unit = "篇" if operation_events and all(e.get("post_key") for e in operation_events) else "行"
     operations = {state: len({str(e.get("post_key") if operations_unit == "篇"
                                  else e.get("record_id")) for e in operation_events

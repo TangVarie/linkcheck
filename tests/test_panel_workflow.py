@@ -180,9 +180,10 @@ class TestResolveTransitions(unittest.TestCase):
                              panel.Resolutions.OUTBOX_MAX_CHARS)
         self.assertEqual(outbox[-1]["record_id"], "r")
         self.assertEqual(outbox[0], backlog[1001 - len(outbox)])
-        first, last, count = self.store.value[panel.Resolutions.DROPPED]["tblA"]
+        first, last, count, lost = self.store.value[panel.Resolutions.DROPPED]["tblA"]
         self.assertEqual((first, count), (TS - 10_000, 1001 - len(outbox)))
         self.assertEqual(last, backlog[count - 1]["at"])
+        self.assertEqual(lost, [], "丢的都是被同一条记录后来的操作覆盖掉的，最新状态还在")
 
         # 恢复之后：剩下的补写进去，丢掉的那段作为缺口一起写，日报标覆盖不完整。
         recovered = mock.Mock()
@@ -193,6 +194,44 @@ class TestResolveTransitions(unittest.TestCase):
                          [(first, last, "tblA")])
         self.assertEqual(len(sent), len(outbox) + 1)
         self.assertNotIn(panel.Resolutions.OUTBOX, self.store.value)
+        self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
+
+    def test_dropped_latest_state_is_rebuilt_from_the_live_state_on_recovery(self):
+        """丢掉的要是某条记录的**最新**状态，之后每一期都会接着报错它的状态：
+        先丢被同一条记录后续操作覆盖掉的；真丢了最新状态的，补写时按此刻的显示
+        状态补一条，缺口一直标到补上为止。"""
+        self.reports.record_events.side_effect = RuntimeError("journal unavailable")
+        backlog = [{"type": "status", "at": TS - 10_000 + i, "table_id": "tblA",
+                    "record_id": f"old{i}", "state": "processing", "post_key": f"xhs:old{i}"}
+                   for i in range(300)]
+        backlog[0]["state"] = "pending"                     # 退回待处理，显示里已没有记录
+        backlog[150] = {**backlog[150], "record_id": "x", "post_key": "xhs:x"}
+        backlog.append({**backlog[150], "at": TS - 1, "state": "resolved"})
+        self.store.value = {
+            panel.Resolutions.OUTBOX: copy.deepcopy(backlog),
+            "tblA/old1": {"reasons": ["有负面"], "seen": TS, "at": TS - 9_999,
+                          "state": "processing", "post_key": "xhs:old1"}}
+        self.assertEqual(self.request(state="processing")[0], 200)
+        outbox = self.store.value[panel.Resolutions.OUTBOX]
+        kept = {(e["record_id"], e["state"]) for e in outbox}
+        self.assertNotIn(("x", "processing"), kept, "被覆盖的先丢")
+        self.assertIn(("x", "resolved"), kept)
+        lost = self.store.value[panel.Resolutions.DROPPED]["tblA"][3]
+        self.assertIn("old0", lost)
+        self.assertNotIn("x", lost)
+
+        recovered = mock.Mock()
+        self.resolutions.flush_journal(recovered)
+        sent = recovered.record_events.call_args.args[0]
+        resync = {e["record_id"]: e for e in sent if e.get("resync")}
+        self.assertEqual(set(resync), set(lost))
+        self.assertEqual(resync["old0"]["state"], "pending")
+        self.assertEqual((resync["old1"]["state"], resync["old1"]["post_key"]),
+                         ("processing", "xhs:old1"))
+        latest = max(e["at"] for e in outbox)
+        self.assertTrue(all(e["at"] > latest for e in resync.values()))
+        gaps = [e for e in sent if e["type"] == "gap"]
+        self.assertEqual(max(g["end"] for g in gaps), resync["old0"]["at"])
         self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
 
     def test_dropped_counter_survives_other_edits(self):

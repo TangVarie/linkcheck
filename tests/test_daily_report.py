@@ -173,6 +173,14 @@ class TestReport(unittest.TestCase):
         self.assertEqual(r["post_states"]["resolved"], 1)
         self.assertEqual(r["post_states"]["pending"], 0)
 
+    def test_resync_status_restores_state_without_counting_as_an_operation(self):
+        """补写重建的状态是「此刻是什么」，不是运营又点了一次。"""
+        r = report([{**status("processing", START - HOUR), "post_key": "xhs:one"},
+                    scan(),
+                    {**status("pending", START + 2000), "post_key": "xhs:one", "resync": True}])
+        self.assertEqual(r["post_states"]["pending"], 1)
+        self.assertEqual(r["operations"], {"pending": 0, "processing": 0, "resolved": 0})
+
     def test_as_of_limits_scans_and_statuses_in_preview(self):
         r = report([scan(), status("resolved", START + HOUR),
                     scan(START + 2 * HOUR, post="xhs:future")], as_of=START + HOUR)
@@ -314,6 +322,25 @@ class TestJournal(unittest.TestCase):
         self.assertTrue(any(c["field_name"] == d.COL_END
                             for c in self.status_reads()[0]["conditions"]))
         self.assertIn(old, events)
+
+    def test_cached_chunk_gap_clears_once_the_chunk_reads_back_whole(self):
+        """分片一时没读全（比如正写着），缓存里的缺口不能一直挂到 6 小时整段重读。"""
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        coverage = {"type": "coverage", "at": START - HOUR, "table_id": "tbl1"}
+        long_status = {**status("processing", START + HOUR), "note": "长" * 20_000}
+        journal.append([coverage, long_status])
+        missing = next(i for i, row in enumerate(self.table.rows)
+                       if row["fields"][d.COL_KIND] == "status")
+        held = self.table.rows.pop(missing)
+        first = journal.read_window(START, END, "tbl1")
+        self.assertFalse(report(first)["window"]["coverage_complete"])
+        self.table.rows.append(held)
+        events = journal.read_window(START, END, "tbl1")
+        self.assertNotIn("gap", [e["type"] for e in events])
+        self.assertIn(long_status, events)
+        self.assertTrue(report(events)["window"]["coverage_complete"])
 
     def test_own_old_dated_write_is_seen_and_others_are_caught_by_the_full_reread(self):
         clock = [END / 1000]
