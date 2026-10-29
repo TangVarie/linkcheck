@@ -490,6 +490,30 @@ class TestJournal(unittest.TestCase):
         clock[0] += 60
         self.assertIn(mine, journal.read_window(START, END, "tbl1"))
 
+    def test_a_write_during_the_very_first_history_read_is_not_lost(self):
+        """缓存还没建（面板刚起来的第一次读），正赶上补写一条好几天前的状态。"""
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        journal.append([{"type": "coverage", "at": START - 20 * 86_400_000, "table_id": "tbl1"}])
+        mine = status("resolved", START - 10 * 86_400_000, record="mine")
+        real = self.table.search
+
+        def search_then_write(*args, filter_spec=None, **kwargs):
+            rows = real(*args, filter_spec=filter_spec, **kwargs)
+            kind = {"field_name": d.COL_KIND, "operator": "is", "value": ["status"]}
+            if (kind in (filter_spec or {}).get("conditions", [])
+                    and not getattr(search_then_write, "wrote", False)):
+                search_then_write.wrote = True
+                journal.append([mine])
+            return rows
+
+        self.table.search = search_then_write
+        self.assertIn(mine, journal.read_window(START, END, "tbl1"))
+        self.table.search = lambda *a, **k: []
+        clock[0] += 60
+        self.assertIn(mine, journal.read_window(START, END, "tbl1"))
+
     def test_missing_create_response_is_not_claimed_as_written(self):
         self.table.batch_create = lambda *a, **kw: []
         with self.assertRaisesRegex(ValueError, "未完整写入"):

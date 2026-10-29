@@ -109,6 +109,11 @@ class Journal:
         self._lock = threading.RLock()
         # (kind, table_id) -> {"events": {身份: 事件}, "through": 毫秒, "full_at": 秒}
         self._history: dict[tuple[str, str], dict] = {}
+        # 自己写进去的历史事件：(kind, table_id) -> {身份: (写入时刻秒, 事件)}。
+        # **不管缓存建没建都记**：整段读（包括面板起来后的第一次）正赶上补写时，
+        # 飞书那边读回来的可能还没有它，靠这里补回去。留 HISTORY_FULL_SECONDS，
+        # 之后的整段重读一定已经读得到。
+        self._written: dict[tuple[str, str], dict[str, tuple[float, dict]]] = {}
 
     def _find(self) -> str:
         with self._lock:
@@ -173,15 +178,15 @@ class Journal:
                 # 自己写进去的历史事件直接记进内存：面板补写的状态可能带着
                 # 好几天前的时刻，增量读往前那一段不一定够得着。
                 if kind in HISTORY_KINDS:
+                    written_at = self._wall()
                     with self._lock:
                         for scope in (project, ""):
+                            mine = self._written.setdefault((kind, scope), {})
                             cached = self._history.get((kind, scope))
-                            if cached is not None:
-                                for e in batch:
+                            for e in batch:
+                                mine[_history_id(e)] = (written_at, e)
+                                if cached is not None:
                                     cached["events"][_history_id(e)] = e
-                                    # 也记一份「自己写的」：整段重读要是正赶上，
-                                    # 飞书那边读回来的可能还没有它，换缓存时补回去。
-                                    cached["written"][_history_id(e)] = e
 
     def _read_kind(self, kind: str, start_ms: Optional[int], end_ms: int,
                    table_id: str = "", whole: Optional[dict] = None) -> list[dict]:
@@ -294,11 +299,13 @@ class Journal:
         """把一次读回来的并进缓存（调用方持锁）。"""
         cached = self._history.get((kind, table_id))
         if full or cached is None:
-            previous = cached
-            cached = {"events": {}, "full_at": now, "written": {}, "through": through}
-            # 整段重读期间自己写进去的：飞书那边读回来的可能还没有，从旧缓存补过来。
-            if previous is not None:
-                cached["events"].update(previous["written"])
+            cached = {"events": {}, "full_at": now, "through": through}
+            # 整段读期间（或之前不久）自己写进去的：飞书那边读回来的可能还没有，补上。
+            mine = self._written.get((kind, table_id), {})
+            for identity, (written_at, event) in list(mine.items()):
+                cached["events"][identity] = event
+                if written_at < now - HISTORY_FULL_SECONDS:
+                    del mine[identity]
             self._history[(kind, table_id)] = cached
         for event in fresh:
             identity = _history_id(event)
