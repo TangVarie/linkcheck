@@ -210,19 +210,27 @@ class TestIdempotencyKey(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
-class TestCountAndBatchDelete(unittest.TestCase):
-    def test_count_reads_total_from_a_one_row_search(self):
-        cap = Captured(ok({"items": [{}], "has_more": True, "total": 1834}))
-        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
-             mock.patch.object(transport, "post_with_retry", cap):
-            self.assertEqual(table().count(), 1834)
-        self.assertIn("records/search?page_size=1", cap.calls[0]["url"])
+class TestJournalUpkeepCalls(unittest.TestCase):
+    """「巡检留痕」写满换表、清空删表要用到的几个接口。"""
 
-    def test_count_without_total_is_unknown_not_zero(self):
-        cap = Captured(ok({"items": [], "has_more": False}))
+    def test_a_full_table_surfaces_its_code_so_the_journal_can_roll_over(self):
+        full = transport.Response(
+            status=200, content_type="application/json",
+            body=json.dumps({"code": 1254103, "msg": "RecordExceedLimit"}))
         with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
-             mock.patch.object(transport, "post_with_retry", cap):
-            self.assertIsNone(table().count())
+             mock.patch.object(transport, "post_with_retry", Captured(full)), \
+             self.assertRaises(feishu.FeishuError) as caught:
+            table().batch_create([{"fields": {"a": "b"}}],
+                                 client_token=feishu.idempotency_key("x"))
+        self.assertEqual(caught.exception.code, 1254103)
+
+    def test_delete_table_sends_a_delete_for_that_table(self):
+        cap = Captured(ok({}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "request_with_retry", cap):
+            feishu.Workspace("cli_x", "s").delete_table("bascnREG", "tblOLD")
+        self.assertEqual(cap.calls[0]["method"], "DELETE")
+        self.assertTrue(cap.calls[0]["url"].endswith("/bitable/v1/apps/bascnREG/tables/tblOLD"))
 
     def test_batch_delete_sends_at_most_500_per_request(self):
         cap = Captured()

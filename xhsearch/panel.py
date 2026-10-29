@@ -1200,8 +1200,6 @@ class DailyReports:
         self._version = 0
         self.warning = ""
         self.resolutions = None
-        # 「巡检留痕」行数提醒：(取的时刻, 那句话)。数一次要发一个飞书请求，十分钟一次够了。
-        self._usage: tuple[float, str] = (-1e9, "")
 
     def _journal(self):
         if self._journal_value is None:
@@ -1278,22 +1276,9 @@ class DailyReports:
             for shown in reports:
                 if shown.get("text"):
                     shown["text"] = "部分处理状态留痕待同步，本报可能不完整。" + shown["text"]
-        payload = {"reports": reports, "error": self.warning, "as_of": events_wall,
-                   "capacity": self._capacity(now)}
+        payload = {"reports": reports, "error": self.warning, "as_of": events_wall}
         # 原始留痕只供服务端 AI 证据抽取；普通日报 API 永远不返回它。
         return (payload, events) if with_events else payload
-
-    def _capacity(self, now: float) -> str:
-        """留痕表快满时的一句提醒（见 daily_report.usage_note）。读不出来就不说。"""
-        from . import daily_report
-        if now - self._usage[0] < 600:
-            return self._usage[1]
-        try:
-            note = daily_report.usage_note(self._journal().usage())
-        except Exception:                                       # noqa: BLE001
-            note = self._usage[1]
-        self._usage = (now, note)
-        return note
 
     def record_status(self, table_id: str, record_id: str, state: str, *,
                       at_ms: Optional[int] = None) -> None:

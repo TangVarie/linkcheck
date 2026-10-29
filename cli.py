@@ -249,7 +249,7 @@ def _journal_report(journal, table, report, run_id: str, *, started: bool = True
 
 
 def _journal_upkeep(journal) -> None:
-    """sweep 顺手清理「巡检留痕」，再报一下行数离飞书单表上限还有多远。
+    """sweep 顺手清理「巡检留痕」（表写满了另有自动换表，见 daily_report.Journal）。
     失败只打警告：这是记账的维护，不是巡检本身，不改退出码。"""
     try:
         result = journal.prune(int(time.time() * 1000))
@@ -257,9 +257,6 @@ def _journal_upkeep(journal) -> None:
             print(f"🧹 巡检留痕清理：删掉 {result['deleted']} 行超期记录"
                   + (f"，旧处理状态里被后来状态盖掉的 {result['folded']} 条合并掉了"
                      if result.get("folded") else ""))
-        note = daily_report.usage_note(journal.usage())
-        if note:
-            print("⚠ " + note)
     except Exception as exc:  # noqa: BLE001
         print(f"⚠ 巡检留痕清理没做成：{type(exc).__name__}: {exc}；下一轮 sweep 再试")
 

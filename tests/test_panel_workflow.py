@@ -451,16 +451,6 @@ class TestDailyReportRequests(unittest.TestCase):
         self.assertTrue(text, payload["reports"][0].get("display_mode"))
         self.assertTrue(text.startswith("部分处理状态留痕待同步"), text[:60])
 
-    def test_report_carries_the_journal_row_warning_and_checks_rarely(self):
-        self.journal.usage.return_value = 1_900
-        first = self.reports.get(overview(todo()))
-        self.assertIn("2 万行", first["capacity"])
-        self.reports.get(overview(todo()))
-        self.assertEqual(self.journal.usage.call_count, 1, "数行数要发请求，十分钟一次")
-        self.clock[0] += 601
-        self.journal.usage.return_value = 500
-        self.assertEqual(self.reports.get(overview(todo()))["capacity"], "")
-
     def test_invalid_date_and_unknown_project_do_not_read_history(self):
         for values in ({"date": "bad"}, {"date": "2026-11-03"},
                        {"date": "2026-01-01"}, {"table_id": "absent"}):

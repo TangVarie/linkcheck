@@ -1623,8 +1623,7 @@ _SCRIPT = r"""
       if (epoch !== reportEpoch || key !== reportKey()) return;
       if (j.error && !(j.reports || []).length) throw new Error(j.error);
       currentReports = j.reports || []; reportCache[key] = currentReports; reportLoaded = true;
-      renderReports(); reportMessage.textContent = (j.error || "统计同步于 " + chinaTime(Date.now(), false)) +
-        (j.capacity ? "。" + j.capacity : "");
+      renderReports(); reportMessage.textContent = j.error || "统计同步于 " + chinaTime(Date.now(), false);
       maybeDraft();
     }).catch(function(e){
       if (epoch !== reportEpoch || key !== reportKey()) return;

@@ -277,6 +277,17 @@ class Workspace:
         )
         return str(_check(resp).get("table_id") or "")
 
+    def delete_table(self, app_token: str, table_id: str) -> None:
+        """删整张数据表。**只给「巡检留痕」轮换后清空的旧表用**。"""
+        resp = transport.request_with_retry(
+            "DELETE",
+            f"{BASE}/bitable/v1/apps/{urllib.parse.quote(app_token, safe='')}"
+            f"/tables/{urllib.parse.quote(table_id, safe='')}",
+            self._headers(), "", timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
+
     def create_field(self, app_token: str, table_id: str,
                      body: dict[str, Any]) -> str:
         """给一张刚建好的表补一列，返回 field_id。
@@ -1035,20 +1046,6 @@ class Bitable:
             created.extend(str(r.get("record_id") or "")
                            for r in (data.get("records") or []))
         return created
-
-    def count(self, *, filter_spec: Optional[dict[str, Any]] = None) -> Optional[int]:
-        """表里（符合条件的）有几行。只取一行、读响应里的 total，不翻页。
-        响应里没有 total 就返回 None——调用方当「不知道」，不能当 0。"""
-        body: dict[str, Any] = {"field_names": [], "automatic_fields": False}
-        if filter_spec:
-            body["filter"] = filter_spec
-        data = self._read(lambda: transport.post_with_retry(
-            self._url("records/search?page_size=1"), self._headers(),
-            json.dumps(body, ensure_ascii=False), timeout=self.timeout,
-            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-        ))
-        total = data.get("total")
-        return total if isinstance(total, int) and not isinstance(total, bool) else None
 
     def batch_delete(self, record_ids: Iterable[str]) -> int:
         """批量删行（一次最多 500 行，分批发）。返回发出去删除的行数。
