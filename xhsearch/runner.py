@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import threading
 import time
 import traceback
@@ -27,6 +26,7 @@ from . import analyze, feishu, protocol, providers, shortlink, tags, transport
 from .config import Budget, Display, Settings
 from .rows import (Row, ToolCall, plan_calls, estimate_yuan, id_form,
                    format_resolved_id, share_key)
+from .rows import post_key as rows_post_key
 # 状态常量定义在 rows.py（选行也要认它），这里原样再导出，调用方照旧写 runner.STATUS_*。
 from .rows import (  # noqa: F401
     STATUS_OK, STATUS_SUSPECT, STATUS_GONE, STATUS_FAILED,
@@ -845,9 +845,13 @@ def _fetch_one(
             expand_failure = expansion.reason
 
     def produce() -> _Fetched:
-        return _fetch_calls(calls, keys, settings, deadline=deadline, timeout=timeout,
-                            disabled=disabled, tally=tally, lock=lock, watch=watch,
-                            expand_failure=expand_failure)
+        fetched = _fetch_calls(calls, keys, settings, deadline=deadline, timeout=timeout,
+                               disabled=disabled, tally=tally, lock=lock, watch=watch,
+                               expand_failure=expand_failure)
+        # 展开出的作品 ID 在交给同篇行**之前**就填上：等着的行（for_sibling 照抄）
+        # 一拿到就醒，晚一步填，它抄到的就是空的——日报里同一篇会被记成两篇。
+        fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
+        return fetched
 
     if share is None:
         fetched = produce()
@@ -866,9 +870,11 @@ def _fetch_one(
         share.fulfil(owned_key, fetched)
     else:
         fetched = share.run(share_key(calls), produce)
-    # 展开是这一行自己做的（每行记自己那条链接对应的 ID），不随共享结果走。
+    # 这一行自己展开过，就记自己那条链接对应的 ID；没展开（拿的是同篇行的结果）
+    # 就保留抄来的那份，别用空值盖掉。
     fetched.requests += expand_requests
-    fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
+    if expanded_id:
+        fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
     return fetched
 
 
@@ -1367,14 +1373,10 @@ def refresh(
 
         scan_event = None
         if status == STATUS_OK and snapshot is not None and analyze.saw_comment_page(snapshot):
-            parsed = row.parsed
-            identity = parsed.content_id
-            post_key = (f"{parsed.platform}:{identity}" if identity else
-                        f"{parsed.platform}:url:" + hashlib.sha256(
-                            (parsed.url or row.link_cell).encode("utf-8")).hexdigest())
+            identity = row.parsed.content_id
             scan_event = {
                 "type": "scan", "at": int(checked_at.timestamp() * 1000),
-                "record_id": row.record_id, "post_key": post_key,
+                "record_id": row.record_id, "post_key": rows_post_key(row),
                 "post_key_estimated": not bool(identity),
                 "negative_checked": bool(verdict.negative_checked),
                 "visible_comments": len(snapshot.comments),
@@ -1481,6 +1483,9 @@ def refresh(
                 if value != row.resolved_id_cell:
                     outcome.fields[f.resolved_id] = value
                 if outcome.scan_event is not None:
+                    # 面板这一刻还只认得链接那个键（「作品ID」写进表之前），
+                    # 记成别名，日报才认得出它点的处理状态是这一篇。
+                    outcome.scan_event["post_alias"] = outcome.scan_event["post_key"]
                     outcome.scan_event["post_key"] = f"{platform}:{fetched.expanded_id}"
                     outcome.scan_event["post_key_estimated"] = False
             if fetched.shared:

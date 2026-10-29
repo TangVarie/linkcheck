@@ -7,15 +7,22 @@
 import hashlib
 import io
 import json
+import threading
 import unittest
 import urllib.error
 from types import SimpleNamespace
 
 from xhsearch import daily_report as d
 from xhsearch import report_ai
+from xhsearch.config import Settings
 
 START, END = d.window_for_date("2026-10-28")
 TABLE = "tbl1"
+NEG = Settings().negative_status.found
+
+
+def todo(label, *reasons):
+    return SimpleNamespace(label=label, reasons=list(reasons or [NEG]))
 
 
 def scan(at=START + 1000, *, post="xhs:one", hits=None, table=TABLE, **kw):
@@ -121,12 +128,20 @@ class TestEvidence(unittest.TestCase):
 
     def test_titles_come_only_from_the_selected_table_and_dedupe(self):
         overview = SimpleNamespace(projects=[
-            SimpleNamespace(table_id=TABLE, todos=[SimpleNamespace(label="甲"), SimpleNamespace(label="甲")],
-                            adhoc_todos=[SimpleNamespace(label="乙")]),
-            SimpleNamespace(table_id="tbl2", todos=[SimpleNamespace(label="别人的")],
+            SimpleNamespace(table_id=TABLE, todos=[todo("甲"), todo("甲")],
+                            adhoc_todos=[todo("乙")]),
+            SimpleNamespace(table_id="tbl2", todos=[todo("别人的")],
                             adhoc_todos=[]),
         ])
-        self.assertEqual(report_ai.alert_titles_for(overview, TABLE), ["甲", "乙"])
+        self.assertEqual(report_ai.alert_titles_for(overview, TABLE, NEG), ["甲", "乙"])
+
+    def test_only_negative_alert_todos_count_as_alerting_posts(self):
+        """风控、失效、卡住不是「预警帖子」，不能被归纳成内容特征。"""
+        overview = SimpleNamespace(projects=[SimpleNamespace(
+            table_id=TABLE, adhoc_todos=[],
+            todos=[todo("负面帖", NEG, "风控中"), todo("失效帖", "已失效"),
+                   todo("卡住的帖", "卡住了")])])
+        self.assertEqual(report_ai.alert_titles_for(overview, TABLE, NEG), ["负面帖"])
 
 
 class TestNormalise(unittest.TestCase):
@@ -140,12 +155,14 @@ class TestNormalise(unittest.TestCase):
             self.evidence("牧高笛那款帐篷不结实"))
         self.assertEqual([item["name"] for item in draft["competitors"]], ["牧高笛"])
 
-    def test_competitor_in_a_title_also_counts(self):
-        evidence = {"comments": [{"content": "一般", "keywords": ""}],
-                    "titles": ["对比牧高笛和挪客"], "keywords": []}
+    def test_a_name_only_in_our_own_titles_is_not_a_competitor(self):
+        """标题是运营给自家帖子写的：自家品牌、对比测评里的名字都在里面。"""
+        evidence = {"comments": [{"content": "挪客那款更轻", "keywords": ""}],
+                    "titles": ["途鸽对比牧高笛和挪客"], "keywords": []}
         draft = report_ai.normalize_draft(
-            {"features": "横向对比。", "competitors": ["挪客"]}, evidence)
-        self.assertEqual(draft["competitors"][0]["name"], "挪客")
+            {"features": "横向对比。", "competitors": ["途鸽", "牧高笛", "挪客"]}, evidence)
+        self.assertEqual([c["name"] for c in draft["competitors"]], ["挪客"])
+        self.assertEqual(draft["competitors"][0]["mentions"], 1)
 
     def test_no_competitors_is_normal_not_an_error(self):
         draft = report_ai.normalize_draft({"features": "情绪偏焦虑。", "competitors": []},
@@ -181,7 +198,7 @@ class FakeReports:
 
 def overview_with(*titles):
     return SimpleNamespace(projects=[SimpleNamespace(
-        table_id=TABLE, todos=[SimpleNamespace(label=t) for t in titles], adhoc_todos=[])])
+        table_id=TABLE, todos=[todo(t) for t in titles], adhoc_todos=[])])
 
 
 class TestGenerate(unittest.TestCase):
@@ -247,6 +264,67 @@ class TestGenerate(unittest.TestCase):
         again = drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE, force=True)
         self.assertEqual(again["features"], "第二次")
         self.assertEqual(len(drafts.seen), 2)
+
+    def test_moving_as_of_does_not_make_new_evidence(self):
+        """当期的 as_of_ms 每分钟都在走。它不送给模型，就不能让缓存失效、重复计费。"""
+        drafts = self.make([answer({"features": "x", "competitors": []})])
+        drafts.generate(overview_with("甲"), date="2026-10-28", table_id=TABLE)
+        drafts.reports.payload = report(
+            window={"start_ms": START, "end_ms": END, "as_of_ms": START + 60_000})
+        again = drafts.generate(overview_with("甲"), date="2026-10-28", table_id=TABLE)
+        self.assertTrue(again["cached"])
+        self.assertEqual(len(drafts.seen), 1)
+
+    def test_titles_come_from_the_resolution_applied_overview(self):
+        """处理完收起来的帖子不再是本期问题；`shown` 是套过「已解决」的那份。"""
+        drafts = self.make([answer({"features": "x", "competitors": []})])
+        drafts.generate(overview_with("已处理的", "还没处理的"), date="2026-10-28",
+                        table_id=TABLE, shown=overview_with("还没处理的"))
+        user = json.loads(drafts.seen[0][0].data.decode("utf-8"))["messages"][1]["content"]
+        self.assertIn("还没处理的", user)
+        self.assertNotIn("已处理的", user)
+
+    def test_force_reserves_the_cooldown_before_queueing(self):
+        """两个同时到的「重新生成」：冷却要在检查的同一把锁里占上，不能等真正
+        外呼时才记——否则两个都过了检查，排队等锁，然后各计费一次。"""
+        drafts = self.make([answer({"features": "x", "competitors": []})])
+        held = []
+        real = drafts._key_lock
+
+        def spy(key):
+            held.append(dict(drafts._force_at))
+            return real(key)
+
+        drafts._key_lock = spy
+        drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE, force=True)
+        self.assertIn(f"{TABLE}:2026-10-28", held[0])
+
+    def test_waiters_reuse_the_result_and_locks_do_not_pile_up(self):
+        """等同一把锁的请求拿前一个的结果；用完的锁要删掉，不能按条数淘汰在用的。"""
+        gate, entered = threading.Event(), threading.Event()
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request)
+            entered.set()
+            gate.wait(5)
+            return answer({"features": "x", "competitors": []})
+
+        drafts = report_ai.ReportDrafts("sk-test", FakeReports([scan()]),
+                                        opener=opener, wall=lambda: 1000.0)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(drafts.generate(
+            overview_with(), date="2026-10-28", table_id=TABLE))) for _ in range(3)]
+        threads[0].start()
+        self.assertTrue(entered.wait(5))
+        for thread in threads[1:]:
+            thread.start()
+        gate.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sorted(r["cached"] for r in results), [False, True, True])
+        self.assertEqual(drafts._locks, {})
 
     def test_changed_evidence_is_a_new_request(self):
         drafts = self.make([answer({"features": "一", "competitors": []}),

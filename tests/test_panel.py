@@ -946,6 +946,21 @@ class TestOverHttp(unittest.TestCase):
     def _authed(self, token):
         return {"Cookie": f"{panel.COOKIE_NAME}={token}"}
 
+    def test_a_timed_poll_does_not_count_as_someone_watching(self):
+        """页面定时拉的（X-Panel-Poll）不记「有人在看」、不叫醒停下的后台取数；
+        开着不动的标签页不能让后台整夜整表读。人点的请求照旧算。"""
+        _status, _cookie, token = self._login()
+        with mock.patch.object(self.cache, "touch", wraps=self.cache.touch) as touch, \
+                mock.patch.object(self.cache, "view", wraps=self.cache.view) as view:
+            status, _body, _ = self._call("/api/overview", headers={
+                **self._authed(token), "X-Panel-Poll": "1"})
+            self.assertEqual(status, 200)
+            touch.assert_not_called()
+            view.assert_not_called()
+            self._call("/api/overview", headers=self._authed(token))
+            touch.assert_called()
+            view.assert_called()
+
     # —— 无需登录 ——
     def test_healthz_needs_no_password(self):
         status, body, _ = self._call("/healthz")

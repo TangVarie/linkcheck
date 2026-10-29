@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -480,14 +479,8 @@ _REASON_RANK = {
 }
 
 
-def _post_key(row: rows_mod.Row) -> str:
-    parsed = row.parsed
-    if parsed.content_id:
-        return f"{parsed.platform}:{parsed.content_id}"
-    if not (parsed.url or row.link_cell):
-        return f"row:{row.record_id}"
-    return f"{parsed.platform}:url:" + hashlib.sha256(
-        (parsed.url or row.link_cell).encode("utf-8")).hexdigest()
+# 和巡检写进留痕的帖子键是同一个算法（rows.post_key），面板点的处理状态才对得上。
+_post_key = rows_mod.post_key
 
 
 def negative_digest_count(text: str, settings: Settings) -> tuple[Optional[int], bool]:

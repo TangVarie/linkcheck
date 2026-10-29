@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -479,6 +480,18 @@ def share_key(calls: list[ToolCall]) -> tuple:
     """
     return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())))
                  for c in calls)
+
+
+def post_key(row: "Row") -> str:
+    """这一行是哪一篇帖子，给日报留痕和面板处理状态用。**两边必须同一个算法**
+    （以前各写一份，已经对不上过）。有作品 ID 用 ID；没有就用链接的摘要。"""
+    parsed = row.parsed
+    if parsed.content_id:
+        return f"{parsed.platform}:{parsed.content_id}"
+    if not (parsed.url or row.link_cell):
+        return f"row:{row.record_id}"
+    return f"{parsed.platform}:url:" + hashlib.sha256(
+        (parsed.url or row.link_cell).encode("utf-8")).hexdigest()
 
 
 def id_form(arguments: dict[str, Any], content_id: str,

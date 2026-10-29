@@ -592,7 +592,9 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
 /* 手机上的待办不是一张必须横滑才能处理的表，而是一组处置卡。
  * 所有字段与按钮都保留；桌面表格的 DOM、勾选逻辑和 API 完全不变。 */
 @media (max-width:700px){
-  .tablewrap{overflow-x:visible}
+  /* 只有待办表变卡片；已处理记录、运行历史这些还是表，留在自己的框里横滑，
+   * 不能把整页撑宽、把「撤销」挤到屏幕外。 */
+  .tablewrap.todo-wrap{overflow-x:visible}
   .tablewrap table.todos{min-width:0;border:0;background:transparent}
   .todos thead{display:none}
   .todos tbody{display:grid;gap:10px}
@@ -1146,7 +1148,7 @@ _SCRIPT = r"""
       table = document.createElement("table"); table.className = "todos" + (archived ? " fold-t" : "");
       table.innerHTML = '<thead><tr>' + (archived ? '' : '<th><input type="checkbox" class="todoAll" aria-label="全选这一页"></th>') +
         '<th>帖子 / 素人</th><th>为什么</th><th>诊断信息</th><th>评论数</th><th>最近检查</th><th>处理</th></tr></thead><tbody></tbody>';
-      var wrap = document.createElement("div"); wrap.className = "tablewrap"; wrap.appendChild(table);
+      var wrap = document.createElement("div"); wrap.className = "tablewrap todo-wrap"; wrap.appendChild(table);
       if (archived) { var fold = document.createElement("details"); fold.className = "fold";
         fold.innerHTML = '<summary>已归档的异常帖子 <b class="foldN">0</b> 帖</summary>'; fold.appendChild(wrap); p.appendChild(fold);
       } else { p.insertBefore(wrap, p.firstChild); var empty = p.querySelector(".tab-empty"); if (empty) empty.hidden = true; }
@@ -1277,25 +1279,34 @@ _SCRIPT = r"""
     renderWorkStats(); applyWorkFilter();
     if (workLive) workLive.textContent = persistentWarning || "处理进度同步于 " + chinaTime(Date.now(), false);
   }
-  function refreshWork(){
+  function refreshWork(poll){
     if (!workbench || document.hidden || overviewBusy) return Promise.resolve();
     overviewBusy = true; var epoch = overviewEpoch;
-    return getJson("/api/overview").then(function(j){ if (epoch === overviewEpoch) applyOverview(j); })
+    return getJson("/api/overview", poll).then(function(j){ if (epoch === overviewEpoch) applyOverview(j); })
       .catch(function(e){ if (workLive) workLive.textContent = "同步延迟：" + e.message; })
       .then(function(){ overviewBusy = false; });
   }
   function reportKey(){ return (workProject ? workProject.value : "") + "/" + (reportDate ? reportDate.value : ""); }
   function notesKey(){ return "linkcheck.daily-notes." + reportKey(); }
-  var draftState = {}, draftEpoch = 0;
+  // draftState：这一页里每一期（项目/日期）AI 草稿到哪一步了。draftSeq：每一期
+  // 最近一次请求的序号，只认最新那次的回应（同一期连点两次，旧的晚到不能盖新的）。
+  var draftState = {}, draftSeq = {};
   function draftNode(){ return document.getElementById("draftState"); }
   function setDraftState(text, state){
     var el = draftNode(); if (!el) return;
     el.textContent = text; el.dataset.state = state || "";
   }
-  function saveNotes(){
+  // drafted：这一期已经用 AI 草稿填过。刷新页面后靠它认出「栏是空的」是运营
+  // 自己删掉的，不再自动补回去、也不再自动花钱请求一次。
+  function saveNotes(drafted){
     if (!reportFeatures || !reportCompetitors) return;
-    try { localStorage.setItem(notesKey(), JSON.stringify({
-      features:reportFeatures.value, competitors:reportCompetitors.value})); }
+    try {
+      var previous = {};
+      try { previous = JSON.parse(localStorage.getItem(notesKey()) || "{}") || {}; } catch (e) {}
+      localStorage.setItem(notesKey(), JSON.stringify({
+        features:reportFeatures.value, competitors:reportCompetitors.value,
+        drafted: !!(drafted || previous.drafted)}));
+    }
     catch (e) { if (reportMessage) reportMessage.textContent = "浏览器未允许本地保存；本次填写仍可复制。"; }
   }
   function loadNotes(){
@@ -1305,18 +1316,33 @@ _SCRIPT = r"""
     reportFeatures.value = notes.features || ""; reportCompetitors.value = notes.competitors || "";
     reportFeatures.disabled = reportCompetitors.disabled = !workProject.value;
     reportFeatures.title = reportCompetitors.title = workProject.value ? "仅保存在此浏览器" : "选择单个项目后补充";
-    var button = document.getElementById("draftReport");
-    if (button) button.disabled = !workProject.value;
+    var key = reportKey(), known = draftState[key];
+    if (!known && notes.drafted) draftState[key] = known = {status: "stored"};
+    if (known && known.unapplied) {
+      // 草稿是切走之后才回来的：现在才填进这一期的两栏。
+      known.unapplied = false; presentDraft(known); return;
+    }
     syncDraftState();
   }
   // 把某一期 AI 的状态显示出来。切项目/切日期都走这里，别让上一期的话留着。
+  function syncDraftButton(){
+    var button = document.getElementById("draftReport"), known = draftState[reportKey()];
+    if (!button) return;
+    var loading = !!(known && known.status === "loading");
+    button.disabled = !workProject || !workProject.value || loading;
+    button.textContent = loading ? "生成中…" : "重新生成";
+  }
   function syncDraftState(){
+    syncDraftButton();
     var known = draftState[reportKey()];
     if (!workProject || !workProject.value) {
       setDraftState("选择单个项目后由 AI 自动归纳。", ""); return;
     }
-    if (!known) { setDraftState("日报载入后自动归纳，也可以手动生成。", ""); return; }
+    if (!known) { setDraftState("展开每日汇报后自动归纳，也可以手动生成。", ""); return; }
     if (known.status === "loading") { setDraftState("DeepSeek 正在归纳本期内容特征…", ""); return; }
+    if (known.status === "stored") {
+      setDraftState("这一期已用过 AI 草稿（改动保存在此浏览器）；要重新归纳点「重新生成」。", ""); return;
+    }
     setDraftState(draftMessage(known),
       known.status === "ok" ? "ok" : (known.status === "unavailable" ||
         known.status === "insufficient_evidence" ? "" : "err"));
@@ -1334,7 +1360,7 @@ _SCRIPT = r"""
     if (names.length && (replace || !reportCompetitors.value.trim())) {
       reportCompetitors.value = names.join("、"); filledCompetitors = true;
     }
-    saveNotes(); composeReport();
+    saveNotes(true); composeReport();
     return {features: filledFeatures, competitors: filledCompetitors, kept: !filledFeatures};
   }
   function draftMessage(draft, applied){
@@ -1351,8 +1377,24 @@ _SCRIPT = r"""
         tail.push("竞品栏已有文字，保留原样");
       return "AI 草稿：" + scope + (tail.length ? "；" + tail.join("；") : "") + "。";
     }
-    if (draft.status === "cached") return "用的是刚才那份草稿，没有重新请求。";
     return draft.error || "AI 暂不可用，可人工填写。";
+  }
+  // 把一期的 AI 结果填进两栏、显示状态。只对**当前这一期**调用。
+  function presentDraft(j){
+    syncDraftButton();
+    if (j.status === "ok" && j.forced && j.cached) {
+      // 冷却期内的「重新生成」：服务端给的是同一份证据的上一份草稿，没再计费。
+      // 拿它替换运营刚改过的字等于白白撤销修改，只填空、照实说。
+      var kept = applyDraft(j, false);
+      setDraftState((j.notice || "刚刚生成过，这是同一份证据的最近结果，没有再次计费。") +
+                    (kept.features || kept.competitors ? "" : "两栏保持原样。"), "ok");
+      return;
+    }
+    if (j.status === "ok") {
+      var applied = applyDraft(j, !!j.forced);
+      setDraftState(draftMessage(j, applied), "ok");
+    } else setDraftState(draftMessage(j),
+      j.status === "unavailable" || j.status === "insufficient_evidence" ? "" : "err");
   }
   function requestDraft(force){
     var key = reportKey(), table = workProject ? workProject.value : "";
@@ -1361,10 +1403,9 @@ _SCRIPT = r"""
     var known = draftState[key];
     if (!force && known) return;
     draftState[key] = {status: "loading"};
-    var epoch = ++draftEpoch;
+    var seq = draftSeq[key] = (draftSeq[key] || 0) + 1;
     setDraftState("DeepSeek 正在归纳本期内容特征…", "");
-    var button = document.getElementById("draftReport");
-    if (button) { button.disabled = true; button.textContent = "生成中…"; }
+    syncDraftButton();
     fetch("/api/report-ai", {method: "POST",
       headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
       body: JSON.stringify({date: reportDate.value, table_id: table, force: !!force})})
@@ -1372,28 +1413,31 @@ _SCRIPT = r"""
         if (!r.ok) { var err = new Error(j.error || ("HTTP " + r.status)); throw err; }
         return j; }); })
       .then(function(j){
-        if (epoch !== draftEpoch || key !== reportKey()) return;
+        if (draftSeq[key] !== seq) return;           // 这一期后来又请求过，以那次为准
+        // 运营切到别的项目/日期了也要记下：花了钱的结果不能扔，也不能让那一期
+        // 一直停在「正在归纳」。回到那一期时（loadNotes）再填进去。
+        j.forced = !!force;
         draftState[key] = j;
-        if (j.status === "ok") {
-          var applied = applyDraft(j, force);
-          setDraftState(draftMessage(j, applied), "ok");
-        } else setDraftState(draftMessage(j),
-          j.status === "unavailable" || j.status === "insufficient_evidence" ? "" : "err");
+        if (key !== reportKey()) { j.unapplied = j.status === "ok"; return; }
+        presentDraft(j);
       })
       .catch(function(err){
-        if (epoch !== draftEpoch || key !== reportKey()) return;
+        if (draftSeq[key] !== seq) return;
         // 失败记成终态：轮询只填空的这一期，不能每分钟重打一次付费接口。
         // 要重试就点「重新生成」（force），服务端另有 30 秒冷却。
-        draftState[key] = {status: "error", error: String(err.message || err)};
-        setDraftState("AI 草稿没生成出来：" + (err.message || err) +
-                      "。可人工填写，或点「重新生成」再试。", "err");
-      })
-      .then(function(){
-        if (button) { button.disabled = !workProject.value; button.textContent = "重新生成"; }
+        draftState[key] = {status: "error", error: "AI 草稿没生成出来：" + (err.message || err) +
+                                                   "。可人工填写，或点「重新生成」再试。"};
+        if (key === reportKey()) syncDraftState();
       });
+  }
+  // 每日汇报展开着才算「打开了这一期日报」。只是点项目标签去处理待办，不该花钱。
+  function reportOpen(){
+    var details = document.getElementById("workDetails"), daily = document.getElementById("dailyPanel");
+    return !!(details && details.open && daily && daily.open);
   }
   function maybeDraft(){
     if (!workbench || !workProject || !workProject.value) return;
+    if (!reportOpen()) return;
     if (!reportLoaded || !reportText || !reportText.value) return;
     // 这一期只要动过手（生成过 / 失败过 / 没证据 / 没配 Key），就不再自动来第二次。
     // 否则一次 429 会在页面开着的时候每分钟重打一次付费接口。
@@ -1484,7 +1528,7 @@ _SCRIPT = r"""
       limitations.forEach(function(s){ var li = document.createElement("li"); li.textContent = s; ul.appendChild(li); }); }
     composeReport();
   }
-  function loadReports(){
+  function loadReports(poll){
     if (!workbench || document.hidden) return Promise.resolve();
     var key = reportKey(), epoch = ++reportEpoch;
     currentReports = reportCache[key] || []; reportLoaded = Object.prototype.hasOwnProperty.call(reportCache, key);
@@ -1492,7 +1536,7 @@ _SCRIPT = r"""
     if (reportMessage) reportMessage.textContent = "正在同步日报…";
     var url = "/api/daily-report?date=" + encodeURIComponent(reportDate.value);
     if (workProject.value) url += "&table_id=" + encodeURIComponent(workProject.value);
-    return getJson(url).then(function(j){
+    return getJson(url, poll).then(function(j){
       if (epoch !== reportEpoch || key !== reportKey()) return;
       if (j.error && !(j.reports || []).length) throw new Error(j.error);
       currentReports = j.reports || []; reportCache[key] = currentReports; reportLoaded = true;
@@ -1530,6 +1574,10 @@ _SCRIPT = r"""
     [reportFeatures, reportCompetitors].forEach(function(input){ input.addEventListener("input", function(){
       saveNotes(); composeReport();
     }); });
+    ["workDetails", "dailyPanel"].forEach(function(id){
+      var fold = document.getElementById(id);
+      if (fold) fold.addEventListener("toggle", function(){ if (fold.open) maybeDraft(); });
+    });
     var draftButton = document.getElementById("draftReport");
     if (draftButton) draftButton.addEventListener("click", function(){
       if (!workProject.value) return;
@@ -1548,8 +1596,9 @@ _SCRIPT = r"""
       }).catch(function(){ reportText.focus(); reportText.select(); reportMessage.textContent = "请复制已选中的汇报正文。"; });
     });
     loadNotes(); refreshWork(); loadReports();
-    setInterval(function(){ if (!document.hidden) refreshWork(); }, 15000);
-    setInterval(function(){ if (!document.hidden) loadReports(); }, 60000);
+    // 定时拉的带 X-Panel-Poll：服务端不把它算成「有人在看」（见 Cache）。
+    setInterval(function(){ if (!document.hidden) refreshWork(true); }, 15000);
+    setInterval(function(){ if (!document.hidden) loadReports(true); }, 60000);
     document.addEventListener("visibilitychange", function(){ if (!document.hidden) { refreshWork(); loadReports(); } });
   }
 
@@ -1747,8 +1796,8 @@ _SCRIPT = r"""
   // 从面板上看出来（服务端根本不把手机号 / 邮箱送到浏览器）。
   var shareBox = document.getElementById("share");
   var shareState = null;
-  function getJson(url){
-    return fetch(url).then(function(r){ return r.json().then(function(j){
+  function getJson(url, poll){
+    return fetch(url, poll ? {headers: {"X-Panel-Poll": "1"}} : undefined).then(function(r){ return r.json().then(function(j){
       if (!r.ok) throw new Error((j.error || ("HTTP " + r.status)) + (j.hint ? "\n" + j.hint : ""));
       return j; }); });
   }
@@ -2176,7 +2225,7 @@ def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) ->
         "「排队刷新」会<b>绕过归档线</b>，所以它们不在上面的列表和批量勾选里——"
         f"多数时候正确的处置是去飞书<b>取消巡查</b>；{done}"
         "在飞书里单独勾「排队刷新」刷过的，24 小时内会回到上面的列表。</p>"
-        f"<div class=tablewrap><table class='todos fold-t'><thead><tr>{_TODO_COLUMNS}</tr>"
+        f"<div class='tablewrap todo-wrap'><table class='todos fold-t'><thead><tr>{_TODO_COLUMNS}</tr>"
         f"</thead><tbody>{rows}</tbody></table></div></details>")
 
 
@@ -2257,7 +2306,7 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
         if items:
             body = "".join(_todo_row(t, offset_hours, show_digest, main=True,
                                      resolvable=resolvable) for t in items)
-            main = (f"<div class=tablewrap><table class=todos><thead>{head}</thead>"
+            main = (f"<div class='tablewrap todo-wrap'><table class=todos><thead>{head}</thead>"
                     f"<tbody>{body}</tbody></table></div>")
         else:
             main = ("<div class=tab-empty>这个项目在管的行眼下都没事。"
