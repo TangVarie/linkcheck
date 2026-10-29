@@ -1311,18 +1311,17 @@ class Resolutions:
     RETRY_SECONDS = 60.0
     OUTBOX = "__journal_outbox__"
     # 留痕一直写不进去时，待补写的事件不能无限攒（整份在一格文本里）。超了先丢
-    # 被同一条记录后面的操作覆盖掉的（只少一次操作计数），没有才丢最早的；丢了多少、
-    # 哪段时间、哪些记录连最新状态都丢了，记在 DROPPED 里（每张表
-    # [最早, 最晚, 条数, [记录…]]）。补写时那段写成留痕缺口；丢了最新状态的记录
-    # 按显示里的那条还原（显示里没了的记成补写时刻的待处理，resync，缺口标到
-    # 那一刻）——不然之后每一期都会接着报错它的状态。不能反过来拦住运营点「已处理」：显示状态是运营的
-    # 工作，日报留痕只是记录，记录坏了不该让工作停下来。
+    # 被同一篇帖子（同一行、同一个帖子键）后面的操作盖掉的，没有才丢最早的。
+    # 每张表记 [最早丢的时刻, 丢了几条, 其中几条是帖子的最新状态]（DROPPED）。
+    # 补写时：从最早丢的那一刻到补写这一刻，各期日报一律标「覆盖不完整」——
+    # 不逐条推算哪几期受影响，这段时间留痕本来就是坏的。丢过最新状态的，那篇帖子
+    # 之后的状态也不可信，缺口再往后标 LOST_STATE_DAYS 天。
+    # 不能反过来拦住运营点「已处理」：显示状态是运营的工作，日报留痕只是记录，
+    # 记录坏了不该让工作停下来。
     DROPPED = "__journal_outbox_dropped__"
     OUTBOX_MAX_EVENTS = 1000
     OUTBOX_MAX_CHARS = 20_000
-    # 要重建的记录最多记这么多（和「已解决」记录的上限一样）。再多说明留痕坏了
-    # 很久，那几期本来就都标着不完整。
-    DROPPED_MAX_RECORDS = 500
+    LOST_STATE_DAYS = KEEP_DAYS
 
     def __init__(self, projects: Projects, *, log: Callable[[str], None] = print,
                  clock: Callable[[], float] = time.monotonic,
@@ -1479,22 +1478,15 @@ class Resolutions:
                 while len(outbox) > 1 and (
                         len(outbox) > self.OUTBOX_MAX_EVENTS
                         or len(json.dumps(outbox, ensure_ascii=False)) > self.OUTBOX_MAX_CHARS):
-                    index, replaced_at = _evictable(outbox)
+                    index, superseded = _evictable(outbox)
                     lost = outbox.pop(index)
                     if (not isinstance(lost, dict) or not isinstance(lost.get("at"), int)
                             or not lost.get("table_id")):
                         continue
-                    first, last, count, records = _dropped_span(
-                        dropped.get(str(lost["table_id"]))) or (lost["at"], lost["at"], 0, [])
-                    record = str(lost.get("record_id") or "")
-                    if (replaced_at is None and record and record not in records
-                            and len(records) < self.DROPPED_MAX_RECORDS):
-                        records = [*records, record]
-                    # 被覆盖的：从它到覆盖它的那次操作之间，各期用的都是丢掉的那个状态，
-                    # 缺口要一直标到那里。
+                    first, count, latest = _dropped_span(
+                        dropped.get(str(lost["table_id"]))) or (lost["at"], 0, 0)
                     dropped[str(lost["table_id"])] = [
-                        min(first, lost["at"]), max(last, lost["at"], replaced_at or 0),
-                        count + 1, records]
+                        min(first, lost["at"]), count + 1, latest + int(not superseded)]
                 data[self.OUTBOX] = outbox
                 if dropped:
                     data[self.DROPPED] = dropped
@@ -1526,53 +1518,26 @@ class Resolutions:
         with self._lock:
             events = list(self._data.get(self.OUTBOX) or [])
             dropped = dict(self._data.get(self.DROPPED) or {})
-            live = self._live(self._data)       # 和页面显示同一份：过期的不算
-        gaps, resync = [], []
-        if dropped:
-            # 待补写里还有这条记录后来的操作，它自己就把最新状态带回来了。
-            pending = {(str(e.get("table_id")), str(e.get("record_id")))
-                       for e in events if isinstance(e, dict)}
-            at = max(int(self._wall() * 1000), self._last_transition_ms + 1)
-            for table_id, span in sorted(dropped.items()):
-                parsed = _dropped_span(span)
-                if not table_id or parsed is None:
-                    continue
-                first, last, count, records = parsed
-                rebuilt = [record for record in records
-                           if (table_id, record) not in pending]
-                unknown = False
-                for record in rebuilt:
-                    entry = live.get(summary.resolution_key(table_id, record))
-                    if isinstance(entry, dict):
-                        # 显示里还挂着 = 丢掉的就是这次点击（转换时两边共用一个时刻）。
-                        # 按原时刻还原：「已处理」之后又扫出负面要重新打开，比的就是它；
-                        # 用补写时刻会把已经重新打开的帖子又算成已处理。
-                        event = {"type": "status", "at": entry["at"], "table_id": table_id,
-                                 "record_id": record,
-                                 "state": entry.get("state") or "resolved"}
-                        if entry.get("post_key"):
-                            event["post_key"] = entry["post_key"]
-                    else:
-                        # 显示里没了 = 退回了待处理，但不知道是哪一刻：记成补写时刻的
-                        # 「此刻状态」，不算一次操作，缺口一直标到这里。
-                        unknown = True
-                        event = {"type": "status", "at": at, "table_id": table_id,
-                                 "record_id": record, "state": "pending", "resync": True}
-                    if event["state"] in daily_report.STATES:
-                        resync.append(event)
-                reason = f"日报留痕积压过久，最早的 {count} 条处理状态记录已丢弃"
-                if rebuilt:
-                    reason += f"，{len(rebuilt)} 条记录的最新状态在补写时按当前显示还原"
-                gaps.extend(daily_report.gap_events(
-                    table_id, first, at if unknown else last, reason))
-            if any(e.get("resync") for e in resync):
-                self._last_transition_ms = at
+        gaps = []
+        now = int(self._wall() * 1000)
+        for table_id, span in sorted(dropped.items()):
+            parsed = _dropped_span(span)
+            if not table_id or parsed is None:
+                continue
+            first, count, latest = parsed
+            reason = f"日报留痕积压过久，丢了 {count} 条待补写的处理状态记录"
+            end = now
+            if latest:
+                reason += (f"，其中 {latest} 条是帖子当时的最新状态，"
+                           f"之后 {self.LOST_STATE_DAYS} 天内这些帖子的状态可能不准")
+                end = now + self.LOST_STATE_DAYS * 86_400_000
+            gaps.extend(daily_report.gap_events(table_id, first, end, reason))
         if not events and not gaps:
             # 上一次留下的「待同步」提示到这里已经不成立了（比如之前读不到处理状态）。
             reports.warning = ""
             return ""
         try:
-            reports.record_events(events + gaps + resync)
+            reports.record_events(events + gaps)
             def acknowledge(current):
                 data = dict(current) if isinstance(current, dict) else {}
                 pending = [e for e in (data.get(self.OUTBOX) or []) if e not in events]
@@ -1586,7 +1551,7 @@ class Resolutions:
             self._commit(acknowledge)
         except Exception as exc:                                # noqa: BLE001
             warning = "状态已保存，日报留痕待同步；系统会自动重试。"
-            lost = sum(parsed[2] for parsed in map(_dropped_span, dropped.values())
+            lost = sum(parsed[1] for parsed in map(_dropped_span, dropped.values())
                        if parsed is not None)
             if lost:
                 warning += f"积压过久，最早的 {lost} 条处理状态记录已丢弃，相关日报会标覆盖不完整。"
@@ -1635,26 +1600,26 @@ class Resolutions:
                 self._loaded_at, self._failed_at = self._clock(), None
 
 
-def _evictable(outbox: list) -> tuple[int, Optional[int]]:
-    """待补写满了先丢哪一条：(位置, 覆盖它的那次操作的时刻；没被覆盖是 None)。
-    被覆盖的最终状态还在，只是它到覆盖之间那段不确定；都没有才丢最早的。
-    最新那条从不丢。"""
-    following: dict = {}
-    replaced: list[Optional[int]] = [None] * len(outbox)
+def _evictable(outbox: list) -> tuple[int, bool]:
+    """待补写满了先丢哪一条：(位置, 是否被同一篇帖子后面的操作盖掉)。
+    「同一篇」= 同一行、同一个帖子键：一行换了链接，新帖子的操作盖不掉旧帖子的
+    状态。盖掉的那篇最终状态还在；都没有才丢最早的。最新那条从不丢。"""
+    later: set = set()
+    superseded = [False] * len(outbox)
     for index in range(len(outbox) - 1, -1, -1):
         event = outbox[index]
-        identity = ((event.get("table_id"), event.get("record_id"))
-                    if isinstance(event, dict) else ("", index))
-        replaced[index] = following.get(identity)
-        at = event.get("at") if isinstance(event, dict) else None
-        following[identity] = at if isinstance(at, int) else replaced[index]
-    return next(((i, at) for i, at in enumerate(replaced) if at is not None), (0, None))
+        identity = ((event.get("table_id"), event.get("record_id"), event.get("post_key"))
+                    if isinstance(event, dict) else ("", index, None))
+        superseded[index] = identity in later
+        later.add(identity)
+    return next(((i, True) for i, flag in enumerate(superseded) if flag), (0, False))
 
 
-def _dropped_span(value: Any) -> Optional[tuple[int, int, int, list[str]]]:
-    if (isinstance(value, list) and len(value) == 4
-            and all(isinstance(v, int) for v in value[:3]) and isinstance(value[3], list)):
-        return value[0], value[1], value[2], [str(r) for r in value[3]]
+def _dropped_span(value: Any) -> Optional[tuple[int, int, int]]:
+    """DROPPED 里一张表的 [最早丢的时刻, 丢了几条, 其中几条是最新状态]。"""
+    if (isinstance(value, list) and len(value) == 3
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)):
+        return value[0], value[1], value[2]
     return None
 
 

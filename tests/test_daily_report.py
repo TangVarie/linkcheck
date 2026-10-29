@@ -173,14 +173,6 @@ class TestReport(unittest.TestCase):
         self.assertEqual(r["post_states"]["resolved"], 1)
         self.assertEqual(r["post_states"]["pending"], 0)
 
-    def test_resync_status_restores_state_without_counting_as_an_operation(self):
-        """补写重建的状态是「此刻是什么」，不是运营又点了一次。"""
-        r = report([{**status("processing", START - HOUR), "post_key": "xhs:one"},
-                    scan(),
-                    {**status("pending", START + 2000), "post_key": "xhs:one", "resync": True}])
-        self.assertEqual(r["post_states"]["pending"], 1)
-        self.assertEqual(r["operations"], {"pending": 0, "processing": 0, "resolved": 0})
-
     def test_as_of_limits_scans_and_statuses_in_preview(self):
         r = report([scan(), status("resolved", START + HOUR),
                     scan(START + 2 * HOUR, post="xhs:future")], as_of=START + HOUR)
@@ -364,6 +356,25 @@ class TestJournal(unittest.TestCase):
         r = report(events + [scan(START + 2 * HOUR)])
         self.assertTrue(r["window"]["coverage_complete"])
         self.assertEqual(r["post_states"]["processing"], 1)
+
+    def test_unrecovered_chunk_gap_keeps_its_earliest_time(self):
+        """一直没读全的那批，增量读报出来的缺口时刻被截到截止线；缓存要留最早那个，
+        不然更早那几期日报会悄悄变成「覆盖完整」。"""
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        coverage = {"type": "coverage", "at": START - 20 * 86_400_000, "table_id": "tbl1"}
+        old = {**status("processing", START - 10 * 86_400_000), "note": "长" * 20_000}
+        journal.append([coverage, old, status("resolved", START + HOUR, record="r2")])
+        missing = next(i for i, row in enumerate(self.table.rows)
+                       if row["fields"][d.COL_KIND] == "status")
+        self.table.rows.pop(missing)
+        start, end = d.window_for_date("2026-10-18")
+        for attempt in ("full", "incremental"):
+            with self.subTest(read=attempt):
+                events = journal.read_window(start, end, "tbl1")
+                r = d.aggregate(events, start, end, "tbl1", "途鸽", as_of_ms=end)
+                self.assertFalse(r["window"]["coverage_complete"])
 
     def test_own_old_dated_write_is_seen_and_others_are_caught_by_the_full_reread(self):
         clock = [END / 1000]

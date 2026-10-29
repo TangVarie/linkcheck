@@ -274,7 +274,15 @@ class Journal:
         else:
             fresh = self._read_kind(kind, cached["through"] - HISTORY_OVERLAP_MS,
                                     through, table_id, whole)
-        cached["events"].update((_history_id(e), e) for e in fresh)
+        for event in fresh:
+            identity = _history_id(event)
+            known = cached["events"].get(identity)
+            # 还没读全的那批：增量读报的缺口时刻被截到了截止线，留最早那个，
+            # 不然更早那几期会悄悄变成「覆盖完整」。
+            if (known is not None and event.get("type") == "gap"
+                    and known["at"] <= event["at"]):
+                continue
+            cached["events"][identity] = event
         # 完整读回来的分片整批进缓存：增量读按时间截掉的那部分旧事件也要（一批
         # 可能跨在截止线上，比如上次没读全、记成缺口的那批，旧事件从没进过缓存）。
         # 它之前的缺口作废，不然日报要一直标「不完整」到下一次整段重读。
@@ -449,11 +457,8 @@ def aggregate(events: list[dict], start: int, end: int, table_id: str, label: st
 
     legacy_statuses: dict[str, dict] = {}
     post_statuses: dict[str, dict] = {}
-    # resync 是面板补写时按当前显示重建的状态（留痕积压丢了最新那条）：
-    # 算「此刻是什么状态」，不算运营又点了一次。
     operation_events = [e for e in selected if e.get("type") == "status"
-                        and e.get("state") in STATES and start <= e["at"]
-                        and not e.get("resync")]
+                        and e.get("state") in STATES and start <= e["at"]]
     operations_unit = "篇" if operation_events and all(e.get("post_key") for e in operation_events) else "行"
     operations = {state: len({str(e.get("post_key") if operations_unit == "篇"
                                  else e.get("record_id")) for e in operation_events

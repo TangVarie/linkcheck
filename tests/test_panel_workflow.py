@@ -166,7 +166,7 @@ class TestResolveTransitions(unittest.TestCase):
         self.assertEqual(self.store.value[panel.Resolutions.OUTBOX][0]["state"], "processing")
 
     def test_full_outbox_drops_the_oldest_instead_of_blocking_work(self):
-        """留痕一直写不进去、待补写攒满了：运营照样能点；丢最早的，记成留痕缺口。"""
+        """留痕一直写不进去、待补写攒满了：运营照样能点；丢的那段记成留痕缺口。"""
         self.reports.record_events.side_effect = RuntimeError("journal unavailable")
         backlog = [{"type": "status", "at": TS - 10_000 + i, "table_id": "tblA",
                     "record_id": "old", "state": "processing"} for i in range(1000)]
@@ -180,84 +180,37 @@ class TestResolveTransitions(unittest.TestCase):
                              panel.Resolutions.OUTBOX_MAX_CHARS)
         self.assertEqual(outbox[-1]["record_id"], "r")
         self.assertEqual(outbox[0], backlog[1001 - len(outbox)])
-        first, last, count, lost = self.store.value[panel.Resolutions.DROPPED]["tblA"]
+        first, count, latest = self.store.value[panel.Resolutions.DROPPED]["tblA"]
         self.assertEqual((first, count), (TS - 10_000, 1001 - len(outbox)))
-        # 缺口标到覆盖最后一条被丢事件的那次操作（同一条记录的下一条）。
-        self.assertEqual(last, backlog[count]["at"])
-        self.assertEqual(lost, [], "丢的都是被同一条记录后来的操作覆盖掉的，最新状态还在")
+        self.assertEqual(latest, 0, "丢的都是被同一篇帖子后来的操作盖掉的，最新状态还在")
 
-        # 恢复之后：剩下的补写进去，丢掉的那段作为缺口一起写，日报标覆盖不完整。
+        # 恢复之后：剩下的补写进去；从最早丢的那一刻到补写这一刻写成缺口。
         recovered = mock.Mock()
         self.assertEqual(self.resolutions.flush_journal(recovered), "")
         sent = recovered.record_events.call_args.args[0]
         gaps = [e for e in sent if e["type"] == "gap"]
         self.assertEqual([(g["at"], g["end"], g["table_id"]) for g in gaps],
-                         [(first, last, "tblA")])
+                         [(first, TS, "tblA")])
         self.assertEqual(len(sent), len(outbox) + 1)
         self.assertNotIn(panel.Resolutions.OUTBOX, self.store.value)
         self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
 
-    def test_dropped_latest_state_is_rebuilt_from_the_live_state_on_recovery(self):
-        """丢掉的要是某条记录的**最新**状态，之后每一期都会接着报错它的状态：
-        先丢被同一条记录后续操作覆盖掉的；真丢了最新状态的，补写时按此刻的显示
-        状态补一条，缺口一直标到补上为止。"""
-        self.reports.record_events.side_effect = RuntimeError("journal unavailable")
-        backlog = [{"type": "status", "at": TS - 10_000 + i, "table_id": "tblA",
-                    "record_id": f"old{i}", "state": "processing", "post_key": f"xhs:old{i}"}
-                   for i in range(300)]
-        backlog[0]["state"] = "pending"                     # 退回待处理，显示里已没有记录
-        backlog[150] = {**backlog[150], "record_id": "x", "post_key": "xhs:x"}
-        backlog.append({**backlog[150], "at": TS - 1, "state": "resolved"})
-        self.store.value = {
-            panel.Resolutions.OUTBOX: copy.deepcopy(backlog),
-            "tblA/old1": {"reasons": ["有负面"], "seen": TS, "at": TS - 9_999,
-                          "state": "processing", "post_key": "xhs:old1"}}
-        self.assertEqual(self.request(state="processing")[0], 200)
-        outbox = self.store.value[panel.Resolutions.OUTBOX]
-        kept = {(e["record_id"], e["state"]) for e in outbox}
-        self.assertNotIn(("x", "processing"), kept, "被覆盖的先丢")
-        self.assertIn(("x", "resolved"), kept)
-        lost = self.store.value[panel.Resolutions.DROPPED]["tblA"][3]
-        self.assertIn("old0", lost)
-        self.assertNotIn("x", lost)
-
-        recovered = mock.Mock()
-        self.resolutions.flush_journal(recovered)
-        sent = recovered.record_events.call_args.args[0]
-        rebuilt = {e["record_id"]: e for e in sent
-                   if e["type"] == "status" and e["record_id"] in lost}
-        self.assertEqual(set(rebuilt), set(lost))
-        # 显示里还挂着的：就是丢掉的那次点击，按原时刻还原（「已处理」之后又扫出
-        # 负面要重新打开，比的就是这个时刻），算一次真实操作。
-        self.assertEqual((rebuilt["old1"]["state"], rebuilt["old1"]["post_key"],
-                          rebuilt["old1"]["at"]), ("processing", "xhs:old1", TS - 9_999))
-        self.assertNotIn("resync", rebuilt["old1"])
-        # 显示里没有了（退回待处理）：不知道什么时候退的，按补写时刻记、不算操作。
-        latest = max(e["at"] for e in outbox)
-        self.assertEqual(rebuilt["old0"]["state"], "pending")
-        self.assertTrue(rebuilt["old0"]["resync"])
-        self.assertGreater(rebuilt["old0"]["at"], latest)
-        gaps = [e for e in sent if e["type"] == "gap"]
-        self.assertEqual(max(g["end"] for g in gaps), rebuilt["old0"]["at"])
-        self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
-
-    def test_gap_for_a_superseded_drop_lasts_until_the_replacement(self):
-        """丢掉的被几天后的操作覆盖：中间那几期都依赖丢掉的状态，都要标不完整。"""
+    def test_superseded_drops_go_first_and_the_gap_covers_until_recovery(self):
+        """丢掉的被几天后的操作盖掉：中间那几期依赖丢掉的状态，一直标到补写为止。"""
         from xhsearch import daily_report as d
         day = 86_400_000
         self.reports.record_events.side_effect = RuntimeError("journal unavailable")
         dropped = {"type": "status", "at": TS - 3 * day, "table_id": "tblA",
                    "record_id": "x", "state": "pending", "post_key": "xhs:x"}
-        # 垫底的也都是同一条记录、一条盖一条：丢它们不丢任何最新状态，不会顺带把缺口拉长。
         filler = [{"type": "status", "at": TS - 3 * day + 1 + i, "table_id": "tblA",
-                   "record_id": "f", "state": "processing"} for i in range(300)]
+                   "record_id": f"f{i}", "state": "processing"} for i in range(300)]
         later = {**dropped, "at": TS - 1000, "state": "resolved"}
-        self.store.value = {panel.Resolutions.OUTBOX: [dropped, *filler, later]}
+        self.store.value = {panel.Resolutions.OUTBOX: [*filler[:150], dropped,
+                                                       *filler[150:], later]}
         self.assertEqual(self.request(state="processing")[0], 200)
         outbox = self.store.value[panel.Resolutions.OUTBOX]
-        self.assertNotIn(dropped, outbox)
+        self.assertNotIn(dropped, outbox, "被盖掉的先丢，哪怕它不是最早的")
         self.assertIn(later, outbox)
-        self.assertEqual(self.store.value[panel.Resolutions.DROPPED]["tblA"][3], [])
         recovered = mock.Mock()
         self.resolutions.flush_journal(recovered)
         gaps = [e for e in recovered.record_events.call_args.args[0] if e["type"] == "gap"]
@@ -266,34 +219,42 @@ class TestResolveTransitions(unittest.TestCase):
         middle = d.aggregate([coverage, *gaps], start, end, "tblA", "项目甲", as_of_ms=end)
         self.assertFalse(middle["window"]["coverage_complete"])
 
-    def test_rebuilt_resolution_keeps_its_time_so_a_later_negative_reopens_it(self):
-        """丢掉的「已处理」之后又扫出负面：日报要和面板一样把它算回待处理。"""
+    def test_link_change_does_not_count_as_superseding_the_old_post(self):
+        """同一行换了链接：新帖子的操作盖不掉旧帖子的状态。旧帖子的最新状态丢了，
+        之后很久的日报都要标不完整，不能装作覆盖完整。"""
         from xhsearch import daily_report as d
+        day = 86_400_000
         self.reports.record_events.side_effect = RuntimeError("journal unavailable")
-        backlog = [{"type": "status", "at": TS - 10_000 + i, "table_id": "tblA",
-                    "record_id": f"old{i}", "state": "processing"} for i in range(300)]
-        backlog[0] = {**backlog[0], "state": "resolved", "post_key": "xhs:p0"}
-        self.store.value = {
-            panel.Resolutions.OUTBOX: copy.deepcopy(backlog),
-            "tblA/old0": {"reasons": ["有负面"], "seen": TS - 20_000, "at": TS - 10_000,
-                          "post_key": "xhs:p0"}}
+        old_post = {"type": "status", "at": TS - 2 * day, "table_id": "tblA",
+                    "record_id": "x", "state": "pending", "post_key": "xhs:old"}
+        new_post = {**old_post, "at": TS - 1000, "state": "resolved", "post_key": "xhs:new"}
+        filler = [{"type": "status", "at": TS - 2 * day + 1 + i, "table_id": "tblA",
+                   "record_id": f"f{i}", "state": "processing"} for i in range(300)]
+        self.store.value = {panel.Resolutions.OUTBOX: [old_post, *filler, new_post]}
         self.assertEqual(self.request(state="processing")[0], 200)
-        self.assertIn("old0", self.store.value[panel.Resolutions.DROPPED]["tblA"][3])
+        outbox = self.store.value[panel.Resolutions.OUTBOX]
+        self.assertNotIn(old_post, outbox)
+        self.assertIn(new_post, outbox)
+        _, count, latest = self.store.value[panel.Resolutions.DROPPED]["tblA"]
+        self.assertEqual(latest, count, "这些都不是被同一篇帖子盖掉的")
         recovered = mock.Mock()
         self.resolutions.flush_journal(recovered)
-        sent = recovered.record_events.call_args.args[0]
-        negative = {"type": "scan", "at": TS - 5_000, "table_id": "tblA", "record_id": "old0",
-                    "post_key": "xhs:p0", "negative_checked": True,
-                    "hits": [{"id": "c1", "content": "又出现了"}]}
-        start, end = d.window_for_date(NOW.date())
-        r = d.aggregate(sent + [negative], start, end, "tblA", "项目甲", as_of_ms=end)
-        self.assertEqual(r["post_states"], {"pending": 1, "processing": 0, "resolved": 0})
+        gaps = [e for e in recovered.record_events.call_args.args[0] if e["type"] == "gap"]
+        self.assertIn("可能不准", gaps[0]["reason"])
+        coverage = {"type": "coverage", "at": TS - 10 * day, "table_id": "tblA"}
+        start, end = d.window_for_date((NOW + timedelta(days=30)).date())
+        later = d.aggregate([coverage, *gaps], start, end, "tblA", "项目甲", as_of_ms=end)
+        self.assertFalse(later["window"]["coverage_complete"])
+        start, end = d.window_for_date(
+            (NOW + timedelta(days=panel.Resolutions.LOST_STATE_DAYS + 2)).date())
+        after = d.aggregate([coverage, *gaps], start, end, "tblA", "项目甲", as_of_ms=end)
+        self.assertTrue(after["window"]["coverage_complete"])
 
     def test_dropped_counter_survives_other_edits(self):
-        self.store.value = {panel.Resolutions.DROPPED: {"tblA": [TS - 5, TS - 1, 3]}}
+        self.store.value = {panel.Resolutions.DROPPED: {"tblA": [TS - 5, 3, 0]}}
         self.resolutions.mark("tblA", "r", ["有负面"], TS)
         self.resolutions.unmark("tblA", "r")
-        self.assertEqual(self.store.value[panel.Resolutions.DROPPED], {"tblA": [TS - 5, TS - 1, 3]})
+        self.assertEqual(self.store.value[panel.Resolutions.DROPPED], {"tblA": [TS - 5, 3, 0]})
         self.assertNotIn(panel.Resolutions.DROPPED, self.resolutions.snapshot())
 
     def test_empty_outbox_clears_a_stale_sync_warning(self):
