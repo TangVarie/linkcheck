@@ -1314,8 +1314,8 @@ class Resolutions:
     # 被同一条记录后面的操作覆盖掉的（只少一次操作计数），没有才丢最早的；丢了多少、
     # 哪段时间、哪些记录连最新状态都丢了，记在 DROPPED 里（每张表
     # [最早, 最晚, 条数, [记录…]]）。补写时那段写成留痕缺口；丢了最新状态的记录
-    # 按此刻的显示状态补一条（resync），缺口一直标到补上为止——不然之后每一期
-    # 都会接着报错它的状态。不能反过来拦住运营点「已处理」：显示状态是运营的
+    # 按显示里的那条还原（显示里没了的记成补写时刻的待处理，resync，缺口标到
+    # 那一刻）——不然之后每一期都会接着报错它的状态。不能反过来拦住运营点「已处理」：显示状态是运营的
     # 工作，日报留痕只是记录，记录坏了不该让工作停下来。
     DROPPED = "__journal_outbox_dropped__"
     OUTBOX_MAX_EVENTS = 1000
@@ -1537,22 +1537,32 @@ class Resolutions:
                 first, last, count, records = parsed
                 rebuilt = [record for record in records
                            if (table_id, record) not in pending]
+                unknown = False
                 for record in rebuilt:
                     entry = live.get(summary.resolution_key(table_id, record))
-                    event = {"type": "status", "at": at, "table_id": table_id,
-                             "record_id": record, "resync": True,
-                             "state": (entry.get("state") or "resolved")
-                             if isinstance(entry, dict) else "pending"}
-                    if isinstance(entry, dict) and entry.get("post_key"):
-                        event["post_key"] = entry["post_key"]
+                    if isinstance(entry, dict):
+                        # 显示里还挂着 = 丢掉的就是这次点击（转换时两边共用一个时刻）。
+                        # 按原时刻还原：「已处理」之后又扫出负面要重新打开，比的就是它；
+                        # 用补写时刻会把已经重新打开的帖子又算成已处理。
+                        event = {"type": "status", "at": entry["at"], "table_id": table_id,
+                                 "record_id": record,
+                                 "state": entry.get("state") or "resolved"}
+                        if entry.get("post_key"):
+                            event["post_key"] = entry["post_key"]
+                    else:
+                        # 显示里没了 = 退回了待处理，但不知道是哪一刻：记成补写时刻的
+                        # 「此刻状态」，不算一次操作，缺口一直标到这里。
+                        unknown = True
+                        event = {"type": "status", "at": at, "table_id": table_id,
+                                 "record_id": record, "state": "pending", "resync": True}
                     if event["state"] in daily_report.STATES:
                         resync.append(event)
                 reason = f"日报留痕积压过久，最早的 {count} 条处理状态记录已丢弃"
                 if rebuilt:
-                    reason += f"，{len(rebuilt)} 条记录的状态在补写时按当前显示重建"
+                    reason += f"，{len(rebuilt)} 条记录的最新状态在补写时按当前显示还原"
                 gaps.extend(daily_report.gap_events(
-                    table_id, first, at if rebuilt else last, reason))
-            if resync:
+                    table_id, first, at if unknown else last, reason))
+            if any(e.get("resync") for e in resync):
                 self._last_transition_ms = at
         if not events and not gaps:
             # 上一次留下的「待同步」提示到这里已经不成立了（比如之前读不到处理状态）。

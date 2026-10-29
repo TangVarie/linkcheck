@@ -223,16 +223,45 @@ class TestResolveTransitions(unittest.TestCase):
         recovered = mock.Mock()
         self.resolutions.flush_journal(recovered)
         sent = recovered.record_events.call_args.args[0]
-        resync = {e["record_id"]: e for e in sent if e.get("resync")}
-        self.assertEqual(set(resync), set(lost))
-        self.assertEqual(resync["old0"]["state"], "pending")
-        self.assertEqual((resync["old1"]["state"], resync["old1"]["post_key"]),
-                         ("processing", "xhs:old1"))
+        rebuilt = {e["record_id"]: e for e in sent
+                   if e["type"] == "status" and e["record_id"] in lost}
+        self.assertEqual(set(rebuilt), set(lost))
+        # 显示里还挂着的：就是丢掉的那次点击，按原时刻还原（「已处理」之后又扫出
+        # 负面要重新打开，比的就是这个时刻），算一次真实操作。
+        self.assertEqual((rebuilt["old1"]["state"], rebuilt["old1"]["post_key"],
+                          rebuilt["old1"]["at"]), ("processing", "xhs:old1", TS - 9_999))
+        self.assertNotIn("resync", rebuilt["old1"])
+        # 显示里没有了（退回待处理）：不知道什么时候退的，按补写时刻记、不算操作。
         latest = max(e["at"] for e in outbox)
-        self.assertTrue(all(e["at"] > latest for e in resync.values()))
+        self.assertEqual(rebuilt["old0"]["state"], "pending")
+        self.assertTrue(rebuilt["old0"]["resync"])
+        self.assertGreater(rebuilt["old0"]["at"], latest)
         gaps = [e for e in sent if e["type"] == "gap"]
-        self.assertEqual(max(g["end"] for g in gaps), resync["old0"]["at"])
+        self.assertEqual(max(g["end"] for g in gaps), rebuilt["old0"]["at"])
         self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
+
+    def test_rebuilt_resolution_keeps_its_time_so_a_later_negative_reopens_it(self):
+        """丢掉的「已处理」之后又扫出负面：日报要和面板一样把它算回待处理。"""
+        from xhsearch import daily_report as d
+        self.reports.record_events.side_effect = RuntimeError("journal unavailable")
+        backlog = [{"type": "status", "at": TS - 10_000 + i, "table_id": "tblA",
+                    "record_id": f"old{i}", "state": "processing"} for i in range(300)]
+        backlog[0] = {**backlog[0], "state": "resolved", "post_key": "xhs:p0"}
+        self.store.value = {
+            panel.Resolutions.OUTBOX: copy.deepcopy(backlog),
+            "tblA/old0": {"reasons": ["有负面"], "seen": TS - 20_000, "at": TS - 10_000,
+                          "post_key": "xhs:p0"}}
+        self.assertEqual(self.request(state="processing")[0], 200)
+        self.assertIn("old0", self.store.value[panel.Resolutions.DROPPED]["tblA"][3])
+        recovered = mock.Mock()
+        self.resolutions.flush_journal(recovered)
+        sent = recovered.record_events.call_args.args[0]
+        negative = {"type": "scan", "at": TS - 5_000, "table_id": "tblA", "record_id": "old0",
+                    "post_key": "xhs:p0", "negative_checked": True,
+                    "hits": [{"id": "c1", "content": "又出现了"}]}
+        start, end = d.window_for_date(NOW.date())
+        r = d.aggregate(sent + [negative], start, end, "tblA", "项目甲", as_of_ms=end)
+        self.assertEqual(r["post_states"], {"pending": 1, "processing": 0, "resolved": 0})
 
     def test_dropped_counter_survives_other_edits(self):
         self.store.value = {panel.Resolutions.DROPPED: {"tblA": [TS - 5, TS - 1, 3]}}
