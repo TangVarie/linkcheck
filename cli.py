@@ -248,6 +248,19 @@ def _journal_report(journal, table, report, run_id: str, *, started: bool = True
         return False
 
 
+def _journal_upkeep(journal) -> None:
+    """sweep 顺手清理「巡检留痕」（表写满了另有自动换表，见 daily_report.Journal）。
+    失败只打警告：这是记账的维护，不是巡检本身，不改退出码。"""
+    try:
+        result = journal.prune(int(time.time() * 1000))
+        if result.get("deleted"):
+            print(f"🧹 巡检留痕清理：删掉 {result['deleted']} 行超期记录"
+                  + (f"，旧处理状态里被后来状态盖掉的 {result['folded']} 条合并掉了"
+                     if result.get("folded") else ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠ 巡检留痕清理没做成：{type(exc).__name__}: {exc}；下一轮 sweep 再试")
+
+
 class NoTables(RuntimeError):
     """一张能巡查的表都没有。`str(exc)` 是可以直接给人看的中文。"""
 
@@ -1252,6 +1265,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                                started=journal_started.get(table.table_id, False),
                                mode=mode):
             worst = 1
+    if journal is not None and mode == "sweep":
+        _journal_upkeep(journal)
 
     if run_id:
         print(f"\nrun_id={run_id}（结构化日志已写到 stderr）")

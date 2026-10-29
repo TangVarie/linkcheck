@@ -1313,6 +1313,11 @@ class Resolutions:
     KEEP_DAYS = 90
     # 整份存在一格文本里，不能无限长。超了先丢最早点的。
     MAX_ENTRIES = 500
+    # 按字数再收一道：一整份（记录 + 待补写 + 丢弃记账）都在「面板设置」的一格里，
+    # 飞书单格上限 10 万字（panel_settings.CELL_MAX_CHARS）。记录本身控制在这个数以内，
+    # 加上待补写的 OUTBOX_MAX_CHARS 和这次要加的那条也到不了上限——
+    # 不然记录攒满 500 条（带帖子键的一条两百来字）以后，每一次点击都写不进去。
+    ENTRIES_MAX_CHARS = 70_000
     RETRY_SECONDS = 60.0
     OUTBOX = "__journal_outbox__"
     # 留痕一直写不进去时，待补写的事件不能无限攒（整份在一格文本里）。超了先丢
@@ -1613,7 +1618,19 @@ class Resolutions:
                 and v["at"] >= since]
         kept.sort(key=lambda kv: kv[1]["at"])
         limit = self.MAX_ENTRIES - room
-        data = dict(kept[-limit:]) if limit > 0 else {}
+        kept = kept[-limit:] if limit > 0 else []
+        # 超字数也丢最早点的：那一行如果还挂着问题会重新出现（多看一眼，不是少看）。
+        size = len(json.dumps(dict(kept), ensure_ascii=False))
+        budget = self.ENTRIES_MAX_CHARS - room * 1000
+        trimmed = 0
+        while kept and size > budget:
+            key, value = kept.pop(0)
+            size -= len(json.dumps({key: value}, ensure_ascii=False))
+            trimmed += 1
+        if trimmed:
+            self.log(f"⚠ 「已解决」记录快到飞书单格字数上限，先收掉最早的 {trimmed} 条"
+                     "（那几行要是还有问题会重新出现）")
+        data = dict(kept)
         if isinstance(current.get(self.OUTBOX), list) and current[self.OUTBOX]:
             data[self.OUTBOX] = list(current[self.OUTBOX])
         if isinstance(current.get(self.DROPPED), dict) and current[self.DROPPED]:

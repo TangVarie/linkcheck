@@ -277,6 +277,17 @@ class Workspace:
         )
         return str(_check(resp).get("table_id") or "")
 
+    def delete_table(self, app_token: str, table_id: str) -> None:
+        """删整张数据表。**只给「巡检留痕」轮换后清空的旧表用**。"""
+        resp = transport.request_with_retry(
+            "DELETE",
+            f"{BASE}/bitable/v1/apps/{urllib.parse.quote(app_token, safe='')}"
+            f"/tables/{urllib.parse.quote(table_id, safe='')}",
+            self._headers(), "", timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        )
+        _check(resp)
+
     def create_field(self, app_token: str, table_id: str,
                      body: dict[str, Any]) -> str:
         """给一张刚建好的表补一列，返回 field_id。
@@ -1035,6 +1046,20 @@ class Bitable:
             created.extend(str(r.get("record_id") or "")
                            for r in (data.get("records") or []))
         return created
+
+    def batch_delete(self, record_ids: Iterable[str]) -> int:
+        """批量删行（一次最多 500 行，分批发）。返回发出去删除的行数。
+        **只给「巡检留痕」的定期清理用**；业务表永远不删行。"""
+        ids = [str(r) for r in record_ids if r]
+        for start in range(0, len(ids), 500):
+            resp = transport.post_with_retry(
+                self._url("records/batch_delete"), self._headers(),
+                json.dumps({"records": ids[start:start + 500]}, ensure_ascii=False),
+                timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            _check(resp)
+        return len(ids)
 
     def delete_record(self, record_id: str) -> None:
         """删一行。**只给注册表用**（「不再监控这张表」），业务表永远不删行。"""

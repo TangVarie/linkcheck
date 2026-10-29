@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import cli
-from xhsearch import daily_report as d
+from xhsearch import daily_report as d, feishu
 
 
 START, END = d.window_for_date("2026-10-28")
@@ -241,18 +241,30 @@ class TestReport(unittest.TestCase):
 
 
 class FakeTable:
-    def __init__(self):
+    def __init__(self, limit=None):
         self.rows, self.tokens, self.searches = [], {}, []
+        self.limit = limit
 
     def batch_create(self, records, *, client_token):
         if client_token not in self.tokens:
-            self.tokens[client_token] = [f"rec{len(self.rows) + i}" for i in range(len(records))]
-            self.rows.extend(copy.deepcopy(records))
+            if self.limit is not None and len(self.rows) + len(records) > self.limit:
+                raise feishu.FeishuError(d.TABLE_FULL_CODE, "RecordExceedLimit")
+            self.tokens[client_token] = [f"rec{self.made + i}" for i in range(len(records))]
+            for rid, record in zip(self.tokens[client_token], records):
+                self.rows.append({"record_id": rid, **copy.deepcopy(record)})
+            self.made += len(records)
         return self.tokens[client_token]
+
+    made = 0
 
     def search(self, fields, *, filter_spec=None, **kwargs):
         self.searches.append(filter_spec)
         return copy.deepcopy(self.rows)
+
+    def batch_delete(self, record_ids):
+        doomed = set(record_ids)
+        self.rows = [r for r in self.rows if r.get("record_id") not in doomed]
+        return len(doomed)
 
 
 class FakeWorkspace:
@@ -514,10 +526,245 @@ class TestJournal(unittest.TestCase):
         clock[0] += 60
         self.assertIn(mine, journal.read_window(START, END, "tbl1"))
 
+    def test_prune_drops_old_scans_and_runs_but_never_coverage(self):
+        """表有行数上限，满了什么都写不进去。超期的扫描、批次删掉；启用记录永远留着。"""
+        day = 86_400_000
+        now = END
+        old = now - (d.RETENTION_DAYS + 10) * day
+        self.journal.append([{"type": "coverage", "at": old - day, "table_id": "tbl1"}])
+        self.journal.append([scan(old, record="gone")])
+        self.journal.append(ran(old + 1000, "old-run"))
+        self.journal.append([scan(START + HOUR, record="kept"), *ran(START + HOUR, "new-run")])
+        before = len(self.table.rows)
+        result = self.journal.prune(now)
+        self.assertEqual(result["deleted"], 3)                # 旧扫描 1 + 旧批次 2
+        self.assertEqual(len(self.table.rows), before - 3)
+        kinds = [r["fields"][d.COL_KIND] for r in self.table.rows]
+        self.assertIn("coverage", kinds)
+        events = self.journal.read_window(START, END, "tbl1")
+        self.assertEqual({e.get("record_id") for e in events if e["type"] == "scan"}, {"kept"})
+        self.assertTrue(report(events)["window"]["coverage_complete"])
+        self.assertEqual(self.journal.prune(now)["deleted"], 0)
+
+    def test_prune_folds_old_statuses_to_the_latest_per_post(self):
+        """状态是累积的，不能直接删：折叠成每篇最后一条（原时刻），之后各期照样认得。"""
+        day = 86_400_000
+        old = END - (d.RETENTION_DAYS + 10) * day
+        states = ("processing", "resolved", "pending")
+        for i in range(d.COMPACT_MIN_BATCHES + 5):
+            self.journal.append([{**status(states[i % 3], old + i * 1000, record="r1"),
+                                  "post_key": "xhs:one"}])
+        self.journal.append([{**status("processing", old + 99_000, record="r2"),
+                              "post_key": "xhs:two"}])
+        last_one = {**status(states[(d.COMPACT_MIN_BATCHES + 4) % 3],
+                             old + (d.COMPACT_MIN_BATCHES + 4) * 1000, record="r1"),
+                    "post_key": "xhs:one"}
+        coverage = {"type": "coverage", "at": old - day, "table_id": "tbl1"}
+        self.journal.append([coverage])
+        before = report(self.journal.read_window(START, END, "tbl1")
+                        + [scan(START + HOUR), scan(START + HOUR, post="xhs:two", record="r2")]
+                        + ran(START + HOUR))
+        result = self.journal.prune(END)
+        status_rows = [r for r in self.table.rows if r["fields"][d.COL_KIND] == "status"]
+        self.assertLessEqual(len(status_rows), 1)
+        self.assertGreater(result["folded"], 0)
+        fresh = d.Journal(self.workspace, lambda *_: self.table, "base", log=lambda _: None)
+        events = fresh.read_window(START, END, "tbl1")
+        statuses = [e for e in events if e["type"] == "status"]
+        self.assertIn(last_one, statuses)
+        self.assertEqual(len(statuses), 2)
+        after = report(events + [scan(START + HOUR), scan(START + HOUR, post="xhs:two", record="r2")]
+                       + ran(START + HOUR))
+        self.assertEqual(after["post_states"], before["post_states"])
+        self.assertEqual(self.journal.prune(END)["deleted"], 0, "折叠过的不再反复重写")
+
+    def test_prune_leaves_a_broken_old_status_batch_alone(self):
+        day = 86_400_000
+        old = END - (d.RETENTION_DAYS + 10) * day
+        for i in range(d.COMPACT_MIN_BATCHES + 1):
+            self.journal.append([{**status("processing", old + i, record=f"r{i}"),
+                                  "note": "长" * (20_000 if i == 0 else 1)}])
+        broken = [r for r in self.table.rows if r["fields"][d.COL_PARTS] > 1]
+        self.table.rows.remove(broken[0])
+        self.journal.prune(END)
+        left = {r["record_id"] for r in self.table.rows}
+        self.assertTrue(all(r["record_id"] in left for r in broken[1:]),
+                        "缺片的那批读不全，不能当成折叠过了删掉")
+
     def test_missing_create_response_is_not_claimed_as_written(self):
         self.table.batch_create = lambda *a, **kw: []
         with self.assertRaisesRegex(ValueError, "未完整写入"):
             self.journal.append([scan()])
+
+
+class FakeBase:
+    """注册表那个 base：好几张留痕表，每张有行数上限，能建表、删表。"""
+
+    def __init__(self, limit=None):
+        self.limit, self.names, self.tables, self.made, self.dropped = limit, {}, {}, 0, []
+
+    def list_tables(self, token):
+        return [{"table_id": tid, "name": name} for tid, name in self.names.items()]
+
+    def create_table(self, token, name, fields):
+        self.made += 1
+        tid = f"tbl{self.made}"
+        self.names[tid], self.tables[tid] = name, FakeTable(self.limit)
+        return tid
+
+    def delete_table(self, token, table_id):
+        if table_id not in self.names:
+            raise feishu.FeishuError(1254041, "TableIdNotFound")
+        del self.names[table_id]
+        self.dropped.append(table_id)
+
+    def bitable(self, token, table_id):
+        if table_id not in self.names:
+            raise feishu.FeishuError(1254041, "TableIdNotFound")
+        return self.tables[table_id]
+
+    def journal(self, **kwargs):
+        kwargs.setdefault("log", lambda _: None)
+        return d.Journal(self, self.bitable, "base", **kwargs)
+
+
+COVERAGE = {"type": "coverage", "at": START - 86_400_000, "table_id": "tbl1"}
+DAY = 86_400_000
+
+
+class TestJournalRotation(unittest.TestCase):
+    """飞书单表有行数上限：写满了谁撞上谁开下一张，不用管理员去扩容。"""
+
+    def setUp(self):
+        self.base = FakeBase(limit=5)
+        self.clock = [END / 1000]                     # 北京时间 2026-10-28 16:00
+        self.logs = []
+        self.cron = self.journal(log=self.logs.append)
+
+    def journal(self, **kwargs):
+        return self.base.journal(wall=lambda: self.clock[0], **kwargs)
+
+    def scans(self, journal, n, offset=0):
+        for i in range(offset, offset + n):
+            journal.append([scan(START + HOUR + i * 1000, record=f"r{i}")])
+
+    def test_a_full_table_rolls_over_to_a_dated_one_and_reads_see_both(self):
+        self.cron.append([COVERAGE])
+        self.scans(self.cron, 6)                      # 第一张 5 行就满
+        self.cron.append(ran(START + 2 * HOUR))
+        self.assertEqual(sorted(self.base.names.values()), ["巡检留痕", "巡检留痕 2026-10-28"])
+        self.assertTrue(any("已新开「巡检留痕 2026-10-28」" in line for line in self.logs))
+        events = self.journal().read_window(START, END, "tbl1")
+        self.assertEqual({e["record_id"] for e in events if e["type"] == "scan"},
+                         {f"r{i}" for i in range(6)})
+        self.assertTrue(report(events)["window"]["coverage_complete"])
+
+    def test_the_panel_follows_a_rollover_and_opens_the_next_table_itself(self):
+        """面板手里的表单是旧的也没关系；队列空着的时候它自己撞满，自己开下一张。"""
+        panel = self.journal(allow_create=False)
+        self.cron.append([COVERAGE])
+        panel.read_window(START, END, "tbl1")         # 面板记下的表单里只有第一张
+        self.scans(self.cron, 6)                      # cron 写满、开了第二张
+        panel.append([status("resolved", START + HOUR, record="r0")])
+        self.assertEqual(len(self.base.names), 2, "跟到 cron 开好的那张，不再多开")
+        for i in range(1, 4):                         # 第二张也写满
+            panel.append([status("processing", START + HOUR + i, record=f"r{i}")])
+        self.assertIn("巡检留痕 2026-10-28 2", self.base.names.values())
+        self.clock[0] += d.TABLES_TTL_SECONDS + 1     # cron 那边过一阵也认得新表
+        statuses = [e for e in self.cron.read_window(START, END, "tbl1") if e["type"] == "status"]
+        self.assertEqual({e["record_id"] for e in statuses}, {"r0", "r1", "r2", "r3"})
+
+    def test_two_writers_rolling_over_at_once_do_not_stop_the_report(self):
+        """两个进程同时撞满、各开了一张同名的：两张都读，不能让日报整个停掉。"""
+        self.base.limit = None
+        self.cron.append([COVERAGE])
+        for record in ("a", "b"):
+            self.base.create_table("base", "巡检留痕 2026-10-28", d.FIELDS)
+            self.journal().append([scan(START + HOUR, record=record), *ran(START + HOUR)])
+        events = self.journal().read_window(START, END, "tbl1")
+        self.assertEqual({e["record_id"] for e in events if e["type"] == "scan"}, {"a", "b"})
+        self.assertTrue(report(events)["window"]["coverage_complete"])
+
+    def test_losing_the_race_to_open_the_next_table_uses_the_winners(self):
+        self.cron.append([COVERAGE])
+        self.scans(self.cron, 4)                      # 第一张满了
+        real_create = self.base.create_table
+
+        def raced(token, name, fields):
+            real_create(token, name, fields)          # 另一个进程抢先建成了这张
+            raise feishu.FeishuError(1254013, "TableNameDuplicated")
+        self.base.create_table = raced
+        self.scans(self.cron, 1, offset=4)
+        self.assertEqual(len(self.base.names), 2)
+        self.assertEqual(sum(len(t.rows) for t in self.base.tables.values()), 6)
+
+    def test_window_reads_only_open_the_tables_that_can_hold_it(self):
+        july, sept = d._table_start("巡检留痕 2026-07-01"), d._table_start("巡检留痕 2026-09-01")
+        tables = [(0, "A"), (july, "B"), (sept, "C")]
+        self.assertEqual(d._tables_for(tables, "scan", START, END), ["C"])
+        self.assertEqual(d._tables_for(tables, "run_start", july + DAY, july + 2 * DAY), ["A", "B"])
+        self.assertEqual(d._tables_for(tables, "status", None, END), ["A", "B", "C"])
+        self.assertEqual(d._tables_for(tables, "gap", START, END), ["A", "B", "C"],
+                         "面板补写的缺口带着旧时刻，会落在新表里")
+        self.assertGreater(d._table_start("巡检留痕 2026-10-28 2"), d._table_start("巡检留痕 2026-10-28"))
+        for other in ("巡检留痕 备份", "巡检留痕 2026-13-40", "被监控的表"):
+            self.assertIsNone(d._table_start(other))
+
+    def old_table_then_new(self, successor):
+        """第一张里攒着 110 天前的东西，然后换到 `successor` 那张写最近的。"""
+        self.base.limit = None
+        old = END - (d.RETENTION_DAYS + 10) * DAY
+        self.cron.append([{**COVERAGE, "at": old - DAY}])
+        self.cron.append([scan(old, record="gone"), *ran(old + 1000, "old-run")])
+        self.cron.append([{**status("processing", old + 2000, record="r1"), "post_key": "xhs:one"}])
+        self.cron.append([{**status("resolved", old + 3000, record="r2"), "post_key": "xhs:two"}])
+        self.base.create_table("base", successor, d.FIELDS)
+        journal = self.journal(log=self.logs.append)
+        journal.append([scan(START + HOUR, record="r1", post="xhs:one"),
+                        scan(START + HOUR, record="r2", post="xhs:two"), *ran(START + HOUR)])
+        return journal
+
+    def test_prune_moves_what_is_left_and_drops_the_emptied_old_table(self):
+        journal = self.old_table_then_new("巡检留痕 2026-09-01")
+        before = report(self.journal().read_window(START, END, "tbl1"))
+        result = journal.prune(END)
+        self.assertEqual((result["deleted"], result["dropped_tables"]), (3, 1))
+        self.assertEqual(list(self.base.names.values()), ["巡检留痕 2026-09-01"])
+        self.assertTrue(any("旧表清空了 1 张" in line for line in self.logs))
+        after = report(self.journal().read_window(START, END, "tbl1"))
+        self.assertTrue(after["window"]["coverage_complete"])
+        self.assertEqual(after["post_states"], before["post_states"])
+        self.assertEqual(after["window"], before["window"])
+        again = journal.prune(END)
+        self.assertEqual((again["deleted"], again["dropped_tables"]), (0, 0))
+
+    def test_an_old_table_stays_while_its_successor_is_new_or_a_batch_is_broken(self):
+        journal = self.old_table_then_new("巡检留痕 2026-10-28")
+        self.assertEqual(journal.prune(END)["dropped_tables"], 0,
+                         "接班那张才开一天：别的进程手里的表单可能还没刷新")
+        self.assertIn("巡检留痕", self.base.names.values())
+
+        self.setUp()
+        journal = self.old_table_then_new("巡检留痕 2026-09-01")
+        first = self.base.tables["tbl1"]
+        broken = [r for r in first.rows if r["fields"][d.COL_KIND] == "status"][0]
+        broken["fields"][d.COL_PARTS] = 2             # 这批读不全
+        self.assertEqual(journal.prune(END)["dropped_tables"], 0)
+        self.assertIn("巡检留痕", self.base.names.values())
+
+    def test_a_table_deleted_elsewhere_is_noticed_on_the_next_read_and_write(self):
+        self.base.limit = None
+        self.cron.append([COVERAGE])
+        reader, writer = self.journal(), self.journal()
+        writer.read_window(START, END, "tbl1")        # 记下的在写的那张还是第一张
+        self.base.create_table("base", "巡检留痕 2026-09-01", d.FIELDS)
+        reader.read_window(START, END, "tbl1")        # 记下了两张
+        self.base.tables["tbl2"].rows = copy.deepcopy(self.base.tables["tbl1"].rows)
+        self.base.delete_table("base", "tbl1")        # 清理把第一张搬空删了
+        writer.append([scan(START + HOUR), *ran(START + HOUR)])
+        self.assertEqual(len(self.base.tables["tbl2"].rows), 4)
+        events = reader.read_window(START, END, "tbl1")
+        self.assertTrue(report(events)["window"]["coverage_complete"])
 
 
 class TestCLIJournal(unittest.TestCase):
@@ -581,6 +828,28 @@ class TestCLIJournal(unittest.TestCase):
         modes = {call.args[0][0]["type"]: call.args[0][0].get("mode")
                  for call in journal.append.call_args_list}
         self.assertEqual((modes["run_start"], modes["run_end"]), ("sweep", "sweep"))
+
+    def test_sweep_prunes_the_journal_and_queue_does_not(self):
+        for mode, expected in (("sweep", 1), ("queue", 0)):
+            journal = mock.Mock()
+            journal.prune.return_value = {"deleted": 0, "folded": 0, "dropped_tables": 0}
+            with self.subTest(mode=mode), \
+                    mock.patch.object(cli, "_tables", return_value=[("甲", SimpleNamespace(table_id="tbl1"))]), \
+                    mock.patch.object(cli, "_daily_journal", return_value=journal), \
+                    mock.patch.object(cli, "_install_stop_handlers"), \
+                    mock.patch.object(cli, "_event_sink", return_value=(None, "")), \
+                    mock.patch.object(cli, "_refresh_table", return_value=(0, set(), 0, 0., None)), \
+                    redirect_stdout(io.StringIO()):
+                cli._run_locked(mode, None, None, cli.Settings(), {"tikhub": "fake"})
+            self.assertEqual(journal.prune.call_count, expected)
+
+    def test_upkeep_failure_is_only_a_warning(self):
+        journal = mock.Mock()
+        journal.prune.side_effect = RuntimeError("feishu down")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli._journal_upkeep(journal)
+        self.assertIn("清理没做成", out.getvalue())
 
     def test_journal_tables_share_one_access_token(self):
         """每次留痕都新建 Bitable 会各取一次 token，一轮一半的飞书调用都在取 token。"""

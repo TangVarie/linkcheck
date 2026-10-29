@@ -42,6 +42,9 @@ FIELDS = [{"field_name": COL_KEY, "type": 1}, {"field_name": COL_VALUE, "type": 
 
 KEY_EDITOR_CHATS = "share.editor_chats"
 KEY_RESOLVED = "todo.resolved"
+# 飞书多维表格一个文本单元格最多 100,000 字（帮助中心「多维表格常见上限」）。
+# 超了飞书直接拒写；在本地先拦下，报一句看得懂的话。
+CELL_MAX_CHARS = 100_000
 
 CACHE_SECONDS = 300.0
 
@@ -149,6 +152,9 @@ class SettingsStore:
                     current = default
             value = change(current)
             text = json.dumps(value, ensure_ascii=False)
+            if len(text) > CELL_MAX_CHARS:
+                raise ValueError(f"「面板设置」{key} 有 {len(text)} 字，超过飞书单个单元格 "
+                                 f"{CELL_MAX_CHARS} 字的上限，没有写入")
             self._put(table_id, key, text, existing)
         self.log(f"⚙ 面板设置 {key} 已更新（{len(text)} 字）")
         return value

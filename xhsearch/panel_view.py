@@ -362,11 +362,19 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 
 /* ---------- 其余定式 ---------- */
 .tools{display:flex;gap:10px;align-items:center}
-.tools .searchbox{position:relative;display:flex;align-items:center}
-.tools .searchbox>.icon{position:absolute;left:10px;top:10px;z-index:1;
+.searchbox{position:relative;display:flex;align-items:center}
+.searchbox>.icon{position:absolute;left:10px;top:10px;z-index:1;
   color:var(--text-faint);pointer-events:none}
-.tools input{width:236px;height:36px;padding-left:32px}
+.searchbox input{height:36px;padding-left:32px}
 .tools button{height:36px}
+/* 找帖子：放在待办工作台里、项目选择旁边。处理完回来点「已处理」时，
+ * 待办一多就靠它定位，不能藏在顶栏角落里。 */
+.work-find{flex:1 1 320px;min-width:0}
+.work-find input{width:100%;min-width:0}
+.find-result{padding:0 14px 10px;font-size:13px;color:var(--text-light)}
+.find-result button{margin:0 2px}
+.find-result b{color:var(--text-dark)}
+tr.found{outline:2px solid var(--primary);outline-offset:-2px}
 input::placeholder,textarea::placeholder{color:var(--text-faint)}
 .queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
   margin-bottom:12px;background:var(--surface);border:1px solid var(--border);
@@ -569,8 +577,7 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
    * 搜索框改成可伸缩、时间戳藏起来（那个宽度下它不是决策信息）。 */
   .top{padding:0 16px;gap:8px}
   .tools{flex:1;min-width:0}
-  .tools .searchbox{flex:1;min-width:0}
-  .tools input{width:auto;flex:1;min-width:0}
+  .work-find{flex:1 1 100%}
   .top .when{display:none}
   .work-head{padding:12px}
   .work-head h2{width:100%}
@@ -775,16 +782,89 @@ _SCRIPT = r"""
 
   var box = document.getElementById("filter");
   if (box) box.addEventListener("input", function(){
-    var q = box.value.trim().toLowerCase();
-    var rows = document.querySelectorAll("#todos tr[data-rec]");
-    for (var i = 0; i < rows.length; i++) {
-      var hit = !q || rows[i].textContent.toLowerCase().indexOf(q) >= 0;
-      rows[i].style.display = hit ? "" : "none";
-    }
     // 筛「风控」时别的项目命中了几行，在各自 tab 上就看得见，不用一页页翻。
     applyWorkFilter();
     recount();
     sync();
+  });
+  if (box) box.addEventListener("keydown", function(e){
+    if (e.key === "Escape") { box.value = ""; applyWorkFilter(); return; }
+    if (e.key === "Enter") { e.preventDefault(); jumpToFound(); }
+  });
+  // 一行能被搜到的东西（和服务端 _find_text 同一套字段）。
+  function findText(t){
+    return [t.label, t.persona, t.project, safeUrl(t.post_url), t.link_cell, t.record_id, t.post_key]
+      .concat(t.reasons || []).filter(function(v){ return v; }).join(" ");
+  }
+  function squash(s){ return String(s || "").toLowerCase().replace(/\s+/g, ""); }
+  // 输入按空格拆成几个词，每个词都要命中。粘贴进来的链接去掉协议、www 和问号
+  // 后面那串（xsec_token 之类每次分享都不一样）；链接里的作品 ID（小红书 24 位、
+  // 抖音一长串数字）单独命中也算——同一篇在表里可能登记的是短链。
+  function searchTerms(raw){
+    return String(raw || "").trim().split(/\s+/).filter(function(w){ return w; }).map(function(word){
+      var q = squash(word).replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[?#]/)[0]
+        .replace(/\/+$/, "");
+      return [q].concat(q.match(/[0-9a-f]{24}|\d{15,20}/g) || []).filter(function(v){ return v; });
+    }).filter(function(alts){ return alts.length; });
+  }
+  function rowMatches(tr, terms){
+    if (!terms.length) return true;
+    var hay = squash((tr.dataset.find || "") + " " + tr.textContent);
+    return terms.every(function(alts){
+      return alts.some(function(term){ return hay.indexOf(term) >= 0; });
+    });
+  }
+  // 搜索结果那一行：当前项目里找到几条；没有的话在哪几个项目里，点一下就过去。
+  function renderFindResult(terms){
+    var out = document.getElementById("findResult"); if (!out) return;
+    if (!terms.length) { out.hidden = true; out.textContent = ""; return; }
+    var current = activeTab(), here = 0, others = [], total = 0;
+    panels.forEach(function(p){
+      var n = countShown(p.querySelectorAll("tr[data-rec]"));
+      total += n;
+      if (current && p.dataset.tab === current.dataset.tab) here = n;
+      else if (n) others.push({tab: p.dataset.tab, name: p.dataset.project || "", n: n});
+    });
+    var resolved = 0, list = document.getElementById("resolvedList");
+    if (list) list.querySelectorAll("tbody tr[data-rec]").forEach(function(tr){ if (!tr.hidden) resolved++; });
+    var name = current ? (current.dataset.project || "当前项目") : "当前项目";
+    var html = here ? "「" + esc(name) + "」里找到 <b>" + here + "</b> 条" +
+      (here > 1 ? "，回车跳到第一条" : "，回车跳过去") : (total ? "「" + esc(name) + "」里没有" : "");
+    if (others.length) html += (html ? "；" : "") + "在其他项目里：" + others.map(function(o){
+      return '<button type="button" class="sm" data-find-tab="' + attr(o.tab) + '">' + esc(o.name) + " " + o.n + "</button>";
+    }).join("");
+    if (resolved) html += (html ? "；" : "") + "已处理记录里有 <b>" + resolved + "</b> 条（可撤销）";
+    if (!html) html = "没找到。可以试试素人编号、标题里的几个字，或帖子链接里的那串 ID。";
+    out.innerHTML = html; out.hidden = false;
+  }
+  function jumpToFound(){
+    var current = activeTab(), target = null;
+    var inPanel = function(p){
+      var rows = p.querySelectorAll("tr[data-rec]");
+      for (var i = 0; i < rows.length; i++) if (shown(rows[i])) return rows[i];
+      return null;
+    };
+    panels.forEach(function(p){ if (!target && current && p.dataset.tab === current.dataset.tab) target = inPanel(p); });
+    if (!target) panels.forEach(function(p){
+      if (target) return; var hit = inPanel(p);
+      if (hit) { showTab(p.dataset.tab, true); target = hit; }
+    });
+    if (!target) {
+      var list = document.getElementById("resolvedList");
+      if (list) { list.querySelectorAll("tbody tr[data-rec]").forEach(function(tr){ if (!target && !tr.hidden) target = tr; });
+        if (target) list.open = true; }
+    }
+    if (!target) return;
+    var fold = target.closest("details"); if (fold && !fold.open) fold.open = true;
+    target.scrollIntoView({block: "center", behavior: "smooth"});
+    document.querySelectorAll("tr.found").forEach(function(tr){ tr.classList.remove("found"); });
+    target.classList.add("found");
+    setTimeout(function(){ target.classList.remove("found"); }, 2400);
+  }
+  var findOut = document.getElementById("findResult");
+  if (findOut) findOut.addEventListener("click", function(e){
+    var b = e.target.closest("button[data-find-tab]"); if (!b) return;
+    showTab(b.dataset.findTab, true); applyWorkFilter(); jumpToFound();
   });
 
   // ---- 待办：批量勾「排队刷新」 + 标出自上次以来新出现的 ----
@@ -1042,10 +1122,10 @@ _SCRIPT = r"""
     if (workLive && persistentWarning) workLive.textContent = persistentWarning;
   }
   function applyWorkFilter(){
-    var q = box ? box.value.trim().toLowerCase() : "";
+    var terms = searchTerms(box ? box.value : "");
     document.querySelectorAll("#todos tr[data-rec]").forEach(function(tr){
       var state = tr.dataset.workState || "pending";
-      var hit = !q || tr.textContent.toLowerCase().indexOf(q) >= 0;
+      var hit = rowMatches(tr, terms);
       var owner = panelOf(tr);
       if (workProject && workProject.value && owner && owner.dataset.project === projectLabel() &&
           tr.dataset.tbl !== workProject.value) hit = false;
@@ -1068,7 +1148,7 @@ _SCRIPT = r"""
     var resolvedList = document.getElementById("resolvedList"), count = 0;
     if (resolvedList) resolvedList.querySelectorAll("tbody tr[data-rec]").forEach(function(tr){
       var hit = (!workProject || !workProject.value || tr.dataset.tbl === workProject.value) &&
-        (!q || tr.textContent.toLowerCase().indexOf(q) >= 0);
+        rowMatches(tr, terms);
       var severity = rowSeverity(tr), wantedSeverity = reasonFilter ? reasonFilter.value : "all";
       hit = hit && (wantedSeverity === "all" ||
         (wantedSeverity === "other" ? !severity : severity === wantedSeverity));
@@ -1079,7 +1159,7 @@ _SCRIPT = r"""
       if (workFilter === "resolved" && count) resolvedList.open = true;
       setText("resolvedCount", "已处理记录 · " + count + " 行（可撤销）");
     }
-    recount(); sync();
+    recount(); sync(); renderFindResult(terms);
   }
   function updateRowState(tr, state){
     tr.dataset.workState = state;
@@ -1108,6 +1188,7 @@ _SCRIPT = r"""
     return '<tr data-rec="' + attr(t.record_id) + '" data-app="' + attr(t.app_token) +
       '" data-tbl="' + attr(t.table_id) + '" data-project="' + attr(t.project) +
       '" data-key="' + attr(t.key) + '" data-work-state="' + attr(state) +
+      '" data-find="' + attr(findText(t)) +
       '" data-reasons="' + attr(JSON.stringify(t.reasons || [])) + '" data-checked="' + attr(t.checked_at_ms || '') + '">' + pick +
       '<td class="which" title="' + attr(t.label || t.record_id) + '"><span class="todo-title">' +
       esc((t.label || t.record_id).slice(0, 24)) + '</span><div class="todo-meta"><span class="persona">' +
@@ -1202,6 +1283,7 @@ _SCRIPT = r"""
     if (title) title.textContent = (t.label || t.record_id).slice(0, 24);
     if (which) which.title = t.label || t.record_id;
     var persona = tr.querySelector(".persona"); if (persona) persona.textContent = t.persona || "—";
+    tr.dataset.find = findText(t);
     var post = tr.querySelector(".post"), postUrl = safeUrl(t.post_url);
     if (post && (!post.querySelector("a") || post.querySelector("a").getAttribute("href") !== postUrl))
       post.innerHTML = postUrl ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(postUrl) + '">查看帖子</a>' : '—';
@@ -1219,6 +1301,7 @@ _SCRIPT = r"""
     if (!tr) { tr = document.createElement("tr"); list.querySelector("tbody").appendChild(tr); }
     tr.dataset.tbl = t.table_id; tr.dataset.rec = t.record_id; tr.dataset.project = t.project;
     tr.dataset.reasons = JSON.stringify(t.reasons || []); tr.dataset.checked = t.checked_at_ms || ""; tr.dataset.workState = "resolved";
+    tr.dataset.find = findText(t);
     var link = safeUrl(t.record_url);
     tr.innerHTML = '<td class="nowrap">' + esc(t.project) + '</td><td class="which">' + esc(t.label || t.record_id) +
       '</td><td>' + esc((t.reasons || []).join('、')) + '</td><td class="nowrap">' +
@@ -2173,7 +2256,7 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
                  if todo.diagnosis or extra else "<span class=muted>—</span>")
     return (
         f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
-        f"data-tbl='{_e(todo.table_id)}'{key} "
+        f"data-tbl='{_e(todo.table_id)}'{key} data-find='{_e(_find_text(todo))}' "
         f"data-reasons='{_e(json.dumps(todo.reasons, ensure_ascii=False))}' "
         f"data-checked='{checked}' data-project='{_e(todo.project)}' data-work-state='{_e(state)}'>"
         f"{pick}"
@@ -2229,11 +2312,24 @@ def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) ->
         f"</thead><tbody>{rows}</tbody></table></div></details>")
 
 
+def _find_text(todo) -> str:
+    """一行能被「找帖子」搜到的东西：完整标题（屏幕上是截断的）、素人编号、
+    帖子链接 / 登记的链接、飞书行号、帖子键（带作品 ID）、项目和问题。
+    和页面上 findText() 拼的是同一套字段。"""
+    post_url = (todo.post_url or "").strip()
+    if not post_url.lower().startswith(("http://", "https://")):
+        post_url = ""                       # 和 _post_link 一样只认 http(s)
+    return " ".join(str(v) for v in (
+        todo.label, todo.persona, todo.project, post_url, todo.link_cell,
+        todo.record_id, getattr(todo, "post_key", ""), *todo.reasons) if v)
+
+
 def _resolved_list(rows, offset_hours: float) -> str:
     """标了「已解决」、暂时收起来的行。收着放在待办底下，点了「撤销」就回来。"""
     body = "".join(
         f"<tr data-tbl='{_e(t.table_id)}' data-rec='{_e(t.record_id)}' "
         f"data-project='{_e(t.project)}' data-work-state='resolved' "
+        f"data-find='{_e(_find_text(t))}' "
         f"data-reasons='{_e(json.dumps(t.reasons, ensure_ascii=False))}' "
         f"data-checked='{t.checked_at_ms if t.checked_at_ms is not None else ''}'>"
         f"<td class=nowrap>{_e(t.project)}</td>"
@@ -2645,6 +2741,10 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
   data-reports='{initial}'>
   <div class=work-head>
     <h2>待办工作台</h2>
+    <span class='searchbox work-find'>{_icon('search')}<input id=filter type=search
+      placeholder='找帖子：标题、素人编号或链接' aria-label='找帖子'
+      title='标题里的几个字、素人编号、帖子链接（含短链或作品 ID）、飞书行号都能搜；多个词用空格隔开；回车跳到第一条'
+      enterkeyhint=search autocomplete=off></span>
     <label class=field-label for=workProject>项目
       <select id=workProject><option value=''>全部项目</option>{options}</select></label>
     <label class=field-label for=reasonFilter>问题层级
@@ -2655,6 +2755,7 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
     <span class=work-source id=workSource>正在读取</span>
     <span class=work-live id=workLive role=status aria-live=polite>正在同步处理进度…</span>
   </div>
+  <div class=find-result id=findResult role=status aria-live=polite hidden></div>
   <div class=work-states role=group aria-label='按待办处理状态筛选'>
     <span class=caption>全部异常待办 · 行（含归档 / 临时检查）</span>
     <button type=button data-work-filter=all aria-pressed=true>全部</button>
@@ -2854,8 +2955,6 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 <div class=main>
   <div class=top>
     <span class=tools>
-      <span class=searchbox>{_icon('search')}<input id=filter type=search
-        placeholder='搜索帖子、问题或编号' aria-label='搜索待办'></span>
       <button id=refresh type=button class=sm>重新取数</button>
     </span>
     <span class=when id=dataWhen>数据于 {_e(when)} 取得</span>

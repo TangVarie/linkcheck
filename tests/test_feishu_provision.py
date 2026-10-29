@@ -210,6 +210,39 @@ class TestIdempotencyKey(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
+class TestJournalUpkeepCalls(unittest.TestCase):
+    """「巡检留痕」写满换表、清空删表要用到的几个接口。"""
+
+    def test_a_full_table_surfaces_its_code_so_the_journal_can_roll_over(self):
+        full = transport.Response(
+            status=200, content_type="application/json",
+            body=json.dumps({"code": 1254103, "msg": "RecordExceedLimit"}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", Captured(full)), \
+             self.assertRaises(feishu.FeishuError) as caught:
+            table().batch_create([{"fields": {"a": "b"}}],
+                                 client_token=feishu.idempotency_key("x"))
+        self.assertEqual(caught.exception.code, 1254103)
+
+    def test_delete_table_sends_a_delete_for_that_table(self):
+        cap = Captured(ok({}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "request_with_retry", cap):
+            feishu.Workspace("cli_x", "s").delete_table("bascnREG", "tblOLD")
+        self.assertEqual(cap.calls[0]["method"], "DELETE")
+        self.assertTrue(cap.calls[0]["url"].endswith("/bitable/v1/apps/bascnREG/tables/tblOLD"))
+
+    def test_batch_delete_sends_at_most_500_per_request(self):
+        cap = Captured()
+        ids = [f"rec{i}" for i in range(1201)]
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            self.assertEqual(table().batch_delete(ids), 1201)
+        self.assertEqual([len(c["body"]["records"]) for c in cap.calls], [500, 500, 201])
+        self.assertTrue(all(c["url"].endswith("/records/batch_delete") for c in cap.calls))
+        self.assertEqual(sum((c["body"]["records"] for c in cap.calls), []), ids)
+
+
 class TestBatchCreate(unittest.TestCase):
     def test_client_token_is_required(self):
         """transport 对超时是自动重试的，没有幂等键就会多出重复行。"""

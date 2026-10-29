@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 import hashlib
 import json
+import re
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -47,6 +48,19 @@ HISTORY_FULL_SECONDS = 6 * 3600
 # 留痕整段写不进去时什么痕迹都不会留（缺口和批次本身也写在同一张表里），
 # 报出来的就是一张「0 篇、0 条」的完整日报。
 QUIET_RUNS_MS = 12 * 3_600_000
+# 定期清理（Journal.prune）：扫描、批次、缺口留这么多天；面板只看得到最近 90 天的
+# 日报，读批次时还要往前多读一天。超期的处理状态折叠成每篇最后一条，不删。
+RETENTION_DAYS = 100
+# 超期的状态批次攒到这么多个才折叠一次（折叠后通常只剩几个）。
+COMPACT_MIN_BATCHES = 20
+# 飞书多维表格单表行数上限按版本不同（帮助中心「多维表格行数扩容」）：基础版 / 商业
+# 标准版默认 2,000 行（管理员可免费领到 2 万行），商业旗舰版和企业版 5 万行，买扩容包
+# 最多 200 万行。满了新增记录报这个码（RecordExceedLimit），Journal 就开下一张表。
+TABLE_FULL_CODE = 1254103
+# 留痕表单记多久重新列一次：别的进程换了新表、删了旧表，常驻的面板要跟上。
+TABLES_TTL_SECONDS = 600
+# 每张表管的时间段前后放这么多余量（换表那一刻前后写进去的、晚一点才写的）。
+TABLE_SPAN_SLACK_MS = 2 * 86_400_000
 STATES = ("pending", "processing", "resolved")
 SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
 
@@ -105,7 +119,9 @@ class Journal:
         self.app_token = app_token
         self.log, self._wall = log, wall
         self.allow_create = allow_create
-        self._table_id = ""
+        # 所有留痕表 [(开用时刻毫秒, table_id)]，最后一张是正在写的（见 _tables）。
+        self._tables_cache: list[tuple[int, str]] = []
+        self._tables_at = 0.0
         self._lock = threading.RLock()
         # (kind, table_id) -> {"events": {身份: 事件}, "through": 毫秒, "full_at": 秒}
         self._history: dict[tuple[str, str], dict] = {}
@@ -115,16 +131,33 @@ class Journal:
         # 之后的整段重读一定已经读得到。
         self._written: dict[tuple[str, str], dict[str, tuple[float, dict]]] = {}
 
-    def _find(self) -> str:
+    # ---------- 表：满了自动开下一张 ----------
+    #
+    # 飞书单表行数有上限（见 TABLE_FULL_CODE 那段说明），满了新增记录报 1254103。
+    # 谁写的时候撞上（cron 或面板都行），就在同一个 base 里新开一张「巡检留痕
+    # 2026-11-10」接着写，不用管理员去点扩容。读的时候按每张表管的时间段挑着读、
+    # 合在一起；旧表里的东西都过期清掉了，整张表删掉（见 prune）。
+
+    def _tables(self, refresh: bool = False) -> list[tuple[int, str]]:
+        """所有留痕表 [(开用时刻毫秒, table_id)]，按开用时刻排，最后一张是正在写的。
+
+        面板一开几个月：别的进程开了新表、删了旧表它要知道，所以隔 TABLES_TTL_SECONDS
+        重新列一次。两个进程同时撞满、各开了一张的，两张都算（读的时候都读）。"""
         with self._lock:
-            if not self._table_id:
-                found = [t["table_id"] for t in self.workspace.list_tables(self.app_token)
-                         if t.get("name") == TABLE_NAME and t.get("table_id")]
-                if len(found) > 1:
-                    raise ValueError("发现多张「巡检留痕」表，请合并后保留唯一一张，日报暂不统计")
-                if found:
-                    self._table_id = found[0]
-            return self._table_id
+            now = self._wall()
+            if refresh or not self._tables_cache or now - self._tables_at > TABLES_TTL_SECONDS:
+                found = []
+                for t in self.workspace.list_tables(self.app_token):
+                    begun = _table_start(str(t.get("name") or ""))
+                    if begun is not None and t.get("table_id"):
+                        found.append((begun, str(t["table_id"])))
+                self._tables_cache, self._tables_at = sorted(found), now
+            return list(self._tables_cache)
+
+    def _find(self, refresh: bool = False) -> str:
+        """正在写的那张（没有就是空串）。"""
+        tables = self._tables(refresh)
+        return tables[-1][1] if tables else ""
 
     def _ensure(self) -> str:
         found = self._find()
@@ -135,65 +168,206 @@ class Journal:
         found = self.workspace.create_table(self.app_token, TABLE_NAME, FIELDS)
         if not found:
             raise ValueError("创建「巡检留痕」失败：飞书未返回 table_id")
-        self._table_id = found
+        self._tables(refresh=True)
         self.log("🧾 已建立「巡检留痕」表，历史数据从启用时开始积累")
         return found
+
+    def _next_table(self, full: str) -> str:
+        """`full` 那张写满了：别人已经开了更新的就用它，否则开一张。
+
+        第一张表只有 cron 建（allow_create）；之后的换表谁撞上谁开，面板也开——
+        不然队列空着的那几个小时里，运营点的「已处理」都要等着。"""
+        with self._lock:
+            tables = self._tables(refresh=True)
+            if tables and tables[-1][1] != full:
+                return tables[-1][1]
+            latest = tables[-1][0] if tables else -1
+            day = datetime.fromtimestamp(self._wall(), SHANGHAI).date().isoformat()
+            names = [f"{TABLE_NAME} {day}"] + [f"{TABLE_NAME} {day} {n}" for n in range(2, 100)]
+            # 名字得排在现在这张后面，不然「最后一张」还是写满的那张（排在后面的也就没人占）。
+            name = next((n for n in names if _table_start(n) > latest), "")
+            if not name:
+                raise ValueError("「巡检留痕」写满了，但今天已经开不出排在后面的新表")
+            try:
+                created = self.workspace.create_table(self.app_token, name, FIELDS)
+            except feishu.FeishuError:
+                # 另一个进程刚好抢先开了（或者建表请求超时重发、其实建成了）：用那张。
+                fresh = self._find(refresh=True)
+                if fresh and fresh != full:
+                    return fresh
+                raise
+            if not created:
+                raise ValueError(f"新开「{name}」失败：飞书未返回 table_id")
+            self._tables(refresh=True)
+            self.log(f"🧾 「巡检留痕」那张表写满了（飞书单表行数上限），已新开「{name}」接着写")
+            return created
 
     def append(self, events: list[dict]) -> None:
         if not events:
             return
-        groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        for event in events:
-            if (not isinstance(event, dict) or event.get("type") not in KINDS
-                    or _ms(event.get("at")) is None or not event.get("table_id")):
-                raise ValueError("留痕事件缺少 type、at 或 table_id")
-            if event["type"] == "status" and event.get("state") not in STATES:
-                raise ValueError("状态留痕必须是 pending / processing / resolved")
-            groups[(str(event["table_id"]), event["type"])].append(dict(event))
+        self._write(_plan(events))
+
+    def _write(self, planned: list[dict]) -> None:
+        """把 _plan 排好的一批批写进正在写的那张（不持锁）；写满了换下一张再写。"""
+        if not planned:
+            return
         # 锁只护「找/建表」和内存缓存，**不护飞书请求**：面板点「已处理」要写留痕，
         # 日报那边正在翻好几页留痕时，这一下不能排在它后面干等。
         with self._lock:
             table_id = self._ensure()
-        table = self._bitable(self.app_token, table_id)
-        for (project, kind), grouped in sorted(groups.items()):
-            # 有界装箱让重试和单格长度都稳定；同一批事件去重后按事实键排序。
-            unique = {event_key(e): e for e in grouped}
-            ordered = [unique[k] for k in sorted(unique)]
-            for start in range(0, len(ordered), MAX_BATCH_EVENTS):
-                batch = ordered[start:start + MAX_BATCH_EVENTS]
-                payload = _json(batch)
-                key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-                parts = [payload[i:i + CHUNK_CHARS]
-                         for i in range(0, len(payload), CHUNK_CHARS)]
-                first, last = min(e["at"] for e in batch), max(e["at"] for e in batch)
-                records = [{"fields": {
-                    COL_KEY: key, COL_PROJECT: project, COL_KIND: kind,
-                    COL_START: first, COL_END: last, COL_PART: i,
-                    COL_PARTS: len(parts), COL_DATA: part,
-                }} for i, part in enumerate(parts)]
-                created = table.batch_create(records, client_token=feishu.idempotency_key(
-                    f"journal:{self.app_token}:{key}"))
-                if len(created) != len(records) or not all(created):
-                    raise ValueError("巡检留痕未完整写入，日报不能视为完整")
-                # 自己写进去的历史事件直接记进内存：面板补写的状态可能带着
-                # 好几天前的时刻，增量读往前那一段不一定够得着。
-                if kind in HISTORY_KINDS:
-                    written_at = self._wall()
-                    with self._lock:
-                        for scope in (project, ""):
-                            mine = self._written.setdefault((kind, scope), {})
-                            cached = self._history.get((kind, scope))
-                            for e in batch:
-                                mine[_history_id(e)] = (written_at, e)
-                                if cached is not None:
-                                    cached["events"][_history_id(e)] = e
+        for item in planned:
+            project, kind, batch, key = item["project"], item["kind"], item["batch"], item["key"]
+            records = item["records"]
+            try:
+                created = self._create(table_id, records, key)
+            except feishu.FeishuError as exc:
+                if exc.code == TABLE_FULL_CODE:
+                    table_id = self._next_table(table_id)
+                else:
+                    # 手里的表单过期了（那张被清理删掉了、别人换了新表）：换到现在那张重写一次。
+                    latest = self._find(refresh=True)
+                    if not latest or latest == table_id:
+                        raise
+                    table_id = latest
+                created = self._create(table_id, records, key)
+            if len(created) != len(records) or not all(created):
+                raise ValueError("巡检留痕未完整写入，日报不能视为完整")
+            # 自己写进去的历史事件直接记进内存：面板补写的状态可能带着
+            # 好几天前的时刻，增量读往前那一段不一定够得着。
+            if kind in HISTORY_KINDS:
+                written_at = self._wall()
+                with self._lock:
+                    for scope in (project, ""):
+                        mine = self._written.setdefault((kind, scope), {})
+                        cached = self._history.get((kind, scope))
+                        for e in batch:
+                            mine[_history_id(e)] = (written_at, e)
+                            if cached is not None:
+                                cached["events"][_history_id(e)] = e
+
+    def _create(self, table_id: str, records: list[dict], key: str) -> list[str]:
+        # 幂等键带上表：同一批换到新表重写，不能被飞书当成旧表那次的重发。
+        return self._bitable(self.app_token, table_id).batch_create(
+            records, client_token=feishu.idempotency_key(
+                f"journal:{self.app_token}:{table_id}:{key}"))
+
+    def prune(self, now_ms: int, *, retention_days: int = RETENTION_DAYS) -> dict:
+        """定期清理，不让留痕越攒越多（每张表都有行数上限，满了就要开新表）。
+
+        - 扫描、批次、缺口：超过 retention_days 天的整批删掉。面板只看得到最近
+          90 天的日报，读批次时往前多读一天，留 100 天够用。
+        - 处理状态：是累积的，不能直接删——把超期的那些折叠成「每篇帖子（没有帖子键
+          的按行）最后一条」，原时刻原样保留，先写折叠后的、再删旧的（中途断了
+          只会多几条重复的，读的时候按事实去重）。旧状态批次不到 COMPACT_MIN_BATCHES
+          个就不折叠，省得每次都重写一遍。缺片、内容对不上的批次不动。
+        - 启用记录（coverage）一条都不删：日报靠它知道从什么时候开始有记录。
+        - 写满换下来的旧表，扫描、批次都过期删光了：剩下的状态和启用记录搬到正在写
+          的那张，删掉整张旧表（见 _drop_empty_tables）。
+        """
+        tables = self._tables(refresh=True)
+        if not tables:
+            return {"deleted": 0, "folded": 0, "dropped_tables": 0}
+        cutoff = now_ms - retention_days * 86_400_000
+        groups: dict[str, dict] = {}
+        _collect(groups, self._search(
+            lambda ts: [tid for _begun, tid in ts],
+            {"conjunction": "and", "conditions": [
+                {"field_name": COL_END, "operator": "isLess", "value": [str(cutoff)]}]}),
+            before=cutoff)
+        doomed: dict[str, list[str]] = defaultdict(list)
+        for g in groups.values():
+            if g["kind"] in ("scan", "run_start", "run_end", "gap"):
+                for tid, rid in g["ids"]:
+                    doomed[tid].append(rid)
+        folded = 0
+        old_status = {key: g for key, g in groups.items() if g["kind"] == "status"}
+        parsed = {key: events for key, g in old_status.items()
+                  if (events := _parse_group(key, g)) is not None}
+        if len(parsed) >= COMPACT_MIN_BATCHES:
+            latest: dict[tuple, dict] = {}
+            for events in parsed.values():
+                for e in events:
+                    if e.get("type") != "status" or _ms(e.get("at")) is None:
+                        continue
+                    who = ((str(e.get("table_id")), "post", str(e["post_key"])) if e.get("post_key")
+                           else (str(e.get("table_id")), "row", str(e.get("record_id") or "")))
+                    if who not in latest or (e["at"], event_key(e)) > (
+                            latest[who]["at"], event_key(latest[who])):
+                        latest[who] = e
+            planned = _plan(list(latest.values()))
+            keep = {item["key"] for item in planned}
+            fresh = [item for item in planned if item["key"] not in parsed]
+            self._write(fresh)
+            for key in parsed:
+                if key not in keep:
+                    for tid, rid in old_status[key]["ids"]:
+                        doomed[tid].append(rid)
+            # 实际少掉的状态条数（被同一篇后来的状态盖掉的那些）
+            folded = (sum(len(events) for key, events in parsed.items() if key not in keep)
+                      - sum(len(item["batch"]) for item in fresh))
+        for tid, ids in doomed.items():
+            self._bitable(self.app_token, tid).batch_delete(ids)
+        dropped = self._drop_empty_tables(self._tables(refresh=True), now_ms)
+        return {"deleted": sum(len(ids) for ids in doomed.values()), "folded": folded,
+                "dropped_tables": dropped}
+
+    def _drop_empty_tables(self, tables: list[tuple[int, str]], now_ms: int) -> int:
+        """写满换下来的旧表只剩处理状态和启用记录了（扫描、批次都过期删光了）：
+        这些原样搬到正在写的那张，删掉整张旧表。
+
+        接班那张开了不到 TABLE_SPAN_SLACK_MS 的不动：别的进程手里的表单可能还没
+        刷新，正往旧表里写。有一批读不全、内容对不上的，整张表留着不动。"""
+        dropped = 0
+        for i, (_begun, tid) in enumerate(tables[:-1]):
+            if tables[i + 1][0] > now_ms - TABLE_SPAN_SLACK_MS:
+                continue
+            groups: dict[str, dict] = {}
+            _collect(groups, [(tid, row) for row in
+                              self._bitable(self.app_token, tid).search(FIELD_NAMES)])
+            if any(g["kind"] not in HISTORY_KINDS for g in groups.values()):
+                continue
+            moving = {key: _parse_group(key, g) for key, g in groups.items()}
+            if any(events is None or not all(e.get("type") == groups[key]["kind"]
+                                             for e in events)
+                   for key, events in moving.items()):
+                continue
+            self._write(_plan([e for events in moving.values() for e in events]))
+            try:
+                self.workspace.delete_table(self.app_token, tid)
+            except feishu.FeishuError:
+                # 删表请求超时重发、其实第一次已经删掉了：表单里没它了就算删成。
+                if tid in {t for _begun, t in self._tables(refresh=True)}:
+                    raise
+            dropped += 1
+        if dropped:
+            self._tables(refresh=True)
+            self.log(f"🧹 「巡检留痕」写满换下来的旧表清空了 {dropped} 张，已删除"
+                     "（剩下的处理状态和启用记录已搬到在用的那张）")
+        return dropped
+
+    def _search(self, pick: Callable[[list[tuple[int, str]]], list[str]],
+                filter_spec: Optional[dict]) -> list[tuple[str, dict]]:
+        """在 pick 从表单里挑出的几张表里搜，返回 [(table_id, 行)]。手里的表单过期了
+        （有张旧表刚被清理删掉）搜不动，就重新列一次表、再搜一遍。"""
+        tables = self._tables()
+        for attempt in range(2):
+            try:
+                return [(tid, row) for tid in pick(tables)
+                        for row in self._bitable(self.app_token, tid).search(
+                            FIELD_NAMES, filter_spec=filter_spec)]
+            except feishu.FeishuError:
+                fresh = self._tables(refresh=True)
+                if attempt or fresh == tables:
+                    raise
+                tables = fresh
+        raise AssertionError("unreachable")
 
     def _read_kind(self, kind: str, start_ms: Optional[int], end_ms: int,
                    table_id: str = "", whole: Optional[dict] = None) -> list[dict]:
         """`whole` 给了就把这次完整读回来的分片记进去：键 → 这一批的**全部**事件
         （不按时间截）。历史缓存靠它清掉旧缺口、补回整批。"""
-        found = self._find()
-        if not found:
+        tables = self._tables()
+        if not tables:
             return []
         conditions = [
             {"field_name": COL_KIND, "operator": "is", "value": [kind]},
@@ -204,10 +378,10 @@ class Journal:
                                "value": [str(start_ms)]})
         if table_id:
             conditions.append({"field_name": COL_PROJECT, "operator": "is", "value": [table_id]})
-        rows = self._bitable(self.app_token, found).search(
-            FIELD_NAMES, filter_spec={"conjunction": "and", "conditions": conditions})
+        rows = self._search(lambda ts: _tables_for(ts, kind, start_ms, end_ms),
+                            {"conjunction": "and", "conditions": conditions})
         chunks: dict[str, dict] = {}
-        for record in rows:
+        for _tid, record in rows:
             cells = record.get("fields") or {}
             key = feishu.read_text(cells.get(COL_KEY))
             project = feishu.read_text(cells.get(COL_PROJECT))
@@ -324,6 +498,102 @@ class Journal:
             cached["events"].update((_history_id(e), e) for e in batch)
         cached["through"] = max(cached["through"], through)
         return [e for e in cached["events"].values() if e["at"] < end_ms]
+
+
+def _table_start(name: str) -> Optional[int]:
+    """留痕表名 → 开用时刻（毫秒，北京时间当天零点）。最早那张就叫「巡检留痕」，记 0；
+    之后写满一张开一张，叫「巡检留痕 2026-11-10」，同一天再开一张后面带序号，
+    按序号往后排。不是留痕表返回 None。"""
+    if name == TABLE_NAME:
+        return 0
+    m = re.fullmatch(re.escape(TABLE_NAME) + r" (\d{4}-\d{2}-\d{2})(?: (\d{1,2}))?", name)
+    if not m:
+        return None
+    try:
+        day = date.fromisoformat(m.group(1))
+    except ValueError:
+        return None
+    return int(datetime.combine(day, dt_time(0), SHANGHAI).timestamp() * 1000) + int(m.group(2) or 0)
+
+
+def _tables_for(tables: list[tuple[int, str]], kind: str, start_ms: Optional[int],
+                end_ms: int) -> list[str]:
+    """读一种留痕要翻哪几张表。扫描、批次是 cron 当场写的，只会落在那一刻正在写的
+    那张：按每张表管的时间段（前后各放 TABLE_SPAN_SLACK_MS 余量）挑。读全部历史、
+    或者是缺口（面板补写的缺口带着好几天前的时刻，落在新表里）就每张都翻。"""
+    if start_ms is None or kind == "gap":
+        return [tid for _begun, tid in tables]
+    picked = []
+    for i, (begun, tid) in enumerate(tables):
+        until = tables[i + 1][0] + TABLE_SPAN_SLACK_MS if i + 1 < len(tables) else None
+        if begun - TABLE_SPAN_SLACK_MS < end_ms and (until is None or until >= start_ms):
+            picked.append(tid)
+    return picked
+
+
+def _collect(groups: dict, rows: list[tuple[str, dict]], *, before: Optional[int] = None) -> None:
+    """把读回来的 [(table_id, 行)] 按批（分片键）归拢，记下每一行在哪张表、行号是什么。"""
+    for table_id, record in rows:
+        cells = record.get("fields") or {}
+        last = _ms(cells.get(COL_END))
+        record_id = str(record.get("record_id") or "")
+        if not record_id or (before is not None and (last is None or last >= before)):
+            continue
+        key = feishu.read_text(cells.get(COL_KEY)) or record_id
+        group = groups.setdefault(key, {"kind": feishu.read_text(cells.get(COL_KIND)),
+                                        "ids": [], "parts": {}, "count": cells.get(COL_PARTS)})
+        group["ids"].append((table_id, record_id))
+        index = _ms(cells.get(COL_PART))
+        if index is not None:
+            group["parts"][index] = feishu.read_text(cells.get(COL_DATA))
+
+
+def _parse_group(key: str, group: dict) -> Optional[list[dict]]:
+    """一批读全了、内容对得上就返回它的事件；缺片 / 对不上返回 None（这批不能动）。"""
+    count = _ms(group["count"])
+    if not count or set(group["parts"]) != set(range(count)):
+        return None
+    payload = "".join(group["parts"][i] for i in range(count))
+    if hashlib.sha256(payload.encode("utf-8")).hexdigest() != key:
+        return None
+    try:
+        events = json.loads(payload)
+    except ValueError:
+        return None
+    if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
+        return None
+    return events
+
+
+def _plan(events: list[dict]) -> list[dict]:
+    """把事件按（项目, 类型）装箱、分片，排成要写的一批批。内容定了键就定了：
+    同一批内容重发是同一个幂等键，清理时也靠这个键认出「已经写过了」。"""
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for event in events:
+        if (not isinstance(event, dict) or event.get("type") not in KINDS
+                or _ms(event.get("at")) is None or not event.get("table_id")):
+            raise ValueError("留痕事件缺少 type、at 或 table_id")
+        if event["type"] == "status" and event.get("state") not in STATES:
+            raise ValueError("状态留痕必须是 pending / processing / resolved")
+        groups[(str(event["table_id"]), event["type"])].append(dict(event))
+    planned = []
+    for (project, kind), grouped in sorted(groups.items()):
+        # 有界装箱让重试和单格长度都稳定；同一批事件去重后按事实键排序。
+        unique = {event_key(e): e for e in grouped}
+        ordered = [unique[k] for k in sorted(unique)]
+        for start in range(0, len(ordered), MAX_BATCH_EVENTS):
+            batch = ordered[start:start + MAX_BATCH_EVENTS]
+            payload = _json(batch)
+            key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            parts = [payload[i:i + CHUNK_CHARS] for i in range(0, len(payload), CHUNK_CHARS)]
+            first, last = min(e["at"] for e in batch), max(e["at"] for e in batch)
+            planned.append({"project": project, "kind": kind, "batch": batch, "key": key,
+                            "records": [{"fields": {
+                                COL_KEY: key, COL_PROJECT: project, COL_KIND: kind,
+                                COL_START: first, COL_END: last, COL_PART: i,
+                                COL_PARTS: len(parts), COL_DATA: part,
+                            }} for i, part in enumerate(parts)]})
+    return planned
 
 
 def _history_id(event: dict) -> str:

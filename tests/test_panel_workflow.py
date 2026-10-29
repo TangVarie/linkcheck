@@ -290,6 +290,23 @@ class TestResolveTransitions(unittest.TestCase):
         self.resolutions.reconcile(overview())
         self.assertNotIn(panel.Resolutions.OUTBOX, self.store.value)
 
+    def test_resolved_records_stay_under_the_feishu_cell_limit(self):
+        """500 条带帖子键的记录一条两百来字，攒满就超过飞书单格 10 万字，
+        之后每一次点击都写不进去。按字数收掉最早的，最新的留着。"""
+        from xhsearch import panel_settings
+        url_key = "xhs:url:" + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        self.store.value = {f"tblAbcdefghijklm/rec{i:012d}": {
+            "reasons": ["有负面", "风控中"], "seen": TS - 600_000 + i, "at": TS - 600_000 + i,
+            "state": "processing", "post_key": url_key} for i in range(500)}
+        self.assertGreater(len(json.dumps(self.store.value, ensure_ascii=False)),
+                           panel_settings.CELL_MAX_CHARS)
+        self.resolutions.mark("tblA", "r", ["有负面"], TS)
+        text = json.dumps(self.store.value, ensure_ascii=False)
+        self.assertLessEqual(len(text), panel.Resolutions.ENTRIES_MAX_CHARS)
+        self.assertIn("tblA/r", self.store.value)
+        self.assertIn("tblAbcdefghijklm/rec000000000499", self.store.value)
+        self.assertNotIn("tblAbcdefghijklm/rec000000000000", self.store.value)
+
     def test_dropped_counter_survives_other_edits(self):
         self.store.value = {panel.Resolutions.DROPPED: {"tblA": [TS - 5, 3, 0]}}
         self.resolutions.mark("tblA", "r", ["有负面"], TS)
