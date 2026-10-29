@@ -2,6 +2,7 @@ import copy
 from datetime import datetime, timezone
 import io
 import json
+import threading
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -24,6 +25,13 @@ def scan(at=START + 1000, *, post="xhs:one", record="r1", hits=None, table="tbl1
 
 def status(state, at=START + 2000, record="r1"):
     return {"type": "status", "at": at, "table_id": "tbl1", "record_id": record, "state": state}
+
+
+def ran(at, run_id="run-normal", table="tbl1", mode="queue"):
+    """一轮正常开跑、收尾的巡检。正常的一天里总有几轮。"""
+    return [{"type": "run_start", "at": at, "table_id": table, "run_id": run_id, "mode": mode},
+            {"type": "run_end", "at": at + 60_000, "table_id": table, "run_id": run_id,
+             "mode": mode}]
 
 
 def report(events, **kwargs):
@@ -133,7 +141,7 @@ class TestReport(unittest.TestCase):
                   {"type": "run_start", "at": START - HOUR, "table_id": "tbl1", "run_id": "run1"}]
         self.assertFalse(report(events)["window"]["coverage_complete"])
         events.append({"type": "run_end", "at": START + 1, "table_id": "tbl1", "run_id": "run1"})
-        self.assertTrue(report(events)["window"]["coverage_complete"])
+        self.assertTrue(report(events + ran(START + HOUR))["window"]["coverage_complete"])
 
     def test_run_closing_just_after_the_cutoff_is_closed(self):
         """一轮 15:58 开跑、16:03 收尾：截止 16:00 的那一期它是闭合的，不是缺口。"""
@@ -163,7 +171,8 @@ class TestReport(unittest.TestCase):
                 r = d.aggregate([coverage, *gaps], start, end, "tbl1", "途鸽", as_of_ms=end)
                 self.assertFalse(r["window"]["coverage_complete"])
         start, end = d.window_for_date("2026-10-29")
-        r = d.aggregate([coverage, *gaps], start, end, "tbl1", "途鸽", as_of_ms=end)
+        r = d.aggregate([coverage, *gaps, *ran(start + HOUR)], start, end, "tbl1", "途鸽",
+                        as_of_ms=end)
         self.assertTrue(r["window"]["coverage_complete"])
 
     def test_status_clicked_on_the_short_link_key_applies_after_expansion(self):
@@ -172,6 +181,34 @@ class TestReport(unittest.TestCase):
                     {**status("resolved"), "post_key": "xhs:url:abc"}])
         self.assertEqual(r["post_states"]["resolved"], 1)
         self.assertEqual(r["post_states"]["pending"], 0)
+
+    def test_a_day_with_no_journaled_run_is_not_called_complete(self):
+        """留痕整段写不进去时什么都不会留下（缺口、批次也写在同一张表里）：
+        不能报一张「0 篇、0 条」的完整日报。"""
+        coverage = {"type": "coverage", "at": START - 5 * 86_400_000, "table_id": "tbl1"}
+        r = report([coverage])
+        self.assertFalse(r["window"]["coverage_complete"])
+        self.assertIn("没有留痕到任何巡检批次", "".join(r["limitations"]))
+        self.assertTrue(report([coverage, *ran(START + HOUR)])["window"]["coverage_complete"])
+        # 当期刚开始几小时还没轮到一批，是正常的
+        early = report([coverage], as_of=START + 2 * HOUR)
+        self.assertTrue(early["window"]["coverage_complete"])
+
+    def test_a_killed_run_before_the_window_does_not_taint_it(self):
+        """前一天被 redeploy 杀掉的一轮：之后同一种巡检又正常跑过，说明它早就结束了。"""
+        coverage = {"type": "coverage", "at": START - 5 * 86_400_000, "table_id": "tbl1"}
+        killed = {"type": "run_start", "at": START - 6 * HOUR, "table_id": "tbl1",
+                  "run_id": "killed", "mode": "queue"}
+        later = ran(START - 6 * HOUR + 300_000, "next", mode="queue")
+        normal = ran(START + HOUR, "today", mode="queue")
+        self.assertTrue(report([coverage, killed, *later, *normal])["window"]["coverage_complete"])
+        # 另一个服务（sweep）后来跑过证明不了：两个服务可能同时在跑
+        other = ran(START - 6 * HOUR + 300_000, "sweep", mode="sweep")
+        self.assertFalse(report([coverage, killed, *other, *normal])["window"]["coverage_complete"])
+        # 被杀的那一轮就在本期里：本期确实不完整
+        inside = {**killed, "at": START + 2 * HOUR}
+        self.assertFalse(report([coverage, inside, *ran(START + 3 * HOUR, "after"),
+                                 *normal])["window"]["coverage_complete"])
 
     def test_as_of_limits_scans_and_statuses_in_preview(self):
         r = report([scan(), status("resolved", START + HOUR),
@@ -322,7 +359,7 @@ class TestJournal(unittest.TestCase):
                             log=lambda _: None, wall=lambda: clock[0])
         coverage = {"type": "coverage", "at": START - HOUR, "table_id": "tbl1"}
         long_status = {**status("processing", START + HOUR), "note": "长" * 20_000}
-        journal.append([coverage, long_status])
+        journal.append([coverage, long_status, *ran(START + HOUR)])
         missing = next(i for i, row in enumerate(self.table.rows)
                        if row["fields"][d.COL_KIND] == "status")
         held = self.table.rows.pop(missing)
@@ -343,7 +380,7 @@ class TestJournal(unittest.TestCase):
         old = {**status("processing", START - 10 * 86_400_000, record="r1"),
                "post_key": "xhs:one", "note": "长" * 20_000}
         recent = {**status("processing", START + HOUR, record="r2"), "post_key": "xhs:two"}
-        journal.append([coverage, old, recent])
+        journal.append([coverage, old, recent, *ran(START + HOUR)])
         missing = next(i for i, row in enumerate(self.table.rows)
                        if row["fields"][d.COL_KIND] == "status")
         held = self.table.rows.pop(missing)
@@ -356,6 +393,18 @@ class TestJournal(unittest.TestCase):
         r = report(events + [scan(START + 2 * HOUR)])
         self.assertTrue(r["window"]["coverage_complete"])
         self.assertEqual(r["post_states"]["processing"], 1)
+
+    def test_a_broken_status_batch_before_the_window_still_flags_it(self):
+        """状态是累积的：本期开始前那批坏了，本期各帖的状态照样不可信。"""
+        coverage = {"type": "coverage", "at": START - 5 * 86_400_000, "table_id": "tbl1"}
+        self.journal.append([coverage, *ran(START + HOUR),
+                             {**status("processing", START - 2 * HOUR), "note": "长" * 20_000}])
+        missing = next(i for i, row in enumerate(self.table.rows)
+                       if row["fields"][d.COL_KIND] == "status")
+        self.table.rows.pop(missing)
+        events = self.journal.read_window(START, END, "tbl1")
+        r = report(events + [scan()])
+        self.assertFalse(r["window"]["coverage_complete"])
 
     def test_unrecovered_chunk_gap_keeps_its_earliest_time(self):
         """一直没读全的那批，增量读报出来的缺口时刻被截到截止线；缓存要留最早那个，
@@ -389,6 +438,57 @@ class TestJournal(unittest.TestCase):
         other.append([theirs])
         clock[0] += d.HISTORY_FULL_SECONDS + 1
         self.assertIn(theirs, journal.read_window(START, END, "tbl1"))
+
+    def test_a_write_does_not_wait_for_a_slow_read(self):
+        """面板点「已处理」要写留痕；日报正在翻几页留痕时，这一下不能排在它后面等。"""
+        self.journal.append([status("processing")])          # 建表
+        gate, entered = threading.Event(), threading.Event()
+        real = self.table.search
+
+        def slow(*args, **kwargs):
+            entered.set()
+            gate.wait(5)
+            return real(*args, **kwargs)
+
+        self.table.search = slow
+        reader = threading.Thread(target=lambda: self.journal.read_window(START, END, "tbl1"))
+        reader.start()
+        self.assertTrue(entered.wait(5))
+        done = threading.Event()
+        writer = threading.Thread(target=lambda: (self.journal.append(
+            [status("resolved", START + 3000)]), done.set()))
+        writer.start()
+        try:
+            self.assertTrue(done.wait(2), "写在等读")
+        finally:
+            gate.set()
+            reader.join(5)
+            writer.join(5)
+
+    def test_a_write_during_a_full_reread_is_not_lost_from_the_cache(self):
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        journal.append([status("processing")])
+        journal.read_window(START, END, "tbl1")             # 建缓存
+        clock[0] += d.HISTORY_FULL_SECONDS + 1               # 下一次要整段重读
+        mine = status("resolved", START - 10 * 86_400_000, record="mine")
+        real = self.table.search
+
+        def search_then_write(*args, filter_spec=None, **kwargs):
+            rows = real(*args, filter_spec=filter_spec, **kwargs)   # 重读拿到的是写之前的那份
+            kind = {"field_name": d.COL_KIND, "operator": "is", "value": ["status"]}
+            if (kind in (filter_spec or {}).get("conditions", [])
+                    and not getattr(search_then_write, "wrote", False)):
+                search_then_write.wrote = True
+                journal.append([mine])
+            return rows
+
+        self.table.search = search_then_write
+        journal.read_window(START, END, "tbl1")
+        self.table.search = lambda *a, **k: []              # 之后飞书那边一时读不到
+        clock[0] += 60
+        self.assertIn(mine, journal.read_window(START, END, "tbl1"))
 
     def test_missing_create_response_is_not_claimed_as_written(self):
         self.table.batch_create = lambda *a, **kw: []
@@ -430,6 +530,41 @@ class TestCLIJournal(unittest.TestCase):
             code = cli._run_locked("sweep", None, None, cli.Settings(), {"tikhub": "fake"})
         self.assertEqual(code, 1)
         writeback.assert_called_once()
+
+    def test_paid_results_are_written_back_before_journaling_and_runs_carry_mode(self):
+        """飞书慢的时候留痕要重试好几轮：排在写回前面，就是拿花过钱的结果去等它。"""
+        order = []
+        journal = mock.Mock()
+        journal.append.side_effect = lambda events: order.append(events[0]["type"])
+        completed = cli.runner.RunReport(outcomes=[cli.runner.Outcome(
+            "r1", cli.runner.STATUS_OK, scan_event=scan())])
+
+        def refreshed(*args, **kwargs):
+            kwargs["before_scan"]()
+            return 0, {"r1"}, 1, .1, (completed, {})
+
+        with mock.patch.object(cli, "_tables", return_value=[("甲", SimpleNamespace(table_id="tbl1"))]), \
+                mock.patch.object(cli, "_daily_journal", return_value=journal), \
+                mock.patch.object(cli, "_install_stop_handlers"), \
+                mock.patch.object(cli, "_event_sink", return_value=(None, "")), \
+                mock.patch.object(cli, "_refresh_table", side_effect=refreshed), \
+                mock.patch.object(cli, "_write_back_table",
+                                  side_effect=lambda *a, **k: order.append("writeback") or 0), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cli._run_locked("sweep", None, None, cli.Settings(),
+                                             {"tikhub": "fake"}), 0)
+        self.assertEqual(order, ["run_start", "writeback", "scan", "run_end"])
+        modes = {call.args[0][0]["type"]: call.args[0][0].get("mode")
+                 for call in journal.append.call_args_list}
+        self.assertEqual((modes["run_start"], modes["run_end"]), ("sweep", "sweep"))
+
+    def test_journal_tables_share_one_access_token(self):
+        """每次留痕都新建 Bitable 会各取一次 token，一轮一半的飞书调用都在取 token。"""
+        env = {"FEISHU_REGISTRY": "https://x.feishu.cn/base/appReg?table=tblReg",
+               "FEISHU_APP_ID": "cli_x", "FEISHU_APP_SECRET": "s"}
+        with mock.patch.dict("os.environ", env, clear=True), redirect_stdout(io.StringIO()):
+            journal = cli._daily_journal()
+        self.assertEqual(journal._bitable, journal.workspace.table)
 
     def test_no_registry_does_not_invent_business_table_journal(self):
         with mock.patch.dict("os.environ", {}, clear=True), redirect_stdout(io.StringIO()), \

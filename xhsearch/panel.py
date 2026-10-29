@@ -1267,10 +1267,15 @@ class DailyReports:
             if self.warning:
                 report["limitations"].append(self.warning)
                 report["window"]["coverage_complete"] = False
-                report["text"] = "部分处理状态留痕待同步，本报可能不完整。" + report["text"]
         reports = [daily_report.present_report(report, snapshots.get(report["table_id"]),
                                                int(now * 1000), journal_error=journal_error)
                    for report in reports]
+        if self.warning:
+            # 加在 present_report **之后**：它会整段重写 text，加在前面就只剩页面上的
+            # 限制说明里有，运营复制出去的那段汇报里看不到「可能不完整」。
+            for shown in reports:
+                if shown.get("text"):
+                    shown["text"] = "部分处理状态留痕待同步，本报可能不完整。" + shown["text"]
         payload = {"reports": reports, "error": self.warning, "as_of": events_wall}
         # 原始留痕只供服务端 AI 证据抽取；普通日报 API 永远不返回它。
         return (payload, events) if with_events else payload
@@ -1344,6 +1349,9 @@ class Resolutions:
         self._reading = False
         # 读的时候有人点了「已解决」：读回来的那份比内存里的旧，不能拿它盖掉。
         self._version = 0
+        # 接了日报留痕（serve 里有 DailyReports 时打开）。没接就不往待补写里放东西——
+        # 没人来补写，只会越攒越多。
+        self.journaling = False
 
     @property
     def enabled(self) -> bool:
@@ -1391,9 +1399,11 @@ class Resolutions:
         if not edits:
             return 0
         stamps = {key: current[key].get("at") for key in edits}
+        now = int(self._wall() * 1000)
 
         def change(stored):
             data = dict(stored) if isinstance(stored, dict) else {}
+            cleared = []
             for key, kept in edits.items():
                 entry = data.get(key)
                 if not isinstance(entry, dict) or entry.get("at") != stamps[key]:
@@ -1402,6 +1412,22 @@ class Resolutions:
                     data[key] = {**entry, "reasons": kept}
                 else:
                     data.pop(key)
+                    if entry.get("state") == "processing" and self.journaling:
+                        cleared.append((key, entry))
+            # 「正在处理」被这里收掉了（问题消失），日报留痕里也得记一笔回到待处理：
+            # 不然留痕里它一直是「正在处理」，过了 16 点按留痕出的日报还把它算成有人在跟，
+            # 面板上却早已是待处理。「已处理」不用记：再出负面时日报自己会重新打开它。
+            events = []
+            for key, entry in cleared:
+                table_id, _, record_id = key.partition("/")
+                event = {"type": "status", "at": max(now, entry["at"] + 1),
+                         "table_id": table_id, "record_id": record_id,
+                         "state": "pending", "auto": True}
+                if entry.get("post_key"):
+                    event["post_key"] = entry["post_key"]
+                events.append(event)
+            if events:
+                self._enqueue(data, events)
             return data
 
         self._commit(change)
@@ -1472,24 +1498,7 @@ class Resolutions:
 
             def change(current):
                 data = self._pruned(current, at, room=int(state != "pending"))
-                outbox = list(data.get(self.OUTBOX) or [])
-                outbox.append(event)
-                dropped = dict(data.get(self.DROPPED) or {})
-                while len(outbox) > 1 and (
-                        len(outbox) > self.OUTBOX_MAX_EVENTS
-                        or len(json.dumps(outbox, ensure_ascii=False)) > self.OUTBOX_MAX_CHARS):
-                    index, superseded = _evictable(outbox)
-                    lost = outbox.pop(index)
-                    if (not isinstance(lost, dict) or not isinstance(lost.get("at"), int)
-                            or not lost.get("table_id")):
-                        continue
-                    first, count, latest = _dropped_span(
-                        dropped.get(str(lost["table_id"]))) or (lost["at"], 0, 0)
-                    dropped[str(lost["table_id"])] = [
-                        min(first, lost["at"]), count + 1, latest + int(not superseded)]
-                data[self.OUTBOX] = outbox
-                if dropped:
-                    data[self.DROPPED] = dropped
+                self._enqueue(data, [event])
                 data.pop(key, None)
                 if state != "pending":
                     data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
@@ -1502,6 +1511,27 @@ class Resolutions:
             # 显示状态与待补写事件同一格原子保存。远程留痕失败后重启也能重试。
             self._commit(change)
             return self._flush_journal(reports)
+
+    def _enqueue(self, data: dict, events: list[dict]) -> None:
+        """把待补写的留痕事件放进 data 的 OUTBOX（就地改）。满了按 DROPPED 那段的规矩丢。"""
+        outbox = list(data.get(self.OUTBOX) or [])
+        outbox.extend(events)
+        dropped = dict(data.get(self.DROPPED) or {})
+        while len(outbox) > 1 and (
+                len(outbox) > self.OUTBOX_MAX_EVENTS
+                or len(json.dumps(outbox, ensure_ascii=False)) > self.OUTBOX_MAX_CHARS):
+            index, superseded = _evictable(outbox)
+            lost = outbox.pop(index)
+            if (not isinstance(lost, dict) or not isinstance(lost.get("at"), int)
+                    or not lost.get("table_id")):
+                continue
+            first, count, latest = _dropped_span(
+                dropped.get(str(lost["table_id"]))) or (lost["at"], 0, 0)
+            dropped[str(lost["table_id"])] = [
+                min(first, lost["at"]), count + 1, latest + int(not superseded)]
+        data[self.OUTBOX] = outbox
+        if dropped:
+            data[self.DROPPED] = dropped
 
     def flush_journal(self, reports) -> str:
         self.snapshot()
@@ -1807,7 +1837,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self._send_json(200, {"reports": [], "error": "日报留痕尚未接入；需配置 FEISHU_REGISTRY"})
             query = parse_qs(urlparse(self.path).query)
             try:
-                overview, _, _ = self.deps.cache.view()
+                overview, _, _ = self._cached_view()
                 return self._send_json(200, reports.get(
                     overview, date=(query.get("date") or [""])[0],
                     table_id=(query.get("table_id") or [""])[0]))
@@ -2002,11 +2032,21 @@ class PanelHandler(BaseHTTPRequestHandler):
             name, _, value = part.strip().partition("=")
             if name == COOKIE_NAME:
                 ok = valid_session(self.deps.config, value.strip())
-                if ok:
-                    # 登录后的任何一个请求都算「有人在看」，后台取数照常（见 Cache）。
+                if ok and not self._polling():
+                    # 登录后的请求都算「有人在看」，后台取数照常（见 Cache）。页面
+                    # 自己定时拉的不算：开着不动的标签页不能让后台整夜整表读。
                     self.deps.cache.touch()
                 return ok
         return False
+
+    def _polling(self) -> bool:
+        """页面定时器发的请求（X-Panel-Poll: 1），不是人点的。"""
+        headers = getattr(self, "headers", None)
+        return headers is not None and headers.get("X-Panel-Poll") == "1"
+
+    def _cached_view(self):
+        """定时轮询只拿现成的快照，不记「有人在看」、不叫醒停下的后台取数。"""
+        return self.deps.cache.snapshot() if self._polling() else self.deps.cache.view()
 
     def _session_token(self) -> str:
         raw = self.headers.get("Cookie") or ""
@@ -2077,7 +2117,7 @@ class PanelHandler(BaseHTTPRequestHandler):
     def _view(self):
         """缓存里那份快照，按「已解决」收掉该收的行、再按条数上限截（顺序见
         summary.for_display）。缓存里的那份不动。"""
-        overview, error, fetched_at = self.deps.cache.view()
+        overview, error, fetched_at = self._cached_view()
         if overview is not None:
             resolutions = self.deps.resolutions
             resolved = resolutions.snapshot() if resolutions is not None else {}
@@ -2430,7 +2470,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         }
 
     def _work_stats(self) -> list[dict]:
-        overview, _, _ = self.deps.cache.view()
+        overview, _, _ = self._cached_view()
         if overview is None:
             return []
         resolutions = self.deps.resolutions
@@ -2571,6 +2611,7 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     reports = DailyReports(projects) if projects.enabled else None
     if reports is not None:
         reports.resolutions = resolutions
+        resolutions.journaling = True
     report_drafts = (report_ai_mod.ReportDrafts(
         config.deepseek_api_key, reports, timeout=config.deepseek_timeout,
         alert_reason=resolved.negative_status.found)

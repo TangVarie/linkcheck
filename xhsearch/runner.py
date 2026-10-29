@@ -845,9 +845,13 @@ def _fetch_one(
             expand_failure = expansion.reason
 
     def produce() -> _Fetched:
-        return _fetch_calls(calls, keys, settings, deadline=deadline, timeout=timeout,
-                            disabled=disabled, tally=tally, lock=lock, watch=watch,
-                            expand_failure=expand_failure)
+        fetched = _fetch_calls(calls, keys, settings, deadline=deadline, timeout=timeout,
+                               disabled=disabled, tally=tally, lock=lock, watch=watch,
+                               expand_failure=expand_failure)
+        # 展开出的作品 ID 在交给同篇行**之前**就填上：等着的行（for_sibling 照抄）
+        # 一拿到就醒，晚一步填，它抄到的就是空的——日报里同一篇会被记成两篇。
+        fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
+        return fetched
 
     if share is None:
         fetched = produce()
@@ -866,9 +870,11 @@ def _fetch_one(
         share.fulfil(owned_key, fetched)
     else:
         fetched = share.run(share_key(calls), produce)
-    # 展开是这一行自己做的（每行记自己那条链接对应的 ID），不随共享结果走。
+    # 这一行自己展开过，就记自己那条链接对应的 ID；没展开（拿的是同篇行的结果）
+    # 就保留抄来的那份，别用空值盖掉。
     fetched.requests += expand_requests
-    fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
+    if expanded_id:
+        fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
     return fetched
 
 

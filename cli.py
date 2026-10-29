@@ -218,12 +218,13 @@ def _daily_journal():
     app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
     registry_table = _registry_table(app_id, app_secret)
     workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
-    return daily_report.Journal(workspace, lambda app_token, table_id: feishu.Bitable(
-        app_id=app_id, app_secret=app_secret, app_token=app_token, table_id=table_id),
-        registry_table.app_token)
+    # workspace.table 共用同一份 token：每次留痕都新建 Bitable 会各取一次 token，
+    # 一轮下来一半的飞书调用都在取 token。
+    return daily_report.Journal(workspace, workspace.table, registry_table.app_token)
 
 
-def _journal_report(journal, table, report, run_id: str, *, started: bool = True) -> bool:
+def _journal_report(journal, table, report, run_id: str, *, started: bool = True,
+                    mode: str = "") -> bool:
     """先保存成功扫描，再闭合批次；失败不挡业务表写回，但必须返回失败。"""
     if journal is None:
         return True
@@ -236,7 +237,8 @@ def _journal_report(journal, table, report, run_id: str, *, started: bool = True
         # 若预先写 run_start 失败，留下明确 gap，而不是用 run_end 假装本轮完整。
         journal.append([{"type": "run_end" if started else "gap",
                          "at": int(time.time() * 1000), "table_id": table.table_id,
-                         "run_id": run_id, "reason": "本轮开始留痕失败" if not started else ""}])
+                         "run_id": run_id, "mode": mode,
+                         "reason": "本轮开始留痕失败" if not started else ""}])
         if events:
             print(f"🧾 已留痕 {len(events)} 条成功扫描；日报按帖子和评论分别去重")
         return started
@@ -1163,8 +1165,11 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 try:
                     journal_at = int(time.time() * 1000)
                     journal.start(table.table_id, journal_at)
+                    # mode：queue / sweep 各是一个定时服务，同一种自己不会重叠。日报靠它
+                    # 认出「后面又开了一轮同种的」= 这一轮（被杀掉的）早就结束了。
                     journal.append([{"type": "run_start", "at": journal_at,
-                                     "table_id": table.table_id, "run_id": journal_run_id}])
+                                     "table_id": table.table_id, "run_id": journal_run_id,
+                                     "mode": mode}])
                     journal_started[table.table_id] = True
                 except Exception as exc:  # noqa: BLE001
                     journal_started[table.table_id] = False
@@ -1206,7 +1211,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 except Exception as exc:  # noqa: BLE001
                     print(f"❌ 表 {label} 写回失败：{exc}")
                 _journal_report(journal, table, report, journal_run_id,
-                                started=journal_started.get(table.table_id, False))
+                                started=journal_started.get(table.table_id, False),
+                                mode=mode)
         _finish(1, error=type(sys.exc_info()[1]).__name__)
         raise
 
@@ -1226,12 +1232,6 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     for label, _table, report, _meta, _cfg in pending:
         runner.emit_run_events(report, on_event, table=label, mode=mode)
 
-    # 与业务表写回解耦：真实取得的扫描结果要留痕，留痕失败也不能丢掉已付费结果。
-    for _label, table, report, _meta, _cfg in pending:
-        if not _journal_report(journal, table, report, journal_run_id,
-                               started=journal_started.get(table.table_id, False)):
-            worst = 1
-
     for label, table, report, fields_meta, per_table in pending:
         if multi:
             print(f"\n━━━━ 表：{label}（结果）━━━━")
@@ -1244,6 +1244,14 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             worst = 1
             continue
         worst = max(worst, code)
+
+    # 留痕放在写回**之后**：先保住付费结果（飞书慢的时候留痕要重试好几轮，
+    # 排在前面就是拿已经花了钱的结果去等它）。留痕失败也不影响已写回的结果。
+    for _label, table, report, _meta, _cfg in pending:
+        if not _journal_report(journal, table, report, journal_run_id,
+                               started=journal_started.get(table.table_id, False),
+                               mode=mode):
+            worst = 1
 
     if run_id:
         print(f"\nrun_id={run_id}（结构化日志已写到 stderr）")

@@ -43,6 +43,10 @@ RUN_GRACE_MS = 2 * 3_600_000
 HISTORY_KINDS = ("status", "coverage")
 HISTORY_OVERLAP_MS = 2 * 86_400_000
 HISTORY_FULL_SECONDS = 6 * 3600
+# 留痕启用之后，一期里过了这么久还一个巡检批次都没留下，就不能说「覆盖完整」：
+# 留痕整段写不进去时什么痕迹都不会留（缺口和批次本身也写在同一张表里），
+# 报出来的就是一张「0 篇、0 条」的完整日报。
+QUIET_RUNS_MS = 12 * 3_600_000
 STATES = ("pending", "processing", "resolved")
 SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
 
@@ -107,14 +111,15 @@ class Journal:
         self._history: dict[tuple[str, str], dict] = {}
 
     def _find(self) -> str:
-        if not self._table_id:
-            found = [t["table_id"] for t in self.workspace.list_tables(self.app_token)
-                     if t.get("name") == TABLE_NAME and t.get("table_id")]
-            if len(found) > 1:
-                raise ValueError("发现多张「巡检留痕」表，请合并后保留唯一一张，日报暂不统计")
-            if found:
-                self._table_id = found[0]
-        return self._table_id
+        with self._lock:
+            if not self._table_id:
+                found = [t["table_id"] for t in self.workspace.list_tables(self.app_token)
+                         if t.get("name") == TABLE_NAME and t.get("table_id")]
+                if len(found) > 1:
+                    raise ValueError("发现多张「巡检留痕」表，请合并后保留唯一一张，日报暂不统计")
+                if found:
+                    self._table_id = found[0]
+            return self._table_id
 
     def _ensure(self) -> str:
         found = self._find()
@@ -140,36 +145,43 @@ class Journal:
             if event["type"] == "status" and event.get("state") not in STATES:
                 raise ValueError("状态留痕必须是 pending / processing / resolved")
             groups[(str(event["table_id"]), event["type"])].append(dict(event))
+        # 锁只护「找/建表」和内存缓存，**不护飞书请求**：面板点「已处理」要写留痕，
+        # 日报那边正在翻好几页留痕时，这一下不能排在它后面干等。
         with self._lock:
-            table = self._bitable(self.app_token, self._ensure())
-            for (project, kind), grouped in sorted(groups.items()):
-                # 有界装箱让重试和单格长度都稳定；同一批事件去重后按事实键排序。
-                unique = {event_key(e): e for e in grouped}
-                ordered = [unique[k] for k in sorted(unique)]
-                for start in range(0, len(ordered), MAX_BATCH_EVENTS):
-                    batch = ordered[start:start + MAX_BATCH_EVENTS]
-                    payload = _json(batch)
-                    key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-                    parts = [payload[i:i + CHUNK_CHARS]
-                             for i in range(0, len(payload), CHUNK_CHARS)]
-                    first, last = min(e["at"] for e in batch), max(e["at"] for e in batch)
-                    records = [{"fields": {
-                        COL_KEY: key, COL_PROJECT: project, COL_KIND: kind,
-                        COL_START: first, COL_END: last, COL_PART: i,
-                        COL_PARTS: len(parts), COL_DATA: part,
-                    }} for i, part in enumerate(parts)]
-                    created = table.batch_create(records, client_token=feishu.idempotency_key(
-                        f"journal:{self.app_token}:{key}"))
-                    if len(created) != len(records) or not all(created):
-                        raise ValueError("巡检留痕未完整写入，日报不能视为完整")
-                    # 自己写进去的历史事件直接记进内存：面板补写的状态可能带着
-                    # 好几天前的时刻，增量读往前那一段不一定够得着。
-                    if kind in HISTORY_KINDS:
+            table_id = self._ensure()
+        table = self._bitable(self.app_token, table_id)
+        for (project, kind), grouped in sorted(groups.items()):
+            # 有界装箱让重试和单格长度都稳定；同一批事件去重后按事实键排序。
+            unique = {event_key(e): e for e in grouped}
+            ordered = [unique[k] for k in sorted(unique)]
+            for start in range(0, len(ordered), MAX_BATCH_EVENTS):
+                batch = ordered[start:start + MAX_BATCH_EVENTS]
+                payload = _json(batch)
+                key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                parts = [payload[i:i + CHUNK_CHARS]
+                         for i in range(0, len(payload), CHUNK_CHARS)]
+                first, last = min(e["at"] for e in batch), max(e["at"] for e in batch)
+                records = [{"fields": {
+                    COL_KEY: key, COL_PROJECT: project, COL_KIND: kind,
+                    COL_START: first, COL_END: last, COL_PART: i,
+                    COL_PARTS: len(parts), COL_DATA: part,
+                }} for i, part in enumerate(parts)]
+                created = table.batch_create(records, client_token=feishu.idempotency_key(
+                    f"journal:{self.app_token}:{key}"))
+                if len(created) != len(records) or not all(created):
+                    raise ValueError("巡检留痕未完整写入，日报不能视为完整")
+                # 自己写进去的历史事件直接记进内存：面板补写的状态可能带着
+                # 好几天前的时刻，增量读往前那一段不一定够得着。
+                if kind in HISTORY_KINDS:
+                    with self._lock:
                         for scope in (project, ""):
                             cached = self._history.get((kind, scope))
                             if cached is not None:
-                                cached["events"].update(
-                                    (_history_id(e), e) for e in batch)
+                                for e in batch:
+                                    cached["events"][_history_id(e)] = e
+                                    # 也记一份「自己写的」：整段重读要是正赶上，
+                                    # 飞书那边读回来的可能还没有它，换缓存时补回去。
+                                    cached["written"][_history_id(e)] = e
 
     def _read_kind(self, kind: str, start_ms: Optional[int], end_ms: int,
                    table_id: str = "", whole: Optional[dict] = None) -> list[dict]:
@@ -231,9 +243,13 @@ class Journal:
                 if whole is not None:
                     whole[key] = parsed
             except (ValueError, TypeError):
-                events.append({"type": "gap", "at": max(start_ms or 0, group["at"]),
-                               "table_id": group["project"], "chunk": key,
-                               "reason": "留痕分片缺失或内容损坏，统计可能不全"})
+                gap = {"type": "gap", "at": max(start_ms or 0, group["at"]),
+                       "table_id": group["project"], "chunk": key,
+                       "reason": "留痕分片缺失或内容损坏，统计可能不全"}
+                if kind in HISTORY_KINDS:
+                    # 状态是累积的：坏掉的那批之后的每一期都受影响，不只它自己那一期。
+                    gap["history"] = True
+                events.append(gap)
         return events
 
     def start(self, table_id: str, at_ms: int) -> None:
@@ -252,28 +268,38 @@ class Journal:
         """
         if end_ms <= start_ms:
             raise ValueError("日报结束时间必须晚于开始时间")
-        with self._lock:
-            events = self._read_kind("scan", start_ms, end_ms, table_id)
-            for kind in HISTORY_KINDS:
-                events.extend(self._read_history(kind, end_ms, table_id))
-            for kind in ("run_start", "run_end", "gap"):
-                events.extend(self._read_kind(kind, start_ms - 86_400_000,
-                                              end_ms + 86_400_000, table_id))
-            return events
+        events = self._read_kind("scan", start_ms, end_ms, table_id)
+        for kind in HISTORY_KINDS:
+            events.extend(self._read_history(kind, end_ms, table_id))
+        for kind in ("run_start", "run_end", "gap"):
+            events.extend(self._read_kind(kind, start_ms - 86_400_000,
+                                          end_ms + 86_400_000, table_id))
+        return events
 
     def _read_history(self, kind: str, end_ms: int, table_id: str) -> list[dict]:
         """截止时的全部历史，读过的记在内存里，之后只补最近那一段。"""
         now = self._wall()
         through = int(now * 1000) + 86_400_000      # 时钟偏一点的未来事件也收进来
-        cached = self._history.get((kind, table_id))
+        with self._lock:
+            known_cache = self._history.get((kind, table_id))
+            full = known_cache is None or now - known_cache["full_at"] > HISTORY_FULL_SECONDS
+            since = None if full else known_cache["through"] - HISTORY_OVERLAP_MS
         whole: dict[str, list[dict]] = {}
-        if cached is None or now - cached["full_at"] > HISTORY_FULL_SECONDS:
-            fresh = self._read_kind(kind, None, through, table_id, whole)
-            cached = {"events": {}, "full_at": now}
+        fresh = self._read_kind(kind, since, through, table_id, whole)    # 不持锁
+        with self._lock:
+            return self._merge_history(kind, table_id, full, now, through, fresh, whole, end_ms)
+
+    def _merge_history(self, kind: str, table_id: str, full: bool, now: float,
+                       through: int, fresh: list[dict], whole: dict, end_ms: int) -> list[dict]:
+        """把一次读回来的并进缓存（调用方持锁）。"""
+        cached = self._history.get((kind, table_id))
+        if full or cached is None:
+            previous = cached
+            cached = {"events": {}, "full_at": now, "written": {}, "through": through}
+            # 整段重读期间自己写进去的：飞书那边读回来的可能还没有，从旧缓存补过来。
+            if previous is not None:
+                cached["events"].update(previous["written"])
             self._history[(kind, table_id)] = cached
-        else:
-            fresh = self._read_kind(kind, cached["through"] - HISTORY_OVERLAP_MS,
-                                    through, table_id, whole)
         for event in fresh:
             identity = _history_id(event)
             known = cached["events"].get(identity)
@@ -289,7 +315,7 @@ class Journal:
         for key, batch in whole.items():
             cached["events"].pop("gap:" + key, None)
             cached["events"].update((_history_id(e), e) for e in batch)
-        cached["through"] = through
+        cached["through"] = max(cached["through"], through)
         return [e for e in cached["events"].values() if e["at"] < end_ms]
 
 
@@ -411,21 +437,41 @@ def aggregate(events: list[dict], start: int, end: int, table_id: str, label: st
                    "处理状态按整帖标记，评论处理数随所属帖子状态统计；再次检出负面会重新打开已处理帖子。",
                    "覆盖依据已保存留痕与可见批次闭合情况，异常退出及留痕故障仍需结合运行日志核对。"]
     gaps = [e for e in selected if e.get("type") == "gap"
-            and e.get("end", e["at"]) >= start]
+            and (e.get("history") or e.get("end", e["at"]) >= start)]
     begun = {str(e.get("run_id")): e for e in selected
              if e.get("type") == "run_start" and e.get("run_id")}
     # 收尾看**所有**读到的 run_end（含截止之后的）：一轮 15:58 开跑、16:03 收尾，
     # 截止 16:00 的那一期它是闭合的。开跑不到 RUN_GRACE_MS 还没收尾的是进行中。
-    closed = {str(e.get("run_id")) for e in events if isinstance(e, dict)
-              and e.get("type") == "run_end" and e.get("table_id") == table_id}
+    runs = sorted((e for e in events if isinstance(e, dict) and e.get("table_id") == table_id
+                   and e.get("type") in ("run_start", "run_end") and _ms(e.get("at")) is not None),
+                  key=lambda e: e["at"])
+    closed = {str(e.get("run_id")) for e in runs if e["type"] == "run_end"}
+
+    def ended_before_window(run: dict) -> bool:
+        # 被杀掉的那一轮没有 run_end。同一种巡检（queue / sweep 各一个定时服务，
+        # 自己不会重叠）后来又开过一轮，它就在那之前结束了；那一刻还在本期开始
+        # 之前，就和本期无关。没记 mode 的老记录证明不了，照旧算。
+        if not run.get("mode"):
+            return False
+        later = next((e["at"] for e in runs if e["at"] > run["at"]
+                      and e.get("mode") == run["mode"]
+                      and str(e.get("run_id")) != str(run.get("run_id"))), None)
+        return later is not None and later <= start
+
     unclosed = [e for key, e in begun.items()
-                if key not in closed and current - e["at"] >= RUN_GRACE_MS]
+                if key not in closed and current - e["at"] >= RUN_GRACE_MS
+                and not ended_before_window(e)]
+    quiet = (started is not None and started <= start and cutoff - start >= QUIET_RUNS_MS
+             and not any(e.get("type") == "run_start" and e["at"] >= start for e in selected))
     if started is None:
         limitations.append("尚无项目启用留痕记录，历史不可追溯；空白统计不能视为实际为零。")
     elif started > start:
         limitations.append(f"本期仅从{_stamp(started)}开始留痕，启用前的工作不可追溯。")
     if gaps or unclosed:
         limitations.append(f"发现 {len(gaps)} 处留痕缺口、{len(unclosed)} 个未闭合批次，本期统计可能不全。")
+    if quiet:
+        limitations.append("本期没有留痕到任何巡检批次：可能确实没有到期的帖子，也可能是留痕一直"
+                           "写不进去；空白统计不能视为实际为零，请对照运行日志。")
 
     post_records: dict[str, set[str]] = defaultdict(set)
     latest_negative: dict[str, int] = {}
@@ -457,8 +503,10 @@ def aggregate(events: list[dict], start: int, end: int, table_id: str, label: st
 
     legacy_statuses: dict[str, dict] = {}
     post_statuses: dict[str, dict] = {}
+    # auto：面板自己补的状态（问题消失、「正在处理」被自动收掉），不是运营点的。
     operation_events = [e for e in selected if e.get("type") == "status"
-                        and e.get("state") in STATES and start <= e["at"]]
+                        and e.get("state") in STATES and start <= e["at"]
+                        and not e.get("auto")]
     operations_unit = "篇" if operation_events and all(e.get("post_key") for e in operation_events) else "行"
     operations = {state: len({str(e.get("post_key") if operations_unit == "篇"
                                  else e.get("record_id")) for e in operation_events
@@ -506,7 +554,8 @@ def aggregate(events: list[dict], start: int, end: int, table_id: str, label: st
         limitations.append("部分帖子缺少作品 ID，使用链接或业务行识别，跨链接去重可能不完整。")
     if unchecked:
         limitations.append(f"本期 {len(unchecked)} 篇帖子至少一次扫描未进行负面词判定。")
-    coverage_complete = started is not None and started <= start and not gaps and not unclosed
+    coverage_complete = (started is not None and started <= start and not gaps
+                         and not unclosed and not quiet)
     report = {
         "table_id": table_id, "label": label,
         "window": {"start_ms": start, "end_ms": end, "as_of_ms": cutoff,

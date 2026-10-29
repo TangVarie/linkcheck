@@ -336,11 +336,37 @@ class TestReportDraftIsAutomaticButHarmless(unittest.TestCase):
         # 竞品为空时不许把人工写的清掉
         self.assertNotIn("reportCompetitors.value = \"\"", body)
 
-    def test_a_slow_response_for_another_window_is_discarded(self):
+    def test_a_response_for_another_window_is_kept_for_that_window(self):
+        """切到别的项目/日期时还在路上的草稿：不填进眼前这一期，但记在它自己那一期，
+        回去时再填——扔掉等于白花一次钱，那一期还会一直停在「正在归纳」。"""
         body = self.js[self.js.index("function requestDraft("):]
         body = body[:body.index("\n  }\n") + 4]
-        self.assertIn("key !== reportKey()", body)
-        self.assertIn("epoch !== draftEpoch", body)
+        self.assertIn("if (draftSeq[key] !== seq) return;", body)
+        self.assertIn("draftState[key] = j;", body)
+        self.assertIn("if (key !== reportKey()) { j.unapplied", body)
+        notes = self.js[self.js.index("function loadNotes("):]
+        notes = notes[:notes.index("\n  }")]
+        self.assertIn("known.unapplied", notes)
+
+    def test_a_tab_click_with_the_report_folded_costs_nothing(self):
+        body = self.js[self.js.index("function maybeDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("if (!reportOpen()) return;", body)
+        self.assertIn('addEventListener("toggle"', self.js)
+
+    def test_a_field_the_operator_cleared_is_not_refilled_after_reload(self):
+        notes = self.js[self.js.index("function loadNotes("):]
+        notes = notes[:notes.index("\n  }")]
+        self.assertIn("notes.drafted", notes)
+        apply = self.js[self.js.index("function applyDraft("):]
+        apply = apply[:apply.index("\n  }")]
+        self.assertIn("saveNotes(true)", apply)
+
+    def test_a_cooled_down_regenerate_does_not_replace_edits(self):
+        body = self.js[self.js.index("function presentDraft("):]
+        body = body[:body.index("\n  }")]
+        self.assertIn("j.forced && j.cached", body)
+        self.assertIn("applyDraft(j, false)", body)
 
     def test_a_failed_draft_is_not_retried_by_polling(self):
         """**踩过的坑**：失败只记成 undefined，60 秒轮询会每分钟再打一次付费接口。
@@ -351,7 +377,7 @@ class TestReportDraftIsAutomaticButHarmless(unittest.TestCase):
         self.assertNotIn('known.status === "ok"', body,
                          "还在按状态挑着重试——失败态会漏过去")
         retry = self.js[self.js.index("function requestDraft("):]
-        retry = retry[:retry.index("var epoch = ++draftEpoch")]
+        retry = retry[:retry.index("var seq = draftSeq[key]")]
         self.assertIn("if (!force && known) return;", retry)
 
     def test_failure_keeps_the_fields_editable_and_says_what_happened(self):

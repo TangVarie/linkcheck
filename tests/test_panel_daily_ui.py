@@ -166,7 +166,7 @@ class TestLiveReportNumbers(unittest.TestCase):
 
     def render(self, report):
         start = panel_view._SCRIPT.index("  function renderReports(){")
-        end = panel_view._SCRIPT.index("  function loadReports(){", start)
+        end = panel_view._SCRIPT.index("  function loadReports(poll){", start)
         function = panel_view._SCRIPT[start:end]
         script = """
 var values = {}, nodes = {};
