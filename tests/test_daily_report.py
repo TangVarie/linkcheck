@@ -246,13 +246,25 @@ class FakeTable:
 
     def batch_create(self, records, *, client_token):
         if client_token not in self.tokens:
-            self.tokens[client_token] = [f"rec{len(self.rows) + i}" for i in range(len(records))]
-            self.rows.extend(copy.deepcopy(records))
+            self.tokens[client_token] = [f"rec{self.made + i}" for i in range(len(records))]
+            for rid, record in zip(self.tokens[client_token], records):
+                self.rows.append({"record_id": rid, **copy.deepcopy(record)})
+            self.made += len(records)
         return self.tokens[client_token]
+
+    made = 0
 
     def search(self, fields, *, filter_spec=None, **kwargs):
         self.searches.append(filter_spec)
         return copy.deepcopy(self.rows)
+
+    def batch_delete(self, record_ids):
+        doomed = set(record_ids)
+        self.rows = [r for r in self.rows if r.get("record_id") not in doomed]
+        return len(doomed)
+
+    def count(self, **kwargs):
+        return len(self.rows)
 
 
 class FakeWorkspace:
@@ -514,6 +526,82 @@ class TestJournal(unittest.TestCase):
         clock[0] += 60
         self.assertIn(mine, journal.read_window(START, END, "tbl1"))
 
+    def test_prune_drops_old_scans_and_runs_but_never_coverage(self):
+        """表有行数上限，满了什么都写不进去。超期的扫描、批次删掉；启用记录永远留着。"""
+        day = 86_400_000
+        now = END
+        old = now - (d.RETENTION_DAYS + 10) * day
+        self.journal.append([{"type": "coverage", "at": old - day, "table_id": "tbl1"}])
+        self.journal.append([scan(old, record="gone")])
+        self.journal.append(ran(old + 1000, "old-run"))
+        self.journal.append([scan(START + HOUR, record="kept"), *ran(START + HOUR, "new-run")])
+        before = len(self.table.rows)
+        result = self.journal.prune(now)
+        self.assertEqual(result["deleted"], 3)                # 旧扫描 1 + 旧批次 2
+        self.assertEqual(len(self.table.rows), before - 3)
+        kinds = [r["fields"][d.COL_KIND] for r in self.table.rows]
+        self.assertIn("coverage", kinds)
+        events = self.journal.read_window(START, END, "tbl1")
+        self.assertEqual({e.get("record_id") for e in events if e["type"] == "scan"}, {"kept"})
+        self.assertTrue(report(events)["window"]["coverage_complete"])
+        self.assertEqual(self.journal.prune(now)["deleted"], 0)
+
+    def test_prune_folds_old_statuses_to_the_latest_per_post(self):
+        """状态是累积的，不能直接删：折叠成每篇最后一条（原时刻），之后各期照样认得。"""
+        day = 86_400_000
+        old = END - (d.RETENTION_DAYS + 10) * day
+        states = ("processing", "resolved", "pending")
+        for i in range(d.COMPACT_MIN_BATCHES + 5):
+            self.journal.append([{**status(states[i % 3], old + i * 1000, record="r1"),
+                                  "post_key": "xhs:one"}])
+        self.journal.append([{**status("processing", old + 99_000, record="r2"),
+                              "post_key": "xhs:two"}])
+        last_one = {**status(states[(d.COMPACT_MIN_BATCHES + 4) % 3],
+                             old + (d.COMPACT_MIN_BATCHES + 4) * 1000, record="r1"),
+                    "post_key": "xhs:one"}
+        coverage = {"type": "coverage", "at": old - day, "table_id": "tbl1"}
+        self.journal.append([coverage])
+        before = report(self.journal.read_window(START, END, "tbl1")
+                        + [scan(START + HOUR), scan(START + HOUR, post="xhs:two", record="r2")]
+                        + ran(START + HOUR))
+        result = self.journal.prune(END)
+        status_rows = [r for r in self.table.rows if r["fields"][d.COL_KIND] == "status"]
+        self.assertLessEqual(len(status_rows), 1)
+        self.assertGreater(result["folded"], 0)
+        fresh = d.Journal(self.workspace, lambda *_: self.table, "base", log=lambda _: None)
+        events = fresh.read_window(START, END, "tbl1")
+        statuses = [e for e in events if e["type"] == "status"]
+        self.assertIn(last_one, statuses)
+        self.assertEqual(len(statuses), 2)
+        after = report(events + [scan(START + HOUR), scan(START + HOUR, post="xhs:two", record="r2")]
+                       + ran(START + HOUR))
+        self.assertEqual(after["post_states"], before["post_states"])
+        self.assertEqual(self.journal.prune(END)["deleted"], 0, "折叠过的不再反复重写")
+
+    def test_prune_leaves_a_broken_old_status_batch_alone(self):
+        day = 86_400_000
+        old = END - (d.RETENTION_DAYS + 10) * day
+        for i in range(d.COMPACT_MIN_BATCHES + 1):
+            self.journal.append([{**status("processing", old + i, record=f"r{i}"),
+                                  "note": "长" * (20_000 if i == 0 else 1)}])
+        broken = [r for r in self.table.rows if r["fields"][d.COL_PARTS] > 1]
+        self.table.rows.remove(broken[0])
+        self.journal.prune(END)
+        left = {r["record_id"] for r in self.table.rows}
+        self.assertTrue(all(r["record_id"] in left for r in broken[1:]),
+                        "缺片的那批读不全，不能当成折叠过了删掉")
+
+    def test_usage_note_warns_near_each_feishu_row_limit(self):
+        self.assertEqual(d.usage_note(None), "")
+        self.assertEqual(d.usage_note(1_500), "")
+        self.assertIn("免费领到 2 万行", d.usage_note(1_700))
+        self.assertEqual(d.usage_note(10_000), "", "过了 2,000 还在写，说明上限至少 2 万")
+        self.assertIn("2 万行", d.usage_note(17_000))
+        self.assertIn("5 万行", d.usage_note(45_000))
+        self.assertEqual(d.usage_note(80_000), "")
+        self.journal.append([scan()])
+        self.assertEqual(self.journal.usage(), len(self.table.rows))
+
     def test_missing_create_response_is_not_claimed_as_written(self):
         self.table.batch_create = lambda *a, **kw: []
         with self.assertRaisesRegex(ValueError, "未完整写入"):
@@ -581,6 +669,29 @@ class TestCLIJournal(unittest.TestCase):
         modes = {call.args[0][0]["type"]: call.args[0][0].get("mode")
                  for call in journal.append.call_args_list}
         self.assertEqual((modes["run_start"], modes["run_end"]), ("sweep", "sweep"))
+
+    def test_sweep_prunes_the_journal_and_queue_does_not(self):
+        for mode, expected in (("sweep", 1), ("queue", 0)):
+            journal = mock.Mock()
+            journal.prune.return_value = {"deleted": 0, "folded": 0}
+            journal.usage.return_value = 100
+            with self.subTest(mode=mode), \
+                    mock.patch.object(cli, "_tables", return_value=[("甲", SimpleNamespace(table_id="tbl1"))]), \
+                    mock.patch.object(cli, "_daily_journal", return_value=journal), \
+                    mock.patch.object(cli, "_install_stop_handlers"), \
+                    mock.patch.object(cli, "_event_sink", return_value=(None, "")), \
+                    mock.patch.object(cli, "_refresh_table", return_value=(0, set(), 0, 0., None)), \
+                    redirect_stdout(io.StringIO()):
+                cli._run_locked(mode, None, None, cli.Settings(), {"tikhub": "fake"})
+            self.assertEqual(journal.prune.call_count, expected)
+
+    def test_upkeep_failure_is_only_a_warning(self):
+        journal = mock.Mock()
+        journal.prune.side_effect = RuntimeError("feishu down")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli._journal_upkeep(journal)
+        self.assertIn("清理没做成", out.getvalue())
 
     def test_journal_tables_share_one_access_token(self):
         """每次留痕都新建 Bitable 会各取一次 token，一轮一半的飞书调用都在取 token。"""

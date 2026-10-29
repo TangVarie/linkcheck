@@ -210,6 +210,31 @@ class TestIdempotencyKey(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
+class TestCountAndBatchDelete(unittest.TestCase):
+    def test_count_reads_total_from_a_one_row_search(self):
+        cap = Captured(ok({"items": [{}], "has_more": True, "total": 1834}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            self.assertEqual(table().count(), 1834)
+        self.assertIn("records/search?page_size=1", cap.calls[0]["url"])
+
+    def test_count_without_total_is_unknown_not_zero(self):
+        cap = Captured(ok({"items": [], "has_more": False}))
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            self.assertIsNone(table().count())
+
+    def test_batch_delete_sends_at_most_500_per_request(self):
+        cap = Captured()
+        ids = [f"rec{i}" for i in range(1201)]
+        with mock.patch.object(feishu.Bitable, "token", return_value="t"), \
+             mock.patch.object(transport, "post_with_retry", cap):
+            self.assertEqual(table().batch_delete(ids), 1201)
+        self.assertEqual([len(c["body"]["records"]) for c in cap.calls], [500, 500, 201])
+        self.assertTrue(all(c["url"].endswith("/records/batch_delete") for c in cap.calls))
+        self.assertEqual(sum((c["body"]["records"] for c in cap.calls), []), ids)
+
+
 class TestBatchCreate(unittest.TestCase):
     def test_client_token_is_required(self):
         """transport 对超时是自动重试的，没有幂等键就会多出重复行。"""

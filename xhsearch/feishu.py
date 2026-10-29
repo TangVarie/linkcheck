@@ -1036,6 +1036,34 @@ class Bitable:
                            for r in (data.get("records") or []))
         return created
 
+    def count(self, *, filter_spec: Optional[dict[str, Any]] = None) -> Optional[int]:
+        """表里（符合条件的）有几行。只取一行、读响应里的 total，不翻页。
+        响应里没有 total 就返回 None——调用方当「不知道」，不能当 0。"""
+        body: dict[str, Any] = {"field_names": [], "automatic_fields": False}
+        if filter_spec:
+            body["filter"] = filter_spec
+        data = self._read(lambda: transport.post_with_retry(
+            self._url("records/search?page_size=1"), self._headers(),
+            json.dumps(body, ensure_ascii=False), timeout=self.timeout,
+            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+        ))
+        total = data.get("total")
+        return total if isinstance(total, int) and not isinstance(total, bool) else None
+
+    def batch_delete(self, record_ids: Iterable[str]) -> int:
+        """批量删行（一次最多 500 行，分批发）。返回发出去删除的行数。
+        **只给「巡检留痕」的定期清理用**；业务表永远不删行。"""
+        ids = [str(r) for r in record_ids if r]
+        for start in range(0, len(ids), 500):
+            resp = transport.post_with_retry(
+                self._url("records/batch_delete"), self._headers(),
+                json.dumps({"records": ids[start:start + 500]}, ensure_ascii=False),
+                timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            _check(resp)
+        return len(ids)
+
     def delete_record(self, record_id: str) -> None:
         """删一行。**只给注册表用**（「不再监控这张表」），业务表永远不删行。"""
         resp = transport.request_with_retry(

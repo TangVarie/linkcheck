@@ -64,6 +64,16 @@ class TestSettingsStore(unittest.TestCase):
         workspace.create_table.assert_not_called()
         self.assertEqual(made, [])
 
+    def test_a_value_over_the_feishu_cell_limit_is_refused_locally(self):
+        """飞书单个文本单元格最多 10 万字；超了在本地就拦下，说清楚，不写。"""
+        bitable = FakeBitable([row("rec1", panel_settings.KEY_RESOLVED, "{}")])
+        store, *_ = self._store([{"table_id": "tblSET", "name": panel_settings.TABLE_NAME}],
+                                bitable)
+        with self.assertRaisesRegex(ValueError, "超过飞书单个单元格"):
+            store.update_json(panel_settings.KEY_RESOLVED,
+                              lambda current: {"x": "长" * panel_settings.CELL_MAX_CHARS}, {})
+        self.assertEqual(bitable.updated, [])
+
     def test_first_write_creates_the_table_next_to_the_registry(self):
         bitable = FakeBitable()
         store, workspace, made, _ = self._store([{"table_id": "tblREG", "name": "被监控的表"}],

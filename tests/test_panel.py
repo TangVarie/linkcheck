@@ -721,6 +721,26 @@ class TestRendering(unittest.TestCase):
         self.assertEqual(link.group(1), url.replace("&", "&amp;"))
         self.assertTrue(link.group(2).startswith("xiaohongshu.com/explore/"))
 
+    def test_find_box_sits_in_the_workbench_and_rows_carry_full_search_keys(self):
+        """处理完回来点「已处理」时靠它找帖子：要在项目选择旁边，不在顶栏角落；
+        能搜到屏幕上截断掉的完整标题、素人编号、帖子链接、作品 ID 和飞书行号。"""
+        long = "露营装备清单｜新手最容易踩的五个坑，第三个我自己也中招了"
+        todo = summary.TodoRow(record_id="recX1", project="A", record_url="https://x/r",
+                               link_cell="http://xhslink.com/a/Zx9", reasons=["有负面"],
+                               label=long, persona="K02",
+                               post_url="https://www.xiaohongshu.com/explore/6aa7?xsec_token=t",
+                               post_key="xhs:6aa74952000000000a0256a2")
+        page = self._page(self._snap(todos=[todo]))
+        work = page[page.index("id=s-work"):page.index("id=s-todo")]
+        self.assertIn("id=filter", work)
+        self.assertIn("id=findResult", work)
+        self.assertNotIn("id=filter", page[page.index("class=top"):page.index("id=s-work")])
+        row = page[page.index("data-rec='recX1'"):]
+        row = row[:row.index(">")]
+        for key in (long, "K02", "xhslink.com/a/Zx9", "6aa74952000000000a0256a2", "recX1",
+                    "explore/6aa7"):
+            self.assertIn(key, row, key)
+
     def test_post_link_only_allows_http(self):
         """链接是运营贴进表里的字：`javascript:` 不能变成一个能点的链接。"""
         todo = summary.TodoRow(record_id="r1", project="A", link_cell="",

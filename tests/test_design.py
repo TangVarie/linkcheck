@@ -277,6 +277,25 @@ class TestQueueingIsHonest(unittest.TestCase):
         handler = handler[:handler.index("\n  });")]
         self.assertIn("recount()", handler)
 
+    def test_find_matches_pasted_links_by_their_content_id(self):
+        """粘贴的链接带每次分享都不一样的 xsec_token；表里登记的可能是短链。
+        去掉问号后面那串，再把作品 ID 单独拿出来也能命中。"""
+        terms = self.js[self.js.index("function searchTerms("):]
+        terms = terms[:terms.index("\n  }")]
+        self.assertIn('split(/[?#]/)[0]', terms)
+        self.assertIn("[0-9a-f]{24}", terms)
+        match = self.js[self.js.index("function rowMatches("):]
+        match = match[:match.index("\n  }")]
+        self.assertIn("tr.dataset.find", match)
+        self.assertIn("terms.every", match)
+
+    def test_find_tells_where_the_matches_are_and_enter_jumps(self):
+        self.assertIn("renderFindResult(terms)", self.js)
+        self.assertIn("在其他项目里", self.js)
+        self.assertIn('e.key === "Enter"', self.js)
+        self.assertIn("jumpToFound()", self.js)
+        self.assertIn("tr.dataset.find = findText(t)", self.js)
+
     def test_the_active_tab_uses_the_primary_colour(self):
         """设计系统对 tab 只定了一条：激活 Tab 用主色。"""
         rule = re.search(r"\.tabs \.tab\.on\{([^}]*)\}", css_without_comments())
@@ -631,7 +650,7 @@ class TestNavigationEdges(unittest.TestCase):
         self.assertIsNotNone(narrow)
         block = narrow.group(1)
         self.assertIn(".top", block, "窄屏断点里没管顶栏")
-        self.assertIn(".tools input", block, "窄屏断点里没管搜索框")
+        self.assertIn(".work-find", block, "窄屏断点里没管搜索框")
         self.assertNotIn("width:220px", block,
                          "搜索框在窄屏还是固定宽度")
 
