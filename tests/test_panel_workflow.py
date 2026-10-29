@@ -182,7 +182,8 @@ class TestResolveTransitions(unittest.TestCase):
         self.assertEqual(outbox[0], backlog[1001 - len(outbox)])
         first, last, count, lost = self.store.value[panel.Resolutions.DROPPED]["tblA"]
         self.assertEqual((first, count), (TS - 10_000, 1001 - len(outbox)))
-        self.assertEqual(last, backlog[count - 1]["at"])
+        # 缺口标到覆盖最后一条被丢事件的那次操作（同一条记录的下一条）。
+        self.assertEqual(last, backlog[count]["at"])
         self.assertEqual(lost, [], "丢的都是被同一条记录后来的操作覆盖掉的，最新状态还在")
 
         # 恢复之后：剩下的补写进去，丢掉的那段作为缺口一起写，日报标覆盖不完整。
@@ -239,6 +240,31 @@ class TestResolveTransitions(unittest.TestCase):
         gaps = [e for e in sent if e["type"] == "gap"]
         self.assertEqual(max(g["end"] for g in gaps), rebuilt["old0"]["at"])
         self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
+
+    def test_gap_for_a_superseded_drop_lasts_until_the_replacement(self):
+        """丢掉的被几天后的操作覆盖：中间那几期都依赖丢掉的状态，都要标不完整。"""
+        from xhsearch import daily_report as d
+        day = 86_400_000
+        self.reports.record_events.side_effect = RuntimeError("journal unavailable")
+        dropped = {"type": "status", "at": TS - 3 * day, "table_id": "tblA",
+                   "record_id": "x", "state": "pending", "post_key": "xhs:x"}
+        # 垫底的也都是同一条记录、一条盖一条：丢它们不丢任何最新状态，不会顺带把缺口拉长。
+        filler = [{"type": "status", "at": TS - 3 * day + 1 + i, "table_id": "tblA",
+                   "record_id": "f", "state": "processing"} for i in range(300)]
+        later = {**dropped, "at": TS - 1000, "state": "resolved"}
+        self.store.value = {panel.Resolutions.OUTBOX: [dropped, *filler, later]}
+        self.assertEqual(self.request(state="processing")[0], 200)
+        outbox = self.store.value[panel.Resolutions.OUTBOX]
+        self.assertNotIn(dropped, outbox)
+        self.assertIn(later, outbox)
+        self.assertEqual(self.store.value[panel.Resolutions.DROPPED]["tblA"][3], [])
+        recovered = mock.Mock()
+        self.resolutions.flush_journal(recovered)
+        gaps = [e for e in recovered.record_events.call_args.args[0] if e["type"] == "gap"]
+        coverage = {"type": "coverage", "at": TS - 10 * day, "table_id": "tblA"}
+        start, end = d.window_for_date((NOW - timedelta(days=1)).date())
+        middle = d.aggregate([coverage, *gaps], start, end, "tblA", "项目甲", as_of_ms=end)
+        self.assertFalse(middle["window"]["coverage_complete"])
 
     def test_rebuilt_resolution_keeps_its_time_so_a_later_negative_reopens_it(self):
         """丢掉的「已处理」之后又扫出负面：日报要和面板一样把它算回待处理。"""

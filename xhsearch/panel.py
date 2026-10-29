@@ -1479,7 +1479,7 @@ class Resolutions:
                 while len(outbox) > 1 and (
                         len(outbox) > self.OUTBOX_MAX_EVENTS
                         or len(json.dumps(outbox, ensure_ascii=False)) > self.OUTBOX_MAX_CHARS):
-                    index, superseded = _evictable(outbox)
+                    index, replaced_at = _evictable(outbox)
                     lost = outbox.pop(index)
                     if (not isinstance(lost, dict) or not isinstance(lost.get("at"), int)
                             or not lost.get("table_id")):
@@ -1487,11 +1487,14 @@ class Resolutions:
                     first, last, count, records = _dropped_span(
                         dropped.get(str(lost["table_id"]))) or (lost["at"], lost["at"], 0, [])
                     record = str(lost.get("record_id") or "")
-                    if (not superseded and record and record not in records
+                    if (replaced_at is None and record and record not in records
                             and len(records) < self.DROPPED_MAX_RECORDS):
                         records = [*records, record]
+                    # 被覆盖的：从它到覆盖它的那次操作之间，各期用的都是丢掉的那个状态，
+                    # 缺口要一直标到那里。
                     dropped[str(lost["table_id"])] = [
-                        min(first, lost["at"]), max(last, lost["at"]), count + 1, records]
+                        min(first, lost["at"]), max(last, lost["at"], replaced_at or 0),
+                        count + 1, records]
                 data[self.OUTBOX] = outbox
                 if dropped:
                     data[self.DROPPED] = dropped
@@ -1632,18 +1635,20 @@ class Resolutions:
                 self._loaded_at, self._failed_at = self._clock(), None
 
 
-def _evictable(outbox: list) -> tuple[int, bool]:
-    """待补写满了先丢哪一条：(位置, 是否被同一条记录后面的操作覆盖)。
-    被覆盖的只少一次操作计数，最终状态还在；都没有才丢最早的。最新那条从不丢。"""
-    later: set = set()
-    superseded = [False] * len(outbox)
+def _evictable(outbox: list) -> tuple[int, Optional[int]]:
+    """待补写满了先丢哪一条：(位置, 覆盖它的那次操作的时刻；没被覆盖是 None)。
+    被覆盖的最终状态还在，只是它到覆盖之间那段不确定；都没有才丢最早的。
+    最新那条从不丢。"""
+    following: dict = {}
+    replaced: list[Optional[int]] = [None] * len(outbox)
     for index in range(len(outbox) - 1, -1, -1):
         event = outbox[index]
         identity = ((event.get("table_id"), event.get("record_id"))
                     if isinstance(event, dict) else ("", index))
-        superseded[index] = identity in later
-        later.add(identity)
-    return next(((i, True) for i, flag in enumerate(superseded) if flag), (0, False))
+        replaced[index] = following.get(identity)
+        at = event.get("at") if isinstance(event, dict) else None
+        following[identity] = at if isinstance(at, int) else replaced[index]
+    return next(((i, at) for i, at in enumerate(replaced) if at is not None), (0, None))
 
 
 def _dropped_span(value: Any) -> Optional[tuple[int, int, int, list[str]]]:
