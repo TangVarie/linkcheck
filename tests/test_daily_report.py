@@ -342,6 +342,29 @@ class TestJournal(unittest.TestCase):
         self.assertIn(long_status, events)
         self.assertTrue(report(events)["window"]["coverage_complete"])
 
+    def test_recovered_chunk_spanning_the_incremental_cutoff_restores_all_its_events(self):
+        """一批里有增量读截止线之前的旧事件：缺口作废时整批都要补回来。"""
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        coverage = {"type": "coverage", "at": START - 20 * 86_400_000, "table_id": "tbl1"}
+        old = {**status("processing", START - 10 * 86_400_000, record="r1"),
+               "post_key": "xhs:one", "note": "长" * 20_000}
+        recent = {**status("processing", START + HOUR, record="r2"), "post_key": "xhs:two"}
+        journal.append([coverage, old, recent])
+        missing = next(i for i, row in enumerate(self.table.rows)
+                       if row["fields"][d.COL_KIND] == "status")
+        held = self.table.rows.pop(missing)
+        journal.read_window(START, END, "tbl1")
+        self.table.rows.append(held)
+        events = journal.read_window(START, END, "tbl1")
+        self.assertEqual({e.get("record_id") for e in events if e["type"] == "status"},
+                         {"r1", "r2"})
+        self.assertNotIn("gap", [e["type"] for e in events])
+        r = report(events + [scan(START + 2 * HOUR)])
+        self.assertTrue(r["window"]["coverage_complete"])
+        self.assertEqual(r["post_states"]["processing"], 1)
+
     def test_own_old_dated_write_is_seen_and_others_are_caught_by_the_full_reread(self):
         clock = [END / 1000]
         journal = d.Journal(self.workspace, lambda *_: self.table, "base",

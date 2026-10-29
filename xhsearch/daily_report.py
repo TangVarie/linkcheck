@@ -172,8 +172,9 @@ class Journal:
                                     (_history_id(e), e) for e in batch)
 
     def _read_kind(self, kind: str, start_ms: Optional[int], end_ms: int,
-                   table_id: str = "", whole: Optional[set] = None) -> list[dict]:
-        """`whole` 给了就把这次完整读回来的分片键放进去（历史缓存靠它清掉旧缺口）。"""
+                   table_id: str = "", whole: Optional[dict] = None) -> list[dict]:
+        """`whole` 给了就把这次完整读回来的分片记进去：键 → 这一批的**全部**事件
+        （不按时间截）。历史缓存靠它清掉旧缺口、补回整批。"""
         found = self._find()
         if not found:
             return []
@@ -228,7 +229,7 @@ class Journal:
                 events.extend(e for e in parsed if e["at"] < end_ms
                               and (start_ms is None or e["at"] >= start_ms))
                 if whole is not None:
-                    whole.add(key)
+                    whole[key] = parsed
             except (ValueError, TypeError):
                 events.append({"type": "gap", "at": max(start_ms or 0, group["at"]),
                                "table_id": group["project"], "chunk": key,
@@ -265,7 +266,7 @@ class Journal:
         now = self._wall()
         through = int(now * 1000) + 86_400_000      # 时钟偏一点的未来事件也收进来
         cached = self._history.get((kind, table_id))
-        whole: set[str] = set()
+        whole: dict[str, list[dict]] = {}
         if cached is None or now - cached["full_at"] > HISTORY_FULL_SECONDS:
             fresh = self._read_kind(kind, None, through, table_id, whole)
             cached = {"events": {}, "full_at": now}
@@ -274,10 +275,12 @@ class Journal:
             fresh = self._read_kind(kind, cached["through"] - HISTORY_OVERLAP_MS,
                                     through, table_id, whole)
         cached["events"].update((_history_id(e), e) for e in fresh)
-        # 上次没读全、记成缺口的分片，这次完整读回来了：缺口作废（比如上次正赶上
-        # 写到一半）。不清掉的话，日报要一直标「不完整」到下一次整段重读。
-        for key in whole:
+        # 完整读回来的分片整批进缓存：增量读按时间截掉的那部分旧事件也要（一批
+        # 可能跨在截止线上，比如上次没读全、记成缺口的那批，旧事件从没进过缓存）。
+        # 它之前的缺口作废，不然日报要一直标「不完整」到下一次整段重读。
+        for key, batch in whole.items():
             cached["events"].pop("gap:" + key, None)
+            cached["events"].update((_history_id(e), e) for e in batch)
         cached["through"] = through
         return [e for e in cached["events"].values() if e["at"] < end_ms]
 
