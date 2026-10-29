@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from xhsearch import analyze, protocol, providers, runner
+from xhsearch import analyze, protocol, providers, runner, summary
 from xhsearch.config import Settings
 from xhsearch.rows import Row
 
@@ -110,6 +110,23 @@ class TestScanFacts(unittest.TestCase):
                           link="https://v.douyin.com/abc123/", expanded_id="7581234567890123456").scan_event
         self.assertEqual(event["post_key"], "douyin:7581234567890123456")
         self.assertFalse(event["post_key_estimated"])
+
+    def test_expanded_shortlink_keeps_the_key_the_panel_still_uses(self):
+        """「作品ID」写进表之前，面板只认得链接那个键，运营点的处理状态带的是它。
+        扫描事件把它记成别名，日报才认得出那是同一篇。"""
+        link = "https://v.douyin.com/abc123/"
+        event = self.scan(analyze.Snapshot("douyin", comment_count=0), link=link,
+                          expanded_id="7581234567890123456").scan_event
+        self.assertEqual(event["post_alias"], summary._post_key(Row("rec1", link)))
+        self.assertNotEqual(event["post_alias"], event["post_key"])
+
+    def test_panel_and_journal_compute_the_same_post_key(self):
+        for link in ("https://www.xiaohongshu.com/explore/" + POST_ID,
+                     "https://xhslink.com/abc123"):
+            with self.subTest(link=link):
+                event = self.scan(analyze.Snapshot("xhs", comment_count=0), link=link).scan_event
+                self.assertEqual(event["post_key"], summary._post_key(Row("rec1", link)))
+                self.assertNotIn("post_alias", event)
 
     def test_same_post_shared_fetch_preserves_expanded_identity(self):
         fetched = runner._Fetched(snapshot=analyze.Snapshot("douyin", comment_count=0),

@@ -135,6 +135,44 @@ class TestReport(unittest.TestCase):
         events.append({"type": "run_end", "at": START + 1, "table_id": "tbl1", "run_id": "run1"})
         self.assertTrue(report(events)["window"]["coverage_complete"])
 
+    def test_run_closing_just_after_the_cutoff_is_closed(self):
+        """一轮 15:58 开跑、16:03 收尾：截止 16:00 的那一期它是闭合的，不是缺口。"""
+        events = [{"type": "coverage", "at": START - 2 * HOUR, "table_id": "tbl1"},
+                  {"type": "run_start", "at": END - 120_000, "table_id": "tbl1", "run_id": "run1"},
+                  {"type": "run_end", "at": END + 180_000, "table_id": "tbl1", "run_id": "run1"}]
+        r = report(events, as_of=END + HOUR)
+        self.assertTrue(r["window"]["coverage_complete"])
+        self.assertNotIn("未闭合", "".join(r["limitations"]))
+
+    def test_a_run_still_in_progress_is_not_reported_unclosed(self):
+        events = [{"type": "coverage", "at": START - 2 * HOUR, "table_id": "tbl1"},
+                  {"type": "run_start", "at": START + HOUR, "table_id": "tbl1", "run_id": "run1"}]
+        self.assertTrue(report(events, as_of=START + HOUR + 600_000)["window"]["coverage_complete"])
+        late = report(events, as_of=START + HOUR + d.RUN_GRACE_MS)
+        self.assertFalse(late["window"]["coverage_complete"])
+
+    def test_gap_spanning_days_is_split_so_every_window_sees_it(self):
+        first, last = START - 2 * 86_400_000 + HOUR, END - HOUR
+        gaps = d.gap_events("tbl1", first, last, "积压")
+        self.assertEqual([(g["at"], g["end"]) for g in gaps], [
+            (first, START - 86_400_000 - 1), (START - 86_400_000, START - 1), (START, last)])
+        coverage = {"type": "coverage", "at": START - 3 * 86_400_000, "table_id": "tbl1"}
+        for day in ("2026-10-26", "2026-10-27", "2026-10-28"):
+            start, end = d.window_for_date(day)
+            with self.subTest(day=day):
+                r = d.aggregate([coverage, *gaps], start, end, "tbl1", "途鸽", as_of_ms=end)
+                self.assertFalse(r["window"]["coverage_complete"])
+        start, end = d.window_for_date("2026-10-29")
+        r = d.aggregate([coverage, *gaps], start, end, "tbl1", "途鸽", as_of_ms=end)
+        self.assertTrue(r["window"]["coverage_complete"])
+
+    def test_status_clicked_on_the_short_link_key_applies_after_expansion(self):
+        """面板点的时候「作品ID」还没写进表，状态带的是链接那个键。"""
+        r = report([scan(post="xhs:real-id", post_alias="xhs:url:abc"),
+                    {**status("resolved"), "post_key": "xhs:url:abc"}])
+        self.assertEqual(r["post_states"]["resolved"], 1)
+        self.assertEqual(r["post_states"]["pending"], 0)
+
     def test_as_of_limits_scans_and_statuses_in_preview(self):
         r = report([scan(), status("resolved", START + HOUR),
                     scan(START + 2 * HOUR, post="xhs:future")], as_of=START + HOUR)
@@ -247,6 +285,49 @@ class TestJournal(unittest.TestCase):
         events = self.journal.read_window(START, END, "tbl1")
         self.assertEqual(len(events), 2)
         self.assertEqual(report(events)["post_states"]["processing"], 1)
+
+    def test_window_sees_a_run_that_closes_just_after_the_cutoff(self):
+        self.journal.append([
+            {"type": "coverage", "at": START - 2 * HOUR, "table_id": "tbl1"},
+            {"type": "run_start", "at": END - 120_000, "table_id": "tbl1", "run_id": "run1"},
+            {"type": "run_end", "at": END + 180_000, "table_id": "tbl1", "run_id": "run1"}])
+        events = self.journal.read_window(START, END, "tbl1")
+        self.assertTrue(report(events, as_of=END + HOUR)["window"]["coverage_complete"])
+
+    def status_reads(self):
+        kind = {"field_name": d.COL_KIND, "operator": "is", "value": ["status"]}
+        return [spec for spec in self.table.searches if kind in spec["conditions"]]
+
+    def test_status_history_is_read_incrementally_after_the_first_full_read(self):
+        """几个月后每次刷新都整段重读几千条点击记录，还拿着读锁让别人一起等。"""
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        old = status("processing", START - 30 * 86_400_000)
+        journal.append([old])
+        journal.read_window(START, END, "tbl1")
+        self.assertFalse(any(c["field_name"] == d.COL_END
+                             for c in self.status_reads()[0]["conditions"]))
+        self.table.searches.clear()
+        events = journal.read_window(START, END, "tbl1")
+        self.assertEqual(len(self.status_reads()), 1)
+        self.assertTrue(any(c["field_name"] == d.COL_END
+                            for c in self.status_reads()[0]["conditions"]))
+        self.assertIn(old, events)
+
+    def test_own_old_dated_write_is_seen_and_others_are_caught_by_the_full_reread(self):
+        clock = [END / 1000]
+        journal = d.Journal(self.workspace, lambda *_: self.table, "base",
+                            log=lambda _: None, wall=lambda: clock[0])
+        other = d.Journal(self.workspace, lambda *_: self.table, "base", log=lambda _: None)
+        journal.read_window(START, END, "tbl1")
+        mine = status("resolved", START - 10 * 86_400_000, record="mine")
+        journal.append([mine])                      # 面板补写好几天前的状态
+        self.assertIn(mine, journal.read_window(START, END, "tbl1"))
+        theirs = status("resolved", START - 10 * 86_400_000, record="theirs")
+        other.append([theirs])
+        clock[0] += d.HISTORY_FULL_SECONDS + 1
+        self.assertIn(theirs, journal.read_window(START, END, "tbl1"))
 
     def test_missing_create_response_is_not_claimed_as_written(self):
         self.table.batch_create = lambda *a, **kw: []

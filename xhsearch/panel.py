@@ -1215,17 +1215,14 @@ class DailyReports:
             table_id: str = "", with_events: bool = False):
         from . import daily_report
         now = self._wall()
-        tz = timezone(timedelta(hours=8))
-        today = datetime.fromtimestamp(now, tz).date()
+        today = datetime.fromtimestamp(now, daily_report.SHANGHAI).date()
         try:
             day = datetime.strptime(date, "%Y-%m-%d").date() if date else today
         except ValueError as exc:
             raise ValueError("date 请使用 YYYY-MM-DD，表示日报截止日") from exc
         if not today - timedelta(days=90) <= day <= today + timedelta(days=1):
             raise ValueError("可查看最近 90 天及当前周期的日报")
-        end = datetime(day.year, day.month, day.day, 16, tzinfo=tz)
-        start_ms = int((end - timedelta(days=1)).timestamp() * 1000)
-        end_ms = int(end.timestamp() * 1000)
+        start_ms, end_ms = daily_report.window_for_date(day)
         if start_ms >= int(now * 1000):
             raise ValueError("这个日报周期还未开始；请在北京时间 16 点后查看下一期")
         if overview is None:
@@ -1313,6 +1310,13 @@ class Resolutions:
     MAX_ENTRIES = 500
     RETRY_SECONDS = 60.0
     OUTBOX = "__journal_outbox__"
+    # 留痕一直写不进去时，待补写的事件不能无限攒（整份在一格文本里）。超了丢
+    # **最早的**，丢了多少、哪段时间记在 DROPPED 里，补写时作为留痕缺口一起写进去，
+    # 那几期日报会标「覆盖不完整」。不能反过来拦住运营点「已处理」——显示状态
+    # 是运营的工作，日报留痕只是记录，记录坏了不该让工作停下来。
+    DROPPED = "__journal_outbox_dropped__"
+    OUTBOX_MAX_EVENTS = 1000
+    OUTBOX_MAX_CHARS = 20_000
 
     def __init__(self, projects: Projects, *, log: Callable[[str], None] = print,
                  clock: Callable[[], float] = time.monotonic,
@@ -1464,12 +1468,23 @@ class Resolutions:
             def change(current):
                 data = self._pruned(current, at, room=int(state != "pending"))
                 outbox = list(data.get(self.OUTBOX) or [])
-                if len(outbox) >= 1000:
-                    raise ValueError("日报留痕积压，待恢复同步后再操作")
                 outbox.append(event)
-                if len(json.dumps(outbox, ensure_ascii=False)) > 20_000:
-                    raise ValueError("日报留痕积压，待恢复同步后再操作")
+                dropped = dict(data.get(self.DROPPED) or {})
+                while len(outbox) > 1 and (
+                        len(outbox) > self.OUTBOX_MAX_EVENTS
+                        or len(json.dumps(outbox, ensure_ascii=False)) > self.OUTBOX_MAX_CHARS):
+                    lost = outbox.pop(0)
+                    if (not isinstance(lost, dict) or not isinstance(lost.get("at"), int)
+                            or not lost.get("table_id")):
+                        continue
+                    span = dropped.get(str(lost["table_id"]))
+                    first, last, count = span if isinstance(span, list) and len(span) == 3 else (
+                        lost["at"], lost["at"], 0)
+                    dropped[str(lost["table_id"])] = [
+                        min(first, lost["at"]), max(last, lost["at"]), count + 1]
                 data[self.OUTBOX] = outbox
+                if dropped:
+                    data[self.DROPPED] = dropped
                 data.pop(key, None)
                 if state != "pending":
                     data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
@@ -1494,12 +1509,21 @@ class Resolutions:
             return self._flush_journal(reports)
 
     def _flush_journal(self, reports) -> str:
+        from . import daily_report
         with self._lock:
             events = list(self._data.get(self.OUTBOX) or [])
-        if not events:
+            dropped = dict(self._data.get(self.DROPPED) or {})
+        gaps = [gap for table_id, span in sorted(dropped.items())
+                if table_id and isinstance(span, list) and len(span) == 3
+                for gap in daily_report.gap_events(
+                    table_id, span[0], span[1],
+                    f"日报留痕积压过久，最早的 {span[2]} 条处理状态记录已丢弃")]
+        if not events and not gaps:
+            # 上一次留下的「待同步」提示到这里已经不成立了（比如之前读不到处理状态）。
+            reports.warning = ""
             return ""
         try:
-            reports.record_events(events)
+            reports.record_events(events + gaps)
             def acknowledge(current):
                 data = dict(current) if isinstance(current, dict) else {}
                 pending = [e for e in (data.get(self.OUTBOX) or []) if e not in events]
@@ -1507,10 +1531,16 @@ class Resolutions:
                     data[self.OUTBOX] = pending
                 else:
                     data.pop(self.OUTBOX, None)
+                if data.get(self.DROPPED) == dropped:
+                    data.pop(self.DROPPED, None)
                 return data
             self._commit(acknowledge)
         except Exception as exc:                                # noqa: BLE001
             warning = "状态已保存，日报留痕待同步；系统会自动重试。"
+            lost = sum(span[2] for span in dropped.values()
+                       if isinstance(span, list) and len(span) == 3)
+            if lost:
+                warning += f"积压过久，最早的 {lost} 条处理状态记录已丢弃，相关日报会标覆盖不完整。"
             reports.warning = warning
             self.log(f"⚠ 日报状态留痕待同步：{exc}")
             return warning
@@ -1542,6 +1572,8 @@ class Resolutions:
         data = dict(kept[-limit:]) if limit > 0 else {}
         if isinstance(current.get(self.OUTBOX), list) and current[self.OUTBOX]:
             data[self.OUTBOX] = list(current[self.OUTBOX])
+        if isinstance(current.get(self.DROPPED), dict) and current[self.DROPPED]:
+            data[self.DROPPED] = dict(current[self.DROPPED])
         return data
 
     def _commit(self, change) -> None:
@@ -1856,8 +1888,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not isinstance(force, bool):
                 raise ValueError("force 必须是布尔值")
             overview, _, _ = self.deps.cache.view()
+            # 日报快照自己套「已解决」，要原样那份；挑预警标题要套过的那份，
+            # 处理完收起来的帖子不再当本期问题送给模型。
+            shown = overview
+            if overview is not None and self.deps.resolutions is not None:
+                shown = summary.apply_resolutions(
+                    overview, self.deps.resolutions.snapshot(),
+                    self.deps.settings or Settings())
             result = self.deps.report_drafts.generate(
-                overview, date=date, table_id=table_id, force=force)
+                overview, date=date, table_id=table_id, force=force, shown=shown)
             return self._send_json(200, result)
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
@@ -2496,7 +2535,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     if reports is not None:
         reports.resolutions = resolutions
     report_drafts = (report_ai_mod.ReportDrafts(
-        config.deepseek_api_key, reports, timeout=config.deepseek_timeout)
+        config.deepseek_api_key, reports, timeout=config.deepseek_timeout,
+        alert_reason=resolved.negative_status.found)
         if reports is not None and config.deepseek_api_key else None)
     cache = Cache(reconciling(produce, resolutions), config.cache_seconds,
                   idle_seconds=config.idle_minutes * 60 or None)

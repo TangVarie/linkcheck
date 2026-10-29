@@ -165,6 +165,48 @@ class TestResolveTransitions(unittest.TestCase):
         self.assertEqual(self.store.value["tblA/r"]["state"], "processing")
         self.assertEqual(self.store.value[panel.Resolutions.OUTBOX][0]["state"], "processing")
 
+    def test_full_outbox_drops_the_oldest_instead_of_blocking_work(self):
+        """留痕一直写不进去、待补写攒满了：运营照样能点；丢最早的，记成留痕缺口。"""
+        self.reports.record_events.side_effect = RuntimeError("journal unavailable")
+        backlog = [{"type": "status", "at": TS - 10_000 + i, "table_id": "tblA",
+                    "record_id": "old", "state": "processing"} for i in range(1000)]
+        self.store.value = {panel.Resolutions.OUTBOX: copy.deepcopy(backlog)}
+        status, body = self.request(state="processing")
+        self.assertEqual(status, 200)
+        self.assertIn("已丢弃", body["warning"])
+        self.assertEqual(self.store.value["tblA/r"]["state"], "processing")
+        outbox = self.store.value[panel.Resolutions.OUTBOX]
+        self.assertLessEqual(len(json.dumps(outbox, ensure_ascii=False)),
+                             panel.Resolutions.OUTBOX_MAX_CHARS)
+        self.assertEqual(outbox[-1]["record_id"], "r")
+        self.assertEqual(outbox[0], backlog[1001 - len(outbox)])
+        first, last, count = self.store.value[panel.Resolutions.DROPPED]["tblA"]
+        self.assertEqual((first, count), (TS - 10_000, 1001 - len(outbox)))
+        self.assertEqual(last, backlog[count - 1]["at"])
+
+        # 恢复之后：剩下的补写进去，丢掉的那段作为缺口一起写，日报标覆盖不完整。
+        recovered = mock.Mock()
+        self.assertEqual(self.resolutions.flush_journal(recovered), "")
+        sent = recovered.record_events.call_args.args[0]
+        gaps = [e for e in sent if e["type"] == "gap"]
+        self.assertEqual([(g["at"], g["end"], g["table_id"]) for g in gaps],
+                         [(first, last, "tblA")])
+        self.assertEqual(len(sent), len(outbox) + 1)
+        self.assertNotIn(panel.Resolutions.OUTBOX, self.store.value)
+        self.assertNotIn(panel.Resolutions.DROPPED, self.store.value)
+
+    def test_dropped_counter_survives_other_edits(self):
+        self.store.value = {panel.Resolutions.DROPPED: {"tblA": [TS - 5, TS - 1, 3]}}
+        self.resolutions.mark("tblA", "r", ["有负面"], TS)
+        self.resolutions.unmark("tblA", "r")
+        self.assertEqual(self.store.value[panel.Resolutions.DROPPED], {"tblA": [TS - 5, TS - 1, 3]})
+        self.assertNotIn(panel.Resolutions.DROPPED, self.resolutions.snapshot())
+
+    def test_empty_outbox_clears_a_stale_sync_warning(self):
+        reports = SimpleNamespace(warning="处理状态暂时读取失败，待补写记录可能尚未同步；日报可能不完整。")
+        self.assertEqual(self.resolutions.flush_journal(reports), "")
+        self.assertEqual(reports.warning, "")
+
     def test_store_failure_does_not_journal_uncommitted_state(self):
         with mock.patch.object(self.store, "update_json", side_effect=RuntimeError("unavailable")):
             self.assertEqual(self.request(state="processing")[0], 500)

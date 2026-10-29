@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from xhsearch import panel, report_ai
+from xhsearch import panel, report_ai, summary
 
 
 def config():
@@ -23,18 +23,21 @@ class FakeDrafts:
         self.error = error
         self.calls = []
 
-    def generate(self, overview, *, date="", table_id="", force=False):
-        self.calls.append({"date": date, "table_id": table_id, "force": force})
+    def generate(self, overview, *, date="", table_id="", force=False, shown=None):
+        self.calls.append({"date": date, "table_id": table_id, "force": force,
+                           "overview": overview, "shown": shown})
         if self.error:
             raise self.error
         return self.result
 
 
-def handler(*, drafts, reports=object(), body=None, authed=True, csrf=True):
+def handler(*, drafts, reports=object(), body=None, authed=True, csrf=True,
+            overview=None, resolutions=None):
+    snapshot = object() if overview is None else overview
     deps = SimpleNamespace(
         reports=reports, report_drafts=drafts,
-        cache=SimpleNamespace(view=lambda: (object(), "", 0.0)),
-        config=config())
+        cache=SimpleNamespace(view=lambda: (snapshot, "", 0.0)),
+        config=config(), resolutions=resolutions, settings=None)
     h = object.__new__(panel.PanelHandler)
     h.server = SimpleNamespace(deps=deps)
     h._send_json = lambda status, payload: (status, payload)
@@ -70,6 +73,25 @@ class TestReportAIRoute(unittest.TestCase):
         self.assertEqual(drafts.calls[0]["date"], "2026-10-28")
         self.assertFalse(drafts.calls[0]["force"])
         self.assertEqual(payload["features"], "围绕露营装备。")
+
+    def test_titles_are_picked_from_the_resolution_applied_overview(self):
+        """日报快照拿原样那份（它自己套「已解决」），挑标题拿套过的那份。"""
+        todo = summary.TodoRow(record_id="rec1", project="途鸽", record_url="",
+                               link_cell="", label="已处理的帖子", table_id="tbl1",
+                               reasons=["有负面"], checked_at_ms=5)
+        overview = summary.Overview(projects=[summary.ProjectSnapshot(
+            label="途鸽", app_token="app", table_id="tbl1", todos=[todo])])
+        resolutions = SimpleNamespace(snapshot=lambda: {
+            summary.resolution_key("tbl1", "rec1"): {
+                "reasons": ["有负面"], "seen": 5, "at": 10}})
+        drafts = FakeDrafts()
+        status, _ = handler(drafts=drafts, overview=overview, resolutions=resolutions,
+                            body={"date": "2026-10-28", "table_id": "tbl1"})._report_ai_action()
+        self.assertEqual(status, 200)
+        call = drafts.calls[0]
+        self.assertIs(call["overview"], overview)
+        self.assertEqual(call["shown"].projects[0].todos, [])
+        self.assertEqual([t.label for t in call["shown"].resolved], ["已处理的帖子"])
 
     def test_force_must_be_a_real_boolean(self):
         drafts = FakeDrafts()

@@ -13,8 +13,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
+
+from . import daily_report
+from .config import Settings
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"
@@ -55,7 +58,6 @@ _RE_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _RE_PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _RE_HANDLE = re.compile(r"@[\w.\-\u4e00-\u9fff]{1,30}")
 _RE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-SHANGHAI = timezone(timedelta(hours=8))
 
 
 def _clean_text(value: Any, limit: int) -> str:
@@ -73,14 +75,18 @@ def _clean_text(value: Any, limit: int) -> str:
 def _stamp(ms: Any) -> str:
     """给模型看的是人能读的时间；毫秒时间戳只会浪费 token 并诱使它换算。"""
     try:
-        value = int(ms)
-        return datetime.fromtimestamp(value / 1000, SHANGHAI).strftime("%m月%d日 %H:%M")
+        return daily_report._stamp(int(ms))
     except (TypeError, ValueError, OverflowError, OSError):
         return "—"
 
 
-def alert_titles_for(overview, table_id: str, limit: int = 20) -> list[str]:
-    """**当前**有问题的帖子标题。运营写的内容标题，不含作者或评论者身份。
+def alert_titles_for(overview, table_id: str, reason: str,
+                     limit: int = 20) -> list[str]:
+    """**当前**还没处理完的负面预警帖子标题。运营写的内容标题，不含作者或评论者身份。
+
+    只认带 `reason`（「有负面」）的待办：风控、失效、卡住这些不是「预警帖子」，
+    混进来模型会把「链接失效」也归纳成内容特征。`overview` 要先套过「已解决」
+    （summary.apply_resolutions），处理完收起来的帖子不再当本期问题。
 
     ⚠️ 它读的是此刻的待办，所以只对**当前窗口**成立。历史窗口拿它当证据，
     等于把今天的问题写成那一天的「主要内容特征」——那正是这个项目一直
@@ -91,6 +97,8 @@ def alert_titles_for(overview, table_id: str, limit: int = 20) -> list[str]:
         if project.table_id != table_id:
             continue
         for todo in list(project.todos) + list(getattr(project, "adhoc_todos", []) or []):
+            if reason not in (getattr(todo, "reasons", None) or []):
+                continue
             title = _clean_text(getattr(todo, "label", ""), 60)
             if title and title not in titles:
                 titles.append(title)
@@ -191,8 +199,9 @@ def normalize_draft(value: Any, evidence: dict) -> dict:
     if len(features) > MAX_FEATURES_CHARS:
         # 模型偶尔超长。截在半句上比整段丢掉好，但要让人看得见被截了。
         features = features[:MAX_FEATURES_CHARS].rstrip("，,、；; ") + "…"
+    # 只拿评论和命中词核验。标题是运营给自家帖子写的，自家品牌、对比测评里
+    # 提到的名字都在里面；只出现在标题里的名字不能算「评论里冒出来的竞品」。
     texts = [item["content"] for item in evidence["comments"]]
-    texts.extend(evidence.get("titles") or [])
     texts.extend(str(item.get("word") or "") for item in evidence["keywords"]
                  if isinstance(item, dict))
     names = value.get("competitors") or []
@@ -218,24 +227,34 @@ class ReportDrafts:
 
     def __init__(self, api_key: str, reports, *, timeout: float = 20.0,
                  opener: Optional[Callable] = None,
-                 wall: Callable[[], float] = time.time):
+                 wall: Callable[[], float] = time.time,
+                 alert_reason: str = Settings().negative_status.found):
         self.api_key = api_key.strip()
         self.reports = reports
         self.timeout = float(timeout)
+        self.alert_reason = alert_reason
         self._opener = opener or urllib.request.urlopen
         self._wall = wall
         self._cache: dict[str, tuple[float, dict]] = {}
-        self._locks: dict[str, threading.Lock] = {}
+        # key -> [锁, 在用的请求数]。没人用了就删，不按条数淘汰：按条数淘汰会
+        # 扔掉别人正拿着的锁，同一份证据的下一个请求拿到新锁，就并发计费了。
+        self._locks: dict[str, list] = {}
         self._force_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def _key_lock(self, key: str) -> threading.Lock:
+    @contextmanager
+    def _key_lock(self, key: str):
         with self._lock:
-            if key not in self._locks:
-                if len(self._locks) >= 32:
-                    self._locks.pop(next(iter(self._locks)))
-                self._locks[key] = threading.Lock()
-            return self._locks[key]
+            entry = self._locks.setdefault(key, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._lock:
+                entry[1] -= 1
+                if not entry[1]:
+                    self._locks.pop(key, None)
 
     def _call(self, messages: list[dict]) -> dict:
         body = json.dumps({
@@ -268,7 +287,9 @@ class ReportDrafts:
             raise ReportAIError("DeepSeek 返回了无法解析的草稿") from exc
 
     def generate(self, overview, *, date: str, table_id: str,
-                 force: bool = False) -> dict:
+                 force: bool = False, shown=None) -> dict:
+        """`overview` 是面板缓存里的原样（日报快照自己套「已解决」）；`shown`
+        是套过「已解决」的那份，只用来挑预警帖子标题，不给就用 `overview`。"""
         if not self.api_key:
             return {"status": "unavailable", "error": "未配置 DEEPSEEK_API_KEY",
                     "features": "", "competitors": []}
@@ -284,7 +305,9 @@ class ReportDrafts:
         report = reports[0]
         # 历史窗口不拿「此刻的待办标题」当证据；那一刻的标题没被留痕，
         # 拿现在的顶上去就是把今天写成那一天。
-        titles = alert_titles_for(overview, table_id) if is_current_window(report) else []
+        titles = (alert_titles_for(overview if shown is None else shown,
+                                   table_id, self.alert_reason)
+                  if is_current_window(report) else [])
         evidence = evidence_for_prompt(events, report, titles)
         if not evidence["comments"] and not evidence["titles"]:
             return {"status": "insufficient_evidence",
@@ -293,13 +316,17 @@ class ReportDrafts:
                               if not is_current_window(report) else
                               "本期没有可分析的帖子标题或预警评论，未调用 AI；人工仍可补充。"),
                     "features": "", "competitors": [], "evidence_count": 0}
+        messages = prompt_messages(evidence)
+        # 指纹只认**真正送去模型的内容**。证据里的 window 带着 as_of_ms，当期
+        # 每分钟都在往前走；把它算进来，每次打开日报都是「新证据」、都要计费。
         fingerprint = hashlib.sha256(json.dumps(
-            evidence, ensure_ascii=False, sort_keys=True,
+            [messages, evidence["sampled"]], ensure_ascii=False,
             separators=(",", ":")).encode("utf-8")).hexdigest()
         cache_key = f"{table_id}:{date}:{fingerprint}"
+        started = self._wall()
         with self._lock:
             cached = self._cache.get(cache_key)
-            if not force and cached and self._wall() - cached[0] < CACHE_SECONDS:
+            if not force and cached and started - cached[0] < CACHE_SECONDS:
                 return {**cached[1], "cached": True}
         # 「重新生成」的服务端冷却：面板口令是运营共用的，浏览器上的确认框
         # 挡不住直接打接口，更不能让连点变成连续计费。缓存里已有结果就先给结果；
@@ -308,7 +335,7 @@ class ReportDrafts:
         if force:
             with self._lock:
                 last = self._force_at.get(throttle_key)
-                wait = (FORCE_COOLDOWN_SECONDS - (self._wall() - last)
+                wait = (FORCE_COOLDOWN_SECONDS - (started - last)
                         if last is not None else 0.0)
                 if wait > 0:
                     cached = self._cache.get(cache_key)
@@ -317,18 +344,22 @@ class ReportDrafts:
                                 "notice": "刚刚生成过，这是同一份证据的最近结果，没有再次计费。"}
                     return {"status": "throttled", "features": "", "competitors": [],
                             "error": f"刚刚请求过，{int(wait) + 1} 秒后可以再试；期间不重复请求模型。"}
-        lock = self._key_lock(cache_key)
-        with lock:
+                # 检查和占位在同一把锁里：两个同时到的 force 只有一个能过。
+                self._force_at[throttle_key] = started
+        with self._key_lock(cache_key):
             with self._lock:
                 cached = self._cache.get(cache_key)
-                if not force and cached and self._wall() - cached[0] < CACHE_SECONDS:
+                if cached and (cached[0] >= started or (
+                        not force and started - cached[0] < CACHE_SECONDS)):
+                    # 排队等锁的时候，前一个请求已经把同一份证据生成好了
+                    #（force 也一样：它要的「重新生成」刚刚发生过）。
                     return {**cached[1], "cached": True}
                 # 冷却从**这一次真实外呼**开始算，不是从「点重新生成」开始算：
                 # 自动生成完立刻连点，同样要挡住。
                 self._force_at[throttle_key] = self._wall()
                 while len(self._force_at) > 64:
                     self._force_at.pop(next(iter(self._force_at)))
-            parsed = self._call(prompt_messages(evidence))
+            parsed = self._call(messages)
             draft = normalize_draft(parsed, evidence)
             basis = [name for name, present in (("预警帖子标题", bool(evidence["titles"])),
                                                 ("第一页预警评论", bool(evidence["comments"])))
