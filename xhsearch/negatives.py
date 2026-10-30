@@ -60,7 +60,7 @@ def comment_key(comment: CommentView) -> str:
     return "txt:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def resolution_cut(resolved: Any, table_id: str, record_id: str, post_key: str,
+def resolution_cut(resolved: Any, table_id: str, record_id: str, post_key: Any,
                    found_label: str) -> Optional[int]:
     """面板上这一行点过「已处理」（而且当时挂着「有负面」）的话，那一刻看到的是
     哪一次检查的结果（毫秒）；那一次以前扫到的负面评论都算处理过了。没点过 → None。
@@ -70,7 +70,8 @@ def resolution_cut(resolved: Any, table_id: str, record_id: str, post_key: str,
     entry = resolved.get(f"{table_id}/{record_id}")
     if not isinstance(entry, dict) or entry.get("state", "resolved") != "resolved":
         return None
-    if entry.get("post_key") and entry["post_key"] != post_key:
+    keys = {post_key} if isinstance(post_key, str) else set(post_key)
+    if entry.get("post_key") and entry["post_key"] not in keys:
         return None                 # 链接换过了，点的是上一篇
     reasons = entry.get("reasons")
     if not isinstance(reasons, list) or found_label not in reasons:
@@ -100,14 +101,16 @@ def _valid_item(item: Any) -> bool:
 
 
 def advance(memory: Optional[dict], *, post_key: str, hits: list[KeywordHit],
-            now_ms: int, cut_ms: Optional[int]) -> tuple[list[Pending], dict]:
+            now_ms: int, cut_ms: Optional[int],
+            aliases: Any = ()) -> tuple[list[Pending], dict]:
     """一行这一轮的负面命中 + 之前攒的 → （还没处理的，要存回去的那份）。**纯函数。**
 
     排序：这一轮看到的按页面顺序在前，之前扫到、这一轮没再看到的按扫到的时刻
     从新到旧排在后面。
     """
     items: dict[str, dict] = {}
-    if isinstance(memory, dict) and memory.get("p") == post_key:
+    # aliases：同一篇的另一个键（短链展开前按链接文字算的，见 rows.post_aliases）。
+    if isinstance(memory, dict) and (memory.get("p") == post_key or memory.get("p") in aliases):
         for item in memory.get("i") or []:
             if _valid_item(item):
                 items[item["k"]] = dict(item)
@@ -208,12 +211,13 @@ class TableLedger:
         self._lock = threading.Lock()
 
     def apply(self, record_id: str, post_key: str, hits: list[KeywordHit],
-              now_ms: int) -> tuple[list[Pending], int]:
+              now_ms: int, aliases: Any = ()) -> tuple[list[Pending], int]:
         """返回（还没处理的, 这一轮看到却已经处理过的条数）。"""
-        cut = resolution_cut(self.resolved, self.table_id, record_id, post_key, self.found_label)
+        keys = {post_key, *aliases}
+        cut = resolution_cut(self.resolved, self.table_id, record_id, keys, self.found_label)
         with self._lock:
             pending, stored = advance(self.rows.get(record_id), post_key=post_key,
-                                      hits=hits, now_ms=now_ms, cut_ms=cut)
+                                      hits=hits, now_ms=now_ms, cut_ms=cut, aliases=keys)
             if stored["i"]:
                 self.rows[record_id] = stored
             else:

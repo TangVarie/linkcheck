@@ -27,6 +27,7 @@ from . import negatives as negatives_mod
 from .config import Budget, Display, Settings
 from .rows import (Row, ToolCall, plan_calls, estimate_yuan, id_form,
                    format_resolved_id, share_key)
+from .rows import post_aliases as rows_post_aliases
 from .rows import post_key as rows_post_key
 # 状态常量定义在 rows.py（选行也要认它），这里原样再导出，调用方照旧写 runner.STATUS_*。
 from .rows import (  # noqa: F401
@@ -1182,7 +1183,7 @@ def refresh(
         if touch_tags and verdict.negative_checked and negatives is not None:
             pending, handled = negatives.apply(
                 row.record_id, rows_post_key(row), verdict.negative_hits,
-                int(checked_at.timestamp() * 1000))
+                int(checked_at.timestamp() * 1000), aliases=rows_post_aliases(row))
             open_keys = {p.key for p in pending}
             journal_hits = [h for h in verdict.negative_hits
                             if negatives_mod.comment_key(h.comment) in open_keys]

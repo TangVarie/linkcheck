@@ -513,6 +513,18 @@ def post_key(row: "Row") -> str:
         (parsed.url or row.link_cell).encode("utf-8")).hexdigest()
 
 
+def post_aliases(row: "Row") -> set[str]:
+    """这一行这一篇帖子可能被记成的键：现在的（post_key），加上「作品ID」还没写进表
+    时按链接文字算的那个。短链第一次展开那一轮记下的东西用的是后者，下一轮就是前者；
+    运营在面板上点的也可能是展开之前的那个。链接换成别的帖子，两个都对不上。"""
+    keys = {post_key(row)}
+    link = parse(row.link_cell)
+    if not link.content_id and (link.url or row.link_cell):
+        keys.add(f"{link.platform}:url:" + hashlib.sha256(
+            (link.url or row.link_cell).encode("utf-8")).hexdigest())
+    return keys
+
+
 def id_form(arguments: dict[str, Any], content_id: str,
             platform: str = "douyin") -> dict[str, Any]:
     """把一条调用的参数从「链接形态」改写成「ID 形态」。
@@ -686,14 +698,16 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
         calls = plan_calls(row, settings, now)
         if not calls:
             continue
-        key = share_key(calls)
-        if key in seen:
-            continue
-        seen.add(key)
         interval = row.refresh_interval_hours(settings, now)
         published_ms = row.schedule_publish_ms(settings, now)
         if interval is None or published_ms is None:
             continue
+        # 先确认这一行真的会被刷，再占同一篇的名额：同一条链接登记两行、一行已归档，
+        # 归档那行排在前面时不能把还在查的那行挤掉。
+        key = share_key(calls)
+        if key in seen:
+            continue
+        seen.add(key)
         published = datetime.fromtimestamp(published_ms / 1000, timezone.utc)
         backoff = row.gone_backoff_hours(settings)
         updated = (None if row.last_updated_ms is None

@@ -254,6 +254,29 @@ class TestNegativeLedger(unittest.TestCase):
         self.assertNotIn("rec0", payload["rows"], "先丢最久没动的行")
         self.assertIn("rec399", payload["rows"])
 
+    def test_a_short_link_resolved_to_an_id_keeps_its_memory_and_resolution(self):
+        short = "https://v.douyin.com/abc123/"
+        before = Row("rec1", short)
+        after = Row("rec1", short, resolved_id_cell="7448118827402972455 ← " + short)
+        self.assertNotEqual(rows.post_key(before), rows.post_key(after))
+        self.assertEqual(rows.post_aliases(after), {rows.post_key(before), rows.post_key(after)})
+        ledger = negatives.TableLedger("tbl1", {}, {}, Settings())
+        ledger.apply("rec1", rows.post_key(before), [hit("踩雷", "a")], NOW_MS,
+                     aliases=rows.post_aliases(before))
+        pending, _ = ledger.apply("rec1", rows.post_key(after), [], NOW_MS + HOUR_MS,
+                                  aliases=rows.post_aliases(after))
+        self.assertEqual([p.key for p in pending], ["id:a"], "展开成 ID 之后还是同一篇")
+        found = Settings().negative_status.found
+        ledger.resolved["tbl1/rec1"] = {"reasons": [found], "seen": NOW_MS + HOUR_MS,
+                                        "post_key": rows.post_key(before)}
+        pending, _ = ledger.apply("rec1", rows.post_key(after), [], NOW_MS + 2 * HOUR_MS,
+                                  aliases=rows.post_aliases(after))
+        self.assertEqual(pending, [], "展开之前点的「已处理」照样认")
+        other = Row("rec1", "https://v.douyin.com/zzz999/")
+        pending, _ = ledger.apply("rec1", rows.post_key(other), [], NOW_MS + 3 * HOUR_MS,
+                                  aliases=rows.post_aliases(other))
+        self.assertEqual(pending, [])
+
     def test_resolution_cut_reads_what_the_operator_saw(self):
         found = Settings().negative_status.found
         resolved = {"tbl1/rec1": {"reasons": [found], "seen": 111, "at": 222, "post_key": "xhs:p"}}
@@ -324,6 +347,22 @@ class TestLedgerInRunner(unittest.TestCase):
         self.assertEqual(summary.negative_digest_count(fourth[self.f.negative_digest],
                                                        self.settings), (1, False))
         self.assertEqual(self.journaled, ["b"])
+
+    def test_runner_hands_the_link_alias_to_the_ledger(self):
+        short = "https://v.douyin.com/abc123/"
+        before = Row("rec1", short, negative_keywords=["踩雷"],
+                     publish_time_ms=NOW_MS - 86_400_000)
+        self.ledger.rows["rec1"] = {"p": rows.post_key(before), "i": [
+            {"k": "id:a", "t": NOW_MS - HOUR_MS, "w": "踩雷", "c": "踩雷了"}]}
+        after = Row("rec1", short, negative_keywords=["踩雷"],
+                    publish_time_ms=NOW_MS - 86_400_000,
+                    resolved_id_cell="7448118827402972455 ← " + short)
+        snap = analyze.Snapshot("douyin", comment_count=3, comments=[comment("好用", "ok")])
+        with mock.patch.object(runner, "_fetch_one", return_value=runner._Fetched(snapshot=snap)):
+            fields = runner.refresh([after], "unused-test-key", self.settings, forced=True,
+                                    now=NOW, clock=lambda: NOW,
+                                    negatives=self.ledger).outcomes[0].fields
+        self.assertEqual(fields[self.f.negative_status], self.settings.negative_status.found)
 
     def test_without_a_ledger_the_old_behaviour_is_unchanged(self):
         self.ledger = None
@@ -412,6 +451,16 @@ class TestForecast(unittest.TestCase):
         self.assertEqual(few.latest_yuan, 0)
         gone = rows.forecast(self.rows(on, days_old=40), on, NOW, keys={"tikhub": "k"})
         self.assertEqual((gone.refreshes, gone.yuan), (0, 0))
+
+    def test_an_archived_duplicate_does_not_hide_the_active_registration(self):
+        on = Settings()
+        archived = self.rows(on, days_old=40)
+        active = self.rows(on, days_old=1)
+        active[0].record_id = "rec2"
+        forward = rows.forecast(archived + active, on, NOW, keys={"tikhub": "k"})
+        backward = rows.forecast(active + archived, on, NOW, keys={"tikhub": "k"})
+        self.assertGreater(forward.refreshes, 0)
+        self.assertEqual(forward.refreshes, backward.refreshes)
 
     def test_an_invalid_post_is_not_charged_past_the_archive_line(self):
         on = Settings()
