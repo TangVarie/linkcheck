@@ -237,12 +237,22 @@ class TestNegativeLedger(unittest.TestCase):
                                       now_ms=NOW_MS + 1, cut_ms=None)
         self.assertEqual(len(memory["i"]), negatives.MAX_ITEMS_PER_ROW)
 
-    def test_handled_items_keep_only_identity_and_the_cell_never_overflows(self):
-        _, memory = negatives.advance(None, post_key="p", hits=[hit("踩雷" * 20, "a")],
+    def test_undo_brings_handled_comments_back_and_the_cell_never_overflows(self):
+        _, memory = negatives.advance(None, post_key="p", hits=[hit("踩雷A", "a")],
                                       now_ms=NOW_MS, cut_ms=None)
-        _, memory = negatives.advance(memory, post_key="p", hits=[], now_ms=NOW_MS + 1,
-                                      cut_ms=NOW_MS)
-        self.assertEqual(set(memory["i"][0]), {"k", "t", "d"})
+        pending, memory = negatives.advance(memory, post_key="p", hits=[hit("踩雷A", "a")],
+                                            now_ms=NOW_MS + 10, cut_ms=NOW_MS, cut_at=NOW_MS + 5)
+        self.assertEqual(pending, [])
+        self.assertEqual(memory["i"][0]["d"], NOW_MS + 5, "记的是点「已处理」的时刻")
+        pending, memory = negatives.advance(memory, post_key="p", hits=[], now_ms=NOW_MS + 20,
+                                            cut_ms=None, reopened_ms=NOW_MS + 15)
+        self.assertEqual([(p.key, p.content) for p in pending], [("id:a", "踩雷A")],
+                         "撤销之后回到待处理，正文还在")
+        # 撤销之后又点了一次已处理（时刻在撤销之后）：撤销那一笔不再把它翻回来
+        pending, _ = negatives.advance(memory, post_key="p", hits=[], now_ms=NOW_MS + 40,
+                                       cut_ms=NOW_MS + 20, cut_at=NOW_MS + 30,
+                                       reopened_ms=NOW_MS + 15)
+        self.assertEqual(pending, [])
         ledger = negatives.TableLedger("tbl1", {}, {}, Settings())
         for i in range(400):
             ledger.apply(f"rec{i}", "p", [hit("踩雷" * 30 + str(j), f"c{i}-{j}") for j in range(5)],
@@ -280,7 +290,8 @@ class TestNegativeLedger(unittest.TestCase):
     def test_resolution_cut_reads_what_the_operator_saw(self):
         found = Settings().negative_status.found
         resolved = {"tbl1/rec1": {"reasons": [found], "seen": 111, "at": 222, "post_key": "xhs:p"}}
-        self.assertEqual(negatives.resolution_cut(resolved, "tbl1", "rec1", "xhs:p", found), 111)
+        self.assertEqual(negatives.resolution_cut(resolved, "tbl1", "rec1", "xhs:p", found),
+                         (111, 222))
         self.assertIsNone(negatives.resolution_cut(resolved, "tbl1", "rec1", "xhs:q", found))
         resolved["tbl1/rec1"]["state"] = "processing"
         self.assertIsNone(negatives.resolution_cut(resolved, "tbl1", "rec1", "xhs:p", found),
@@ -347,6 +358,13 @@ class TestLedgerInRunner(unittest.TestCase):
         self.assertEqual(summary.negative_digest_count(fourth[self.f.negative_digest],
                                                        self.settings), (1, False))
         self.assertEqual(self.journaled, ["b"])
+        # 运营在面板上点了「撤销」：那次「已处理」标掉的 a 回到待处理
+        del self.resolved["tbl1/rec1"]
+        self.resolved[negatives.REOPENED_KEY] = {
+            "tbl1/rec1": second[self.f.last_updated] + 5000}
+        fifth = self.run_once(second_at + timedelta(hours=24), [comment("好用", "ok")])
+        self.assertEqual(summary.negative_digest_count(fifth[self.f.negative_digest],
+                                                       self.settings), (2, False))
 
     def test_runner_hands_the_link_alias_to_the_ledger(self):
         short = "https://v.douyin.com/abc123/"
@@ -461,6 +479,16 @@ class TestForecast(unittest.TestCase):
         backward = rows.forecast(active + archived, on, NOW, keys={"tikhub": "k"})
         self.assertGreater(forward.refreshes, 0)
         self.assertEqual(forward.refreshes, backward.refreshes)
+
+    def test_an_invalid_post_backs_off_further_after_each_confirmation(self):
+        on = Settings()
+        f = on.fields
+        row = runner.row_from_record({"record_id": "rec1", "fields": {
+            f.link: LINK, f.publish_time: NOW_MS - 86_400_000, f.last_updated: NOW_MS,
+            f.refresh_status: runner.STATUS_GONE, f.consecutive_failures: 2,
+            f.monitoring: True}}, on)
+        # 72 → 144 → 288 小时：第 3、9、21 天，下一次是第 45 天
+        self.assertEqual(rows.forecast([row], on, NOW, keys={"tikhub": "k"}).refreshes, 3)
 
     def test_an_invalid_post_is_not_charged_past_the_archive_line(self):
         on = Settings()

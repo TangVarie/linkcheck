@@ -22,7 +22,8 @@
 扫到的就是那一下处理掉的。
 
 存进去的评论正文截短到 CONTENT_CHARS 字，留 KEEP_DAYS 天：快照里要能把「这一轮
-没再看到」的那几条写出来，所以正文得留一点；整份在一格里，所以要截、要过期。
+没再看到」的那几条写出来，所以正文得留一点（处理过的也留：面板上点「撤销」的话
+它们要回到快照里）；整份在一格里，所以要截、要过期。
 """
 
 from __future__ import annotations
@@ -60,11 +61,24 @@ def comment_key(comment: CommentView) -> str:
     return "txt:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+# 面板上点「撤销」的时刻：todo.resolved 那一格里的 {"表/行": 毫秒}（panel.Resolutions
+# 写）。撤销会把「已解决」那条记录删掉，可删掉也可能只是问题消了（reconcile）——
+# 两者分不开，所以撤销另记一笔。之前那次「已处理」标掉的负面评论回到待处理。
+REOPENED_KEY = "__reopened__"
+
+
+def reopened_at(resolved: Any, table_id: str, record_id: str) -> Optional[int]:
+    """这一行最近一次在面板上被「撤销」的时刻。没撤销过 → None。**纯函数。**"""
+    marks = resolved.get(REOPENED_KEY) if isinstance(resolved, dict) else None
+    value = marks.get(f"{table_id}/{record_id}") if isinstance(marks, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def resolution_cut(resolved: Any, table_id: str, record_id: str, post_key: Any,
-                   found_label: str) -> Optional[int]:
-    """面板上这一行点过「已处理」（而且当时挂着「有负面」）的话，那一刻看到的是
-    哪一次检查的结果（毫秒）；那一次以前扫到的负面评论都算处理过了。没点过 → None。
-    **纯函数。**"""
+                   found_label: str) -> Optional[tuple[int, int]]:
+    """面板上这一行点过「已处理」（而且当时挂着「有负面」）的话：（那一刻看到的是哪一次
+    检查的结果, 点的时刻），毫秒。看到的那一次以前扫到的负面评论都算处理过了；点的时刻
+    记在评论上，之后撤销的话认得出是哪一下标掉的。没点过 → None。**纯函数。**"""
     if not isinstance(resolved, dict):
         return None
     entry = resolved.get(f"{table_id}/{record_id}")
@@ -76,11 +90,13 @@ def resolution_cut(resolved: Any, table_id: str, record_id: str, post_key: Any,
     reasons = entry.get("reasons")
     if not isinstance(reasons, list) or found_label not in reasons:
         return None
-    for name in ("seen", "at"):
+    def stamp(name: str) -> Optional[int]:
         value = entry.get(name)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-    return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    seen, at = stamp("seen"), stamp("at")
+    if seen is None and at is None:
+        return None
+    return (seen if seen is not None else at, at if at is not None else seen)
 
 
 @dataclass
@@ -101,7 +117,8 @@ def _valid_item(item: Any) -> bool:
 
 
 def advance(memory: Optional[dict], *, post_key: str, hits: list[KeywordHit],
-            now_ms: int, cut_ms: Optional[int],
+            now_ms: int, cut_ms: Optional[int], cut_at: Optional[int] = None,
+            reopened_ms: Optional[int] = None,
             aliases: Any = ()) -> tuple[list[Pending], dict]:
     """一行这一轮的负面命中 + 之前攒的 → （还没处理的，要存回去的那份）。**纯函数。**
 
@@ -114,15 +131,16 @@ def advance(memory: Optional[dict], *, post_key: str, hits: list[KeywordHit],
         for item in memory.get("i") or []:
             if _valid_item(item):
                 items[item["k"]] = dict(item)
+    if reopened_ms is not None:
+        # 撤销：在那之前点的「已处理」标掉的，回到待处理。
+        for item in items.values():
+            if "d" in item and item["d"] < reopened_ms:
+                del item["d"]
     if cut_ms is not None:
+        mark = cut_at if cut_at is not None else cut_ms
         for item in items.values():
             if "d" not in item and item["t"] <= cut_ms:
-                item["d"] = cut_ms
-    for item in items.values():
-        if "d" in item:
-            # 处理过的只用来认「是不是同一条」，正文和命中词不用再存。
-            item.pop("c", None)
-            item.pop("w", None)
+                item["d"] = mark
     current: list[str] = []
     seen_now: dict[str, KeywordHit] = {}
     for hit in hits:
@@ -215,9 +233,13 @@ class TableLedger:
         """返回（还没处理的, 这一轮看到却已经处理过的条数）。"""
         keys = {post_key, *aliases}
         cut = resolution_cut(self.resolved, self.table_id, record_id, keys, self.found_label)
+        reopened = reopened_at(self.resolved, self.table_id, record_id)
         with self._lock:
             pending, stored = advance(self.rows.get(record_id), post_key=post_key,
-                                      hits=hits, now_ms=now_ms, cut_ms=cut, aliases=keys)
+                                      hits=hits, now_ms=now_ms,
+                                      cut_ms=cut[0] if cut else None,
+                                      cut_at=cut[1] if cut else None,
+                                      reopened_ms=reopened, aliases=keys)
             if stored["i"]:
                 self.rows[record_id] = stored
             else:

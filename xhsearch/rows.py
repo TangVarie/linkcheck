@@ -709,7 +709,9 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
             continue
         seen.add(key)
         published = datetime.fromtimestamp(published_ms / 1000, timezone.utc)
-        backoff = row.gone_backoff_hours(settings)
+        gone = row.gone_backoff_hours(settings) is not None
+        slowest = settings.refresh.slowest_interval_hours() or 0
+        failures = row.consecutive_failures or 0
         updated = (None if row.last_updated_ms is None
                    else datetime.fromtimestamp(row.last_updated_ms / 1000, timezone.utc))
         at = now if updated is None else max(now, updated + timedelta(hours=interval))
@@ -719,7 +721,13 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
                 (at - published).total_seconds() / 86400)
             if tier is None:
                 break                       # 过了归档线（已失效的行也一样，归档了就不再看）
-            step = backoff or tier
+            step = tier
+            if gone:
+                # 已失效的行每再确认一次死讯「连续失败次数」+1，间隔翻倍
+                # （和 Row.gone_backoff_hours 同一个算法）：按还会继续失效算。
+                failures += 1
+                extra = max(0, failures - settings.safety.strikes_before_gone)
+                step = slowest * 2 ** min(extra, 10)
             for call in plan_calls(row, settings, at):
                 if call.min_count is not None and not _over(row.previous_comment_count,
                                                             call.min_count):

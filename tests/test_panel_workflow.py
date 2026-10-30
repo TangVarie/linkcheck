@@ -135,10 +135,20 @@ class TestResolveTransitions(unittest.TestCase):
         self.assertEqual(body["work_stats"][0]["processing"], 1)
         status, body = self.request(state="pending")
         self.assertEqual(status, 200)
-        self.assertEqual(self.store.value, {})
+        self.assertEqual(self.store.value, {}, "撤销的是「正在处理」，不用另记撤销")
         event = self.reports.record_events.call_args.args[0][0]
         self.assertEqual(event["state"], "pending")
         self.assertGreater(event["at"], TS)
+
+    def test_undoing_a_negative_resolution_leaves_a_reopened_mark(self):
+        from xhsearch import negatives
+        self.assertEqual(self.request(state="resolved")[0], 200)
+        self.assertEqual(self.request(state="pending")[0], 200)
+        marks = self.store.value[negatives.REOPENED_KEY]
+        self.assertGreater(marks["tblA/r"], TS)
+        self.assertNotIn("tblA/r", self.store.value)
+        self.assertEqual(self.request(state="resolved")[0], 200)
+        self.assertNotIn(negatives.REOPENED_KEY, self.store.value)
 
     def test_unknown_state_and_forged_record_never_write(self):
         for changes, expected in (({"state": "anything"}, 400),

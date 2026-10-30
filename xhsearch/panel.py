@@ -49,7 +49,7 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
-from . import (channels as channels_mod, feishu, panel_settings, panel_view,
+from . import (channels as channels_mod, feishu, negatives, panel_settings, panel_view,
                provision, railway, readout, registry, report_ai as report_ai_mod,
                schema, summary, tablespec)
 
@@ -1363,6 +1363,8 @@ class Resolutions:
     DROPPED = "__journal_outbox_dropped__"
     OUTBOX_MAX_EVENTS = 1000
     OUTBOX_MAX_CHARS = 20_000
+    # 「撤销」记了几笔（negatives.REOPENED_KEY），留最近的这么多条。
+    REOPENED_MAX = 300
     LOST_STATE_DAYS = KEEP_DAYS
 
     def __init__(self, projects: Projects, *, log: Callable[[str], None] = print,
@@ -1498,6 +1500,7 @@ class Resolutions:
         def change(current):
             data = self._pruned(current, at, room=1)
             data.pop(key, None)
+            _note_reopened(data, key, None)
             data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
             if state == "processing":
                 data[key]["state"] = state
@@ -1536,7 +1539,12 @@ class Resolutions:
             def change(current):
                 data = self._pruned(current, at, room=int(state != "pending"))
                 self._enqueue(data, [event])
-                data.pop(key, None)
+                undone = data.pop(key, None)
+                if state == "pending":
+                    if _was_negative_resolution(undone, self._found_label()):
+                        _note_reopened(data, key, at)
+                else:
+                    _note_reopened(data, key, None)
                 if state != "pending":
                     data[key] = {"reasons": list(reasons), "seen": seen, "at": at}
                     if state == "processing":
@@ -1631,13 +1639,21 @@ class Resolutions:
     def unmark(self, table_id: str, record_id: str) -> None:
         key = summary.resolution_key(table_id, record_id)
 
+        at = int(self._wall() * 1000)
+
         def change(current):
-            data = self._pruned(current, int(self._wall() * 1000))
-            data.pop(key, None)
+            data = self._pruned(current, at)
+            if _was_negative_resolution(data.pop(key, None), self._found_label()):
+                _note_reopened(data, key, at)
             return data
 
         self._commit(change)
         self.log(f"↩ 撤销已解决 {key}")
+
+    def _found_label(self) -> str:
+        settings = getattr(self.projects, "settings", None)
+        return getattr(getattr(settings, "negative_status", None), "found", "") \
+            or Settings().negative_status.found
 
     def _pruned(self, current: Any, now_ms: int, *, room: int = 0) -> dict:
         """去掉过期的、坏掉的；超过上限丢最早点的。room = 给马上要加的那条留几个位置
@@ -1667,6 +1683,13 @@ class Resolutions:
             data[self.OUTBOX] = list(current[self.OUTBOX])
         if isinstance(current.get(self.DROPPED), dict) and current[self.DROPPED]:
             data[self.DROPPED] = dict(current[self.DROPPED])
+        reopened = current.get(negatives.REOPENED_KEY)
+        if isinstance(reopened, dict):
+            live = sorted(((k, v) for k, v in reopened.items()
+                           if isinstance(v, int) and not isinstance(v, bool) and v >= since),
+                          key=lambda kv: kv[1])[-self.REOPENED_MAX:]
+            if live:
+                data[negatives.REOPENED_KEY] = dict(live)
         return data
 
     def _commit(self, change) -> None:
@@ -1677,6 +1700,28 @@ class Resolutions:
                 self._data = value
                 self._version += 1
                 self._loaded_at, self._failed_at = self._clock(), None
+
+
+def _was_negative_resolution(entry: Any, found: str) -> bool:
+    """撤销掉的是不是一条带着「有负面」的「已处理」——只有它会让攒着的负面评论被标成
+    处理过，撤销时才要另记一笔（「正在处理」不标任何东西）。"""
+    return (isinstance(entry, dict) and entry.get("state", "resolved") == "resolved"
+            and isinstance(entry.get("reasons"), list) and found in entry["reasons"])
+
+
+def _note_reopened(data: dict, key: str, at: Optional[int]) -> None:
+    """「撤销」的那一刻另记一笔（negatives.REOPENED_KEY）：cron 那边攒着的负面评论里，
+    之前那次「已处理」标掉的要回到待处理——光看「已解决」那条记录被删了，分不出是
+    撤销还是问题消了。再点「已处理」/「正在处理」就把这一笔清掉。at=None = 清掉。"""
+    marks = dict(data.get(negatives.REOPENED_KEY) or {})
+    if at is None:
+        marks.pop(key, None)
+    else:
+        marks[key] = at
+    if marks:
+        data[negatives.REOPENED_KEY] = marks
+    else:
+        data.pop(negatives.REOPENED_KEY, None)
 
 
 def _evictable(outbox: list) -> tuple[int, bool]:
