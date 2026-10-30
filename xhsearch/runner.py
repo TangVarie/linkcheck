@@ -1175,10 +1175,16 @@ def refresh(
         # 开了最新评论的表：负面评论攒着，点了「已处理」才收（negatives.py）。
         # 要在拼诊断信息之前算：「命中 N 条」那句要和攒下来的对得上。
         pending, handled = None, 0
+        # 留痕里记的负面命中。攒负面的表只记还没处理的：处理过的那条再被看到，
+        # 日报会当成「处理之后又有负面」把这篇算回待处理，和表里写的无负面打架。
+        journal_hits = verdict.negative_hits
         if touch_tags and verdict.negative_checked and negatives is not None:
             pending, handled = negatives.apply(
                 row.record_id, rows_post_key(row), verdict.negative_hits,
                 int(checked_at.timestamp() * 1000))
+            open_keys = {p.key for p in pending}
+            journal_hits = [h for h in verdict.negative_hits
+                            if negatives_mod.comment_key(h.comment) in open_keys]
             earlier = sum(1 for p in pending if p.hit is None)
             if earlier:
                 verdict.notes.append(
@@ -1416,7 +1422,7 @@ def refresh(
                 else f"🔵 评论里出现新蓝词：{'、'.join(fresh)}")
 
         scan_event = None
-        if status == STATUS_OK and snapshot is not None and analyze.saw_comment_page(snapshot):
+        if status == STATUS_OK and snapshot is not None and analyze.saw_negative_pool(snapshot):
             identity = row.parsed.content_id
             scan_event = {
                 "type": "scan", "at": int(checked_at.timestamp() * 1000),
@@ -1428,7 +1434,7 @@ def refresh(
                           "content": hit.comment.content,
                           "created_at_ms": hit.comment.created_at_ms,
                           "keywords": [hit.keyword]}
-                         for hit in verdict.negative_hits],
+                         for hit in journal_hits],
             }
 
         return Outcome(row.record_id, status, fields, "；".join(log_notes)[:200],

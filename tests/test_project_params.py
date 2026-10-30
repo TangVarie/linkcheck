@@ -151,6 +151,24 @@ class TestLatestPage(unittest.TestCase):
         self.assertIn("最新", digest.splitlines()[1])
         self.assertIn("1 条只在最新那一页", "；".join(verdict.notes))
 
+    def test_an_empty_default_page_still_lets_the_latest_page_be_checked(self):
+        snap = analyze.Snapshot("xhs", comment_count=30, comments=[],
+                                latest_comments=[comment("用了踩雷", "c3")])
+        verdict = analyze.decide(snap, self.settings, previous_comment_count=30, age_hours=24,
+                                 seed_keywords=["求链接"], negative_keywords=["踩雷"])
+        self.assertTrue(verdict.negative_checked)
+        self.assertEqual([h.comment.comment_id for h in verdict.negative_hits], ["c3"])
+        self.assertFalse(verdict.seed_checked, "评论状态仍只认默认那一页")
+        self.assertFalse(verdict.pin_checked)
+
+    def test_projects_with_different_latest_thresholds_do_not_share_a_fetch(self):
+        strict = Settings()
+        strict.latest_comments_over = 100
+        key5 = rows.share_key(rows.plan_calls(xhs_row(), self.settings, NOW))
+        key100 = rows.share_key(rows.plan_calls(xhs_row(), strict, NOW))
+        self.assertNotEqual(key5, key100,
+                            "门槛 100 那边只取了默认那一页，门槛 5 那边不能拿它顶替")
+
     def test_a_missing_latest_page_is_said_out_loud(self):
         snap = analyze.Snapshot("xhs", comment_count=30, comments=[comment("好", "c1")],
                                 latest_error="[rate_limit/429] too fast")
@@ -259,9 +277,11 @@ class TestLedgerInRunner(unittest.TestCase):
     def run_once(self, at, comments):
         snap = analyze.Snapshot("xhs", comment_count=30, comments=comments)
         with mock.patch.object(runner, "_fetch_one", return_value=runner._Fetched(snapshot=snap)):
-            return runner.refresh([xhs_row()], "unused-test-key", self.settings, forced=True,
-                                  now=at, clock=lambda: at,
-                                  negatives=self.ledger).outcomes[0].fields
+            outcome = runner.refresh([xhs_row()], "unused-test-key", self.settings, forced=True,
+                                     now=at, clock=lambda: at,
+                                     negatives=self.ledger).outcomes[0]
+        self.journaled = [h["id"] for h in outcome.scan_event["hits"]]
+        return outcome.fields
 
     def test_accumulates_then_resolves_then_raises_only_new_ones(self):
         found, clean = self.settings.negative_status.found, self.settings.negative_status.clean
@@ -278,11 +298,13 @@ class TestLedgerInRunner(unittest.TestCase):
         self.assertEqual(third[self.f.negative_status], clean)
         self.assertIn("之前已处理过", third[self.f.failure_reason])
         self.assertNotIn(f"→ {found}", third[self.f.failure_reason], "诊断信息不能和负面状态打架")
+        self.assertEqual(self.journaled, [], "处理过的那条再看到，日报不能把这篇算回待处理")
         fourth = self.run_once(second_at + timedelta(hours=16),
                                [comment("踩雷 别买", "a"), comment("又踩雷", "b")])
         self.assertEqual(fourth[self.f.negative_status], found)
         self.assertEqual(summary.negative_digest_count(fourth[self.f.negative_digest],
                                                        self.settings), (1, False))
+        self.assertEqual(self.journaled, ["b"])
 
     def test_without_a_ledger_the_old_behaviour_is_unchanged(self):
         self.ledger = None
@@ -371,6 +393,17 @@ class TestForecast(unittest.TestCase):
         self.assertEqual(few.latest_yuan, 0)
         gone = rows.forecast(self.rows(on, days_old=40), on, NOW, keys={"tikhub": "k"})
         self.assertEqual((gone.refreshes, gone.yuan), (0, 0))
+
+    def test_an_invalid_post_is_not_charged_past_the_archive_line(self):
+        on = Settings()
+        f = on.fields
+        published = int((NOW - timedelta(days=30)).timestamp() * 1000)
+        row = runner.row_from_record({"record_id": "rec1", "fields": {
+            f.link: LINK, f.publish_time: published, f.last_updated: NOW_MS,
+            f.refresh_status: runner.STATUS_GONE, f.consecutive_failures: 2,
+            f.monitoring: True}}, on)
+        self.assertEqual(rows.forecast([row], on, NOW, keys={"tikhub": "k"}).refreshes, 0,
+                         "下一次是 72 小时后、发布 33 天，已经归档了")
 
     def test_next_round_estimate_skips_the_latest_page_for_small_posts(self):
         on = Settings()

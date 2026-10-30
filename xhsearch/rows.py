@@ -495,7 +495,9 @@ def share_key(calls: list[ToolCall]) -> tuple:
     指纹相同；同一个 ID 一行要 detail、一行不要（发布时间不同），指纹不同，
     各走各的——那本来就是两组不同的请求。
     """
-    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())))
+    # min_count 也算进去：同一篇登记在两个项目、「最新」门槛不同（一个 100、一个 5）
+    # 时，门槛高的那边取回来的只有默认那一页，门槛低的那边不能拿它顶替。
+    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())), c.min_count)
                  for c in calls)
 
 
@@ -699,10 +701,11 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
         at = now if updated is None else max(now, updated + timedelta(hours=interval))
         counted = False
         while at <= horizon:
-            step = backoff or settings.refresh.interval_hours_for_age(
+            tier = settings.refresh.interval_hours_for_age(
                 (at - published).total_seconds() / 86400)
-            if step is None:
-                break                       # 过了归档线
+            if tier is None:
+                break                       # 过了归档线（已失效的行也一样，归档了就不再看）
+            step = backoff or tier
             for call in plan_calls(row, settings, at):
                 if call.min_count is not None and not _over(row.previous_comment_count,
                                                             call.min_count):

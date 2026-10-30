@@ -242,6 +242,14 @@ def saw_comment_page(snapshot: Snapshot) -> bool:
             or comments_hidden(snapshot))
 
 
+def saw_negative_pool(snapshot: Snapshot) -> bool:
+    """查负面词那一步有没有东西可看：默认那一页看到了，或者「最新」那一页拿到了评论。
+
+    默认那一页回了个空页（评论多、上游这一页没给）而最新那一页有评论时，负面词照查
+    ——那几条是实打实看到的。种子词、置顶仍只认默认那一页（saw_comment_page）。"""
+    return saw_comment_page(snapshot) or bool(snapshot.latest_comments)
+
+
 def _comment_created_at_ms(value: Any) -> Optional[int]:
     """供应商的秒/毫秒 epoch 统一成毫秒。缺失和坏值保留为未知。"""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
@@ -1143,7 +1151,7 @@ def decide(
     # 判定闸门和种子关键词完全一样：没填词不碰、没看到评论页不碰。
     # 后者尤其重要——拿上游缺数当「无负面」写进表里，等于给运营一个
     # 假的安全感，比不判还糟。
-    if negative_keywords and saw_comment_page(snapshot):
+    if negative_keywords and saw_negative_pool(snapshot):
         verdict.negative_checked = True
         # 作者标记不可信时**不拿它排除任何东西**——排除就是信了它。
         # 一边声明「这家的作者标记不可信」、一边还照着它把评论丢掉，是自相
