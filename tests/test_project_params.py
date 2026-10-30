@@ -127,6 +127,9 @@ class TestLatestPage(unittest.TestCase):
         self.assertEqual([c.comment_id for c in fetched.snapshot.latest_comments], ["c9"])
         self.assertEqual([c.comment_id for c in fetched.snapshot.comments], ["c1"],
                          "默认那一页不能被最新那一页盖掉")
+        self.assertTrue(fetched.snapshot.author_reported)
+        self.assertFalse(fetched.snapshot.latest_author_reported,
+                         "最新那一页没带作者标记，就按它自己的不可信算")
 
     def test_a_failed_latest_page_does_not_fail_the_row(self):
         err = protocol.Err(protocol.Failure.RATE_LIMIT, "429", "too fast")
@@ -150,6 +153,22 @@ class TestLatestPage(unittest.TestCase):
         digest = analyze.format_negative_digest(verdict.negative_hits, self.settings.digest)
         self.assertIn("最新", digest.splitlines()[1])
         self.assertIn("1 条只在最新那一页", "；".join(verdict.notes))
+
+    def test_each_page_uses_its_own_author_marker_trust(self):
+        own = comment("踩雷？不会的，温和配方", "mine", is_author=True)
+        trusted_latest = analyze.Snapshot("xhs", comment_count=30, comments=[comment("好", "c1")],
+                                          author_reported=False, latest_comments=[own],
+                                          latest_author_reported=True)
+        verdict = analyze.decide(trusted_latest, self.settings, previous_comment_count=30,
+                                 age_hours=24, negative_keywords=["踩雷"])
+        self.assertEqual(verdict.negative_hits, [], "最新那一页的作者标记可信，自家回复要排除")
+        untrusted_latest = analyze.Snapshot("xhs", comment_count=30, comments=[comment("好", "c1")],
+                                            latest_comments=[own], latest_author_reported=False)
+        verdict = analyze.decide(untrusted_latest, self.settings, previous_comment_count=30,
+                                 age_hours=24, negative_keywords=["踩雷"])
+        self.assertEqual([h.comment.comment_id for h in verdict.negative_hits], ["mine"],
+                         "不可信的标记不拿来排除")
+        self.assertIn("不报作者标记", "；".join(verdict.notes))
 
     def test_an_empty_default_page_still_lets_the_latest_page_be_checked(self):
         snap = analyze.Snapshot("xhs", comment_count=30, comments=[],

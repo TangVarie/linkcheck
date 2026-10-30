@@ -1009,8 +1009,9 @@ def _fetch_calls(
         assert isinstance(result, protocol.Ok)
         if call.latest_page:
             if out.snapshot is not None:
-                out.snapshot.latest_comments = analyze.read_comment_page(
-                    call.platform, result.data).comments
+                page = analyze.read_comment_page(call.platform, result.data)
+                out.snapshot.latest_comments = page.comments
+                out.snapshot.latest_author_reported = page.author_reported
         elif call.purpose == "comments":
             out.snapshot = analyze.read_comment_page(call.platform, result.data)
         elif out.snapshot is not None:

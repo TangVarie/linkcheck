@@ -137,6 +137,9 @@ class Snapshot:
     # latest_error 写着原因）。
     latest_comments: Optional[list[CommentView]] = None
     latest_error: str = ""
+    # 最新那一页那家通道报不报可信的作者标记（和 author_reported 同义）。两页可能
+    # 走了不同的通道（默认那一页降到备胎、最新那一页主通道又好了），各按各的算。
+    latest_author_reported: bool = True
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -667,7 +670,8 @@ def _comment_identity(comment: CommentView) -> tuple:
 
 
 def match_all_keywords(snapshot: Snapshot, keywords: list[str],
-                       *, skip_author: bool = False) -> list[KeywordHit]:
+                       *, skip_author: bool = False,
+                       skip_author_latest: Optional[bool] = None) -> list[KeywordHit]:
     """把关键词组 × 第一页评论的**全部**命中都找出来，按评论原序返回。
 
     和 match_seed_keywords 的区别只在「找第一个」还是「找全部」：
@@ -691,8 +695,12 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
     """
     hits: list[KeywordHit] = []
     needles = [(k, _normalize(k)) for k in keywords]
+    if skip_author_latest is None:
+        skip_author_latest = skip_author
     for comment in negative_pool(snapshot):
-        if skip_author and comment.is_author:
+        # 只在最新那一页的那几条，按那一页那家通道的作者标记可不可信来定。
+        skip = skip_author_latest if comment.from_latest else skip_author
+        if skip and comment.is_author:
             continue
         haystack = _normalize(comment.content)
         for keyword, needle in needles:
@@ -1160,7 +1168,8 @@ def decide(
         # 宁可把自家回复也算进来（下面那句提醒会让人去核一眼），
         # 也不能漏掉真负面。
         verdict.negative_hits = match_all_keywords(
-            snapshot, negative_keywords, skip_author=snapshot.author_reported)
+            snapshot, negative_keywords, skip_author=snapshot.author_reported,
+            skip_author_latest=snapshot.latest_author_reported)
         if verdict.negative_hits:
             words = "、".join(dict.fromkeys(h.keyword for h in verdict.negative_hits))
             newest = sum(1 for h in verdict.negative_hits if h.comment.from_latest)
@@ -1177,7 +1186,8 @@ def decide(
             # 而命中的可能是自己昨天回的那一句。
             # 只在真有命中时才报——没命中就没有「排除没生效」这回事，
             # 每轮都挂一句只会把真正要看的那几条淹掉。
-            if not snapshot.author_reported:
+            if not snapshot.author_reported or (
+                    newest and not snapshot.latest_author_reported):
                 # 措辞是给运营看的，别在这里用 markdown 记号——「诊断信息」是
                 # 飞书的纯文本格子，星号会原样显示出来（其余诊断语句也都不带）。
                 verdict.notes.append(
