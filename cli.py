@@ -29,8 +29,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from xhsearch import (daily_report, feishu, providers, rows as rows_mod, runlock, runner,
-                      schema, tablespec)
+from xhsearch import (daily_report, feishu, negatives as negatives_mod, panel_settings,
+                      providers, rows as rows_mod, runlock, runner, schema, tablespec)
 from xhsearch.config import Budget, Channels, Settings
 from xhsearch.envfile import load_dotenv
 
@@ -221,6 +221,20 @@ def _daily_journal():
     # workspace.table 共用同一份 token：每次留痕都新建 Bitable 会各取一次 token，
     # 一轮下来一半的飞书调用都在取 token。
     return daily_report.Journal(workspace, workspace.table, registry_table.app_token)
+
+
+def _negative_ledger(settings: Settings):
+    """开了最新评论的表要攒负面评论（xhsearch/negatives.py），存在注册表 base 的
+    「面板设置」里。没配注册表就攒不了：照老办法只看这一轮的命中，说一声。"""
+    if not os.environ.get("FEISHU_REGISTRY", "").strip():
+        print("⚠ 未配置 FEISHU_REGISTRY：开了「最新评论门槛」的表攒不了负面评论，"
+              "「负面状态」只按这一轮看到的写")
+        return None
+    app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
+    registry_table = _registry_table(app_id, app_secret)
+    workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
+    store = panel_settings.SettingsStore(workspace, workspace.table, registry_table.app_token)
+    return negatives_mod.Ledger(store, settings)
 
 
 def _journal_report(journal, table, report, run_id: str, *, started: bool = True,
@@ -620,7 +634,8 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
                    share: runner.FetchShare | None = None,
                    watch: runner.ContractWatch | None = None,
                    estimate_seen: set | None = None,
-                   before_scan=None):
+                   before_scan=None,
+                   negatives=None):
     """在一张表上执行 mode 的**刷新阶段**（读表 + 打上游），不写回。
 
     返回（退出码, 找到的 record_id, 待刷行数, 预估元, 待写回材料）。
@@ -801,6 +816,7 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
         stop=stop,
         share=share,
         watch=watch,
+        negatives=negatives,
     )
     return 0, found, len(row_list), yuan, (report, fields_meta)
 
@@ -1148,6 +1164,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                        set[str] | None, Settings]] = []
     channels_dead = False
     journal = None
+    # 开了最新评论的表攒负面评论用的（第一张开了的表才建，见 _negative_ledger）。
+    ledger = None
+    ledger_tried = False
     journal_run_id = feishu.idempotency_key()
     journal_started: dict[str, bool] = {}
     if mode != "estimate":
@@ -1189,6 +1208,16 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                     worst = 1
                     print(f"❌ 日报批次开始留痕失败：{type(exc).__name__}: {exc}；本轮照常巡检，日报覆盖不完整")
             journal_kwargs = {"before_scan": begin_journal} if journal is not None else {}
+            if per_table.latest_comments_over is not None and mode != "estimate":
+                if not ledger_tried:
+                    ledger_tried = True
+                    try:
+                        ledger = _negative_ledger(settings)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"⚠ 攒负面评论的地方没接上（{type(exc).__name__}: {exc}）："
+                              "「负面状态」这一轮只按这一轮看到的写")
+                if ledger is not None:
+                    journal_kwargs["negatives"] = ledger.for_table(table.table_id, per_table)
             try:
                 code, found, row_count, yuan, prep = _refresh_table(
                     mode, record_ids, per_table, api_keys, table, now,
@@ -1226,6 +1255,8 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                 _journal_report(journal, table, report, journal_run_id,
                                 started=journal_started.get(table.table_id, False),
                                 mode=mode)
+        if ledger is not None:
+            ledger.save(int(time.time() * 1000))
         _finish(1, error=type(sys.exc_info()[1]).__name__)
         raise
 
@@ -1257,6 +1288,10 @@ def _run_locked(mode: str, record_ids: list[str] | None,
             worst = 1
             continue
         worst = max(worst, code)
+
+    # 攒着的负面评论在写回之后存：写回没成也存（下一轮按存的这份重算）。
+    if ledger is not None and not ledger.save(int(time.time() * 1000)):
+        worst = 1
 
     # 留痕放在写回**之后**：先保住付费结果（飞书慢的时候留痕要重试好几轮，
     # 排在前面就是拿已经花了钱的结果去等它）。留痕失败也不影响已写回的结果。

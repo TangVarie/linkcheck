@@ -71,6 +71,10 @@ from .protocol import Err, Failure, Ok, Result, build_body, endpoint, headers, p
 SOCIALDATAX = "socialdatax"
 TIKHUB = "tikhub"
 
+# 评论排序：抽象名（rows.SORT_*）→ 两家各自的参数值。
+TIKHUB_SORTS = {"default": "default", "latest": "latest_v2"}
+SDX_SORTS = {"default": "default", "latest": "time_descending"}
+
 # 每家通道在**小红书评论页**上，哪几个维度的值可信。
 #
 # ⚠️ 这不是「响应里有没有这个字段」。能力必须由通道**声明**，不能从响应里推断，
@@ -288,7 +292,10 @@ def _sdx_build(api_key: str, platform: str, purpose: str, arguments: dict[str, A
     args = dict(arguments)
     # 抽象参数 → SocialDataX 的参数名
     if platform == "xhs" and purpose == "comments":
-        args["sort_type"] = args.pop("sort", "default")
+        sort = args.pop("sort", "default")
+        # 规范里的枚举是 default / time_descending / like_count_descending
+        # （docs/待验证清单.md「数据能力」）。
+        args["sort_type"] = SDX_SORTS.get(sort, sort)
     else:
         args.pop("sort", None)
     if "url" in args and platform == "xhs":
@@ -381,7 +388,9 @@ def _tikhub_build(api_key: str, platform: str, purpose: str, arguments: dict[str
             # 只取第一页，永远不翻页。对方文档说 default 排序「翻页时会丢失或
             # 重复评论」——那是分页场景的问题，对我们不成立。而综合排序才是
             # 运营眼里的评论区，也是置顶评论出现的那一屏。
-            params["sort_strategy"] = args.get("sort", "default")
+            # 「最新」那一页是 latest_v2（按时间倒序，对方 OpenAPI 的枚举）。
+            sort = args.get("sort", "default")
+            params["sort_strategy"] = TIKHUB_SORTS.get(sort, sort)
     else:
         if args.get("aweme_id"):
             params["aweme_id"] = args["aweme_id"]

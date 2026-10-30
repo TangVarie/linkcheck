@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 
 @dataclass
@@ -793,6 +794,18 @@ class Settings:
     # 这张表不往「蓝词字段」里记的词（竞品名之类）。按表配：登记表里的
     # 「蓝词排除词」那一格，见 registry.apply_overrides 和 analyze.excluded_by。
     blue_word_excludes: tuple[str, ...] = ()
+
+    # 小红书「最新」排序也扫一页（2026-10-30 运营要的）：None = 不扫（老行为）；
+    # N = 这一轮评论数超过 N 条的小红书帖子，在默认排序那一页之外再取一页按时间
+    # 倒序的（10 条），负面词两页一起查。默认排序第一页被自家铺的评论、高赞评论
+    # 占满时，新冒出来的负面评论排不进去，只看默认那一页就扫不到。
+    #
+    # 只对小红书：抖音评论接口没有排序参数（两家都是，见 docs/待验证清单.md）。
+    # 每扫一次多一次评论调用的钱（TikHub ¥0.072），所以按表配：登记表里的
+    # 「最新评论门槛」那一格，见 registry.apply_overrides。开了的表，扫到的负面
+    # 评论攒着，点了「已处理」才收（见 negatives.py）——最新那一页翻得快，
+    # 下一轮它可能已经被新评论挤出去了，不能因为这一轮没看到就当没事了。
+    latest_comments_over: Optional[int] = None
 
     # 小红书笔记发布多少天内额外调一次 detail。**默认 0 = 不调。**
     #

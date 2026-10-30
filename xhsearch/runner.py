@@ -18,11 +18,12 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
 from . import analyze, feishu, protocol, providers, shortlink, tags, transport
+from . import negatives as negatives_mod
 from .config import Budget, Display, Settings
 from .rows import (Row, ToolCall, plan_calls, estimate_yuan, id_form,
                    format_resolved_id, share_key)
@@ -837,8 +838,8 @@ def _fetch_one(
         expansion = resolver.resolve(url)
         expand_requests = expansion.requests
         if expansion.ok:
-            calls = [ToolCall(c.platform, c.purpose,
-                              id_form(c.arguments, expansion.content_id, c.platform))
+            calls = [replace(c, arguments=id_form(c.arguments, expansion.content_id,
+                                                  c.platform))
                      for c in calls]
             expanded_id, expanded_url = expansion.content_id, url
         else:
@@ -929,6 +930,12 @@ def _fetch_calls(
         return out
 
     for call in calls:
+        if call.min_count is not None:
+            # 补充的那一页（小红书「最新」）：默认那一页回来了、评论数超过门槛才发。
+            # 评论数没超的帖子，默认那一页本来就把评论装全了，多付一次钱买不到新东西。
+            if out.snapshot is None or out.snapshot.comment_count is None \
+                    or out.snapshot.comment_count <= call.min_count:
+                continue
         if deadline is not None and time.monotonic() >= deadline:
             if out.snapshot is None:
                 # 一个请求都还没发：整行留给下一轮，绝不写回。
@@ -957,6 +964,15 @@ def _fetch_calls(
                         "限流等待中到达软截止，本行留给下一轮"))
                 break  # 评论已到手：detail 放弃，按已有数据完成本行
             result = attempt(call)
+
+        if (isinstance(result, protocol.Err) and call.min_count is not None
+                and result.kind not in protocol.FATAL):
+            # 「最新」那一页没取到（限流、上游抖动、说笔记没了……）：默认那一页
+            # 已经到手，这一行照常下结论，只是负面这一轮只查了默认那一页——
+            # 记一句，诊断信息里说出来（analyze.decide）。
+            if out.snapshot is not None:
+                out.snapshot.latest_error = str(result)[:120]
+            continue
 
         if isinstance(result, protocol.Err):
             # 重试后的结果也走同一套分类——之前的写法在这里直接 return，
@@ -991,7 +1007,11 @@ def _fetch_calls(
             continue
 
         assert isinstance(result, protocol.Ok)
-        if call.purpose == "comments":
+        if call.latest_page:
+            if out.snapshot is not None:
+                out.snapshot.latest_comments = analyze.read_comment_page(
+                    call.platform, result.data).comments
+        elif call.purpose == "comments":
             out.snapshot = analyze.read_comment_page(call.platform, result.data)
         elif out.snapshot is not None:
             analyze.merge_detail(out.snapshot, result.data)
@@ -1043,6 +1063,7 @@ def refresh(
     clock: Optional[Callable[[], datetime]] = None,
     share: Optional[FetchShare] = None,
     watch: Optional[ContractWatch] = None,
+    negatives: Optional[Any] = None,
 ) -> RunReport:
     """刷新一批行。不写回，只算结果——写回由调用方决定时机。
 
@@ -1151,6 +1172,23 @@ def refresh(
         抹掉上一次的真实结论。
         """
         checked_at = stamp()
+        # 开了最新评论的表：负面评论攒着，点了「已处理」才收（negatives.py）。
+        # 要在拼诊断信息之前算：「命中 N 条」那句要和攒下来的对得上。
+        pending, handled = None, 0
+        if touch_tags and verdict.negative_checked and negatives is not None:
+            pending, handled = negatives.apply(
+                row.record_id, rows_post_key(row), verdict.negative_hits,
+                int(checked_at.timestamp() * 1000))
+            earlier = sum(1 for p in pending if p.hit is None)
+            if earlier:
+                verdict.notes.append(
+                    f"⚠ 还有 {earlier} 条之前扫到的负面评论没处理（这一轮没再看到，"
+                    f"多半被新评论挤出了那一页），在面板上点「已处理」才收")
+            if handled and not pending:
+                # 判定那一步写的是「命中 N 条 → 有负面」，这里落表的是无负面：换掉那句。
+                claim = f"→ {settings.negative_status.found}，详见"
+                verdict.notes[:] = [n for n in verdict.notes if claim not in n]
+                verdict.notes.append(f"这一轮看到的 {handled} 条负面评论之前已处理过，不再提醒")
         fields = _base_fields(settings, status=status, notes=verdict.notes,
                               checked_at=checked_at)
         tag_plan: Optional[TagPlan] = None
@@ -1202,7 +1240,9 @@ def refresh(
                  analyze.comment_status_value(verdict, settings),
                  comment_status_options),
                 (f.negative_status,
-                 analyze.negative_status_value(verdict, settings),
+                 (analyze.negative_status_value(verdict, settings) if pending is None
+                  else settings.negative_status.found if pending
+                  else settings.negative_status.clean),
                  negative_status_options),
                 (f.pinned_status,
                  analyze.pin_status_value(verdict, row.pin_status, settings),
@@ -1313,7 +1353,11 @@ def refresh(
         # 或者「（未命中）」），没判过一个字都不碰。
         # 判过却不写的话，上一轮的负面评论会一直留在格子里，
         # 运营会以为负面还在——那比不写更误导。
-        if touch_tags and verdict.negative_checked:
+        if touch_tags and verdict.negative_checked and pending is not None:
+            fields[f.negative_digest] = negatives_mod.format_digest(
+                pending, settings.digest, minute=settings.display.minute,
+                resolved_now=handled)
+        elif touch_tags and verdict.negative_checked:
             fields[f.negative_digest] = analyze.format_negative_digest(
                 verdict.negative_hits, settings.digest)
 

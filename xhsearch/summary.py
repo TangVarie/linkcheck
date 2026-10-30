@@ -1045,6 +1045,39 @@ class TierShift:
         return "；".join(parts) + "。"
 
 
+def preview_cost(records: list[dict], old: Settings, new: Settings, *,
+                 keys: Optional[dict] = None, now: Optional[datetime] = None,
+                 days: int = 30) -> tuple["rows_mod.Forecast", "rows_mod.Forecast"]:
+    """改参数前后，这些行接下来 `days` 天各要花多少（rows.forecast）。**不发请求、不花钱。**"""
+    now = now or datetime.now(timezone.utc)
+    before = rows_mod.forecast([runner.row_from_record(r, old) for r in records],
+                               old, now, days=days, keys=keys)
+    after = rows_mod.forecast([runner.row_from_record(r, new) for r in records],
+                              new, now, days=days, keys=keys)
+    return before, after
+
+
+def describe_forecast(before: "rows_mod.Forecast", after: "rows_mod.Forecast") -> str:
+    """改参数前后，接下来那几天大概花多少钱，一句话。"""
+    days = after.days
+
+    def money(f) -> str:
+        return f"¥{f.yuan:.2f}（约 ¥{f.per_day:.2f}/天，刷 {f.refreshes} 次）"
+
+    head = (f"按现在在管、还没归档的 {after.rows} 篇帖子算，未来 {days} 天："
+            if after.rows else f"按现在在管的帖子算，未来 {days} 天：")
+    if abs(after.yuan - before.yuan) < 0.005 and after.refreshes == before.refreshes:
+        text = f"{head}{money(after)}，和现在一样"
+    else:
+        diff = after.yuan - before.yuan
+        text = (f"{head}改之前 {money(before)}，改之后 {money(after)}，"
+                f"{'多' if diff > 0 else '少'} ¥{abs(diff):.2f}")
+    if after.latest_yuan:
+        text += (f"；其中多扫「最新」那一页 ¥{after.latest_yuan:.2f}"
+                 f"（{after.latest_rows} 篇评论数超过门槛的小红书帖子）")
+    return text + "。之后新发的帖子另算。"
+
+
 def preview_tier_shift(records: list[dict], old: Settings, new: Settings,
                        *, now: Optional[datetime] = None,
                        max_examples: int = 5) -> TierShift:
