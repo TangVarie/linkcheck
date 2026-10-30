@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .config import Settings
@@ -48,6 +48,18 @@ class ToolCall:
     platform: str            # "xhs" | "douyin"
     purpose: str             # "comments" | "detail"
     arguments: dict[str, Any]
+    # 有值 = 补充的那一页（小红书「最新」排序）：这一轮评论数超过它才发，
+    # 发不成也不影响这一行的结论（和 detail 一样）。见 Settings.latest_comments_over。
+    min_count: Optional[int] = None
+
+    @property
+    def latest_page(self) -> bool:
+        return self.purpose == "comments" and self.arguments.get("sort") == SORT_LATEST
+
+
+# 评论排序的抽象名，两家各自翻译（providers._sdx_build / _tikhub_build）。
+SORT_DEFAULT = "default"
+SORT_LATEST = "latest"
 
 
 # 「作品ID」那一格的写法：`7584415807459888384 ← https://v.douyin.com/abc/`
@@ -452,7 +464,12 @@ def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> 
         # 会把老的置顶评论压到最后。
         # 参数名是抽象的——两家叫法不同（sort_type / sort_strategy），
         # 由 providers 层各自翻译。
-        calls.append(ToolCall("xhs", "comments", {**target, "sort": "default"}))
+        calls.append(ToolCall("xhs", "comments", {**target, "sort": SORT_DEFAULT}))
+        # 再扫一页「最新」：评论数要等默认那一页回来才知道，所以只是排上，
+        # 发不发由 runner 按这一轮的评论数定（min_count）。
+        if settings.latest_comments_over is not None:
+            calls.append(ToolCall("xhs", "comments", {**target, "sort": SORT_LATEST},
+                                  min_count=settings.latest_comments_over))
 
         want_detail = settings.detail_within_days > 0 and (
             age_days is None or age_days <= settings.detail_within_days
@@ -478,7 +495,9 @@ def share_key(calls: list[ToolCall]) -> tuple:
     指纹相同；同一个 ID 一行要 detail、一行不要（发布时间不同），指纹不同，
     各走各的——那本来就是两组不同的请求。
     """
-    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())))
+    # min_count 也算进去：同一篇登记在两个项目、「最新」门槛不同（一个 100、一个 5）
+    # 时，门槛高的那边取回来的只有默认那一页，门槛低的那边不能拿它顶替。
+    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())), c.min_count)
                  for c in calls)
 
 
@@ -492,6 +511,18 @@ def post_key(row: "Row") -> str:
         return f"row:{row.record_id}"
     return f"{parsed.platform}:url:" + hashlib.sha256(
         (parsed.url or row.link_cell).encode("utf-8")).hexdigest()
+
+
+def post_aliases(row: "Row") -> set[str]:
+    """这一行这一篇帖子可能被记成的键：现在的（post_key），加上「作品ID」还没写进表
+    时按链接文字算的那个。短链第一次展开那一轮记下的东西用的是后者，下一轮就是前者；
+    运营在面板上点的也可能是展开之前的那个。链接换成别的帖子，两个都对不上。"""
+    keys = {post_key(row)}
+    link = parse(row.link_cell)
+    if not link.content_id and (link.url or row.link_cell):
+        keys.add(f"{link.platform}:url:" + hashlib.sha256(
+            (link.url or row.link_cell).encode("utf-8")).hexdigest())
+    return keys
 
 
 def id_form(arguments: dict[str, Any], content_id: str,
@@ -592,22 +623,125 @@ def estimate_yuan(
     total = 0.0
     for row in rows:
         for call in plan_calls(row, settings, now):
-            prices: list[float] = []
-            for name in settings.channels.for_platform(call.platform):
-                if keys is not None and not keys.get(name):
-                    continue
-                if is_disabled(name, call.platform, dead):
-                    continue
-                try:
-                    provider = get_provider(name)
-                except ValueError:
-                    continue
-                if any(provider.can_handle(call.platform, call.purpose, form)
-                       for form in _argument_forms(call)):
-                    prices.append(provider.yuan_per_call(call.platform, call.purpose))
-                    if not worst_case:
-                        break
-            # 一家都接不了：这一行实际会以「不支持的链接形态/没通道」失败，不产生费用
-            if prices:
-                total += max(prices) if worst_case else prices[0]
+            # 「最新」那一页要等这一轮的评论数：报给人看的按表里现在的评论数猜
+            # 发不发；预算预留（悲观口径）一律算上。
+            if (call.min_count is not None and not worst_case
+                    and not _over(row.previous_comment_count, call.min_count)):
+                continue
+            total += _call_price(call, settings, keys, dead, worst_case)
     return total
+
+
+def _over(count: Optional[int], floor: int) -> bool:
+    return count is not None and count > floor
+
+
+def _call_price(call: ToolCall, settings: Settings, keys: Optional[dict[str, str]],
+                dead: set[str], worst_case: bool) -> float:
+    """一次调用多少钱：乐观口径按实际会走的那家，悲观口径按可能走到的最贵那家。
+    一家都接不了 = 这一行实际会以「不支持的链接形态/没通道」失败，不产生费用。"""
+    prices: list[float] = []
+    for name in settings.channels.for_platform(call.platform):
+        if keys is not None and not keys.get(name):
+            continue
+        if is_disabled(name, call.platform, dead):
+            continue
+        try:
+            provider = get_provider(name)
+        except ValueError:
+            continue
+        if any(provider.can_handle(call.platform, call.purpose, form)
+               for form in _argument_forms(call)):
+            prices.append(provider.yuan_per_call(call.platform, call.purpose))
+            if not worst_case:
+                break
+    if not prices:
+        return 0.0
+    return max(prices) if worst_case else prices[0]
+
+
+@dataclass
+class Forecast:
+    """接下来一段时间按现在的参数大概要花多少（rows.forecast）。"""
+
+    days: int = 30
+    yuan: float = 0.0
+    refreshes: int = 0
+    rows: int = 0
+    # 其中「最新」那一页的钱（小红书，评论数超过门槛的帖子才扫）。
+    latest_yuan: float = 0.0
+    latest_rows: int = 0
+
+    @property
+    def per_day(self) -> float:
+        return self.yuan / self.days if self.days else 0.0
+
+
+def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None,
+             *, days: int = 30, keys: Optional[dict[str, str]] = None,
+             seen: Optional[set] = None) -> Forecast:
+    """按现在的刷新频率，把这些行接下来 `days` 天会被刷几次、花多少钱推一遍。
+
+    **只算现在表里在管、还没归档的帖子**——之后新发的帖子另算。每一行从它
+    下一次到期起，按「那一刻的帖龄 → 那一档的间隔」一步步往后推，过了归档线
+    就停（和 Row.is_due 同一套档位）。已失效的行按退避节奏算。评估中那 24 小时
+    的窗口不重放（要看基线历史），所以评估中的帖子会略报少一点。
+    「最新」那一页按表里现在的评论数判发不发；同一篇登记两行只算一次。
+    """
+    now = now or datetime.now(timezone.utc)
+    seen = set() if seen is None else seen
+    out = Forecast(days=days)
+    horizon = now + timedelta(days=days)
+    for row in rows:
+        if not row.monitoring:
+            continue
+        calls = plan_calls(row, settings, now)
+        if not calls:
+            continue
+        interval = row.refresh_interval_hours(settings, now)
+        published_ms = row.schedule_publish_ms(settings, now)
+        if interval is None or published_ms is None:
+            continue
+        # 先确认这一行真的会被刷，再占同一篇的名额：同一条链接登记两行、一行已归档，
+        # 归档那行排在前面时不能把还在查的那行挤掉。
+        key = share_key(calls)
+        if key in seen:
+            continue
+        seen.add(key)
+        published = datetime.fromtimestamp(published_ms / 1000, timezone.utc)
+        gone = row.gone_backoff_hours(settings) is not None
+        slowest = settings.refresh.slowest_interval_hours() or 0
+        failures = row.consecutive_failures or 0
+        updated = (None if row.last_updated_ms is None
+                   else datetime.fromtimestamp(row.last_updated_ms / 1000, timezone.utc))
+        at = now if updated is None else max(now, updated + timedelta(hours=interval))
+        counted = False
+        while at <= horizon:
+            tier = settings.refresh.interval_hours_for_age(
+                (at - published).total_seconds() / 86400)
+            if tier is None:
+                break                       # 过了归档线（已失效的行也一样，归档了就不再看）
+            step = tier
+            if gone:
+                # 已失效的行每再确认一次死讯「连续失败次数」+1，间隔翻倍
+                # （和 Row.gone_backoff_hours 同一个算法）：按还会继续失效算。
+                failures += 1
+                extra = max(0, failures - settings.safety.strikes_before_gone)
+                step = slowest * 2 ** min(extra, 10)
+            for call in plan_calls(row, settings, at):
+                if call.min_count is not None and not _over(row.previous_comment_count,
+                                                            call.min_count):
+                    continue
+                price = _call_price(call, settings, keys, set(), False)
+                out.yuan += price
+                if call.latest_page:
+                    out.latest_yuan += price
+            out.refreshes += 1
+            counted = True
+            at += timedelta(hours=step)
+        if counted:
+            out.rows += 1
+            if settings.latest_comments_over is not None and row.parsed.platform == "xhs" \
+                    and _over(row.previous_comment_count, settings.latest_comments_over):
+                out.latest_rows += 1
+    return out

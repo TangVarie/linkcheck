@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -220,7 +221,7 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
         expansion = shortlink.expand_douyin(calls[0].arguments["url"])
         if expansion.ok:
             print(f"  🔗 短链已展开（免费，{expansion.requests} 跳）：aweme_id={expansion.aweme_id}")
-            calls = [ToolCall(c.platform, c.purpose, id_form(c.arguments, expansion.aweme_id))
+            calls = [dataclasses.replace(c, arguments=id_form(c.arguments, expansion.aweme_id))
                      for c in calls]
             unsupported = [c for c in calls
                            if not provider.can_handle(c.platform, c.purpose, c.arguments)]

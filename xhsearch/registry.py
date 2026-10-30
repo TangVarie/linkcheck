@@ -55,9 +55,21 @@ COL_TIER_HOT = "爆贴门槛"
 COL_TIER_SUPER_HOT = "大爆门槛"
 COL_FLOP_HOURS = "无水花小时"
 COL_ARCHIVE_DAYS = "归档天数"
+# —— 逐表刷新频率（2026-10-30 加）：分层刷新三档各自的间隔（小时）——
+# 档位界线不动（发布 0-2 天 / 3-7 天 / 8 天起到归档），只改每档隔多久查一次。
+# 刷新节奏也是纯行级的：一张表查得勤，不影响别的表任何判定（预算是整轮共享
+# 的，但那是「钱够不够」，不是「这一行该怎么判」）。
+COL_INTERVAL_EARLY = "0到2天间隔小时"
+COL_INTERVAL_WEEK = "3到7天间隔小时"
+COL_INTERVAL_LATE = "8天起间隔小时"
+INTERVAL_COLUMNS = (COL_INTERVAL_EARLY, COL_INTERVAL_WEEK, COL_INTERVAL_LATE)
+# —— 小红书加扫「最新」那一页（2026-10-30 加）：空着 = 不扫；填 N = 评论数超过
+# N 条的帖子每次多扫一页按时间倒序的评论。见 Settings.latest_comments_over。
+COL_LATEST_OVER = "最新评论门槛"
 
 THRESHOLD_COLUMNS = (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT,
-                     COL_FLOP_HOURS, COL_ARCHIVE_DAYS)
+                     COL_FLOP_HOURS, COL_ARCHIVE_DAYS, *INTERVAL_COLUMNS,
+                     COL_LATEST_OVER)
 
 # —— 逐表蓝词排除词（2026-10-22 加）——
 # 这张表不往「蓝词字段」里记的词，主要是竞品名。文本列，逗号分隔（顿号、
@@ -332,7 +344,12 @@ def read_overrides(entry: Entry, base) -> Override:
     out.values.update(tiers)
 
     for column, floor, ceiling in ((COL_FLOP_HOURS, 1, 24 * 365),
-                                   (COL_ARCHIVE_DAYS, 1, 3650)):
+                                   (COL_ARCHIVE_DAYS, 1, 3650),
+                                   # 最快每小时一次（cron 5 分钟一轮，再快就是
+                                   # 每轮都刷）；最慢两个月一次。
+                                   *((c, 1, 24 * 60) for c in INTERVAL_COLUMNS),
+                                   # 0 = 不管多少评论都扫。
+                                   (COL_LATEST_OVER, 0, 1_000_000)):
         value = raw.get(column)
         if value is None:
             continue
@@ -342,6 +359,40 @@ def read_overrides(entry: Entry, base) -> Override:
             continue
         out.values[column] = value
     return out
+
+
+def param_specs(base) -> list[dict]:
+    """面板「参数」表单要画的东西：分组、说人话的名字、全局默认值（空着时用的那个）。
+    列名就是注册表里的列名；表单只认这里列出来的。"""
+    tiers = list(base.refresh.tiers)
+
+    def tier_hours(index: int):
+        return tiers[index][1] if index < len(tiers) else None
+
+    th = base.thresholds
+    return [
+        {"column": COL_INTERVAL_EARLY, "group": "刷新频率", "label": "发布 0–2 天：每几小时查一次",
+         "default": tier_hours(0), "min": 1},
+        {"column": COL_INTERVAL_WEEK, "group": "刷新频率", "label": "发布 3–7 天：每几小时查一次",
+         "default": tier_hours(1), "min": 1},
+        {"column": COL_INTERVAL_LATE, "group": "刷新频率", "label": "发布 8 天起：每几小时查一次",
+         "default": tier_hours(2), "min": 1},
+        {"column": COL_ARCHIVE_DAYS, "group": "刷新频率", "label": "发布满几天不再自动查（归档）",
+         "default": base.refresh.archive_after_days, "min": 1},
+        {"column": COL_LATEST_OVER, "group": "评论扫描",
+         "label": "评论数超过几条，就多扫一页「最新」评论",
+         "default": base.latest_comments_over, "min": 0,
+         "hint": "空着 = 只扫默认排序那一页。只对小红书（抖音接口没有按最新排序）。"
+                 "开了之后扫到的负面评论会攒着，点了「已处理」才收。"},
+        {"column": COL_TIER_EVALUATING, "group": "热度判定", "label": "评估中：评论数到几条",
+         "default": th.tier_evaluating, "min": 1},
+        {"column": COL_TIER_HOT, "group": "热度判定", "label": "爆贴：评论数到几条",
+         "default": th.tier_hot, "min": 1},
+        {"column": COL_TIER_SUPER_HOT, "group": "热度判定", "label": "大爆：评论数到几条",
+         "default": th.tier_super_hot, "min": 1},
+        {"column": COL_FLOP_HOURS, "group": "热度判定", "label": "发布满几小时还不到评估中算无水花",
+         "default": th.flop_hours, "min": 1},
+    ]
 
 
 # 排除词至少几个字：一个字的词（「S」「黑」）几乎能排掉任何东西。
@@ -402,18 +453,47 @@ def apply_overrides(base, entry: Entry, *, log=None):
         settings.thresholds.flop_hours = values[COL_FLOP_HOURS]
     if COL_ARCHIVE_DAYS in values:
         settings.refresh.archive_after_days = values[COL_ARCHIVE_DAYS]
+    if any(c in values for c in INTERVAL_COLUMNS):
+        # 只换间隔，不换档位界线；没填的那一档用全局的。
+        tiers = list(settings.refresh.tiers)
+        for index, column in enumerate(INTERVAL_COLUMNS):
+            if column in values and index < len(tiers):
+                tiers[index] = (tiers[index][0], values[column])
+        settings.refresh.tiers = tiers
+    if COL_LATEST_OVER in values:
+        settings.latest_comments_over = values[COL_LATEST_OVER]
     if log:
         shown = "、".join(f"{k}={v}" for k, v in sorted(values.items()))
-        log(f"⚙ 「{entry.label}」用的是这张表自己的阈值：{shown}")
+        log(f"⚙ 「{entry.label}」用的是这张表自己的参数：{shown}")
     return settings
 
 
 def set_thresholds(table: feishu.Bitable, record_id: str,
-                   values: dict) -> None:
-    """写回逐表阈值。`None` / 空 = 清掉那一格，回到全局默认。"""
+                   values: dict) -> list[str]:
+    """写回逐表参数。`None` / 空 = 清掉那一格，回到全局默认。
+
+    老的注册表里没有后来加的那几列（刷新频率、最新评论门槛）：要写的列不在就
+    先建上（数字列，纯追加，不碰已有的列），不让人去飞书里手工加列。
+    返回这次新建的列名。"""
     fields = {}
     for column in THRESHOLD_COLUMNS:
         if column in values:
             fields[column] = values[column]
+    if not fields:
+        return []
+    meta = table.fields_meta()
+    if meta is None:
+        raise RegistryError("读不到注册表的字段列表，没写")
+    made = []
+    for column in list(fields):
+        if column in meta:
+            continue
+        if fields[column] is None:
+            del fields[column]          # 本来就没有这一格，谈不上清空
+            continue
+        table.create_field({"field_name": column, "type": 2,
+                            "property": {"formatter": "0"}})
+        made.append(column)
     if fields:
         table.batch_update([{"record_id": record_id, "fields": fields}])
+    return made

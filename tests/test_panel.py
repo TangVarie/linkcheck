@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from xhsearch import balance as balance_mod
-from xhsearch import (channels, feishu, panel, panel_view, providers,
+from xhsearch import (channels, feishu, negatives, panel, panel_view, providers,
                       railway, summary, transport)
 from xhsearch.config import Settings
 
@@ -3132,8 +3132,11 @@ class TestResolutions(unittest.TestCase):
         self.assertEqual(res.snapshot(), store.value)
         self.assertEqual(store.reads, 0, "刚写完不用再读一遍")
         res.unmark("tblA", "rec1")
-        self.assertEqual(store.value, {})
-        self.assertEqual(res.snapshot(), {})
+        # 撤销的是一条「有负面」的已处理：另记一笔撤销时刻，攒着的负面评论好回到待处理
+        self.assertEqual(store.value, {negatives.REOPENED_KEY: {"tblA/rec1": int(NOW.timestamp() * 1000)}})
+        self.assertEqual(res.snapshot(), {}, "这一笔不是「已解决」记录，不收任何行")
+        res.mark("tblA", "rec1", ["有负面"], 124)
+        self.assertNotIn(negatives.REOPENED_KEY, store.value, "再点已处理就清掉")
 
     def test_reads_are_cached(self):
         store = self._Store({"t/r": {"reasons": ["有负面"], "at": TS}})
@@ -3229,7 +3232,8 @@ class TestResolutions(unittest.TestCase):
         store = self._Store(full)
         res, _ = self._make(store)
         res.unmark("t", "r5")
-        self.assertEqual(len(store.value), panel.Resolutions.MAX_ENTRIES - 1)
+        entries = {k: v for k, v in store.value.items() if k != negatives.REOPENED_KEY}
+        self.assertEqual(len(entries), panel.Resolutions.MAX_ENTRIES - 1)
         self.assertIn(f"t/r{panel.Resolutions.MAX_ENTRIES - 1}", store.value,
                       "撤销一条，最早点的那条不能跟着没")
 

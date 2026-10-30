@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
@@ -43,6 +43,9 @@ class CommentView:
     # 留痕按平台评论 ID 去重；创建时间只是上游事实，不用发现时间代填。
     comment_id: str = ""
     created_at_ms: Optional[int] = None
+    # 只在「最新」排序那一页里看到的（默认那一页没有）。负面快照里标出来，
+    # 运营去 App 里找的时候知道要切到「最新」。
+    from_latest: bool = False
 
     def one_line(self, fmt: DigestFormat, extra_mark: str = "") -> str:
         text = re.sub(r"\s+", " ", self.content or "").strip()
@@ -52,6 +55,8 @@ class CommentView:
         marks = []
         if extra_mark:
             marks.append(extra_mark)
+        if self.from_latest:
+            marks.append("最新")
         if self.is_pinned:
             marks.append("置顶")
         if self.is_author:
@@ -126,6 +131,15 @@ class Snapshot:
     # 这种时候 comment_count 记的是**别人看得到的** 0——小红书界面上也不显示
     # 评论数——接口报的原数留在这里，只给诊断信息和存活判断用。
     hidden_comment_count: int = 0
+    # 小红书「最新」排序那一页（Settings.latest_comments_over）。只拿来查负面：
+    # 置顶、评论状态、评论区快照说的都是默认排序那一屏，不看它。
+    # None = 这一轮没取（没开、评论数没超门槛，或者没取到——没取到时
+    # latest_error 写着原因）。
+    latest_comments: Optional[list[CommentView]] = None
+    latest_error: str = ""
+    # 最新那一页那家通道报不报可信的作者标记（和 author_reported 同义）。两页可能
+    # 走了不同的通道（默认那一页降到备胎、最新那一页主通道又好了），各按各的算。
+    latest_author_reported: bool = True
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -229,6 +243,14 @@ def saw_comment_page(snapshot: Snapshot) -> bool:
     """
     return (bool(snapshot.comments) or snapshot.comment_count == 0
             or comments_hidden(snapshot))
+
+
+def saw_negative_pool(snapshot: Snapshot) -> bool:
+    """查负面词那一步有没有东西可看：默认那一页看到了，或者「最新」那一页拿到了评论。
+
+    默认那一页回了个空页（评论多、上游这一页没给）而最新那一页有评论时，负面词照查
+    ——那几条是实打实看到的。种子词、置顶仍只认默认那一页（saw_comment_page）。"""
+    return saw_comment_page(snapshot) or bool(snapshot.latest_comments)
 
 
 def _comment_created_at_ms(value: Any) -> Optional[int]:
@@ -622,8 +644,34 @@ class KeywordHit:
     comment: CommentView
 
 
+def negative_pool(snapshot: Snapshot) -> list[CommentView]:
+    """查负面词要看的全部评论：默认那一页，加上「最新」那一页里默认那一页没有的。
+
+    同一条评论两页都有时只算一次（按平台评论 ID；没有 ID 的按正文+昵称）。
+    只在最新那一页的打上 from_latest（拷一份，不改快照里的原件）。
+    """
+    pool = list(snapshot.comments)
+    if not snapshot.latest_comments:
+        return pool
+    seen = {_comment_identity(c) for c in pool}
+    for comment in snapshot.latest_comments:
+        identity = _comment_identity(comment)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        pool.append(replace(comment, from_latest=True))
+    return pool
+
+
+def _comment_identity(comment: CommentView) -> tuple:
+    if comment.comment_id:
+        return ("id", comment.comment_id)
+    return ("text", _normalize(comment.content), comment.author_name)
+
+
 def match_all_keywords(snapshot: Snapshot, keywords: list[str],
-                       *, skip_author: bool = False) -> list[KeywordHit]:
+                       *, skip_author: bool = False,
+                       skip_author_latest: Optional[bool] = None) -> list[KeywordHit]:
     """把关键词组 × 第一页评论的**全部**命中都找出来，按评论原序返回。
 
     和 match_seed_keywords 的区别只在「找第一个」还是「找全部」：
@@ -647,8 +695,12 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
     """
     hits: list[KeywordHit] = []
     needles = [(k, _normalize(k)) for k in keywords]
-    for comment in snapshot.comments:
-        if skip_author and comment.is_author:
+    if skip_author_latest is None:
+        skip_author_latest = skip_author
+    for comment in negative_pool(snapshot):
+        # 只在最新那一页的那几条，按那一页那家通道的作者标记可不可信来定。
+        skip = skip_author_latest if comment.from_latest else skip_author
+        if skip and comment.is_author:
             continue
         haystack = _normalize(comment.content)
         for keyword, needle in needles:
@@ -1107,7 +1159,7 @@ def decide(
     # 判定闸门和种子关键词完全一样：没填词不碰、没看到评论页不碰。
     # 后者尤其重要——拿上游缺数当「无负面」写进表里，等于给运营一个
     # 假的安全感，比不判还糟。
-    if negative_keywords and saw_comment_page(snapshot):
+    if negative_keywords and saw_negative_pool(snapshot):
         verdict.negative_checked = True
         # 作者标记不可信时**不拿它排除任何东西**——排除就是信了它。
         # 一边声明「这家的作者标记不可信」、一边还照着它把评论丢掉，是自相
@@ -1116,11 +1168,15 @@ def decide(
         # 宁可把自家回复也算进来（下面那句提醒会让人去核一眼），
         # 也不能漏掉真负面。
         verdict.negative_hits = match_all_keywords(
-            snapshot, negative_keywords, skip_author=snapshot.author_reported)
+            snapshot, negative_keywords, skip_author=snapshot.author_reported,
+            skip_author_latest=snapshot.latest_author_reported)
         if verdict.negative_hits:
             words = "、".join(dict.fromkeys(h.keyword for h in verdict.negative_hits))
+            newest = sum(1 for h in verdict.negative_hits if h.comment.from_latest)
+            where = ("第一页评论" if snapshot.latest_comments is None
+                     else "默认、最新两页评论" + (f"（{newest} 条只在最新那一页）" if newest else ""))
             verdict.notes.append(
-                f"⚠ 第一页评论命中 {len(verdict.negative_hits)} 条负面/竞品词（{words}）"
+                f"⚠ {where}命中 {len(verdict.negative_hits)} 条负面/竞品词（{words}）"
                 f"→ {settings.negative_status.found}，详见「{settings.fields.negative_digest}」"
             )
             # 这一轮的通道不报作者标记 → skip_author 静默失效，自家账号回的
@@ -1130,7 +1186,8 @@ def decide(
             # 而命中的可能是自己昨天回的那一句。
             # 只在真有命中时才报——没命中就没有「排除没生效」这回事，
             # 每轮都挂一句只会把真正要看的那几条淹掉。
-            if not snapshot.author_reported:
+            if not snapshot.author_reported or (
+                    newest and not snapshot.latest_author_reported):
                 # 措辞是给运营看的，别在这里用 markdown 记号——「诊断信息」是
                 # 飞书的纯文本格子，星号会原样显示出来（其余诊断语句也都不带）。
                 verdict.notes.append(
@@ -1139,6 +1196,9 @@ def decide(
                     "——先过一眼快照，确认命中的不是自己回的")
     elif negative_keywords:
         verdict.notes.append("本轮未取到评论页内容，负面词判定保持原样")
+    if negative_keywords and snapshot.latest_error and verdict.negative_checked:
+        verdict.notes.append(f"「最新」排序那一页没取到（{snapshot.latest_error}），"
+                             "这一轮负面词只查了默认排序那一页")
 
     # —— 蓝词：评论正文里的 `#词[搜索高亮]#` 标记，同一份第一页评论 ——
     # 这一轮扫不扫、哪些是新词、要不要翻「是否截图」由调用方对着表里的现值

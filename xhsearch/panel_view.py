@@ -1713,18 +1713,33 @@ _SCRIPT = r"""
     return lines;
   }
   function thresholdForm(e){
-    var cols = e.threshold_columns || [];
-    var inputs = cols.map(function(c){
-      var v = e.thresholds && e.thresholds[c] != null ? e.thresholds[c] : "";
-      return "<label class=muted style='display:inline-block;margin:0 10px 6px 0'>" +
-        esc(c) + " <input type=number min=1 style='width:90px' data-col='" + attr(c) +
-        "' value='" + attr(String(v)) + "' placeholder='默认'></label>";
+    // 按组画（刷新频率 / 评论扫描 / 热度判定）；老的面板接口没有 params 就按列名平铺。
+    var specs = e.params || (e.threshold_columns || []).map(function(c){
+      return {column: c, group: "", label: c, default: null, min: 1};
+    });
+    var groups = [], byGroup = {};
+    specs.forEach(function(p){
+      if (!byGroup[p.group]) { byGroup[p.group] = []; groups.push(p.group); }
+      byGroup[p.group].push(p);
+    });
+    var body = groups.map(function(g){
+      var inputs = byGroup[g].map(function(p){
+        var v = e.thresholds && e.thresholds[p.column] != null ? e.thresholds[p.column] : "";
+        var def = p.default == null ? "默认不扫" : "默认 " + p.default;
+        return "<label class=muted style='display:inline-block;margin:0 12px 6px 0'>" +
+          esc(p.label) + " <input type=number min=" + Number(p.min || 0) + " style='width:104px' data-col='" +
+          attr(p.column) + "' value='" + attr(String(v)) + "' placeholder='" + attr(def) + "'>" +
+          (p.hint ? "<div class=muted style='font-size:12px;max-width:520px'>" + esc(p.hint) + "</div>" : "") +
+          "</label>";
+      }).join("");
+      return (g ? "<div style='margin:6px 0 2px'><b>" + esc(g) + "</b></div>" : "") + inputs;
     }).join("");
     return "<div class=thr data-rec='" + attr(e.record_id) + "' hidden style='flex-basis:100%;margin-top:8px'>" +
-      "<div class=muted style='margin-bottom:6px'>空着 = 用全局默认。" +
+      "<div class=muted style='margin-bottom:6px'>只改这个项目。空着 = 用全局默认（格子里灰字那个数）。" +
+      "保存前先点「先算给我看」：会算出改前改后未来 30 天大概花多少钱。" +
       "熔断比例、两击定罪、冷却、单轮预算<b>不能逐表</b>——它们有跨表语义，" +
       "逐表不同会让「这一轮该不该熔」说不清。</div>" +
-      inputs +
+      body +
       "<div><button type=button data-thr=preview>先算给我看</button> " +
       "<button type=button data-thr=save disabled>保存</button></div>" +
       "<div class='out thrOut'></div></div>";
@@ -1758,7 +1773,7 @@ _SCRIPT = r"""
           "<div class=acts>" +
           "<button type=button data-act=build data-app='" + attr(e.app_token) + "' data-tbl='" + attr(e.table_id) + "'>补齐缺的列</button>" +
           "<button type=button data-act=enable data-rec='" + attr(e.record_id) + "' data-on='" + (e.enabled ? "0" : "1") + "'>" + (e.enabled ? "停用" : "启用") + "</button>" +
-          "<button type=button data-act=thresholds data-rec='" + attr(e.record_id) + "'>阈值</button>" +
+          "<button type=button data-act=thresholds data-rec='" + attr(e.record_id) + "'>参数</button>" +
           "<button type=button data-act=remove data-rec='" + attr(e.record_id) + "' data-label='" + attr(e.label) + "'>移除</button>" +
           "</div><div class='out rowOut' style='flex-basis:100%'></div>" +
           thresholdForm(e) + "</div>";
@@ -1793,7 +1808,9 @@ _SCRIPT = r"""
           out2.textContent = "算一下…（不花钱）";
           post("thresholds", {record_id: rec, values: thrValues(panelBox), preview: true})
             .then(function(j){
-              var lines = [j.describe];
+              var lines = [];
+              if (j.cost && j.cost.describe) lines.push(esc(j.cost.describe));
+              lines.push(esc(j.describe));
               if (j.examples && j.examples.length) lines.push("比如：\n· " + j.examples.map(esc).join("\n· "));
               if (j.problems && j.problems.length) lines.push("这几处填得不对，已忽略：\n· " + j.problems.map(esc).join("\n· "));
               out2.innerHTML = lines.join("\n\n");
@@ -1802,7 +1819,13 @@ _SCRIPT = r"""
             .catch(function(err){ out2.textContent = String(err); b.disabled = false; });
         } else {
           post("thresholds", {record_id: rec, values: thrValues(panelBox)})
-            .then(function(){ out2.innerHTML = "<span class=ok>保存了。下一轮 cron（≤5 分钟）生效，不用重新部署。</span>"; })
+            .then(function(j){
+              var lines = ["<span class=ok>保存了。下一轮 cron（≤5 分钟）生效，不用重新部署。</span>"];
+              if (j && j.created_columns && j.created_columns.length)
+                lines.push("注册表里新建了这几列：" + j.created_columns.map(esc).join("、"));
+              if (j && j.formula) lines.push(esc(j.formula));
+              out2.innerHTML = lines.join("\n");
+            })
             .catch(function(err){ out2.textContent = String(err); b.disabled = false; });
         }
         return;
