@@ -129,6 +129,7 @@ svg{display:block;flex:none}
 .num{font-family:var(--font-num);font-variant-numeric:tabular-nums;
   letter-spacing:-.01em}
 .muted{color:var(--text-light);font-size:12px}
+.lead-in{margin:0 0 12px}
 .icon{width:16px;height:16px;stroke:currentColor;stroke-width:1.75;fill:none;
   stroke-linecap:round;stroke-linejoin:round;display:inline-block;
   vertical-align:-3px}
@@ -150,8 +151,8 @@ svg{display:block;flex:none}
 .side .brand span{font-size:12px;color:var(--text-faint)}
 .side nav{padding:8px 0 24px}
 .side .grp{font-size:11px;color:var(--text-faint);padding:0 16px;
-  margin:24px 0 6px;letter-spacing:.08em}
-.side .grp:first-child{margin-top:10px}
+  margin:24px 0 8px;letter-spacing:.08em}
+.side .grp:first-child{margin-top:12px}
 .side nav a{display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;
   font-size:14px;font-weight:500;color:var(--text);text-decoration:none;
   transition:background-color .16s ease-out,color .16s ease-out}
@@ -173,7 +174,7 @@ svg{display:block;flex:none}
 .content{padding:24px;max-width:1440px;margin:0 auto}
 
 /* ---------- 标题与编辑式导语 ---------- */
-h1{font-size:24px;font-weight:700;margin:0 0 6px;color:var(--text-dark);
+h1{font-size:24px;font-weight:700;margin:0 0 8px;color:var(--text-dark);
   letter-spacing:-.02em}
 /* 导语：15px 基色 50%，重点词 90% + semibold（DESIGN.md §3） */
 .lede{font-size:15px;color:var(--text-light);margin:0 0 24px;max-width:78ch}
@@ -193,7 +194,7 @@ h2 .n{font-weight:400;color:var(--text-faint)}
 /* ---------- KPI：1 个深青主块 + 最多 3 张白卡 ---------- */
 .kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;
   margin:0 0 8px}
-.kpi>*{padding:16px 18px;min-height:112px;display:flex;flex-direction:column;
+.kpi>*{padding:16px 20px;min-height:112px;display:flex;flex-direction:column;
   justify-content:space-between}
 .kpi .lead{background:var(--block-primary);color:#fff}
 .kpi .lead .k{font-size:13px;color:rgba(255,255,255,.85);letter-spacing:.02em}
@@ -225,15 +226,16 @@ td{padding:12px;border-top:1px solid var(--border);font-size:14px;
 tbody tr{transition:background-color .14s ease-out}
 tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
-td.right{text-align:right}
+/* 数字列整列右对齐，表头跟着数字走，个位对个位 */
+td.right,th.right{text-align:right}
 /* 行操作：13px 主色深青。scenarios/03 明写「行操作用 13px 蓝字链接」，
  * 而模板里通用的 a 是 accent 赭石——仲裁顺序中**场景文件规则高于模板**，
  * 这一处听场景的。 */
 td a.act{font-size:13px;color:var(--primary)}
 /* 帖子身份合成一栏：标题用于定位，素人编号和原帖入口退到第二行。
  * 信息没少，但不再用两个独立列把「为什么」和处置动作挤到屏幕外。 */
-td.which{color:var(--text-dark);min-width:190px;max-width:260px}
-.todo-title{display:block;font-weight:600;line-height:1.45;margin-bottom:5px}
+td.which{color:var(--text-dark);min-width:190px;max-width:280px}
+.todo-title{display:block;font-weight:600;line-height:1.45;margin-bottom:4px}
 .todo-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
   font-size:12px;color:var(--text-light);line-height:1.45}
 .todo-meta .persona{font-family:var(--font-num);color:var(--text-light)}
@@ -241,8 +243,9 @@ td.which{color:var(--text-dark);min-width:190px;max-width:260px}
 .todos td.acts{min-width:168px}
 .todos td.diagnosis{min-width:180px;max-width:320px}
 tr.fresh td:nth-child(2){border-left:3px solid var(--primary)}
-tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary);
-  margin-left:6px;font-weight:600}
+/* 「新」跟在标题后面，不单独占一行把每条新待办撑高 */
+tr.fresh .todo-title::after{content:"新";font-size:12px;color:var(--primary);
+  margin-left:8px;font-weight:600}
 
 /* ---------- 徽标：高 20、直角、语义浅底 + 加深档字 ---------- */
 .chip{display:inline-block;height:20px;line-height:20px;padding:0 8px;
@@ -255,7 +258,7 @@ tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary
 /* ---------- 卡片与色块 ---------- */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
   gap:16px;align-items:start}
-.card{background:var(--surface);border:1px solid var(--border);padding:18px}
+.card{background:var(--surface);border:1px solid var(--border);padding:20px}
 .card.bad{border-color:var(--danger);border-left-width:3px}
 .card h3{margin:0 0 2px;font-size:16px;font-weight:600;color:var(--text-dark)}
 .card .rows{margin:12px 0 0;font-size:14px}
@@ -264,24 +267,24 @@ tr.fresh td:nth-child(2)::after{content:"新";font-size:12px;color:var(--primary
 .card .rows div:first-child{border-top:0}
 .card .rows .lbl{color:var(--text-light)}
 .card .big{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
-.project-detail{margin-top:10px;border-top:1px solid var(--border)}
+.project-detail{margin-top:12px;border-top:1px solid var(--border)}
 .project-detail>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  padding:10px 0 4px;color:var(--text);font-size:13px}
+  padding:12px 0 4px;color:var(--text);font-size:13px}
 .project-detail>summary .detail-link{margin-left:auto;color:var(--primary);font-size:12px}
-.project-detail .rows{margin-top:6px}
-.project-snapshot{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:13px;
+.project-detail .rows{margin-top:8px}
+.project-snapshot{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px;
   color:var(--text-light)}
 .project-snapshot b{font-family:var(--font-num);font-weight:600;color:var(--text-dark)}
 
 /* ---------- 横幅：浅调底 + 文字色阶（禁彩字配浅底） ---------- */
-.problem,.note{padding:10px 12px;margin:12px 0;font-size:13px;
+.problem,.note{padding:12px;margin:12px 0;font-size:13px;
   display:flex;gap:8px;align-items:flex-start;line-height:1.55}
 .problem{background:var(--tint-danger);color:var(--danger-deep);
   border-left:3px solid var(--danger)}
 .note{background:var(--tint-warning);color:var(--warning-deep);
   border-left:3px solid var(--warning)}
-.problem ul{margin:4px 0 0;padding-left:18px}
-.problem li{margin:3px 0}
+.problem ul{margin:4px 0 0;padding-left:20px}
+.problem li{margin:4px 0}
 .problem .icon,.note .icon{margin-top:3px}
 
 /* ---------- 控件：高 40 / 直角 / 聚焦 2px 主色环 ---------- */
@@ -300,6 +303,13 @@ button.danger{background:var(--danger);color:#fff}
   height:36px;padding:0;background:var(--surface);
   border:1px solid var(--border);color:var(--text);display:flex;
   align-items:center;justify-content:center}
+/* 有侧栏的那几屏，开关收进侧栏底部专门留出的一格：悬浮在内容区右下角
+ * 会压住待办表最右一列（「已处理」）。登录页没有侧栏、窄屏侧栏变顶条，
+ * 这两种照旧右下角；不认 :has() 的浏览器也是退回右下角。 */
+@media (min-width:901px){
+  body:has(>.app) .theme-btn{right:auto;left:188px;bottom:16px}
+  .side .foot{padding-bottom:68px}
+}
 input[type=password],input[type=search],input[type=text],input[type=number]{
   font:14px/1 var(--font-sans);height:40px;padding:0 12px;
   border:1px solid var(--border-strong);background:var(--surface);
@@ -321,23 +331,23 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 .login{max-width:360px;margin:14vh auto;background:var(--surface);
   border:1px solid var(--border)}
 .login .field{background:var(--field-brand);color:var(--on-field);
-  padding:20px 28px 18px}
+  padding:20px 28px}
 .login .field .brand{display:flex;align-items:center;gap:8px;color:inherit}
-.login .field .say{margin:14px 0 0;font-size:15px;font-weight:500;
+.login .field .say{margin:12px 0 0;font-size:15px;font-weight:500;
   color:inherit}
 .login .body{padding:24px 28px 28px}
 .login h1{font-size:20px;margin:0 0 4px}
 .login p{margin:0 0 20px}
 .login button{width:100%}
-.err{color:var(--danger-deep);background:var(--tint-danger);padding:8px 10px;
-  font-size:13px;margin:0 0 14px}
+.err{color:var(--danger-deep);background:var(--tint-danger);padding:8px 12px;
+  font-size:13px;margin:0 0 16px}
 
 /* ---------- 四态：空 / 骨架 ---------- */
 .empty{background:var(--surface);border:1px solid var(--border);padding:32px;
   text-align:center;color:var(--text-light);font-size:14px}
-.empty .icon{width:24px;height:24px;stroke-width:1.5;margin:0 auto 10px;
+.empty .icon{width:24px;height:24px;stroke-width:1.5;margin:0 auto 12px;
   color:var(--text-faint)}
-.empty .two{font-size:13px;color:var(--text-faint);margin-top:6px}
+.empty .two{font-size:13px;color:var(--text-faint);margin-top:8px}
 /* 骨架屏微光是负面清单 #2 明文豁免的唯一渐变 */
 .sk{background:var(--bg-secondary);background-image:linear-gradient(90deg,
   rgba(0,0,0,0) 0%,var(--fill) 50%,rgba(0,0,0,0) 100%);
@@ -361,7 +371,7 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
 }
 
 /* ---------- 其余定式 ---------- */
-.tools{display:flex;gap:10px;align-items:center}
+.tools{display:flex;gap:12px;align-items:center}
 .searchbox{position:relative;display:flex;align-items:center}
 .searchbox>.icon{position:absolute;left:10px;top:10px;z-index:1;
   color:var(--text-faint);pointer-events:none}
@@ -371,14 +381,14 @@ summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
  * 待办一多就靠它定位，不能藏在顶栏角落里。 */
 .work-find{flex:1 1 320px;min-width:0}
 .work-find input{width:100%;min-width:0}
-.find-result{padding:0 14px 10px;font-size:13px;color:var(--text-light)}
+.find-result{padding:0 16px 12px;font-size:13px;color:var(--text-light)}
 .find-result button{margin:0 2px}
 .find-result b{color:var(--text-dark)}
 tr.found{outline:2px solid var(--primary);outline-offset:-2px}
 input::placeholder,textarea::placeholder{color:var(--text-faint)}
 .queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
   margin-bottom:12px;background:var(--surface);border:1px solid var(--border);
-  padding:10px 12px}
+  padding:12px}
 .queuebar .queue-help{font-size:12px;color:var(--text-light)}
 #queueOut{flex:1;min-width:220px}
 .top-status{position:absolute;top:52px;right:24px;z-index:8;max-width:min(520px,90vw);
@@ -405,7 +415,7 @@ input::placeholder,textarea::placeholder{color:var(--text-faint)}
 /* tab 上的条数：颜色说的是这个项目最坏的一档（同徽标的加深档），
  * 所以严重度色要压过激活态的主色——信息先于装饰。 */
 .tabs .cnt{display:inline-flex;align-items:center;justify-content:center;min-width:22px;
-  height:20px;padding:0 5px;font-size:12px;font-family:var(--font-num);
+  height:20px;padding:0 6px;font-size:12px;font-family:var(--font-num);
   color:var(--text-light);background:var(--fill);transition:background-color .16s ease-out,
   color .16s ease-out}
 .tabs .tab.on .cnt{color:var(--primary);background:var(--tint-primary)}
@@ -418,19 +428,19 @@ input::placeholder,textarea::placeholder{color:var(--text-faint)}
 .proj .who b{font-weight:600;color:var(--text-dark)}
 .proj .acts{display:flex;gap:8px}
 .proj.off{opacity:.55}
-.addbox{background:var(--surface);border:1px solid var(--border);padding:18px;
+.addbox{background:var(--surface);border:1px solid var(--border);padding:20px;
   margin-top:16px}
 .addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .addbox input[type=text]{flex:1;min-width:200px}
 .out{margin-top:12px;font-size:13px;white-space:pre-wrap;color:var(--text)}
 /* 新建表给谁开权限：在建表那个框里、发丝线隔开。改这里不用重新部署。 */
-.share{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);
+.share{margin-top:16px;padding-top:12px;border-top:1px solid var(--border);
   font-size:13px}
 .share .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .share .lbl{color:var(--text-light);min-width:7em}
 .share select{height:32px;border:1px solid var(--border-strong);background:var(--surface);
   color:var(--text-dark);font:13px var(--font-sans);padding:0 8px}
-.share .pick{margin-top:8px;padding:10px 12px;background:var(--bg);
+.share .pick{margin-top:8px;padding:12px;background:var(--bg);
   border:1px solid var(--border)}
 .share .pick label{display:block;margin:4px 0}
 .ok{color:var(--success-deep)}
@@ -449,7 +459,7 @@ details[open]>:not(summary){animation:detail-in .18s ease-out both}
 .fold{margin-top:12px;background:var(--surface);border:1px solid var(--border);
   border-left:3px solid var(--warning)}
 .fold>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  padding:12px 14px;font-size:14px;color:var(--text-dark);list-style:none}
+  padding:12px 16px;font-size:14px;color:var(--text-dark);list-style:none}
 .fold>summary::-webkit-details-marker{display:none}
 .fold>summary .icon{color:var(--warning-deep)}
 .fold>summary .chip{margin:0}
@@ -462,11 +472,11 @@ details[open]>:not(summary){animation:detail-in .18s ease-out both}
 .fold[open] .fold-hint::after{transform:rotate(-135deg);margin-bottom:-2px}
 .fold .fold-close,.fold[open] .fold-open{display:none}
 .fold[open] .fold-close{display:inline}
-.fold-why{font-size:13px;color:var(--text-light);margin:0;padding:0 14px 12px;
+.fold-why{font-size:13px;color:var(--text-light);margin:0;padding:0 16px 12px;
   line-height:1.55}
 .fold .tablewrap{border-top:1px solid var(--border)}
 .fold table{border:0}
-.tab-empty{padding:14px 16px;font-size:13px;color:var(--text-light);
+.tab-empty{padding:16px;font-size:13px;color:var(--text-light);
   background:var(--surface);border:1px solid var(--border)}
 /* tab 上「+N」：这个项目底下还收着几行已归档的。淡色，不和主数字抢。 */
 .tabs .more{font-size:12px;font-family:var(--font-num);color:var(--text-faint);
@@ -483,20 +493,20 @@ tr.resolvedNote td{font-size:13px;color:var(--success-deep);
 tr.resolvedNote button.link{margin-left:8px}
 .resolved{margin-top:12px}
 .resolved .tablewrap{margin-top:4px}
-#projects{background:var(--surface);border:1px solid var(--border);padding:4px 18px}
+#projects{background:var(--surface);border:1px solid var(--border);padding:4px 20px}
 /* 待办工作台：项目、问题层级和处理状态常显；统计与日报按需展开。
  * 首屏的任务是处置，不是先读两排指标。所有指标仍保留原 DOM 和统计口径。 */
 .workbench{background:var(--surface);border:1px solid var(--border);margin:16px 0 12px}
-.work-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 14px}
+.work-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px}
 .work-head h2{margin:0;font-size:16px;margin-right:2px}
 .work-head select{min-width:150px;max-width:100%}
 .work-head .field-label{display:flex;align-items:center;gap:6px;font-size:12px;
   color:var(--text-light)}
 .work-head .field-label select{color:var(--text-dark)}
-.work-context{padding:10px 14px 0;font-size:12px;color:var(--text-light)}
+.work-context{padding:12px 16px 0;font-size:12px;color:var(--text-light)}
 .work-details{border-top:1px solid var(--border)}
 .work-details>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  padding:10px 14px;color:var(--text);font-size:13px;font-weight:500}
+  padding:12px 16px;color:var(--text);font-size:13px;font-weight:500}
 .work-details>summary::after{content:'展开';margin-left:auto;color:var(--primary);font-size:12px}
 .work-details[open]>summary::after{content:'收起'}
 select,input[type=date],textarea{font:14px/1.5 var(--font-sans);color:var(--text-dark);
@@ -506,58 +516,60 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--primary);out
 textarea{width:100%;resize:vertical;min-height:72px}
 .work-live{margin-left:auto;font-size:12px;color:var(--text-light)}
 .work-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));
-  gap:0;padding:18px 0 12px}
-.work-metric{padding:0 18px;border-right:1px solid var(--border);min-width:0}
+  gap:0;padding:20px 0 12px}
+.work-metric{padding:0 16px;border-right:1px solid var(--border);min-width:0}
 .work-metric:last-child{border-right:0}
 .work-metric .metric-label{display:block;font-size:13px;color:var(--text-light)}
 .work-metric .metric-value{display:block;font:600 30px/1.35 var(--font-num);
-  color:var(--text-dark);margin-top:5px}
-.work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:5px}
+  color:var(--text-dark);margin-top:4px}
+.work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:4px}
 .work-metric .metric-note{display:block;font-size:12px;color:var(--text-light);margin-top:2px}
-.work-source{font-size:12px;color:var(--primary);background:var(--tint-primary);padding:3px 7px}
-.work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 14px 12px}
+.work-source{font-size:12px;color:var(--primary);background:var(--tint-primary);padding:2px 8px}
+.work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 16px}
 .work-states .caption{font-size:12px;color:var(--text-light);margin-right:4px}
 .work-states button{height:32px;font-size:13px;font-weight:500;padding:0 10px;background:none;
   border:1px solid var(--border)}
 .work-states button[aria-pressed=true]{color:var(--primary);background:var(--tint-primary);
   border-color:var(--primary)}
 .work-states b{font-family:var(--font-num);margin-left:6px}
-.work-summary{padding:0 18px 10px;color:var(--text-light);font-size:12px}
+.work-summary{padding:0 16px 12px;color:var(--text-light);font-size:12px}
 .daily{border-top:1px solid var(--border)}
-.daily>summary{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+.daily>summary{padding:12px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
   color:var(--text-dark);font-weight:500}
 .daily>summary::after{content:'展开';margin-left:auto;font-size:12px;color:var(--primary)}
 .daily[open]>summary::after{content:'收起'}
-.daily-body{padding:0 18px 18px}
-.daily-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:2px 0 14px}
+.daily-body{padding:0 16px 16px}
+.daily-tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:4px 0 16px}
 .daily-tools label{font-size:13px;color:var(--text-light)}
 .daily-tools .copy{margin-left:auto}
 .daily-text{min-height:140px;line-height:1.65;font-size:14px}
-.daily-extra{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
-.daily-extra label{font-size:13px;display:block;color:var(--text);margin-bottom:6px}
+.daily-extra{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+.daily-extra label{font-size:13px;display:block;color:var(--text);margin-bottom:8px}
 .daily-extra .muted{font-weight:400;margin-left:6px}
 .daily-evidence{font-size:13px;line-height:1.8;margin:12px 0;color:var(--text)}
 .daily-limits{font-size:12px;color:var(--warning-deep);margin:8px 0;padding-left:18px}
 .daily-message{font-size:12px;color:var(--text-light);min-height:20px;margin-top:8px}
-.daily-fold{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}
+.daily-fold{margin-top:12px;border-top:1px solid var(--border);padding-top:12px}
 .daily-fold>summary{font-size:13px;color:var(--text-light)}
-.daily-fold .daily-extra{margin-top:10px}
+.daily-fold .daily-extra{margin-top:12px}
 .daily-fold p{font-size:12px;margin:8px 0;color:var(--text-light)}
-.draft-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-  margin:12px 0 4px;padding:8px 10px;background:var(--bg)}
+.draft-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  margin:12px 0 4px;padding:8px 12px;background:var(--bg)}
 .draft-state{font-size:12px;color:var(--text-light);flex:1;min-width:180px}
 .draft-state[data-state=ok]{color:var(--success-deep)}
 .draft-state[data-state=err]{color:var(--danger-deep)}
 .draft-bar button{flex:none}
 .diagnostic>summary{font-size:13px;color:var(--text);max-width:26em}
 .diagnostic .diagnostic-body{margin-top:8px;font-size:13px;white-space:pre-wrap;max-width:40em}
-.work-state{display:block;width:max-content;min-width:44px;text-align:center;
+/* 「处理」一格排成一行：去这一行 · 状态 · 正在处理 · 已处理。
+ * 以前状态徽标独占一行、按钮再起一行，每条待办被撑到三行高。 */
+.work-state{display:inline-block;min-width:44px;text-align:center;
   padding:0 6px;line-height:20px;font-size:12px;color:var(--text-light);
-  background:var(--fill);margin-bottom:6px}
+  background:var(--fill);margin-left:12px}
 .work-state.processing{color:var(--primary);font-weight:600;background:var(--tint-primary)}
 button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-decoration:underline}
 .work-error{display:block;font-size:12px;color:var(--danger-deep);max-width:22em;white-space:normal}
-.monitor-help{margin:8px 0 14px;font-size:13px;color:var(--text-light)}
+.monitor-help{margin:8px 0 16px;font-size:13px;color:var(--text-light)}
 .monitor-help p{margin:8px 0}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
   clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -585,14 +597,14 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .work-head select{flex:1;min-width:0;width:100%}
   .work-live{width:100%;margin-left:0}
   .top-status{right:16px;max-width:calc(100vw - 32px)}
-  .work-metrics{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px 0;row-gap:14px}
-  .work-metric{padding:0 14px}
+  .work-metrics{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px 0;row-gap:16px}
+  .work-metric{padding:0 16px}
   .work-metric:nth-child(2n){border-right:0}
   .work-metric .metric-value{font-size:28px}
-  .work-states{padding:12px 14px 6px}
-  .work-summary{padding:4px 14px 12px}
-  .daily>summary{padding:12px 14px}
-  .daily-body{padding:0 14px 14px}
+  .work-states{padding:12px 16px 8px}
+  .work-summary{padding:4px 16px 12px}
+  .daily>summary{padding:12px 16px}
+  .daily-body{padding:0 16px 16px}
   .daily-extra{grid-template-columns:1fr}
   .daily-tools .copy{margin-left:0}
 }
@@ -604,7 +616,7 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .tablewrap.todo-wrap{overflow-x:visible}
   .tablewrap table.todos{min-width:0;border:0;background:transparent}
   .todos thead{display:none}
-  .todos tbody{display:grid;gap:10px}
+  .todos tbody{display:grid;gap:12px}
   .todos tbody tr{display:grid;grid-template-columns:24px minmax(0,1fr);gap:0 8px;
     background:var(--surface);border:1px solid var(--border);padding:12px}
   .todos tbody td{display:block;grid-column:2;border:0;padding:4px 0;
@@ -613,12 +625,13 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .todos tbody td.which{grid-column:2;grid-row:1;padding-top:0}
   .todos tbody td.reasons{padding-top:8px}
   .todos tbody td.comments::before{content:'评论数';color:var(--text-light);
-    font-size:12px;margin-right:10px}
+    font-size:12px;margin-right:8px}
   .todos tbody td.when::before{content:'最近检查';color:var(--text-light);
-    font-size:12px;margin-right:10px}
+    font-size:12px;margin-right:8px}
   .todos tbody td.acts{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;
-    border-top:1px solid var(--border);margin-top:6px;padding-top:10px;white-space:normal}
-  .todos tbody td.acts .work-state{flex-basis:auto;margin-bottom:0}
+    border-top:1px solid var(--border);margin-top:8px;padding-top:12px;white-space:normal}
+  .todos tbody td.comments{text-align:left}
+  .todos tbody td.acts .work-state{flex-basis:auto;margin-left:0}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
   .todos .diagnostic>summary,.todos .diagnostic .diagnostic-body{max-width:none}
   .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
@@ -633,6 +646,20 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
 _SCRIPT = r"""
 (function(){
   var token = document.body.dataset.csrf || "";
+
+  // 报错给人看的那一句。fetch 本身没发出去（断网、服务在重启、CSP 拦了）时
+  // 浏览器只给「TypeError: Failed to fetch」，运营看不懂；服务端回的 JSON 不是
+  // JSON（Railway 重启时的 502 页）时是一句 SyntaxError。这两种翻成人话，
+  // 原文留在括号里方便排查；服务端自己给的 j.error 原样显示，只去掉
+  // 直接 String(err) 会带上的「Error: 」前缀。
+  function errText(err){
+    var msg = String((err && err.message) || err || "");
+    if (err && err.name === "TypeError" && /fetch|network|load failed/i.test(msg))
+      return "连不上面板服务（" + msg + "），稍后再试";
+    if (err && err.name === "SyntaxError")
+      return "面板服务的回应读不懂，可能正在重启，稍后再试";
+    return msg;
+  }
 
   // ---- 深浅模式：默认跟随系统；点右下角开关改为手动指定 ----
   // templates/dashboard.html 的定式：两态翻转。没存过偏好时第一下必须从
@@ -707,7 +734,7 @@ _SCRIPT = r"""
         btn.disabled = false; btn.textContent = "重新取数"; refreshSay("待办与汇总已更新。", "ok");
       }).catch(function(err){
         btn.disabled = false; btn.textContent = "重新取数";
-        refreshSay("更新失败：" + String(err.message || err) + "；仍显示当前快照。", "error");
+        refreshSay("更新失败：" + errText(err) + "；仍显示当前快照。", "error");
       });
   });
   // ---- 待办：按项目分页 ----
@@ -980,7 +1007,7 @@ _SCRIPT = r"""
         for (var a2 = 0; a2 < alls.length; a2++) alls[a2].checked = false;
         sync();
       })
-      .catch(function(err){ if (qOut) qOut.textContent = String(err); btnQ.disabled = false; });
+      .catch(function(err){ if (qOut) qOut.textContent = errText(err); btnQ.disabled = false; });
   });
 
   // 帖子处理进度是共享状态；保存成功后同步顶部，失败不改变原状态。
@@ -1031,7 +1058,7 @@ _SCRIPT = r"""
       applyWorkFilter(); recount(); sync();
       refreshWork(); loadReports();
     }).catch(function(err){
-      errorBox.textContent = String(err.message || err);
+      errorBox.textContent = errText(err);
       if (err.status === 409) refreshWork();
     }).then(function(){
       delete tr.dataset.busy;
@@ -1199,7 +1226,7 @@ _SCRIPT = r"""
       (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : '')) + '</td>' +
       '<td class="diagnosis"><details class="diagnostic"><summary>' + esc(diagnostic.slice(0, 48) || '查看诊断与评论摘要') +
       '</summary><div class="diagnostic-body">' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></details></td>' +
-      '<td class="comments">' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
+      '<td class="nowrap right comments num">' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
       chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '') + '</td>' +
       '<td class="nowrap acts">' + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去这一行</a>' : '') + controls + '</td></tr>';
   }
@@ -1366,7 +1393,7 @@ _SCRIPT = r"""
     if (!workbench || document.hidden || overviewBusy) return Promise.resolve();
     overviewBusy = true; var epoch = overviewEpoch;
     return getJson("/api/overview", poll).then(function(j){ if (epoch === overviewEpoch) applyOverview(j); })
-      .catch(function(e){ if (workLive) workLive.textContent = "同步延迟：" + e.message; })
+      .catch(function(e){ if (workLive) workLive.textContent = "同步延迟：" + errText(e); })
       .then(function(){ overviewBusy = false; });
   }
   function reportKey(){ return (workProject ? workProject.value : "") + "/" + (reportDate ? reportDate.value : ""); }
@@ -1508,7 +1535,7 @@ _SCRIPT = r"""
         if (draftSeq[key] !== seq) return;
         // 失败记成终态：轮询只填空的这一期，不能每分钟重打一次付费接口。
         // 要重试就点「重新生成」（force），服务端另有 30 秒冷却。
-        draftState[key] = {status: "error", error: "AI 草稿没生成出来：" + (err.message || err) +
+        draftState[key] = {status: "error", error: "AI 草稿没生成出来：" + errText(err) +
                                                    "。可人工填写，或点「重新生成」再试。"};
         if (key === reportKey()) syncDraftState();
       });
@@ -1627,7 +1654,7 @@ _SCRIPT = r"""
       maybeDraft();
     }).catch(function(e){
       if (epoch !== reportEpoch || key !== reportKey()) return;
-      reportMessage.textContent = "日报同步延迟：" + e.message + (reportLoaded ? "；已保留上次结果。" : "；暂时无法取得统计。");
+      reportMessage.textContent = "日报同步延迟：" + errText(e) + (reportLoaded ? "；已保留上次结果。" : "；暂时无法取得统计。");
       if (!reportLoaded) setText("workSummary", "本期统计暂不可用，请稍后重试。");
     });
   }
@@ -1778,7 +1805,7 @@ _SCRIPT = r"""
           "</div><div class='out rowOut' style='flex-basis:100%'></div>" +
           thresholdForm(e) + "</div>";
       }).join("");
-    }).catch(function(err){ list.className = "problem"; list.textContent = String(err); });
+    }).catch(function(err){ list.className = "problem"; list.textContent = errText(err); });
   }
   if (list) {
     load();
@@ -1816,7 +1843,7 @@ _SCRIPT = r"""
               out2.innerHTML = lines.join("\n\n");
               saveBtn.disabled = false; b.disabled = false;
             })
-            .catch(function(err){ out2.textContent = String(err); b.disabled = false; });
+            .catch(function(err){ out2.textContent = errText(err); b.disabled = false; });
         } else {
           post("thresholds", {record_id: rec, values: thrValues(panelBox)})
             .then(function(j){
@@ -1826,7 +1853,7 @@ _SCRIPT = r"""
               if (j && j.formula) lines.push(esc(j.formula));
               out2.innerHTML = lines.join("\n");
             })
-            .catch(function(err){ out2.textContent = String(err); b.disabled = false; });
+            .catch(function(err){ out2.textContent = errText(err); b.disabled = false; });
         }
         return;
       }
@@ -1867,7 +1894,7 @@ _SCRIPT = r"""
           return;
         }
         load();
-      }).catch(function(err){ tell(esc(String(err)), ""); b.disabled = false; });
+      }).catch(function(err){ tell(esc(errText(err)), ""); b.disabled = false; });
     });
   }
   var btnCheck = document.getElementById("btnCheck");
@@ -1891,9 +1918,9 @@ _SCRIPT = r"""
         add.disabled = true;
         post("add", {label: label, target: target, client_token: "add-" + target + "-" + label}).then(function(){
           say("加好了。<b>还没启用</b>——确认配置齐了再点上面那一行的「启用」。", "ok"); load();
-        }).catch(function(err){ say(esc(String(err)), ""); add.disabled = false; });
+        }).catch(function(err){ say(esc(errText(err)), ""); add.disabled = false; });
       });
-    }).catch(function(err){ say(esc(String(err)), ""); });
+    }).catch(function(err){ say(esc(errText(err)), ""); });
   });
   // ---- 新建表给谁开权限 ----
   // 群可编辑：面板上从应用所在的群里勾选，存在注册表 base 里，不用碰部署。
@@ -1938,7 +1965,7 @@ _SCRIPT = r"""
   function loadShare(){
     if (!shareBox) return;
     getJson("/api/share").then(function(j){ shareState = j.share; renderShare(); })
-      .catch(function(err){ shareBox.innerHTML = "<div class=muted>" + esc(String(err)) + "</div>"; });
+      .catch(function(err){ shareBox.innerHTML = "<div class=muted>" + esc(errText(err)) + "</div>"; });
   }
   if (shareBox) {
     loadShare();
@@ -1966,7 +1993,7 @@ _SCRIPT = r"""
             }).join("") +
             "<div style='margin-top:8px'><button type=button class=sm data-share=save-chats>保存</button> " +
             "<button type=button class=sm data-share=close-pick>收起</button></div>";
-        }).catch(function(err){ pick.innerHTML = esc(String(err)); b.disabled = false; });
+        }).catch(function(err){ pick.innerHTML = esc(errText(err)); b.disabled = false; });
         return;
       }
       if (what === "close-pick") { document.getElementById("chatPick").hidden = true; return; }
@@ -1978,7 +2005,7 @@ _SCRIPT = r"""
         post("share_chats", {chats: chats}).then(function(j){
           shareState = j.share; renderShare();
           shareSay("存好了：" + (chats.length ? chats.map(function(c){ return esc(c.name || c.chat_id); }).join("、") : "没有群") + " 可编辑。之后每张新建的表都会加上。", "ok");
-        }).catch(function(err){ shareSay(esc(String(err)), ""); b.disabled = false; });
+        }).catch(function(err){ shareSay(esc(errText(err)), ""); b.disabled = false; });
         return;
       }
       if (what === "apply") {
@@ -1993,7 +2020,7 @@ _SCRIPT = r"""
           if (!lines.length) lines.push("上面还没配任何人和群，没什么可加的。");
           shareSay(lines.join("\n"), j.ok && j.granted.length ? "ok" : "");
           b.disabled = false;
-        }).catch(function(err){ shareSay(esc(String(err)), ""); b.disabled = false; });
+        }).catch(function(err){ shareSay(esc(errText(err)), ""); b.disabled = false; });
       }
     });
   }
@@ -2022,7 +2049,7 @@ _SCRIPT = r"""
       // 还有手动步骤没做时不标成「全好了」的绿色：表是建好了，但还没好用。
       say(lines.join("\n"), (bad.length || manual.length) ? "" : "ok");
       btnCreate.disabled = false;
-    }).catch(function(err){ say(esc(String(err)), ""); btnCreate.disabled = false; });
+    }).catch(function(err){ say(esc(errText(err)), ""); btnCreate.disabled = false; });
   });
 })();
 """
@@ -2159,9 +2186,11 @@ def _stamp(ms: Optional[int], offset_hours: float = 8.0) -> str:
     return moment.astimezone(tz).strftime("%m-%d %H:%M")
 
 
-# 「哪一条」显示多少个字。中文十来个字就够在表里 Ctrl+F 定位了，
-# 再长会把表撑宽、把「为什么」和「诊断信息」挤没。完整文本挂在 title 上。
-LABEL_CHARS = 14
+# 「哪一条」显示多少个字。14 个字经常把关键信息切掉（「日本 7 天 eSIM 真实…」），
+# 而且浏览器那边重画待办行时本来就截 24 个字（_SCRIPT 的 rowHtml），
+# 两边不一致的话，同一行过 15 秒标题就变长一截。列宽有 max-width 兜着，
+# 长标题折成两行，不会把「为什么」和「诊断信息」挤没。完整文本挂在 title 上。
+LABEL_CHARS = 24
 
 
 def _clip(text: str, limit: int = LABEL_CHARS) -> str:
@@ -2288,7 +2317,7 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         f"<span class=post>{_post_link(todo.post_url)}</span></div></td>"
         f"<td class=reasons>{_chips(todo.reasons, _REASON_CLASS)}{_scope_chip(todo) if main else ''}</td>"
         f"<td class=diagnosis>{diagnosis}</td>"
-        f"<td class='nowrap comments'>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
+        f"<td class='nowrap right comments num'>{_e(todo.comment_count) if todo.comment_count is not None else '—'}</td>"
         # 「排队中」= 勾了、cron 还没来接。这是面板上唯一能分开「同样的错」
         # 和「还没刷回来」的信号——勾着，这一行看到的就还是旧结果。
         # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT，按 td.when 找格子）。
@@ -2300,7 +2329,7 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
 
 
 _TODO_COLUMNS = ("<th>帖子 / 素人</th><th>为什么</th>"
-                 "<th>诊断信息</th><th>评论数</th><th>最近检查</th><th>处理</th>")
+                 "<th>诊断信息</th><th class=right>评论数</th><th>最近检查</th><th>处理</th>")
 
 
 def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) -> str:
@@ -2544,7 +2573,7 @@ def _run_row(run, offset_hours: float) -> str:
             f"<td class=nowrap>{_e(started)}</td>"
             f"<td class=nowrap>{_e(run.mode or '—')}</td>"
             f"<td>{tables}</td>"
-            f"<td class=nowrap>{run.rows}</td>"
+            f"<td class='nowrap right num'>{run.rows}</td>"
             f"<td class='nowrap right num'>¥{run.cost_yuan:.2f}</td>"
             f"<td class='nowrap right'>{left}</td>"
             f"<td>{badge}{''.join(extra)}</td>"
@@ -2570,8 +2599,8 @@ def _runs_section(runs, log_error: str, offset_hours: float) -> str:
                 "<code>RUN_LOG_JSON=1</code>，日志才带结构化事件；"
                 "Railway 免费 / Hobby 套餐日志只留 7 天。</div></div>")
         return f"<h2 id=s-runs>运行历史</h2>{note}{body}"
-    head = ("<tr><th>开跑</th><th>模式</th><th>表</th><th>行数</th>"
-            "<th>花费</th><th>跑完剩</th><th>结果</th></tr>")
+    head = ("<tr><th>开跑</th><th>模式</th><th>表</th><th class=right>行数</th>"
+            "<th class=right>花费</th><th class=right>跑完剩</th><th>结果</th></tr>")
     rows = "".join(_run_row(r, offset_hours) for r in runs)
     unfinished = sum(1 for r in runs if not r.finished)
     warn = ""
@@ -2698,8 +2727,8 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
         # 而它其实已经下线了——这正是要在这里说破的那个落差。
         out = down.get(b.channel)
         if out is not None and not b.error:
-            main = (f"${b.amount:.2f}" if b.unit == "USD"
-                    else f"{b.amount:.0f} 积分")
+            main = (f"${b.amount:,.2f}" if b.unit == "USD"
+                    else f"{b.amount:,.0f} 积分")
             cards.append(
                 f"<div class='card bad'><h3>{_e(b.label)}</h3>"
                 f"<div class='big num'>{_e(main)}</div>"
@@ -2716,14 +2745,16 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
                 "<div class=muted>这不等于余额为 0——去对应后台看一眼，"
                 "或检查 Key 是不是过期了</div></div>")
             continue
+        # 金额一律带千分位：「18240 积分」紧挨着「$21.40」，一个有分隔一个没有，
+        # 位数要一位一位数。
         if b.unit == "USD":
-            main = f"${b.amount:.2f}"
-            sub = (f"≈ ¥{b.yuan:.2f}（按 {b.rate:g} 折算）"
+            main = f"${b.amount:,.2f}"
+            sub = (f"≈ ¥{b.yuan:,.2f}（按 {b.rate:g} 折算）"
                    if b.yuan is not None else "")
             sub_cls = "muted num"
         else:
-            main = f"{b.amount:.0f} 积分"
-            sub = f"≈ ¥{b.yuan:.2f}" if b.yuan is not None else ""
+            main = f"{b.amount:,.0f} 积分"
+            sub = f"≈ ¥{b.yuan:,.2f}" if b.yuan is not None else ""
             sub_cls = "muted num"
         credit = (f"<div class=muted>另有赠送额度 {b.free_credit:g}</div>"
                   if b.free_credit else "")
@@ -2734,11 +2765,12 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
 
     note = ""
     if runway is not None and runway.known:
+        # 平安无事时是一行灰字，下面紧贴着余额卡——给它和 .sub 一样的 12px 底距。
         cls = "problem" if runway.days <= alert_days else (
-            "note" if runway.days <= warn_days else "muted")
+            "note" if runway.days <= warn_days else "muted lead-in")
         partial = ("；<b>只算了读得到的那家</b>，实际比这个多"
                    if runway.partial else "")
-        note = (f"<div class={cls}>按最近 {runway.runs_used} 轮"
+        note = (f"<div class='{cls}'>按最近 {runway.runs_used} 轮"
                 f"（{runway.hours_covered:.1f} 小时）的实际花速 "
                 f"<span class=num>¥{runway.yuan_per_day:.2f}/天</span>，余额还够跑 "
                 f"<b class=num>{runway.days:.0f} 天</b>{partial}</div>")
