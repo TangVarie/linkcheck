@@ -204,11 +204,13 @@ class TestNegativeSnapshotForTheReport(unittest.TestCase):
         for not_comments in ("", "（未命中）", "手工写的备注"):
             self.assertEqual(summary.negative_digest_comments(not_comments, Settings()), [])
 
-    def test_without_author_names_a_colon_in_the_comment_is_kept(self):
+    def test_nicknames_are_stripped_even_after_the_setting_was_turned_off(self):
+        """开关管的是以后怎么写；关开关之前写下的快照还带着昵称，归档帖会一直留着。
+        宁可把正文里恰好有的短前缀也剥掉，不把昵称交出去。"""
         settings = Settings()
         settings.digest.show_author_name = False
-        self.assertEqual(summary.negative_digest_comments("1. [命中「贵」] 结论: 太贵", settings),
-                         [("结论: 太贵", "贵")])
+        self.assertEqual(summary.negative_digest_comments("1. [命中「贵」] 私人昵称: 太贵", settings),
+                         [("太贵", "贵")])
 
     def test_report_rows_carry_title_and_comments_only_for_negative_rows(self):
         f = Settings().fields
@@ -232,6 +234,16 @@ class TestNegativeSnapshotForTheReport(unittest.TestCase):
         self.assertEqual(actual["negative_checked_from_ms"], ms(older))
         self.assertEqual(actual["negative_checked_to_ms"], ms(newer),
                          "没负面的行不算进这批帖子的检查时间")
+
+    def test_one_unknown_check_time_suppresses_the_range(self):
+        """有一篇的检查时间读不出来，就不能拿其余几篇的范围说「这 N 篇都在……」。"""
+        known = record(1, negative=True, digest=digest(1), checked=NOW - timedelta(days=2))
+        unknown = record(2, negative=True, digest=digest(1))
+        del unknown["fields"][Settings().fields.last_updated]
+        actual = report(project([known, unknown]))
+        self.assertEqual(actual["negative_posts"], 2)
+        self.assertIsNone(actual["negative_checked_from_ms"])
+        self.assertIsNone(actual["negative_checked_to_ms"])
 
 if __name__ == "__main__":
     unittest.main()

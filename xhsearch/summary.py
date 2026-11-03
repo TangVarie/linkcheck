@@ -532,7 +532,10 @@ def negative_digest_comments(text: str, settings: Settings) -> list[tuple[str, s
             continue
         hit = _DIGEST_HIT.search(match.group("marks") or "")
         rest = match.group("rest").strip()
-        if settings.digest.show_author_name and ": " in rest:
+        # 不看「现在」开没开 show_author_name：那个开关管的是**以后**怎么写，表里已经
+        # 写下的快照可能还带着昵称（关开关之前写的，归档帖会一直留着）。宁可把正文里
+        # 恰好有的一个短前缀也剥掉，不把昵称交出去。
+        if ": " in rest:
             who, body = rest.split(": ", 1)
             if len(who) <= _DIGEST_AUTHOR_MAX:
                 rest = body.strip()
@@ -998,8 +1001,11 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
             return len(selected), count, any(value["lower"] for value in selected), posts, comments
 
         current = totals(list(negatives.values()))
-        checked_at = [value["checked"] for value in negatives.values()
-                      if value["checked"] is not None]
+        # 有一篇的检查时间读不出来，就不报这一批的日期范围——用其余几篇的范围冒充
+        # 「这 N 篇最近一次检查都在……」，说的就不是真话。
+        checked_at = ([value["checked"] for value in negatives.values()]
+                      if all(value["checked"] is not None for value in negatives.values())
+                      else [])
         window = totals([value for key, value in negatives.items() if key in checked])
         item.update({"checked_posts": len(checked), "window_checked_posts": len(checked),
                      "negative_posts": current[0], "negative_comments": current[1],

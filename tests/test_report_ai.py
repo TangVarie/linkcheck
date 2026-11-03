@@ -159,7 +159,8 @@ class TestEvidence(unittest.TestCase):
         evidence = report_ai.evidence_for_prompt(
             [scan(hits=[{"id": "x", "content": "这一期别的帖子里的评论"}])],
             report(current_snapshot=snapshot), posts("甲", "乙"))
-        self.assertEqual([p["title"] for p in evidence["posts"]], ["甲", "乙"])
+        self.assertEqual(sorted(p["title"] for p in evidence["posts"]), ["乙", "甲"])
+        self.assertNotIn("key", evidence["posts"][0], "帖子键是标识，不交给模型")
         self.assertEqual(evidence["comments"], [], "只讲那 N 篇，不混进别的帖子的评论")
         self.assertEqual(evidence["keywords"], [])
         self.assertEqual(evidence["counts"]["negative_now"], 2)
@@ -184,6 +185,32 @@ class TestEvidence(unittest.TestCase):
         self.assertEqual([c["content"] for c in found[0]["comments"]], ["太贵了", "售后差"],
                          "同一篇登记两行，评论合并去重")
         self.assertEqual(found[1]["comments"], [], "没评论也照样送标题")
+
+    def test_too_many_posts_are_cut_to_the_latest_and_disclosed(self):
+        """21 篇只送 20 篇：要标「抽样」，提示词里也要告诉模型只给了其中几篇，
+        不能让它把一部分当成全部 21 篇来写。"""
+        rows = [negative_row(f"帖{i:02d}", checked=START + i) for i in range(21)]
+        found = report_ai.negative_posts_for(SimpleNamespace(projects=[SimpleNamespace(
+            table_id=TABLE, report_rows=rows)]), TABLE)
+        snapshot = {"available": True, "window_is_current": True, "negative_posts": 21,
+                    "window_negative_posts": 0, "post_states": {}}
+        evidence = report_ai.evidence_for_prompt([], report(current_snapshot=snapshot), found)
+        self.assertEqual(len(evidence["posts"]), report_ai.MAX_POSTS)
+        self.assertNotIn("帖00", [p["title"] for p in evidence["posts"]], "截掉的是最久没查的")
+        self.assertTrue(evidence["sampled"])
+        self.assertEqual(evidence["counts"]["posts_supplied"], report_ai.MAX_POSTS)
+        self.assertIn("posts_supplied", report_ai.prompt_messages(evidence)[0]["content"])
+
+    def test_a_routine_recheck_does_not_reorder_the_prompt(self):
+        """只是检查时间往前挪了一下，标题和评论都没变：提示词必须一模一样，
+        不然缓存指纹一变，同一份证据 15 分钟内又要计费一次。"""
+        def prompt(first_checked, second_checked):
+            overview = SimpleNamespace(projects=[SimpleNamespace(table_id=TABLE, report_rows=[
+                negative_row("甲", checked=first_checked), negative_row("乙", checked=second_checked)])])
+            evidence = report_ai.evidence_for_prompt(
+                [], report(), report_ai.negative_posts_for(overview, TABLE))
+            return report_ai.prompt_messages(evidence)
+        self.assertEqual(prompt(START + 1, START + 2), prompt(START + 3, START + 2))
 
     def test_snapshot_comments_are_scrubbed_before_leaving(self):
         found = report_ai.negative_posts_for(SimpleNamespace(projects=[SimpleNamespace(
