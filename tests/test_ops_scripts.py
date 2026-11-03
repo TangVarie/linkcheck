@@ -440,6 +440,25 @@ class TestNextCheckDrift(unittest.TestCase):
         self.assertIn("不是公式列", note)
 
 
+class TestNextCheckShadows(unittest.TestCase):
+    """途鸽那张表两列都在：机器换「下次检查时间」，运营看「下次巡查时间」。"""
+
+    def test_both_columns_names_the_one_the_machine_leaves_alone(self):
+        meta = meta_with()
+        meta["下次巡查时间"] = {"type": 20, "formula": "[最近检查时间] + 3"}
+        note = provision.next_check_shadows(meta)
+        self.assertIn("机器只更新「下次检查时间」", note)
+        self.assertIn("「下次巡查时间」不会跟着刷新频率变", note)
+        self.assertEqual(provision.next_check_plan(Settings(), meta).column,
+                         NEXT_CHECK_COLUMN, "两列都在时换的是机器那一列")
+
+    def test_a_single_column_under_either_name_is_fine(self):
+        self.assertEqual(provision.next_check_shadows(meta_with()), "")
+        self.assertEqual(provision.next_check_shadows(renamed(meta_with(), "下次巡查时间")), "")
+        self.assertEqual(provision.next_check_shadows(without_column(meta_with())), "")
+        self.assertEqual(provision.next_check_shadows(None), "")
+
+
 def ok(payload=None):
     return transport.Response(status=200, content_type="application/json",
                               body=json.dumps({"code": 0, "data": payload or {}}))

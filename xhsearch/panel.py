@@ -400,9 +400,9 @@ def _collect_one(label, table, settings, api_keys, *,
     health = schema.schema_problems(settings, meta)
     # 「下次检查时间」那一列的公式跟这张表的刷新频率对不上，就一直挂在卡上，
     # 不能只在改参数那一下的回执里闪一次（见 provision.next_check_drift）。
-    drift = provision.next_check_drift(settings, meta)
-    if drift:
-        health = [*health, drift]
+    # 两列「下次…时间」并存也要说：机器只换其中一列，运营看的可能是另一列。
+    notes = [provision.next_check_drift(settings, meta), provision.next_check_shadows(meta)]
+    health = [*health, *(n for n in notes if n)]
     # 「哪一条」用哪一列，在 search 之前定下来（下面那条纪律的同一个原因）。
     picked = summary.pick_label_column(known, label_column)
     # 只请求确实存在的列：按名字请求不存在的列会让整个 search 报 1254045，

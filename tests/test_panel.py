@@ -451,6 +451,24 @@ class TestCollect(unittest.TestCase):
         self.assertFalse(any("刷新频率对不上" in p for p in in_step.projects[0].health),
                          "对得上就不报")
 
+    def test_two_next_check_columns_are_flagged_on_the_card(self):
+        """两列都在：公式对得上也要说，运营看的可能是机器不管的那一列。"""
+        from xhsearch import provision
+        settings = Settings()
+        meta = healthy_meta(settings)
+        current = provision.next_check_formula(settings)
+        meta["下次检查时间"] = {"type": 20, "result_type": 5, "formula": current}
+        meta["下次巡查时间"] = {"type": 20, "result_type": 5, "formula": "[最近检查时间] + 3"}
+        overview = panel.collect([("途鸽", FakeTable(meta, []))], settings, {}, now=NOW)
+        health = overview.projects[0].health
+        self.assertTrue(any("机器只更新「下次检查时间」" in p for p in health))
+        self.assertFalse(any("刷新频率对不上" in p for p in health),
+                         "机器那一列本身是对的，不报频率问题")
+        del meta["下次巡查时间"]
+        alone = panel.collect([("途鸽", FakeTable(meta, []))], settings, {}, now=NOW)
+        self.assertFalse(any("机器只更新" in p for p in alone.projects[0].health),
+                         "删掉另一列之后提示就消失")
+
     def test_empty_metadata_is_treated_the_same_as_unreadable(self):
         """多维表格的主字段不可删，健康的表不可能一列都没有。"""
         overview = panel.collect([("A", FakeTable({}, []))], Settings(), {}, now=NOW)
