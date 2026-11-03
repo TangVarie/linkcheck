@@ -152,6 +152,18 @@ class TestEvidence(unittest.TestCase):
         self.assertIn("不要用“异常”“样本”", system)
         self.assertIn("不要写“评论为空”“无法归纳”", system)
 
+    def test_prompt_keeps_the_paragraph_about_content_not_about_our_numbers_or_keywords(self):
+        """线上第一版：「按 counts，上述时段……其中 6 篇已处理、1 篇在处理中」——露了字段名、
+        复述了正文的数；还把「割韭菜」「润滑剂」说成「普通词当作负面词命中」。那些词是运营
+        特意设的预警词，黑话更要当信号看，不该被模型判成误命中。"""
+        system = report_ai.prompt_messages(
+            report_ai.evidence_for_prompt([], report(), posts("留学生回国求职")))[0]["content"]
+        self.assertIn("不要提 JSON 里的字段名", system)
+        self.assertIn("不要复述其他数字和处理状态", system)
+        self.assertIn("行业黑话、暗语", system)
+        self.assertIn("不要说它们是普通词、泛称或误命中", system)
+        self.assertNotIn("最后一句按 counts", system)
+
     def test_the_current_window_sends_the_posts_and_the_report_counts_not_period_comments(self):
         snapshot = {"available": True, "window_is_current": True, "as_of_ms": START + 3_600_000,
                     "window_checked_posts": 50, "window_negative_posts": 0, "negative_posts": 2,
@@ -163,10 +175,9 @@ class TestEvidence(unittest.TestCase):
         self.assertNotIn("key", evidence["posts"][0], "帖子键是标识，不交给模型")
         self.assertEqual(evidence["comments"], [], "只讲那 N 篇，不混进别的帖子的评论")
         self.assertEqual(evidence["keywords"], [])
-        self.assertEqual(evidence["counts"]["negative_now"], 2)
-        self.assertEqual(evidence["counts"]["negative_in_period"], 0)
-        self.assertNotIn("checked_in_period", evidence["counts"],
-                         "每轮巡检都变的数不进提示词，不然缓存指纹跟着变、重复计费")
+        self.assertEqual(evidence["counts"], {"negative_now": 2},
+                         "只送篇数：处理状态正文已经写了，送了模型就会复述；"
+                         "每轮巡检都变的数进了提示词，缓存指纹跟着变、重复计费")
         user = report_ai.prompt_messages(evidence)[1]["content"]
         self.assertNotIn("17:00", user, "截至几点每分钟都在走，不进提示词")
         self.assertNotIn("这一期别的帖子里的评论", user)
