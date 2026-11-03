@@ -240,6 +240,53 @@ class TestReport(unittest.TestCase):
         self.assertEqual(r["operations_unit"], "篇")
 
 
+class TestSnapshotTextMatchesTheMetrics(unittest.TestCase):
+    """复制出去的汇报正文要和工作台顶上那排数对得上。
+
+    线上截图：顶上「当前负面帖子 7 / 正在处理 1 / 已处理 6」，正文却写「快照可见
+    0 条预警评论；上述帖子：已处理 0 篇，正在处理 0 篇，待处理 0 篇」——正文只算
+    上述时段里检查过的帖子，那 7 篇的最近检查都在时段之前。两个口径都对，但正文
+    只写了一个，收汇报的人会读成「没有负面」。"""
+
+    def present(self, **snapshot):
+        base = {"available": True, "monitoring_posts": 195, "window_checked_posts": 48,
+                "window_negative_posts": 0, "window_negative_comments": 0,
+                "window_post_states": {"pending": 0, "processing": 0, "resolved": 0},
+                "negative_posts": 7, "negative_comments": 7,
+                "post_states": {"pending": 0, "processing": 1, "resolved": 6}}
+        base.update(snapshot)
+        return d.present_report(report([]), base, START + HOUR)["text"]
+
+    def test_older_negative_posts_are_reported_with_the_same_numbers_as_the_metrics(self):
+        text = self.present()
+        self.assertIn("上述时段已检查 48 篇帖子。其中 0 篇有负面预警。", text)
+        self.assertIn("当前仍有负面的帖子共 7 篇（含上述时段之前查出的）："
+                      "已处理 6 篇，正在处理 1 篇，待处理 0 篇。", text)
+        self.assertNotIn("快照可见 0", text, "一篇负面都没有时不写 0 条评论")
+        self.assertNotIn("上述帖子：", text, "也不写 0/0/0 的处理进度")
+        self.assertNotIn("本期", text)
+
+    def test_negatives_inside_the_period_keep_their_own_details(self):
+        text = self.present(window_negative_posts=2, window_negative_comments=3,
+                            window_post_states={"pending": 1, "processing": 1, "resolved": 0})
+        self.assertIn("其中 2 篇有负面预警。", text)
+        self.assertIn("这些帖子快照可见 3 条预警评论。", text)
+        self.assertIn("上述帖子：已处理 0 篇，正在处理 1 篇，待处理 1 篇。", text)
+        self.assertIn("当前仍有负面的帖子共 7 篇", text)
+
+    def test_no_negative_posts_at_all_says_so(self):
+        text = self.present(negative_posts=0, negative_comments=0,
+                            post_states={"pending": 0, "processing": 0, "resolved": 0})
+        self.assertIn("当前没有负面帖子。", text)
+        self.assertNotIn("当前仍有负面的帖子", text)
+
+    def test_unknown_current_state_is_not_written_as_zero(self):
+        text = self.present(negative_posts=None,
+                            post_states={"pending": None, "processing": None, "resolved": None})
+        self.assertIn("当前负面帖子数量及处理进度待核实。", text)
+        self.assertNotIn("当前没有负面帖子", text)
+
+
 class FakeTable:
     def __init__(self, limit=None):
         self.rows, self.tokens, self.searches = [], {}, []
