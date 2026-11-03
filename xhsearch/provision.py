@@ -253,10 +253,11 @@ def _tier_expr(age_expr: str, tiers) -> str:
 
 # 「下次检查时间」不是巡查列（机器不读不写，飞书自己算），名字就定在这里。
 NEXT_CHECK_COLUMN = "下次检查时间"
-# 同一列在老表里的另一个叫法。途鸽那张表是运营自己建的这一列，叫「下次巡查时间」。
-# 以前只认上面那个名字：面板上改了刷新频率，判定成「表里没有这一列」就跳过，
-# 运营的那一列一直按默认 72 小时报下次时间——看上去就像改了没生效。
-# 新建的表仍然叫「下次检查时间」；两个名字都在的表，认前一个。
+# 同一列在老表里的另一个叫法：运营自己建过一列「下次巡查时间」。只有它的表，
+# 以前判成「表里没有这一列」就跳过，那一列一直按默认 72 小时报下次时间。
+# 新建的表仍然叫「下次检查时间」；两个名字都在的表，认前一个，另一个见
+# next_check_shadows——途鸽那张表就是两列都在，机器换的是「下次检查时间」，
+# 运营看的是「下次巡查时间」，看上去就像改了频率没生效。
 NEXT_CHECK_ALIASES = (NEXT_CHECK_COLUMN, "下次巡查时间")
 
 
@@ -808,3 +809,23 @@ def next_check_drift(settings: Settings, meta: Optional[dict]) -> str:
         return ""
     return (f"「{plan.column}」的公式和这张表现在的刷新频率对不上，表里显示的下次时间不准。"
             "在「加表 / 改配置」里点这张表的「参数」，保存一次就会换上")
+
+
+def next_check_shadows(meta: Optional[dict]) -> str:
+    """表里同时有好几列「下次…时间」时，提醒哪一列机器不管。没有返回空串。**纯函数。**
+
+    途鸽那张表两列都在：改频率时机器换的是「下次检查时间」的公式，运营视图里
+    看的却是另一列「下次巡查时间」——那一列的公式写死了 72 小时，谁也不会去换它。
+    两列显示的时间不一样，运营照着不动的那一列估检查时间，看上去就像改了频率没生效。
+    机器只认一列（next_check_column），另外那几列不碰：它们可能是运营自己的东西，
+    删不删由人定。
+    """
+    meta = meta or {}
+    kept = next_check_column(meta)
+    others = [name for name in NEXT_CHECK_ALIASES if name in meta and name != kept]
+    if not others:
+        return ""
+    shown = "」「".join(others)
+    return (f"表里同时有「{kept}」和「{shown}」：机器只更新「{kept}」，"
+            f"「{shown}」不会跟着刷新频率变，看它会估错检查时间。"
+            f"删掉「{shown}」，或者在视图里只留「{kept}」")
