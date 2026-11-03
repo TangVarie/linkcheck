@@ -607,6 +607,31 @@ def _stamp(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, SHANGHAI).strftime("%m月%d日 %H:%M")
 
 
+def _state_counts(states: dict) -> str:
+    """「已处理 X 篇，正在处理 Y 篇，待处理 Z 篇」。读不到的那一档写「待核实」，不写 0。"""
+    return "，".join(
+        (f"{label} {states[state]} 篇" if states.get(state) is not None else f"{label}待核实")
+        for state, label in (("resolved", "已处理"), ("processing", "正在处理"),
+                             ("pending", "待处理")))
+
+
+def _current_negative_line(snapshot: dict) -> str:
+    """表里**此刻**所有带负面的帖子及处理进度——和工作台顶上那排「当前负面帖子
+    （累计）/ 待处理 / 正在处理 / 已处理」同一个口径、同一组数。
+
+    上一行只算上述时段里检查过的帖子；老帖查得少，之前查出负面、还在处理的帖子
+    常常不在里面。不补这一行，复制出去的汇报会写「已处理 0、正在处理 0」，
+    而顶上那排写着「正在处理 1、已处理 6」——两处数字对不上。
+    """
+    total = snapshot.get("negative_posts")
+    if total is None:
+        return "当前负面帖子数量及处理进度待核实。"
+    if total == 0:
+        return "当前没有负面帖子。"
+    return (f"当前仍有负面的帖子共 {total} 篇（含上述时段之前查出的）："
+            + _state_counts(snapshot.get("post_states") or {}) + "。")
+
+
 def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
                    *, journal_error: str = "") -> dict:
     """展示与复制层：优先交代可确认的数字，不把缺失留痕写成零工作量。"""
@@ -657,17 +682,18 @@ def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
         if negative is not None:
             lines[-1] += f"其中 {negative} 篇有负面预警。"
         states = snapshot.get("window_post_states") or {}
-        if comments is not None:
-            lines.append(f"快照可见{'至少 ' if lower else ' '}{comments} 条预警评论。")
-        elif negative:
-            lines.append("负面评论条数待核实。")
-        if negative is not None:
-            lines.append("上述帖子：" + "，".join(
-                (f"{label} {states[state]} 篇" if states.get(state) is not None else f"{label}待核实")
-                for state, label in (("resolved", "已处理"), ("processing", "正在处理"),
-                                     ("pending", "待处理"))) + "。")
-        else:
+        if negative:
+            # 只在上述时段里确有负面帖子时，才写这些帖子的评论数和处理进度。
+            # 一篇都没有时还写「快照可见 0 条、已处理 0 篇……」，收汇报的人会
+            # 读成「什么负面都没有」，而运营手上可能还挂着之前查出来的帖子。
+            if comments is not None:
+                lines.append(f"这些帖子快照可见{'至少 ' if lower else ' '}{comments} 条预警评论。")
+            else:
+                lines.append("负面评论条数待核实。")
+            lines.append("上述帖子：" + _state_counts(states) + "。")
+        elif negative is None:
             lines.append("所选时段的负面数量及处理进度待核实。")
+        lines.append(_current_negative_line(snapshot))
         lines.append("按现有表最近检查及评论快照统计。")
     else:
         prefix = "已扫描" if window.get("coverage_complete") else "已记录扫描"

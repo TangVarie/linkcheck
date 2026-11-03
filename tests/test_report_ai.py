@@ -126,6 +126,14 @@ class TestEvidence(unittest.TestCase):
         self.assertNotIn(str(END), user)
         self.assertNotIn("rec-secret", user)
 
+    def test_prompt_names_the_titles_as_open_negative_posts_not_this_periods_samples(self):
+        """标题是「此刻还没处理完的负面帖子」，可能是这一期之前查出来的；
+        叫它「本期异常样本」，就和正文按时段统计的「其中 0 篇有负面」打架。"""
+        system = report_ai.prompt_messages(
+            report_ai.evidence_for_prompt([scan()], report(), ["露营装备清单"]))[0]["content"]
+        self.assertIn("当前未处理的负面帖子", system)
+        self.assertIn("不要写成“本期异常样本”", system)
+
     def test_titles_come_only_from_the_selected_table_and_dedupe(self):
         overview = SimpleNamespace(projects=[
             SimpleNamespace(table_id=TABLE, todos=[todo("甲"), todo("甲")],
