@@ -196,6 +196,11 @@ class ReportRow:
     negative_count_lower_bound: bool
     reasons: list[str] = field(default_factory=list)
     adhoc: bool = False
+    # 日报 AI 归纳「仍有负面的帖子」用：这一行的内容标题，和「负面评论快照」里
+    # 解析出来的 (评论正文, 命中词)。昵称、IP、赞数在解析时就丢掉，见
+    # negative_digest_comments。只有 negative_found 的行才填评论。
+    label: str = ""
+    negative_comments: list = field(default_factory=list)
 
 
 # 「哪一条」优先去这些列里找。第一个命中的就用，所以顺序 = 优先级。
@@ -447,7 +452,8 @@ def build_snapshot(
         reasons = _todo_reasons(
             row, settings, refresh_status=refresh_status,
             negative_status=negative_status, stale=stale)
-        snap.report_rows.append(_report_row(row, cells, settings, reasons=reasons))
+        snap.report_rows.append(_report_row(row, cells, settings, reasons=reasons,
+                                            label_column=label_column, clean=clean))
         if reasons:
             # **全部收进来，排完序再截断**（见函数末尾）。在这里按飞书返回的
             # 记录顺序截，一次大面积事故就能用低优先级的「卡住了」占满前
@@ -505,21 +511,60 @@ def negative_digest_count(text: str, settings: Settings) -> tuple[Optional[int],
     return len(indices), len(indices) >= settings.digest.max_comments
 
 
+_DIGEST_LINE = re.compile(r"^\s*\d+\.\s*(?:\[(?P<marks>[^\]]*)\]\s*)?(?P<rest>.*)$")
+_DIGEST_HIT = re.compile(r"命中「([^」]*)」")
+# 「昵称: 」前缀最长认多少个字。再长就当成评论正文里本来就有的冒号，不剥。
+_DIGEST_AUTHOR_MAX = 24
+
+
+def negative_digest_comments(text: str, settings: Settings) -> list[tuple[str, str]]:
+    """「负面评论快照」那一格 → [(评论正文, 命中词)]。**纯函数。**
+
+    格式见 analyze.format_negative_digest：`1. [命中「词」 · 3赞 · 广东] 昵称: 正文`。
+    只留正文和命中词——昵称、IP、赞数、置顶/作者标记一律不要：这份东西是交给
+    日报 AI 归纳用的，那些是个人信息，和「内容特征」无关。「（未命中）」和
+    「…（还有 N 条未显示）」不是评论，跳过。
+    """
+    out: list[tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        match = _DIGEST_LINE.match(line)
+        if not match:
+            continue
+        hit = _DIGEST_HIT.search(match.group("marks") or "")
+        rest = match.group("rest").strip()
+        # 不看「现在」开没开 show_author_name：那个开关管的是**以后**怎么写，表里已经
+        # 写下的快照可能还带着昵称（关开关之前写的，归档帖会一直留着）。宁可把正文里
+        # 恰好有的一个短前缀也剥掉，不把昵称交出去。
+        if ": " in rest:
+            who, body = rest.split(": ", 1)
+            if len(who) <= _DIGEST_AUTHOR_MAX:
+                rest = body.strip()
+        if rest:
+            out.append((rest, hit.group(1) if hit else ""))
+    return out
+
+
 def _report_row(row: rows_mod.Row, cells: dict, settings: Settings, *,
-                reasons: list[str], adhoc: bool = False) -> ReportRow:
+                reasons: list[str], adhoc: bool = False, label_column: str = "",
+                clean=None) -> ReportRow:
     f = settings.fields
     negative = feishu.read_text(cells.get(f.negative_status)) == settings.negative_status.found
-    count, lower = (negative_digest_count(feishu.read_text(cells.get(f.negative_digest)), settings)
-                    if negative else (0, False))
+    digest = feishu.read_text(cells.get(f.negative_digest)) if negative else ""
+    count, lower = negative_digest_count(digest, settings) if negative else (0, False)
+    clean = clean or (lambda text: text)
     return ReportRow(
         record_id=row.record_id, post_key=_post_key(row), last_checked_ms=row.last_updated_ms,
         successfully_checked=feishu.read_text(cells.get(f.refresh_status)) == runner.STATUS_OK,
         negative_found=negative, negative_digest_count=count,
-        negative_count_lower_bound=lower, reasons=list(reasons), adhoc=adhoc)
+        negative_count_lower_bound=lower, reasons=list(reasons), adhoc=adhoc,
+        label=clean(row_label(row, cells, settings, label_column)),
+        negative_comments=[(clean(text), word) for text, word
+                           in negative_digest_comments(digest, settings)])
 
 
 def build_report_rows(records: list[dict], settings: Settings, *,
-                      now: Optional[datetime] = None, adhoc: bool = False) -> list[ReportRow]:
+                      now: Optional[datetime] = None, adhoc: bool = False,
+                      label_column: str = "", scrub=None) -> list[ReportRow]:
     """为临时检查记录生成同口径的统计数据；未巡查行只保留最近 24 小时查过的。"""
     now = now or datetime.now(timezone.utc)
     out = []
@@ -532,7 +577,8 @@ def build_report_rows(records: list[dict], settings: Settings, *,
             row, settings, refresh_status=feishu.read_text(cells.get(settings.fields.refresh_status)),
             negative_status=feishu.read_text(cells.get(settings.fields.negative_status)),
             stale=False if adhoc else _is_stale(row, settings, now))
-        out.append(_report_row(row, cells, settings, reasons=reasons, adhoc=adhoc))
+        out.append(_report_row(row, cells, settings, reasons=reasons, adhoc=adhoc,
+                               label_column=label_column, clean=scrub))
     return out
 
 
@@ -888,6 +934,9 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
                 "checked_posts": None, "window_checked_posts": None, "monitoring_posts": None,
                 "negative_posts": None, "negative_comments": None,
                 "negative_comments_lower_bound": False, "negative_comments_estimated": True,
+                # 仍有负面的这批帖子，最近一次检查最早 / 最晚在什么时候。「当前」不是一个
+                # 时段，是「最近一次检查的结果」，正文要把这批检查落在哪几天写出来。
+                "negative_checked_from_ms": None, "negative_checked_to_ms": None,
                 "post_states": dict.fromkeys(states), "comment_states": dict.fromkeys(states),
                 "window_negative_posts": None, "window_negative_comments": None,
                 "window_negative_comments_lower_bound": False,
@@ -933,7 +982,10 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
             lower = (any(row.negative_count_lower_bound for row in negative_rows)
                      or any(row.negative_digest_count is None for row in negative_rows)
                      or len(negative_rows) > 1)
-            negatives[key] = {"state": state, "count": count, "lower": lower}
+            checked_at = [row.last_checked_ms for row in negative_rows
+                          if row.last_checked_ms is not None]
+            negatives[key] = {"state": state, "count": count, "lower": lower,
+                              "checked": max(checked_at) if checked_at else None}
 
         def totals(selected):
             posts = dict.fromkeys(states, 0)
@@ -949,11 +1001,18 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
             return len(selected), count, any(value["lower"] for value in selected), posts, comments
 
         current = totals(list(negatives.values()))
+        # 有一篇的检查时间读不出来，就不报这一批的日期范围——用其余几篇的范围冒充
+        # 「这 N 篇最近一次检查都在……」，说的就不是真话。
+        checked_at = ([value["checked"] for value in negatives.values()]
+                      if all(value["checked"] is not None for value in negatives.values())
+                      else [])
         window = totals([value for key, value in negatives.items() if key in checked])
         item.update({"checked_posts": len(checked), "window_checked_posts": len(checked),
                      "negative_posts": current[0], "negative_comments": current[1],
                      "negative_comments_lower_bound": current[2],
                      "post_states": current[3], "comment_states": current[4],
+                     "negative_checked_from_ms": min(checked_at) if checked_at else None,
+                     "negative_checked_to_ms": max(checked_at) if checked_at else None,
                      "window_negative_posts": window[0], "window_negative_comments": window[1],
                      "window_negative_comments_lower_bound": window[2],
                      "window_post_states": window[3], "window_comment_states": window[4]})
@@ -965,6 +1024,7 @@ def snapshot_report(overview: Overview, resolved: dict, settings: Settings,
             item["error"] = "缺少最近检查时间或巡查状态，无法确认本期检查数量"
         if not project.report_negative_available:
             item.update({"negative_posts": None, "negative_comments": None,
+                         "negative_checked_from_ms": None, "negative_checked_to_ms": None,
                          "post_states": dict.fromkeys(states), "comment_states": dict.fromkeys(states),
                          "window_negative_posts": None, "window_negative_comments": None,
                          "window_post_states": dict.fromkeys(states),

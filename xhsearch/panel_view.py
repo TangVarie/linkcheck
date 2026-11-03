@@ -1478,8 +1478,8 @@ _SCRIPT = r"""
   function draftMessage(draft, applied){
     if (draft.status === "ok") {
       var bits = [];
-      if (draft.evidence_count) bits.push(draft.evidence_count + " 条预警评论");
-      if (draft.title_count) bits.push(draft.title_count + " 个预警帖子标题");
+      if (draft.title_count) bits.push(draft.title_count + " 篇仍有负面的帖子");
+      if (draft.evidence_count) bits.push(draft.evidence_count + " 条负面评论");
       var scope = bits.length ? "依据 " + bits.join(" + ") : "已生成";
       if (draft.sampled) scope += "（超出上限，抽样）";
       var tail = [];
@@ -1619,9 +1619,9 @@ _SCRIPT = r"""
     setText("metricCheckedPeriod", range && range.start_ms != null && range.end_ms != null ?
       chinaTime(range.start_ms, true) + "—" + chinaTime(Math.min(range.end_ms,
         currentWindow ? (snapshotEnd || Date.now()) : (range.as_of_ms || Date.now())), true) : "北京时间");
-    setText("metricNegativeLabel", "当前负面帖子（累计）");
+    setText("metricNegativeLabel", "仍有负面的帖子");
     setText("metricComments", commentKnown ? (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
-      (commentsEstimated ? "约 " : "")) + comments + " 条预警评论" : "评论条数待核实");
+      (commentsEstimated ? "约 " : "")) + comments + " 条负面评论 · 按最近一次检查" : "评论条数待核实");
     var source = !reportLoaded ? "正在读取" : (snapshotCount ? "现有表快照" : "当前表暂不可用");
     setText("workSource", source);
     setText("workSummary", !reportLoaded ? "正在读取现有数据…" : (snapshotCount ?
@@ -2834,7 +2834,7 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
       <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
         <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
         <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
-      <div class=work-metric><span class=metric-label id=metricNegativeLabel>当前负面帖子（累计）</span>
+      <div class=work-metric><span class=metric-label id=metricNegativeLabel>仍有负面的帖子</span>
         <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
         <span class=metric-note id=metricComments>评论条数待核实</span></div>
       <div class=work-metric><span class=metric-label>待处理</span>
@@ -2863,11 +2863,11 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
           </div>
           <div class=daily-extra>
             <div><label for=reportFeatures>主要内容特征</label>
-              <textarea id=reportFeatures placeholder='AI 会按当前未处理的负面帖子标题与本期预警评论自动填入，可直接修改。'></textarea></div>
+              <textarea id=reportFeatures placeholder='AI 会按仍有负面的帖子（含已处理）的标题与负面评论快照自动填入，可直接修改。'></textarea></div>
             <div><label for=reportCompetitors>疑似竞品</label>
               <textarea id=reportCompetitors placeholder='AI 只列证据中出现过的名称，没有就留空。'></textarea></div>
           </div>
-          <p>AI 基于当前未处理的负面帖子标题与本期第一页预警评论归纳，未发送作者、昵称或 IP；修改保存在此浏览器，按项目和日期区分。</p>
+          <p>AI 基于仍有负面的帖子（含已处理）的标题与表里的负面评论快照归纳，未发送作者、昵称或 IP；修改保存在此浏览器，按项目和日期区分。</p>
         </details>
         <details class=daily-fold id=reportMethod><summary>统计说明与数据明细</summary>
           <div class=daily-evidence id=reportEvidence></div>

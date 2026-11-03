@@ -191,5 +191,59 @@ class TestDigestCounts(unittest.TestCase):
             self.assertEqual(summary.negative_digest_count(value, Settings()), (None, True))
 
 
+
+class TestNegativeSnapshotForTheReport(unittest.TestCase):
+    """日报 AI 归纳「仍有负面的帖子」要用的东西：标题、负面评论正文、最近一次检查时间。"""
+
+    def test_snapshot_comments_keep_only_text_and_keyword(self):
+        text = ("1. [命中「太贵」 · 最新 · 3赞 · 广东] 私人昵称: 这个价格太贵了\n"
+                "2. [命中「售后」 · 置顶] 小号: 售后: 一直不回\n"
+                "…（还有 2 条未显示）")
+        self.assertEqual(summary.negative_digest_comments(text, Settings()),
+                         [("这个价格太贵了", "太贵"), ("售后: 一直不回", "售后")])
+        for not_comments in ("", "（未命中）", "手工写的备注"):
+            self.assertEqual(summary.negative_digest_comments(not_comments, Settings()), [])
+
+    def test_nicknames_are_stripped_even_after_the_setting_was_turned_off(self):
+        """开关管的是以后怎么写；关开关之前写下的快照还带着昵称，归档帖会一直留着。
+        宁可把正文里恰好有的短前缀也剥掉，不把昵称交出去。"""
+        settings = Settings()
+        settings.digest.show_author_name = False
+        self.assertEqual(summary.negative_digest_comments("1. [命中「贵」] 私人昵称: 太贵", settings),
+                         [("太贵", "贵")])
+
+    def test_report_rows_carry_title_and_comments_only_for_negative_rows(self):
+        f = Settings().fields
+        negative = record(1, negative=True, digest=digest(1))
+        negative["fields"]["文案"] = "露营装备清单"
+        snap = project([negative, record(2, digest=digest(1))], label_column="文案")
+        rows = {row.record_id: row for row in snap.report_rows}
+        self.assertEqual(rows["1"].label, "露营装备清单")
+        self.assertEqual(rows["1"].negative_comments, [("示例预警内容", "费用")])
+        self.assertEqual(rows["2"].negative_comments, [], "没负面的行不带评论")
+        self.assertNotIn("私人昵称", str(rows["1"].negative_comments))
+        self.assertIn(f.negative_digest, negative["fields"])
+
+    def test_report_says_when_the_still_negative_posts_were_last_checked(self):
+        older, newer = NOW - timedelta(days=4), NOW - timedelta(days=1)
+        snap = project([record(1, negative=True, digest=digest(1), checked=older),
+                        record(2, negative=True, digest=digest(1), checked=newer),
+                        record(3, checked=NOW - timedelta(days=9))])
+        actual = report(snap)
+        self.assertEqual(actual["negative_posts"], 2)
+        self.assertEqual(actual["negative_checked_from_ms"], ms(older))
+        self.assertEqual(actual["negative_checked_to_ms"], ms(newer),
+                         "没负面的行不算进这批帖子的检查时间")
+
+    def test_one_unknown_check_time_suppresses_the_range(self):
+        """有一篇的检查时间读不出来，就不能拿其余几篇的范围说「这 N 篇都在……」。"""
+        known = record(1, negative=True, digest=digest(1), checked=NOW - timedelta(days=2))
+        unknown = record(2, negative=True, digest=digest(1))
+        del unknown["fields"][Settings().fields.last_updated]
+        actual = report(project([known, unknown]))
+        self.assertEqual(actual["negative_posts"], 2)
+        self.assertIsNone(actual["negative_checked_from_ms"])
+        self.assertIsNone(actual["negative_checked_to_ms"])
+
 if __name__ == "__main__":
     unittest.main()

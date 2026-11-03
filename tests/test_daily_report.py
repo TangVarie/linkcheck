@@ -241,50 +241,63 @@ class TestReport(unittest.TestCase):
 
 
 class TestSnapshotTextMatchesTheMetrics(unittest.TestCase):
-    """复制出去的汇报正文要和工作台顶上那排数对得上。
+    """复制出去的汇报正文要和工作台顶上那排数对得上，而且每个数都说清楚算的是什么。
 
-    线上截图：顶上「当前负面帖子 7 / 正在处理 1 / 已处理 6」，正文却写「快照可见
-    0 条预警评论；上述帖子：已处理 0 篇，正在处理 0 篇，待处理 0 篇」——正文只算
-    上述时段里检查过的帖子，那 7 篇的最近检查都在时段之前。两个口径都对，但正文
-    只写了一个，收汇报的人会读成「没有负面」。"""
+    线上截图：顶上「7 / 正在处理 1 / 已处理 6」，正文却写「快照可见 0 条预警评论；
+    上述帖子：已处理 0 篇……」——正文只算上述时段里检查过的帖子，那 7 篇的最近检查
+    都在时段之前。补上「当前」那一行之后，读的人又问：当前是从什么时候算到什么时候？
+    「负面状态」每次检查都会被覆盖，所以它的意思是「最近一次检查仍看到负面评论」，
+    不是一个时段的累计；正文要把这句话、截至时刻、这批检查落在哪几天都写出来。"""
+
+    AS_OF = START + 22 * HOUR + 16 * 60_000            # 11 月 3 日之类的「此刻」
 
     def present(self, **snapshot):
-        base = {"available": True, "monitoring_posts": 195, "window_checked_posts": 48,
+        base = {"available": True, "monitoring_posts": 195, "window_checked_posts": 50,
+                "as_of_ms": self.AS_OF,
                 "window_negative_posts": 0, "window_negative_comments": 0,
                 "window_post_states": {"pending": 0, "processing": 0, "resolved": 0},
                 "negative_posts": 7, "negative_comments": 7,
+                "negative_checked_from_ms": START - 4 * 24 * HOUR,
+                "negative_checked_to_ms": START - 1 * 24 * HOUR,
                 "post_states": {"pending": 0, "processing": 1, "resolved": 6}}
         base.update(snapshot)
         return d.present_report(report([]), base, START + HOUR)["text"]
 
-    def test_older_negative_posts_are_reported_with_the_same_numbers_as_the_metrics(self):
+    def test_still_negative_posts_say_as_of_when_and_when_they_were_checked(self):
         text = self.present()
-        self.assertIn("上述时段已检查 48 篇帖子。其中 0 篇有负面预警。", text)
-        self.assertIn("当前仍有负面的帖子共 7 篇（含上述时段之前查出的）："
+        self.assertIn("上述时段已检查 50 篇帖子。其中 0 篇看到负面评论。", text)
+        self.assertIn(f"截至 {d._stamp(self.AS_OF)}，最近一次检查仍看到负面评论的帖子共 7 篇"
+                      f"（这 7 篇最近一次检查在 {d._day(START - 4 * 24 * HOUR)}—"
+                      f"{d._day(START - 1 * 24 * HOUR)}之间）："
                       "已处理 6 篇，正在处理 1 篇，待处理 0 篇。", text)
-        self.assertNotIn("快照可见 0", text, "一篇负面都没有时不写 0 条评论")
-        self.assertNotIn("上述帖子：", text, "也不写 0/0/0 的处理进度")
-        self.assertNotIn("本期", text)
+        for gone in ("快照可见 0", "上述帖子：", "累计", "含上述时段之前", "预警", "本期"):
+            self.assertNotIn(gone, text)
+
+    def test_checks_on_a_single_day_read_naturally(self):
+        same = START - 2 * 24 * HOUR
+        text = self.present(negative_checked_from_ms=same, negative_checked_to_ms=same + HOUR)
+        self.assertIn(f"（这 7 篇最近一次检查都在 {d._day(same)}）", text)
 
     def test_negatives_inside_the_period_keep_their_own_details(self):
         text = self.present(window_negative_posts=2, window_negative_comments=3,
                             window_post_states={"pending": 1, "processing": 1, "resolved": 0})
-        self.assertIn("其中 2 篇有负面预警。", text)
-        self.assertIn("这些帖子快照可见 3 条预警评论。", text)
+        self.assertIn("其中 2 篇看到负面评论。", text)
+        self.assertIn("这些帖子快照里有 3 条负面评论。", text)
         self.assertIn("上述帖子：已处理 0 篇，正在处理 1 篇，待处理 1 篇。", text)
-        self.assertIn("当前仍有负面的帖子共 7 篇", text)
+        self.assertIn("最近一次检查仍看到负面评论的帖子共 7 篇", text)
 
     def test_no_negative_posts_at_all_says_so(self):
         text = self.present(negative_posts=0, negative_comments=0,
+                            negative_checked_from_ms=None, negative_checked_to_ms=None,
                             post_states={"pending": 0, "processing": 0, "resolved": 0})
-        self.assertIn("当前没有负面帖子。", text)
-        self.assertNotIn("当前仍有负面的帖子", text)
+        self.assertIn("没有帖子在最近一次检查时看到负面评论。", text)
+        self.assertNotIn("共 0 篇", text)
 
     def test_unknown_current_state_is_not_written_as_zero(self):
         text = self.present(negative_posts=None,
                             post_states={"pending": None, "processing": None, "resolved": None})
-        self.assertIn("当前负面帖子数量及处理进度待核实。", text)
-        self.assertNotIn("当前没有负面帖子", text)
+        self.assertIn("最近一次检查仍看到负面评论的帖子数量及处理进度待核实。", text)
+        self.assertNotIn("没有帖子", text)
 
 
 class FakeTable:

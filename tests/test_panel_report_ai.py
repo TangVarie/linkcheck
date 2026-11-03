@@ -23,9 +23,9 @@ class FakeDrafts:
         self.error = error
         self.calls = []
 
-    def generate(self, overview, *, date="", table_id="", force=False, shown=None):
+    def generate(self, overview, *, date="", table_id="", force=False):
         self.calls.append({"date": date, "table_id": table_id, "force": force,
-                           "overview": overview, "shown": shown})
+                           "overview": overview})
         if self.error:
             raise self.error
         return self.result
@@ -74,24 +74,16 @@ class TestReportAIRoute(unittest.TestCase):
         self.assertFalse(drafts.calls[0]["force"])
         self.assertEqual(payload["features"], "围绕露营装备。")
 
-    def test_titles_are_picked_from_the_resolution_applied_overview(self):
-        """日报快照拿原样那份（它自己套「已解决」），挑标题拿套过的那份。"""
-        todo = summary.TodoRow(record_id="rec1", project="途鸽", record_url="",
-                               link_cell="", label="已处理的帖子", table_id="tbl1",
-                               reasons=["有负面"], checked_at_ms=5)
+    def test_the_model_sees_the_raw_overview_resolved_posts_included(self):
+        """AI 归纳的是正文那 N 篇仍有负面的帖子，**含已处理的**——所以拿原样那份，
+        不再先套「已解决」把处理完的帖子拿掉（那正是「正文 7 篇、AI 只讲 1 篇」的来源）。"""
         overview = summary.Overview(projects=[summary.ProjectSnapshot(
-            label="途鸽", app_token="app", table_id="tbl1", todos=[todo])])
-        resolutions = SimpleNamespace(snapshot=lambda: {
-            summary.resolution_key("tbl1", "rec1"): {
-                "reasons": ["有负面"], "seen": 5, "at": 10}})
+            label="途鸽", app_token="app", table_id="tbl1")])
         drafts = FakeDrafts()
-        status, _ = handler(drafts=drafts, overview=overview, resolutions=resolutions,
+        status, _ = handler(drafts=drafts, overview=overview,
                             body={"date": "2026-10-28", "table_id": "tbl1"})._report_ai_action()
         self.assertEqual(status, 200)
-        call = drafts.calls[0]
-        self.assertIs(call["overview"], overview)
-        self.assertEqual(call["shown"].projects[0].todos, [])
-        self.assertEqual([t.label for t in call["shown"].resolved], ["已处理的帖子"])
+        self.assertIs(drafts.calls[0]["overview"], overview)
 
     def test_force_must_be_a_real_boolean(self):
         drafts = FakeDrafts()
