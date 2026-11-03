@@ -14,7 +14,8 @@
 不用再去列设置里手改那个 30。
 
 为什么敢自动改：公式列的值是飞书算出来的，不存人填的数据，换公式不丢
-东西。只动「下次检查时间」这一列，而且只在它**已经是公式列**时才动——
+东西。只动「下次检查时间」这一列（老表里叫「下次巡查时间」的也认，见
+`provision.NEXT_CHECK_ALIASES`），而且只在它**已经是公式列**时才动——
 不是公式列（有人手填了日期）的一律跳过，改类型会清掉那一列。建列是纯
 追加：新列排在表尾，已有的列一个都不碰。
 
@@ -68,20 +69,21 @@ def describe(label: str, plan: FormulaPlan) -> list[str]:
         lines.append(f"  现在：{plan.current or '（飞书没给公式原文，按新版覆盖）'}")
         lines.append(f"  换成：{plan.wanted}")
     elif plan.action == "missing":
-        lines.append("  --apply 会在表尾建一列公式列「下次检查时间」，公式：")
+        lines.append(f"  --apply 会在表尾建一列公式列「{plan.column}」，公式：")
         lines.append(f"  {plan.wanted}")
     return lines
 
 
-def _raw_property(table) -> str:
+def _raw_property(table, column: str = NEXT_CHECK_COLUMN) -> str:
     try:
-        info = (table.fields_meta_raw() or {}).get(NEXT_CHECK_COLUMN) or {}
+        info = (table.fields_meta_raw() or {}).get(column) or {}
     except Exception as exc:  # noqa: BLE001
         return f"（读不到：{exc}）"
     return json.dumps(info.get("property"), ensure_ascii=False)
 
 
-def verify(table, settings: Settings, format_sent: bool) -> tuple[list[str], bool]:
+def verify(table, settings: Settings, format_sent: bool,
+           column: str = NEXT_CHECK_COLUMN) -> tuple[list[str], bool]:
     """写完读回来看一眼：公式对不对、是不是按日期显示。返回（给人看的行, 公式没问题）。
 
     只有「读回来的公式确定和新版不一样」算失败（进退出码）。读回来比不了、
@@ -89,7 +91,7 @@ def verify(table, settings: Settings, format_sent: bool) -> tuple[list[str], boo
     都照实说、给出手动的办法。
     """
     try:
-        info = (table.fields_meta() or {}).get(NEXT_CHECK_COLUMN) or {}
+        info = (table.fields_meta() or {}).get(column) or {}
     except Exception as exc:  # noqa: BLE001
         return [f"  ✓ 已提交，但读回来失败（{exc}）：去表里看一眼那一列"], True
     current = info.get("formula") or ""
@@ -116,7 +118,7 @@ def verify(table, settings: Settings, format_sent: bool) -> tuple[list[str], boo
     else:
         lines.append(f"  ⚠ 飞书收了，但读回来还是按「{shown_as}」类显示，不是日期。")
     lines.append(f"    {MANUAL_FORMAT}")
-    lines.append(f"    这一列的原始设置（显示成数字的话发给开发）：{_raw_property(table)}")
+    lines.append(f"    这一列的原始设置（显示成数字的话发给开发）：{_raw_property(table, column)}")
     return lines, formula_ok
 
 
@@ -140,10 +142,10 @@ def run(tables, settings: Settings, apply: bool, out=print) -> int:
         try:
             if creating:
                 format_sent = table.create_formula_field(
-                    NEXT_CHECK_COLUMN, plan.wanted, result_type=DATE_RESULT)
+                    plan.column, plan.wanted, result_type=DATE_RESULT)
             else:
                 format_sent = table.set_formula(
-                    NEXT_CHECK_COLUMN, plan.wanted, result_type=DATE_RESULT)
+                    plan.column, plan.wanted, result_type=DATE_RESULT)
         except Exception as exc:  # noqa: BLE001
             out(f"  ✗ 没{'建' if creating else '换'}成：{exc}")
             out("    飞书报错 = 表没动；网络超时的话说不准，不带 --apply 再跑一次看现状")
@@ -151,7 +153,7 @@ def run(tables, settings: Settings, apply: bool, out=print) -> int:
             continue
         if creating:
             out("  ✓ 已在表尾建好（视图里可以拖到「最近检查时间」旁边）")
-        lines, formula_ok = verify(table, per_table, format_sent)
+        lines, formula_ok = verify(table, per_table, format_sent, plan.column)
         for line in lines:
             out(line)
         if formula_ok:
@@ -184,7 +186,7 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     settings = cli.build_settings()
-    print("会真改表（只动「下次检查时间」这一列：换公式，或者在表尾建上）\n" if apply
+    print("会真改表（只动「下次检查时间」/「下次巡查时间」这一列：换公式，或者在表尾建上）\n" if apply
           else "只看不改。加 --apply 才真动\n")
     return run(cli._tables(selected), settings, apply)
 

@@ -275,6 +275,8 @@ tr.fresh .todo-title::after{content:"新";font-size:12px;color:var(--primary);
 .project-snapshot{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px;
   color:var(--text-light)}
 .project-snapshot b{font-family:var(--font-num);font-weight:600;color:var(--text-dark)}
+.project-refresh{margin-top:8px;font-size:12px;color:var(--text-light);line-height:1.55}
+.project-refresh>span:first-child{color:var(--text);margin:0 4px}
 
 /* ---------- 横幅：浅调底 + 文字色阶（禁彩字配浅底） ---------- */
 .problem,.note{padding:12px;margin:12px 0;font-size:13px;
@@ -2511,6 +2513,12 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
         f"<div><span class=lbl>负面词</span><span>已填 {p.negative_keyword_rows}"
         f"/{p.total_rows}{f'（{neg_gap} 行没填）' if neg_gap else ''}</span></div>")
 
+    # 机器现在按什么节奏刷这张表。和 cron 同一个函数算出来的（逐表参数覆盖全局），
+    # 改完参数看这一行就知道下一轮按什么跑——不用去翻日志、也不用信表里那一列。
+    refresh = (f"<div class=project-refresh>刷新频率 <span>{_e(p.refresh_text)}</span>"
+               f"<span class=muted>{'（本表自定）' if p.refresh_custom else '（全局默认）'}"
+               "</span></div>" if p.refresh_text else "")
+
     card_class = "card" if p.healthy else "card bad"
     # 截断了就必须说：把截断后的长度当成精确计数，等于在大面积事故的时候
     # 少报——而那正是最不该少报的时候。
@@ -2524,6 +2532,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
   <div class=project-snapshot>
     <span>在管 <b>{p.total_rows}</b> 行</span><span>要人管 <b>{p.needs_attention}</b> 行{dropped}</span>
     <span>卡住 <b>{p.stale_rows}</b> 行</span></div>
+  {refresh}
   <details class=project-detail{' open' if problems else ''}>
     <summary>费用、巡检与字段详情<span class=detail-link>查看</span></summary>
     <div class=rows>

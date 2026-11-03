@@ -414,6 +414,43 @@ class TestCollect(unittest.TestCase):
         overview = panel.collect([("A", FakeTable(None, []))], Settings(), {}, now=NOW)
         self.assertIn("添加文档应用", overview.projects[0].error)
 
+    def test_each_card_says_how_often_cron_will_check_that_table(self):
+        """改完频率，运营要能在面板上直接核对「机器现在按什么跑」。
+        用的是和 cron 同一个逐表 Settings，不是全局那一份。"""
+        settings = Settings()
+        tuned = Settings()
+        tuned.refresh.tiers = [(2, 8), (7, 24), (30, 24)]
+        tables = [("改过", FakeTable(healthy_meta(settings), [], table_id="tblT")),
+                  ("没改", FakeTable(healthy_meta(settings), [], table_id="tblD"))]
+        overview = panel.collect(tables, settings, {}, now=NOW,
+                                 settings_for=lambda t: tuned if t == "tblT" else settings)
+        custom, default = overview.projects
+        self.assertEqual(custom.refresh_text,
+                         "0–2 天每 8 小时 · 3–7 天每 24 小时 · 8 天起每 24 小时 · 满 30 天归档")
+        self.assertEqual((custom.refresh_custom, default.refresh_custom), (True, False))
+        card = panel_view._project_card(custom, 8)
+        self.assertIn("8 天起每 24 小时", card)
+        self.assertIn("本表自定", card)
+        self.assertIn("全局默认", panel_view._project_card(default, 8))
+
+    def test_a_next_check_column_on_the_old_frequency_stays_flagged(self):
+        """频率改了、表里「下次巡查时间」的公式还是旧的：表里报的时间是错的，
+        这件事要一直挂在项目卡上，直到对上为止。"""
+        from xhsearch import provision
+        settings = Settings()
+        tuned = Settings()
+        tuned.refresh.tiers = [(2, 8), (7, 24), (30, 24)]
+        meta = healthy_meta(settings)
+        meta["下次巡查时间"] = {"type": 20, "result_type": 5,
+                              "formula": provision.next_check_formula(settings)}
+        overview = panel.collect([("途鸽", FakeTable(meta, []))], settings, {}, now=NOW,
+                                 settings_for=lambda _t: tuned)
+        self.assertTrue(any("「下次巡查时间」的公式和这张表现在的刷新频率对不上" in p
+                            for p in overview.projects[0].health))
+        in_step = panel.collect([("途鸽", FakeTable(meta, []))], settings, {}, now=NOW)
+        self.assertFalse(any("刷新频率对不上" in p for p in in_step.projects[0].health),
+                         "对得上就不报")
+
     def test_empty_metadata_is_treated_the_same_as_unreadable(self):
         """多维表格的主字段不可删，健康的表不可能一列都没有。"""
         overview = panel.collect([("A", FakeTable({}, []))], Settings(), {}, now=NOW)
