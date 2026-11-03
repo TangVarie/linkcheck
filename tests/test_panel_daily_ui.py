@@ -54,11 +54,13 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertIn("", options, "全部项目是初始汇总入口")
         self.assertNotIn("open", dom.by_id("dailyPanel"), "日报不挤占默认监控视图")
 
-    def test_the_negative_metric_says_it_is_not_limited_to_the_period(self):
-        """顶上那排是表里此刻全部负面帖子，不是上述时段的；标签要说清楚，
-        不然和汇报正文「上述时段……其中 0 篇有负面预警」看着对不上。"""
-        self.assertIn("id=metricNegativeLabel>当前负面帖子（累计）<", self.page())
-        self.assertIn('setText("metricNegativeLabel", "当前负面帖子（累计）")', panel_view._SCRIPT)
+    def test_the_negative_metric_says_what_it_counts(self):
+        """顶上那排是「最近一次检查仍有负面评论」的帖子，不是时段累计。上一版叫
+        「当前负面帖子（累计）」，读的人就问「从什么时候累计到什么时候」。"""
+        self.assertIn("id=metricNegativeLabel>仍有负面的帖子<", self.page())
+        self.assertIn('setText("metricNegativeLabel", "仍有负面的帖子")', panel_view._SCRIPT)
+        self.assertIn('" 条负面评论 · 按最近一次检查"', panel_view._SCRIPT)
+        self.assertNotIn("累计", self.page())
 
     def test_processing_is_a_shared_visible_state_and_preserves_record_identity(self):
         row = self.todo("processing")

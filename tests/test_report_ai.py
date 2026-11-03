@@ -18,11 +18,28 @@ from xhsearch.config import Settings
 
 START, END = d.window_for_date("2026-10-28")
 TABLE = "tbl1"
-NEG = Settings().negative_status.found
 
 
-def todo(label, *reasons):
-    return SimpleNamespace(label=label, reasons=list(reasons or [NEG]))
+def negative_row(title, comments=(("这个用了之后有点不舒服", "不舒服"),), *, post=None,
+                 checked=START + 1000, negative=True, record=None):
+    """report_rows 里的一行：标题 + 「负面评论快照」解析出来的 (正文, 命中词)。"""
+    return SimpleNamespace(record_id=record or f"rec-{title}", post_key=post or f"xhs:{title}",
+                           label=title, negative_found=negative,
+                           negative_comments=list(comments), last_checked_ms=checked)
+
+
+def overview_with(*titles, table=TABLE):
+    """此刻仍有负面的帖子。不给标题就默认一篇，免得每条用例都要写。"""
+    titles = titles or ("露营帐篷实测",)
+    return SimpleNamespace(projects=[SimpleNamespace(
+        table_id=table, report_rows=[negative_row(t) for t in titles])])
+
+
+NO_NEGATIVES = SimpleNamespace(projects=[SimpleNamespace(table_id=TABLE, report_rows=[])])
+
+
+def posts(*titles):
+    return report_ai.negative_posts_for(overview_with(*titles), TABLE)
 
 
 def scan(at=START + 1000, *, post="xhs:one", hits=None, table=TABLE, **kw):
@@ -116,40 +133,65 @@ class TestEvidence(unittest.TestCase):
         self.assertNotIn("\x00", evidence["comments"][0]["content"])
 
     def test_prompt_carries_readable_dates_and_no_raw_identifiers(self):
-        evidence = report_ai.evidence_for_prompt([scan()], report(),
-                                                 ["露营装备清单"])
+        evidence = report_ai.evidence_for_prompt([scan()], report(), posts("露营装备清单"))
         messages = report_ai.prompt_messages(evidence)
         self.assertIn("json", messages[0]["content"].lower())
         user = messages[1]["content"]
         self.assertIn("露营装备清单", user)
         self.assertIn("10月27日 16:00", user)
         self.assertNotIn(str(END), user)
-        self.assertNotIn("rec-secret", user)
+        self.assertNotIn("rec-", user)
 
-    def test_prompt_names_the_titles_as_open_negative_posts_not_this_periods_samples(self):
-        """标题是「此刻还没处理完的负面帖子」，可能是这一期之前查出来的；
-        叫它「本期异常样本」，就和正文按时段统计的「其中 0 篇有负面」打架。"""
+    def test_prompt_talks_about_the_same_posts_as_the_report_text(self):
+        """线上：正文写「0 篇看到负面评论 / 仍有负面的帖子共 7 篇」，AI 却写「本期异常
+        样本仅1条……预警评论第一页为空」——读的人分不清它在说哪批、为什么没评论。"""
         system = report_ai.prompt_messages(
-            report_ai.evidence_for_prompt([scan()], report(), ["露营装备清单"]))[0]["content"]
-        self.assertIn("当前未处理的负面帖子", system)
-        self.assertIn("不要写成“本期异常样本”", system)
+            report_ai.evidence_for_prompt([], report(), posts("露营装备清单")))[0]["content"]
+        self.assertIn("最近一次检查时第一页评论里仍有负面词的帖子（含运营已处理的）", system)
+        self.assertIn("这 N 篇仍有负面的帖子", system)
+        self.assertIn("不要用“异常”“样本”", system)
+        self.assertIn("不要写“评论为空”“无法归纳”", system)
 
-    def test_titles_come_only_from_the_selected_table_and_dedupe(self):
+    def test_the_current_window_sends_the_posts_and_the_report_counts_not_period_comments(self):
+        snapshot = {"available": True, "window_is_current": True, "as_of_ms": START + 3_600_000,
+                    "window_checked_posts": 50, "window_negative_posts": 0, "negative_posts": 2,
+                    "post_states": {"pending": 0, "processing": 1, "resolved": 1}}
+        evidence = report_ai.evidence_for_prompt(
+            [scan(hits=[{"id": "x", "content": "这一期别的帖子里的评论"}])],
+            report(current_snapshot=snapshot), posts("甲", "乙"))
+        self.assertEqual([p["title"] for p in evidence["posts"]], ["甲", "乙"])
+        self.assertEqual(evidence["comments"], [], "只讲那 N 篇，不混进别的帖子的评论")
+        self.assertEqual(evidence["keywords"], [])
+        self.assertEqual(evidence["counts"]["negative_now"], 2)
+        self.assertEqual(evidence["counts"]["negative_in_period"], 0)
+        self.assertNotIn("checked_in_period", evidence["counts"],
+                         "每轮巡检都变的数不进提示词，不然缓存指纹跟着变、重复计费")
+        user = report_ai.prompt_messages(evidence)[1]["content"]
+        self.assertNotIn("17:00", user, "截至几点每分钟都在走，不进提示词")
+        self.assertNotIn("这一期别的帖子里的评论", user)
+
+    def test_negative_posts_come_from_the_selected_table_include_handled_and_dedupe(self):
+        rows = [negative_row("甲", (("太贵了", "贵"),), post="xhs:a"),
+                negative_row("甲", (("太贵了", "贵"), ("售后差", "售后")), post="xhs:a",
+                             record="rec-dup"),
+                negative_row("乙", (), post="xhs:b"),
+                negative_row("没负面的", (), post="xhs:c", negative=False)]
         overview = SimpleNamespace(projects=[
-            SimpleNamespace(table_id=TABLE, todos=[todo("甲"), todo("甲")],
-                            adhoc_todos=[todo("乙")]),
-            SimpleNamespace(table_id="tbl2", todos=[todo("别人的")],
-                            adhoc_todos=[]),
-        ])
-        self.assertEqual(report_ai.alert_titles_for(overview, TABLE, NEG), ["甲", "乙"])
+            SimpleNamespace(table_id=TABLE, report_rows=rows),
+            SimpleNamespace(table_id="tbl2", report_rows=[negative_row("别人的")])])
+        found = report_ai.negative_posts_for(overview, TABLE)
+        self.assertEqual([p["title"] for p in found], ["甲", "乙"])
+        self.assertEqual([c["content"] for c in found[0]["comments"]], ["太贵了", "售后差"],
+                         "同一篇登记两行，评论合并去重")
+        self.assertEqual(found[1]["comments"], [], "没评论也照样送标题")
 
-    def test_only_negative_alert_todos_count_as_alerting_posts(self):
-        """风控、失效、卡住不是「预警帖子」，不能被归纳成内容特征。"""
-        overview = SimpleNamespace(projects=[SimpleNamespace(
-            table_id=TABLE, adhoc_todos=[],
-            todos=[todo("负面帖", NEG, "风控中"), todo("失效帖", "已失效"),
-                   todo("卡住的帖", "卡住了")])])
-        self.assertEqual(report_ai.alert_titles_for(overview, TABLE, NEG), ["负面帖"])
+    def test_snapshot_comments_are_scrubbed_before_leaving(self):
+        found = report_ai.negative_posts_for(SimpleNamespace(projects=[SimpleNamespace(
+            table_id=TABLE, report_rows=[negative_row("甲", (("加我 13800008888 @某账号", "加我"),))])]),
+            TABLE)
+        text = found[0]["comments"][0]["content"]
+        self.assertNotIn("13800008888", text)
+        self.assertNotIn("@某账号", text)
 
 
 class TestNormalise(unittest.TestCase):
@@ -171,6 +213,14 @@ class TestNormalise(unittest.TestCase):
             {"features": "横向对比。", "competitors": ["途鸽", "牧高笛", "挪客"]}, evidence)
         self.assertEqual([c["name"] for c in draft["competitors"]], ["挪客"])
         self.assertEqual(draft["competitors"][0]["mentions"], 1)
+
+    def test_a_competitor_in_the_posts_snapshot_comments_counts(self):
+        evidence = {"comments": [], "keywords": [], "posts": [
+            {"title": "途鸽对比牧高笛", "comments": [{"content": "挪客那款更轻", "keywords": "挪客"}]}]}
+        draft = report_ai.normalize_draft(
+            {"features": "横向对比。", "competitors": ["牧高笛", "挪客"]}, evidence)
+        self.assertEqual([c["name"] for c in draft["competitors"]], ["挪客"],
+                         "只出现在标题里的名字不算")
 
     def test_no_competitors_is_normal_not_an_error(self):
         draft = report_ai.normalize_draft({"features": "情绪偏焦虑。", "competitors": []},
@@ -204,11 +254,6 @@ class FakeReports:
         return {"reports": [self.payload], "error": self.error}, self.events
 
 
-def overview_with(*titles):
-    return SimpleNamespace(projects=[SimpleNamespace(
-        table_id=TABLE, todos=[todo(t) for t in titles], adhoc_todos=[])])
-
-
 class TestGenerate(unittest.TestCase):
     def make(self, responses, events=None, error="", timeout=5.0, report_payload=None):
         reports = FakeReports(events if events is not None else [scan()], error=error,
@@ -230,10 +275,10 @@ class TestGenerate(unittest.TestCase):
 
     def test_success_returns_draft_without_echoing_evidence(self):
         drafts = self.make([answer({"features": "围绕露营装备，情绪偏焦虑。",
-                                    "competitors": [{"name": "牧高笛"}]})],
-                           events=[scan(hits=[{"id": "c1", "content": "牧高笛那款不舒服",
-                                               "keywords": ["不舒服"]}])])
-        result = drafts.generate(overview_with("帐篷实测"), date="2026-10-28", table_id=TABLE)
+                                    "competitors": [{"name": "牧高笛"}]})])
+        overview = SimpleNamespace(projects=[SimpleNamespace(table_id=TABLE, report_rows=[
+            negative_row("帐篷实测", (("牧高笛那款不舒服", "不舒服"),))])])
+        result = drafts.generate(overview, date="2026-10-28", table_id=TABLE)
         self.assertEqual(result["status"], "ok")
         self.assertIn("露营", result["features"])
         self.assertEqual(result["competitors"][0]["name"], "牧高笛")
@@ -283,14 +328,15 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(again["cached"])
         self.assertEqual(len(drafts.seen), 1)
 
-    def test_titles_come_from_the_resolution_applied_overview(self):
-        """处理完收起来的帖子不再是本期问题；`shown` 是套过「已解决」的那份。"""
+    def test_handled_posts_are_described_too(self):
+        """正文写「仍有负面的帖子共 7 篇：已处理 6……」，AI 也要讲这 7 篇，
+        不能只讲还没处理完的那 1 篇。"""
         drafts = self.make([answer({"features": "x", "competitors": []})])
         drafts.generate(overview_with("已处理的", "还没处理的"), date="2026-10-28",
-                        table_id=TABLE, shown=overview_with("还没处理的"))
+                        table_id=TABLE)
         user = json.loads(drafts.seen[0][0].data.decode("utf-8"))["messages"][1]["content"]
         self.assertIn("还没处理的", user)
-        self.assertNotIn("已处理的", user)
+        self.assertIn("已处理的", user)
 
     def test_force_reserves_the_cooldown_before_queueing(self):
         """两个同时到的「重新生成」：冷却要在检查的同一把锁里占上，不能等真正
@@ -342,9 +388,10 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(len(drafts.seen), 2)
 
     def test_no_evidence_never_calls_the_model(self):
-        drafts = self.make([answer({"features": "不该被用到", "competitors": []})], events=[])
-        result = drafts.generate(overview_with(), date="2026-10-28", table_id=TABLE)
+        drafts = self.make([answer({"features": "不该被用到", "competitors": []})])
+        result = drafts.generate(NO_NEGATIVES, date="2026-10-28", table_id=TABLE)
         self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertIn("没有最近一次检查仍看到负面评论的帖子", result["error"])
         self.assertEqual(drafts.seen, [])
 
     def test_missing_key_returns_unavailable_without_network(self):

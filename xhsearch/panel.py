@@ -453,7 +453,7 @@ def _collect_one(label, table, settings, api_keys, *,
         show_digest=show_digest, scrub=scrub, route=route, label_column=picked,
         max_todos=None)
     snap.report_rows.extend(summary.build_report_rows(
-        unmonitored, settings, now=now, adhoc=True))
+        unmonitored, settings, now=now, adhoc=True, label_column=picked, scrub=scrub))
     # 截图读数：字段接口看不出「数据整理」上的 AI 捷径挂没挂，只能看数据——
     # 截图传了、这一格却一直空着，就是捷径没在干活。两列都在才判得了；
     # 缺列的情况体检那边已经在报，这里不重复。
@@ -2070,15 +2070,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not isinstance(force, bool):
                 raise ValueError("force 必须是布尔值")
             overview, _, _ = self.deps.cache.view()
-            # 日报快照自己套「已解决」，要原样那份；挑预警标题要套过的那份，
-            # 处理完收起来的帖子不再当本期问题送给模型。
-            shown = overview
-            if overview is not None and self.deps.resolutions is not None:
-                shown = summary.apply_resolutions(
-                    overview, self.deps.resolutions.snapshot(),
-                    self.deps.settings or Settings())
+            # 日报快照自己套「已解决」，要原样那份。AI 归纳的「仍有负面的帖子」
+            # 含已处理的（和正文那 N 篇同一批），所以也用原样那份。
             result = self.deps.report_drafts.generate(
-                overview, date=date, table_id=table_id, force=force, shown=shown)
+                overview, date=date, table_id=table_id, force=force)
             return self._send_json(200, result)
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
@@ -2739,8 +2734,7 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
         reports.resolutions = resolutions
         resolutions.journaling = True
     report_drafts = (report_ai_mod.ReportDrafts(
-        config.deepseek_api_key, reports, timeout=config.deepseek_timeout,
-        alert_reason=resolved.negative_status.found)
+        config.deepseek_api_key, reports, timeout=config.deepseek_timeout)
         if reports is not None and config.deepseek_api_key else None)
     cache = Cache(reconciling(produce, resolutions), config.cache_seconds,
                   idle_seconds=config.idle_minutes * 60 or None)

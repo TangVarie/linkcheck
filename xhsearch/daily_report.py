@@ -615,20 +615,36 @@ def _state_counts(states: dict) -> str:
                              ("pending", "待处理")))
 
 
-def _current_negative_line(snapshot: dict) -> str:
-    """表里**此刻**所有带负面的帖子及处理进度——和工作台顶上那排「当前负面帖子
-    （累计）/ 待处理 / 正在处理 / 已处理」同一个口径、同一组数。
+def _day(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, SHANGHAI).strftime("%m月%d日")
 
-    上一行只算上述时段里检查过的帖子；老帖查得少，之前查出负面、还在处理的帖子
-    常常不在里面。不补这一行，复制出去的汇报会写「已处理 0、正在处理 0」，
-    而顶上那排写着「正在处理 1、已处理 6」——两处数字对不上。
+
+def _current_negative_line(snapshot: dict) -> str:
+    """表里**此刻**仍有负面的帖子及处理进度——和工作台顶上那排「仍有负面的帖子 /
+    待处理 / 正在处理 / 已处理」同一个口径、同一组数。
+
+    「负面状态」每次检查都会被覆盖，所以「当前负面」的准确意思是「最近一次检查时
+    第一页评论里仍有负面词」——它不是某个时段的累计。正文要把这句话说出来，再写清
+    这批帖子的最近一次检查落在哪几天：老帖查得少，常常整批都在上述时段之前，不写
+    出来读的人会问「从什么时候算到什么时候」。
+
+    上一行只算上述时段里检查过的帖子。不补这一行，复制出去的汇报会写「已处理 0、
+    正在处理 0」，而顶上那排写着「正在处理 1、已处理 6」——两处数字对不上。
     """
     total = snapshot.get("negative_posts")
+    as_of = snapshot.get("as_of_ms")
+    when = f"截至 {_stamp(as_of)}，" if as_of else ""
     if total is None:
-        return "当前负面帖子数量及处理进度待核实。"
+        return "最近一次检查仍看到负面评论的帖子数量及处理进度待核实。"
     if total == 0:
-        return "当前没有负面帖子。"
-    return (f"当前仍有负面的帖子共 {total} 篇（含上述时段之前查出的）："
+        return f"{when}没有帖子在最近一次检查时看到负面评论。"
+    first, last = snapshot.get("negative_checked_from_ms"), snapshot.get("negative_checked_to_ms")
+    span = ""
+    if first is not None and last is not None:
+        a, b = _day(first), _day(last)
+        span = (f"（这 {total} 篇最近一次检查都在 {a}）" if a == b
+                else f"（这 {total} 篇最近一次检查在 {a}—{b}之间）")
+    return (f"{when}最近一次检查仍看到负面评论的帖子共 {total} 篇{span}："
             + _state_counts(snapshot.get("post_states") or {}) + "。")
 
 
@@ -680,14 +696,14 @@ def present_report(report: dict, current_snapshot: Optional[dict], now_ms: int,
         else:
             lines.append("所选时段的检查数量待核实。")
         if negative is not None:
-            lines[-1] += f"其中 {negative} 篇有负面预警。"
+            lines[-1] += f"其中 {negative} 篇看到负面评论。"
         states = snapshot.get("window_post_states") or {}
         if negative:
             # 只在上述时段里确有负面帖子时，才写这些帖子的评论数和处理进度。
             # 一篇都没有时还写「快照可见 0 条、已处理 0 篇……」，收汇报的人会
             # 读成「什么负面都没有」，而运营手上可能还挂着之前查出来的帖子。
             if comments is not None:
-                lines.append(f"这些帖子快照可见{'至少 ' if lower else ' '}{comments} 条预警评论。")
+                lines.append(f"这些帖子快照里有{'至少 ' if lower else ' '}{comments} 条负面评论。")
             else:
                 lines.append("负面评论条数待核实。")
             lines.append("上述帖子：" + _state_counts(states) + "。")
