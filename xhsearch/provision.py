@@ -253,6 +253,19 @@ def _tier_expr(age_expr: str, tiers) -> str:
 
 # 「下次检查时间」不是巡查列（机器不读不写，飞书自己算），名字就定在这里。
 NEXT_CHECK_COLUMN = "下次检查时间"
+# 同一列在老表里的另一个叫法。途鸽那张表是运营自己建的这一列，叫「下次巡查时间」。
+# 以前只认上面那个名字：面板上改了刷新频率，判定成「表里没有这一列」就跳过，
+# 运营的那一列一直按默认 72 小时报下次时间——看上去就像改了没生效。
+# 新建的表仍然叫「下次检查时间」；两个名字都在的表，认前一个。
+NEXT_CHECK_ALIASES = (NEXT_CHECK_COLUMN, "下次巡查时间")
+
+
+def next_check_column(meta: Optional[dict]) -> str:
+    """表里「下次检查时间」那一列实际叫什么。一个都没有就返回新表该建的名字。"""
+    for name in NEXT_CHECK_ALIASES:
+        if name in (meta or {}):
+            return name
+    return NEXT_CHECK_COLUMN
 
 
 def next_check_formula(settings: Settings) -> str:
@@ -723,6 +736,8 @@ class FormulaPlan:
     wanted: str
     current: str = ""
     reason: str = ""
+    # 这张表里那一列实际叫什么（见 NEXT_CHECK_ALIASES）。missing 时是要建的名字。
+    column: str = NEXT_CHECK_COLUMN
 
 
 # 公式结果的 data_type：5 = 日期。见 feishu.DATE_RESULT。
@@ -735,33 +750,61 @@ def next_check_plan(settings: Settings, meta: Optional[dict]) -> FormulaPlan:
     新版公式比老版多一支：「巡查状态 = 已失效」的行按退避节奏算（72 → 144 →
     288 小时……），和机器真正的复查节奏一致（见 rows.Row.gone_backoff_hours）。
     老版对已失效的行报的是一个**更早**的时间——不出错，但不是真话。
+
+    那一列叫「下次检查时间」还是「下次巡查时间」都认（见 NEXT_CHECK_ALIASES），
+    实际的列名放在 `plan.column` 里，换公式、建列、回执都用它。
     """
     f = settings.fields
     meta = meta or {}
     wanted = next_check_formula(settings)
-    info = meta.get(NEXT_CHECK_COLUMN)
+    column = next_check_column(meta)
+    info = meta.get(column)
     if info is not None and info.get("type") != FORMULA:
-        return FormulaPlan("wrong_type", wanted,
-                           reason=f"「{NEXT_CHECK_COLUMN}」不是公式列"
+        return FormulaPlan("wrong_type", wanted, column=column,
+                           reason=f"「{column}」不是公式列"
                                   f"（现在是「{schema.type_name(info.get('type'))}」），"
                                   "改类型会动这一列已有的数据，这里不动它")
     refs = (f.publish_time, f.last_updated, f.refresh_status, f.consecutive_failures)
     gaps = [c for c in refs if c not in meta]
     current = (info or {}).get("formula") or ""
     if gaps:
-        return FormulaPlan("no_refs", wanted, current=current,
+        return FormulaPlan("no_refs", wanted, current=current, column=column,
                            reason=f"公式要引用的列不全：缺 {'、'.join(gaps)}，"
                                   "先在面板上「补齐缺的列」")
     if info is None:
-        return FormulaPlan("missing", wanted,
-                           reason=f"表里没有「{NEXT_CHECK_COLUMN}」这一列")
+        names = "」或「".join(NEXT_CHECK_ALIASES)
+        return FormulaPlan("missing", wanted, column=column,
+                           reason=f"表里没有「{names}」这一列")
     if current and readout.canonical(current) == readout.canonical(wanted):
         shown_as = info.get("result_type")
         if shown_as is not None and shown_as != _DATE_RESULT_TYPE:
-            return FormulaPlan("update", wanted, current=current,
+            return FormulaPlan("update", wanted, current=current, column=column,
                                reason="公式已经是新版，但结果按数字显示（一串像 46312 的数），"
                                       "重发一次带上日期格式")
-        return FormulaPlan("up_to_date", wanted, current=current)
+        return FormulaPlan("up_to_date", wanted, current=current, column=column)
     # 读不到原文、或者原文里还有翻不回列名的引用（`bitable::…`）：比不了，
     # 按新版覆盖——这一列是机器算的公式，不存人填的数据，换掉不丢东西。
-    return FormulaPlan("update", wanted, current=current)
+    return FormulaPlan("update", wanted, current=current, column=column)
+
+
+def next_check_drift(settings: Settings, meta: Optional[dict]) -> str:
+    """表里那一列「下次检查时间」跟这张表现在的刷新频率对不对得上。
+    对不上返回一句给运营看的话，对得上（或者判断不了）返回空串。**纯函数。**
+
+    面板每次读表都跑一遍：改了频率而公式没换，表里报的下次时间就是错的，
+    运营会照着它错误地估计什么时候查——这种错不能只在改参数那一下的回执里
+    闪一次，得一直挂在项目卡上，直到对上为止。
+
+    只在**确定**对不上时才说：公式原文读不到、或者还有翻不回列名的引用
+    （`bitable::…`）时比不了，不报；结果只是按数字显示的那种不算频率问题。
+    """
+    plan = next_check_plan(settings, meta)
+    if plan.action == "wrong_type":
+        return (f"「{plan.column}」不是公式列，不会跟着刷新频率变，"
+                "表里显示的下次时间可能不准")
+    if plan.action != "update" or plan.reason:
+        return ""
+    if not plan.current or "bitable::" in plan.current:
+        return ""
+    return (f"「{plan.column}」的公式和这张表现在的刷新频率对不上，表里显示的下次时间不准。"
+            "在「加表 / 改配置」里点这张表的「参数」，保存一次就会换上")

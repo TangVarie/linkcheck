@@ -598,6 +598,22 @@ class RefreshTiers:
         """最慢的那一档间隔。已失效的行从这里起步退避（见 rows.Row.gone_backoff_hours）。"""
         return max((hours for _days, hours in self.tiers), default=None)
 
+    def describe(self) -> str:
+        """给人看的刷新节奏：「0–2 天每 8 小时 · 3–7 天每 24 小时 · 8 天起每 72 小时 ·
+        满 30 天归档」。面板项目卡和改参数的回执都用它——运营要能一眼核对
+        「我刚改的那个数，机器现在是不是就按它在跑」。"""
+        if not self.tiers:
+            return "不自动刷新"
+        parts = []
+        start = 0
+        for index, (max_age_days, hours) in enumerate(self.tiers):
+            last = index == len(self.tiers) - 1
+            span = f"{start} 天起" if last else f"{start}–{max_age_days} 天"
+            parts.append(f"{span}每 {hours:g} 小时")
+            start = max_age_days + 1
+        parts.append(f"满 {self.archive_after_days} 天归档")
+        return " · ".join(parts)
+
 
 @dataclass
 class Safety:

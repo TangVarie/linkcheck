@@ -107,6 +107,11 @@ class ProjectSnapshot:
     error: str = ""
     # 体检问题（_schema_problems 的原文）。空 = 这张表配置没问题。
     health: list[str] = field(default_factory=list)
+    # 这张表**现在**按什么节奏刷（RefreshTiers.describe），和 cron 用同一个
+    # apply_overrides 算出来；refresh_custom = 注册表里这张表改过刷新频率或归档天数。
+    # 项目卡上直接摆出来：改完参数，看这一行就知道机器下一轮按什么跑。
+    refresh_text: str = ""
+    refresh_custom: bool = False
 
     total_rows: int = 0
     archived_rows: int = 0

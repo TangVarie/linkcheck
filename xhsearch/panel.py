@@ -34,6 +34,7 @@ basic security checks」。用它是为了守住这个项目的零依赖，代�
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -354,10 +355,15 @@ def collect(
         # 这里不跟着做，改过 归档天数 的项目会出现「面板说到期 12 行、
         # cron 刷了 40 行」这种谁都不信的局面。不传就是全局那一份。
         per_table = settings_for(table.table_id) if settings_for else settings
-        projects.append(_collect_one(
+        snap = _collect_one(
             label, table, per_table, api_keys,
             show_digest=show_digest, feishu_base=feishu_base, now=now,
-            scrub=scrub, label_column=label_column, seen_calls=seen_calls))
+            scrub=scrub, label_column=label_column, seen_calls=seen_calls)
+        snap.refresh_text = per_table.refresh.describe()
+        snap.refresh_custom = (
+            per_table.refresh.tiers != settings.refresh.tiers
+            or per_table.refresh.archive_after_days != settings.refresh.archive_after_days)
+        projects.append(snap)
     return summary.Overview(projects=projects, generated_at=now,
                             disabled_tables=[t for t in disabled_tables if t])
 
@@ -392,6 +398,11 @@ def _collect_one(label, table, settings, api_keys, *,
 
     known = set(meta)
     health = schema.schema_problems(settings, meta)
+    # 「下次检查时间」那一列的公式跟这张表的刷新频率对不上，就一直挂在卡上，
+    # 不能只在改参数那一下的回执里闪一次（见 provision.next_check_drift）。
+    drift = provision.next_check_drift(settings, meta)
+    if drift:
+        health = [*health, drift]
     # 「哪一条」用哪一列，在 search 之前定下来（下面那条纪律的同一个原因）。
     picked = summary.pick_label_column(known, label_column)
     # 只请求确实存在的列：按名字请求不存在的列会让整个 search 报 1254045，
@@ -1186,21 +1197,31 @@ class Projects:
         entry = next((e for e in self.list() if e.record_id == record_id), None)
         if entry is None or not entry.table_id:
             return result
+        # 公式按**这次写进去的值**算，不靠刚写完立刻读回来：读回来要是还是旧值，
+        # 算出来的就是旧公式，结果会是一句「公式本来就对」，表里一个字都没变。
+        # None = 这一格清空、回到全局默认。
+        merged = {**entry.thresholds, **values}
+        entry = dataclasses.replace(
+            entry, thresholds={k: v for k, v in merged.items() if v is not None})
+        per_table = registry.apply_overrides(self.settings, entry)
+        running = per_table.refresh.describe()
+        result["refresh"] = running
+        column = provision.NEXT_CHECK_COLUMN
         try:
-            per_table = registry.apply_overrides(self.settings, entry)
             table = self._bitable(entry.app_token, entry.table_id)
             plan = provision.next_check_plan(per_table, table.fields_meta() or {})
+            column = plan.column
             if plan.action == "update":
-                table.set_formula(provision.NEXT_CHECK_COLUMN, plan.wanted,
-                                  result_type=feishu.DATE_RESULT)
-                result["formula"] = f"「{provision.NEXT_CHECK_COLUMN}」的公式已按新频率换好"
+                table.set_formula(column, plan.wanted, result_type=feishu.DATE_RESULT)
+                result["formula"] = (f"「{column}」的公式已按新频率换好，"
+                                     f"表里的下次时间会按「{running}」重算")
             elif plan.action == "up_to_date":
-                result["formula"] = f"「{provision.NEXT_CHECK_COLUMN}」的公式本来就对"
+                result["formula"] = f"「{column}」的公式本来就是「{running}」"
             else:
-                result["formula"] = (f"「{provision.NEXT_CHECK_COLUMN}」没换（{plan.reason or plan.action}）"
-                                     "，表里那一列显示的时间可能和新频率对不上")
+                result["formula"] = (f"「{column}」没换（{plan.reason or plan.action}），"
+                                     "表里那一列显示的时间可能和新频率对不上")
         except Exception as exc:  # noqa: BLE001
-            result["formula"] = (f"「{provision.NEXT_CHECK_COLUMN}」的公式没换成（{exc}），"
+            result["formula"] = (f"「{column}」的公式没换成（{exc}），"
                                  "参数已经生效，只是表里那一列显示的时间还是旧的")
         return result
 
@@ -2537,6 +2558,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             if payload.get("preview"):
                 return projects.preview_thresholds(text("record_id"), clean)
             saved = projects.set_thresholds(text("record_id"), clean)
+            # 项目卡上的「刷新频率」和「下次时间对不上」都从概览里来：
+            # 不刷新的话，存完之后卡片还要等一个缓存周期才变，像是没存上。
+            self.deps.cache.refresh()
             return {"ok": True, **saved}
         if action == "enable":
             projects.set_enabled(text("record_id"), bool(payload.get("enabled")))
@@ -2623,6 +2647,7 @@ def _project_json(p: summary.ProjectSnapshot) -> dict:
         "label": p.label, "table_id": p.table_id, "app_token": p.app_token,
         "table_url": p.table_url, "error": p.error,
         "health": p.health, "total_rows": p.total_rows,
+        "refresh_text": p.refresh_text, "refresh_custom": p.refresh_custom,
         "archived_rows": p.archived_rows, "queued_rows": p.queued_rows,
         "due_rows": p.due_rows, "due_yuan": round(p.due_yuan, 2),
         "estimate_blocked": p.estimate_blocked,

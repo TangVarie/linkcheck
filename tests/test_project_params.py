@@ -9,8 +9,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import cli
-from xhsearch import (analyze, negatives, panel, protocol, providers, registry, rows,
-                      runner, summary)
+from xhsearch import (analyze, negatives, panel, protocol, provision, providers, registry,
+                      rows, runner, summary)
 from xhsearch.config import Settings
 from xhsearch.rows import Row
 
@@ -530,7 +530,7 @@ class TestPanelSave(unittest.TestCase):
         p = self.projects({registry.COL_INTERVAL_LATE: 48})
         table = mock.Mock()
         table.fields_meta.return_value = {"下次检查时间": {"type": 20, "formula": "old"}}
-        plan = SimpleNamespace(action="update", wanted="NEW", reason="")
+        plan = provision.FormulaPlan("update", "NEW", column="下次检查时间")
         with mock.patch.object(p, "_bitable", return_value=table), \
                 mock.patch.object(panel.provision, "next_check_plan", return_value=plan) as planner:
             result = p.set_thresholds("recP", {registry.COL_INTERVAL_LATE: 48})
@@ -538,6 +538,54 @@ class TestPanelSave(unittest.TestCase):
         self.assertEqual(used.refresh.tiers[-1], (30, 48), "公式按这张表自己的频率写")
         table.set_formula.assert_called_once()
         self.assertIn("已按新频率换好", result["formula"])
+
+    def _business(self, column, settings):
+        """一张业务表：引用的列都在，那一列「下次…时间」是按 settings 写的公式列。"""
+        f = settings.fields
+        meta = {c: {"type": 1} for c in (f.publish_time, f.last_updated,
+                                          f.refresh_status, f.consecutive_failures)}
+        meta[column] = {"type": 20, "formula": provision.next_check_formula(settings),
+                        "result_type": 5}
+        table = mock.Mock()
+        table.fields_meta.return_value = meta
+        return table
+
+    def test_the_older_column_name_gets_its_formula_swapped_too(self):
+        """途鸽那张表的这一列叫「下次巡查时间」。以前只认「下次检查时间」，
+        判成「表里没有这一列」就跳过——频率改了，表里一直按 72 小时报。"""
+        p = self.projects({})
+        table = self._business("下次巡查时间", Settings())
+        with mock.patch.object(p, "_bitable", return_value=table):
+            result = p.set_thresholds("recP", {registry.COL_INTERVAL_LATE: 24})
+        table.set_formula.assert_called_once()
+        column, expression = table.set_formula.call_args.args
+        self.assertEqual(column, "下次巡查时间")
+        self.assertIn('"D") <= 7, 24, 24)', expression, "8 天起那一档换成了 24 小时")
+        self.assertIn("「下次巡查时间」的公式已按新频率换好", result["formula"])
+        self.assertIn("8 天起每 24 小时", result["formula"], "回执里说清楚现在按什么跑")
+        self.assertEqual(result["refresh"],
+                         "0–2 天每 8 小时 · 3–7 天每 24 小时 · 8 天起每 24 小时 · 满 30 天归档")
+
+    def test_the_formula_follows_what_was_just_written_not_a_stale_read_back(self):
+        """刚写完立刻读回来，读到的可能还是旧值。公式要按这次写进去的值算，
+        不然会得出一句「公式本来就对」，表里一个字都没变。"""
+        p = self.projects({registry.COL_INTERVAL_LATE: 72})      # 读回来的还是旧的 72
+        table = self._business("下次检查时间", Settings())
+        with mock.patch.object(p, "_bitable", return_value=table):
+            result = p.set_thresholds("recP", {registry.COL_INTERVAL_LATE: 12})
+        table.set_formula.assert_called_once()
+        self.assertIn('"D") <= 7, 24, 12)', table.set_formula.call_args.args[1])
+        self.assertIn("8 天起每 12 小时", result["refresh"])
+
+    def test_clearing_a_value_goes_back_to_the_global_default(self):
+        tuned = Settings()
+        tuned.refresh.tiers = [(2, 8), (7, 24), (30, 48)]
+        p = self.projects({registry.COL_INTERVAL_LATE: 48})
+        table = self._business("下次检查时间", tuned)
+        with mock.patch.object(p, "_bitable", return_value=table):
+            result = p.set_thresholds("recP", {registry.COL_INTERVAL_LATE: None})
+        self.assertIn('"D") <= 7, 24, 72)', table.set_formula.call_args.args[1])
+        self.assertIn("8 天起每 72 小时", result["refresh"])
 
     def test_threshold_only_changes_leave_the_formula_alone(self):
         p = self.projects({})

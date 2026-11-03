@@ -1640,6 +1640,14 @@ class TestWholeDayTiers(unittest.TestCase):
         self.assertEqual(self.refresh.interval_hours_for_age(30.99), 72)
         self.assertIsNone(self.refresh.interval_hours_for_age(31.0))
 
+    def test_describe_matches_the_panel_form_labels(self):
+        """项目卡和改参数回执上的那一句，档位界线和表单「发布 0–2 天 / 3–7 天 /
+        8 天起」一致，和 interval_hours_for_age 的整天口径一致。"""
+        self.assertEqual(self.refresh.describe(),
+                         "0–2 天每 8 小时 · 3–7 天每 24 小时 · 8 天起每 72 小时 · 满 30 天归档")
+        self.refresh.tiers = []
+        self.assertEqual(self.refresh.describe(), "不自动刷新")
+
 
 class TestProtocol(unittest.TestCase):
     """错误码取自 SocialDataX 公开 OpenAPI 规范的 x-socialdatax-error-contract。

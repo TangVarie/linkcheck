@@ -390,6 +390,55 @@ class TestNextCheckPlan(unittest.TestCase):
         self.assertTrue(next_check_plan(settings, meta_with()).wanted.startswith(
             'IF(DATEDIF([发布时间], NOW(), "D") > 14, ""'))
 
+    def test_the_older_column_name_is_the_same_column(self):
+        """途鸽那张表这一列叫「下次巡查时间」，不能判成「没有这一列」。"""
+        meta = renamed(meta_with(), "下次巡查时间")
+        plan = next_check_plan(self.settings, meta)
+        self.assertEqual((plan.action, plan.column), ("update", "下次巡查时间"))
+        meta = renamed(meta_with(next_check_formula(self.settings)), "下次巡查时间")
+        self.assertEqual(next_check_plan(self.settings, meta).action, "up_to_date")
+
+    def test_missing_names_both_spellings(self):
+        plan = next_check_plan(self.settings, without_column(meta_with()))
+        self.assertEqual((plan.action, plan.column), ("missing", NEXT_CHECK_COLUMN))
+        self.assertIn("下次巡查时间", plan.reason)
+
+
+def renamed(meta, name):
+    meta = dict(meta)
+    meta[name] = meta.pop(NEXT_CHECK_COLUMN)
+    return meta
+
+
+class TestNextCheckDrift(unittest.TestCase):
+    """面板每次读表都核对：表里那一列跟这张表现在的刷新频率对不对得上。"""
+
+    def setUp(self):
+        self.settings = Settings()
+
+    def test_matching_formula_says_nothing(self):
+        meta = meta_with(next_check_formula(self.settings))
+        self.assertEqual(provision.next_check_drift(self.settings, meta), "")
+
+    def test_a_formula_from_the_old_frequency_is_reported_by_its_real_name(self):
+        tuned = Settings()
+        tuned.refresh.tiers = [(2, 8), (7, 24), (30, 24)]
+        meta = renamed(meta_with(next_check_formula(self.settings)), "下次巡查时间")
+        note = provision.next_check_drift(tuned, meta)
+        self.assertIn("「下次巡查时间」的公式和这张表现在的刷新频率对不上", note)
+        self.assertIn("「参数」", note, "告诉运营怎么修")
+
+    def test_what_cannot_be_compared_is_not_reported(self):
+        """读不到原文 / 还有 bitable:: 引用：比不了就不报，免得一直误报。"""
+        self.assertEqual(provision.next_check_drift(self.settings, meta_with(None)), "")
+        raw = meta_with("bitable::$table[tblA].$field[fld1] + 3")
+        self.assertEqual(provision.next_check_drift(self.settings, raw), "")
+        self.assertEqual(provision.next_check_drift(self.settings, without_column(meta_with())), "")
+
+    def test_a_hand_filled_date_column_is_reported(self):
+        note = provision.next_check_drift(self.settings, meta_with(type_code=5))
+        self.assertIn("不是公式列", note)
+
 
 def ok(payload=None):
     return transport.Response(status=200, content_type="application/json",
@@ -661,6 +710,15 @@ class TestUpdaterRun(unittest.TestCase):
         self.assertIn("✓ 按日期显示", text)
         self.assertIn("已在表尾建好", text)
         self.assertIn("这次换了 1 张，建了 1 张", text)
+
+    def test_the_older_column_name_is_updated_in_place_not_duplicated(self):
+        """「下次巡查时间」那张表：换它的公式，不在表尾再建一列「下次检查时间」。"""
+        table = FakeTable(renamed(meta_with(), "下次巡查时间"), table_id="tblTu")
+        code, text = self.run_it([("途鸽", table)], apply=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(table.created, [])
+        self.assertEqual(table.formulas, [("下次巡查时间", self.wanted, feishu.DATE_RESULT)])
+        self.assertIn("✓ 公式已是新版（读回来核对过）", text)
 
     def test_number_display_is_resent_with_the_date_format(self):
         shown_as_number = meta_with(self.wanted)
