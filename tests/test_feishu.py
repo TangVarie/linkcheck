@@ -106,6 +106,17 @@ class TestTransientReadRetry(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(len(sent), 2)
 
+    def test_rate_limit_is_retried_too(self):
+        """1254290 TooManyRequest：sweep 改成每 5 分钟一轮后，和面板每分钟读表撞上，
+        面板上一张表整张报「读记录失败」。频控挡下的请求没执行，等一下重发就好。"""
+        records, sent, slept = self._search([
+            feishu_err(feishu.RATE_LIMIT_CODE, "TooManyRequest"),
+            ok({"items": [{"record_id": "rec1"}], "has_more": False}),
+        ])
+        self.assertEqual([r["record_id"] for r in records], ["rec1"])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(slept.call_count, 1)
+
     def test_it_gives_up_after_a_bounded_number_of_tries_and_says_so(self):
         with self.assertRaises(feishu.FeishuError) as ctx:
             self._search([feishu_err(1254002, "Fail")] * feishu._READ_ATTEMPTS)
@@ -283,6 +294,40 @@ class TestErrorCodeContract(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1254291)
         # 退避次数有上界；旧写法这里是 2n-1 = 15 次立即请求
         self.assertEqual(calls["n"], feishu._CONFLICT_ATTEMPTS)
+
+    def test_rate_limit_on_write_back_retries_the_whole_chunk(self):
+        """写回撞上限流：这些行的结果已经付过钱了，丢掉就是白花。
+        限流的请求没被执行，整块退避重发，不拆、不会写两遍。"""
+        bodies: list[list[str]] = []
+
+        def fake_post(url, headers, body, timeout=30.0):
+            bodies.append([r["record_id"] for r in json.loads(body).get("records") or []])
+            if len(bodies) == 1:
+                return feishu_err(feishu.RATE_LIMIT_CODE, "TooManyRequest")
+            return ok({})
+
+        updates = [{"record_id": f"rec{i}", "fields": {"x": 1}} for i in range(8)]
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep") as slept:
+            written = make_table().batch_update(updates, errors=[])
+        self.assertEqual(written, 8)
+        self.assertEqual([len(b) for b in bodies], [8, 8], "整块重发，没有二分")
+        self.assertEqual(slept.call_count, 1, "重发前要退避")
+
+    def test_rate_limit_that_never_clears_is_bounded_and_explained(self):
+        calls = {"n": 0}
+
+        def fake_post(url, headers, body, timeout=30.0):
+            calls["n"] += 1
+            return feishu_err(feishu.RATE_LIMIT_CODE, "TooManyRequest")
+
+        with mock.patch.object(transport, "post", side_effect=fake_post), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(feishu.FeishuError) as ctx:
+                make_table().batch_update([{"record_id": "a", "fields": {"x": 1}}], errors=[])
+        self.assertEqual(ctx.exception.code, feishu.RATE_LIMIT_CODE)
+        self.assertEqual(calls["n"], feishu._CONFLICT_ATTEMPTS)
+        self.assertIn("请求过快", ctx.exception.hint)
 
     def test_record_id_not_found_is_the_code_that_gets_bisected(self):
         """1254043 RecordIdNotFound：这一行的问题不影响别的行，隔离出来其余照写。"""

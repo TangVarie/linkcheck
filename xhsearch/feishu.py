@@ -90,18 +90,26 @@ WRITE_CONFLICT_CODE = 1254291
 _CONFLICT_ATTEMPTS = 4
 _CONFLICT_BASE_DELAY = 1.0
 
+# 限流：TooManyRequest ——「请求过快，稍后重试」。被频控挡在门外、**没有执行**，
+# 所以读和写都能原样重发（这一点和 1254002 不同，那个可能其实写进去了）。
+# 2026-11 线上：sweep 从一天三轮改成每 5 分钟一轮之后，和面板每分钟一次的读表
+# 撞在一起，面板上一张表报「读记录失败：[1254290] TooManyRequest」。原来它不在
+# 任何重试名单里：读就是这张表这一轮整张跳过，写就是**已经付过钱的结果写不回去**。
+RATE_LIMIT_CODE = 1254290
+
 # 读接口上「飞书说过一会儿再试」的业务码，按官方 records/search 文档的错误码表：
 # * 1254002 Fail ——「如果该报错偶尔发生，可能是服务器超时或不稳定，请重试解决」。
 #   2026-10 线上实测：queue 模式里两张表同一轮各报一次、其余表照常、之后自己好了。
 #   它是 **HTTP 200** 带业务码，传输层看到的是成功响应，根本不会重试——原来一次
 #   抖动就是「这张表这一轮整张跳过」。
 # * 1254607 Data not ready ——「建议等待一段时间后重试」。HTTP 400，传输层同样不重试。
+# * 1254290 TooManyRequest ——「请求过快，稍后重试」，见 RATE_LIMIT_CODE。
 # （1255040 请求超时是 HTTP 504，传输层已经按 5xx 重试过，这里不再叠一层。）
 #
 # **只用在读上。** 读重发多少次都改不坏表；写不一样——1254002 也可能是「其实
 # 写进去了、只是回包说失败」，盲目重发 batch_create 会多出重复行（写冲突
-# 1254291 另有自己的整块退避，见 _post_chunk）。
-_TRANSIENT_READ_CODES = frozenset({1254002, 1254607})
+# 1254291 和限流 1254290 另有自己的整块退避，见 _post_chunk）。
+_TRANSIENT_READ_CODES = frozenset({1254002, 1254607, RATE_LIMIT_CODE})
 # 总共试几次、退避基准（full jitter：第 1 次重试前等 0~2 秒、第 2 次 0~4 秒）。
 # 一张表最多多等几秒，换掉的是「这张表这一轮整张不巡查」。
 _READ_ATTEMPTS = 3
@@ -157,6 +165,9 @@ _HINTS = {
     1254291: "写冲突：同一张表正在被并发写入或请求过快。"
              "检查是不是有两个调度器（queue/sweep/手动）同时在跑——"
              "所有付费入口必须共享同一个运行租约（见 xhsearch/runlock.py）",
+    1254290: "请求过快：同一个应用对飞书多维表格的请求太密，已经退避重试过几次还是被限流。"
+             "偶尔一次不用管，下一轮会自己好；常常出现的话，看是不是有两个调度器同时在跑，"
+             "或者面板读表太勤（可以设 PANEL_IDLE_MINUTES 让没人看时停下）",
     91403: "没有权限，检查应用权限范围和文档协作者设置",
     1254302: "这张表开了「高级权限」：光把应用加成「可编辑」协作者不够，"
              "还要进高级权限设置给这个应用「可管理」",
@@ -693,10 +704,11 @@ class Bitable:
         return written
 
     def _post_chunk(self, chunk: list[dict[str, Any]]) -> None:
-        """把一个分片发出去。写冲突（1254291）在这里整块退避重试。
+        """把一个分片发出去。写冲突（1254291）和限流（1254290）在这里整块退避重试。
 
         重试次数固定、退避带 full jitter：多个写入方同时撞上同一张表时，
-        固定退避会让它们在同一毫秒一起回来，冲突永远解不开。
+        固定退避会让它们在同一毫秒一起回来，冲突永远解不开。限流同理，而且
+        限流的请求没被执行，重发不会写两遍。
         """
         last: Optional[FeishuError] = None
         for attempt in range(_CONFLICT_ATTEMPTS):
@@ -711,7 +723,7 @@ class Bitable:
                 _check(resp)
                 return
             except FeishuError as exc:
-                if exc.code != WRITE_CONFLICT_CODE:
+                if exc.code not in (WRITE_CONFLICT_CODE, RATE_LIMIT_CODE):
                     raise
                 last = exc
                 if attempt == _CONFLICT_ATTEMPTS - 1:
@@ -727,8 +739,8 @@ class Bitable:
             return len(chunk)
         except FeishuError as exc:
             if exc.code not in _ROW_LEVEL_CODES:
-                # 表级错误和写冲突：二分只会放大失败，直接向上抛。
-                # 写冲突已经在 _post_chunk 里退避重试过 _CONFLICT_ATTEMPTS 次。
+                # 表级错误、写冲突和限流：二分只会放大失败，直接向上抛。
+                # 写冲突和限流已经在 _post_chunk 里退避重试过 _CONFLICT_ATTEMPTS 次。
                 raise
             if len(chunk) == 1:
                 errors.append((str(chunk[0].get("record_id") or ""), exc))
