@@ -1771,7 +1771,22 @@ _SCRIPT = r"""
       body +
       "<div><button type=button data-thr=preview>先算给我看</button> " +
       "<button type=button data-thr=save disabled>保存</button></div>" +
-      "<div class='out thrOut'></div></div>";
+      "<div class='out thrOut'></div>" + excludesForm(e) + "</div>";
+  }
+  // 蓝词排除词：竞品名等不往「蓝词字段」里记的词。和上面的数字参数分开存——它不影响
+  // 花费，用不着先算；改了数字没算、只想改排除词的人也不该被「先算给我看」挡住。
+  function excludesForm(e){
+    var words = (e.blue_word_excludes || []).join("、");
+    return "<div class=excl style='margin-top:16px;padding-top:12px;border-top:1px solid var(--border)'>" +
+      "<div style='margin:0 0 4px'><b>蓝词排除词</b></div>" +
+      "<div class=muted style='font-size:12px;max-width:560px;margin-bottom:6px'>" +
+      "竞品名等不往「蓝词字段」里记的词，扫到也不记、不叫截图。逗号或顿号分隔，每个至少 2 个字。" +
+      "中文按包含算（「奥佳华」也排掉「奥佳华7598vpro」），英文按整个单词、不分大小写" +
+      "（「sis」排掉「sis黑胶」，不排「analysis」）。已经记进「蓝词字段」的词不会自动删，要清理找技术。" +
+      "</div><textarea data-excl rows=2 style='max-width:560px' placeholder='比如：奥佳华、maurten'>" +
+      esc(words) + "</textarea>" +
+      "<div style='margin-top:8px'><button type=button data-excl-save>保存排除词</button></div>" +
+      "<div class='out exclOut'></div></div>";
   }
   function thrValues(box){
     var out = {};
@@ -1819,9 +1834,27 @@ _SCRIPT = r"""
       if (out2) out2.textContent = "值已变化，请重新点「先算给我看」再保存。";
     });
     list.addEventListener("click", function(ev){
-      var b = ev.target.closest ? ev.target.closest("button[data-act],button[data-thr]") : null;
+      var b = ev.target.closest ? ev.target.closest("button[data-act],button[data-thr],button[data-excl-save]") : null;
       if (!b) return;
       var act = b.dataset.act;
+      if (b.hasAttribute("data-excl-save")) {
+        var exclBox = b.closest(".thr"), field = exclBox.querySelector("textarea[data-excl]");
+        var exclOut = exclBox.querySelector(".exclOut");
+        b.disabled = true; exclOut.textContent = "保存中…";
+        post("excludes", {record_id: exclBox.dataset.rec, text: field.value})
+          .then(function(j){
+            // 回填成机器认的样子（拆开、去重之后），存进去什么一眼看得到。
+            field.value = (j.words || []).join("、");
+            var lines = ["<span class=ok>" + (j.words && j.words.length
+              ? "保存了 " + j.words.length + " 个排除词。下一轮 cron（≤5 分钟）起生效。"
+              : "已清空，这张表不再排除任何词。") + "</span>"];
+            if (j.created_columns && j.created_columns.length)
+              lines.push("注册表里新建了这几列：" + j.created_columns.map(esc).join("、"));
+            exclOut.innerHTML = lines.join("\n"); b.disabled = false;
+          })
+          .catch(function(err){ exclOut.textContent = errText(err); b.disabled = false; });
+        return;
+      }
       if (act === "thresholds") {
         var box = list.querySelector(".thr[data-rec='" + b.dataset.rec + "']");
         if (box) box.hidden = !box.hidden;

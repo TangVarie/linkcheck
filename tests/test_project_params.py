@@ -594,6 +594,29 @@ class TestPanelSave(unittest.TestCase):
         bitable.assert_not_called()
         self.assertEqual(result["formula"], "")
 
+    def test_saving_excludes_writes_the_registry_and_reports_the_words(self):
+        p = self.projects({})
+        result = p.set_blue_word_excludes("recP", "奥佳华，sis")
+        self.assertEqual(result["words"], ["奥佳华", "sis"])
+        update = p._registry.return_value.batch_update.call_args.args[0]
+        self.assertEqual(update, [{"record_id": "recP",
+                                   "fields": {registry.COL_BLUE_WORD_EXCLUDES: "奥佳华、sis"}}])
+
+    def test_short_excludes_are_refused_before_anything_is_written(self):
+        p = self.projects({})
+        with self.assertRaises(ValueError):
+            p.set_blue_word_excludes("recP", "奥佳华、S")
+        p._registry.return_value.batch_update.assert_not_called()
+
+    def test_the_parameter_form_shows_and_saves_the_excludes(self):
+        from xhsearch import panel_view
+        data = panel._entry_json(registry.Entry(record_id="r", label="x",
+                                                blue_word_excludes=["奥佳华", "sis"]), Settings())
+        self.assertEqual(data["blue_word_excludes"], ["奥佳华", "sis"])
+        self.assertIn("function excludesForm(e)", panel_view._SCRIPT)
+        self.assertIn('post("excludes", {record_id: exclBox.dataset.rec, text: field.value})',
+                      panel_view._SCRIPT)
+
     def test_entry_json_carries_the_grouped_form(self):
         data = panel._entry_json(registry.Entry(record_id="r", label="x"), Settings())
         self.assertEqual({p["group"] for p in data["params"]}, {"刷新频率", "评论扫描", "热度判定"})

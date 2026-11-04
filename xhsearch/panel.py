@@ -1225,6 +1225,17 @@ class Projects:
                                  "参数已经生效，只是表里那一列显示的时间还是旧的")
         return result
 
+    def set_blue_word_excludes(self, record_id: str, text: str) -> dict:
+        """改这张表的「蓝词排除词」（竞品名等不往「蓝词字段」里记的词）。
+
+        只写登记表那一格，cron 下一轮读注册表时就用上（registry.apply_overrides）。
+        **格子里已经记下的竞品词不会因此被删**——那要跑 tools/purge_blue_word_excludes.py。
+        """
+        words = registry.parse_blue_word_excludes(text)
+        self.log(f"⚙ 改蓝词排除词 {record_id}：{'、'.join(words) or '（清空）'}")
+        made = registry.set_blue_word_excludes(self._registry(), record_id, words)
+        return {"words": words, "created_columns": made}
+
     def set_enabled(self, record_id: str, enabled: bool) -> None:
         self.log(f"📋 {'启用' if enabled else '停用'} 注册表行 {record_id}")
         registry.set_enabled(self._registry(), record_id, enabled)
@@ -2557,6 +2568,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             # 不刷新的话，存完之后卡片还要等一个缓存周期才变，像是没存上。
             self.deps.cache.refresh()
             return {"ok": True, **saved}
+        if action == "excludes":
+            raw = payload.get("text")
+            if raw is not None and not isinstance(raw, str):
+                raise ValueError("text 要是字符串")
+            return {"ok": True, **projects.set_blue_word_excludes(text("record_id"), raw or "")}
         if action == "enable":
             projects.set_enabled(text("record_id"), bool(payload.get("enabled")))
             self.deps.cache.refresh()
@@ -2599,6 +2615,7 @@ def _entry_json(entry, settings: Optional[Settings] = None) -> dict:
             "app_token": entry.app_token, "table_id": entry.table_id,
             "thresholds": dict(entry.thresholds or {}),
             "threshold_columns": list(registry.THRESHOLD_COLUMNS),
+            "blue_word_excludes": list(entry.blue_word_excludes or []),
             "params": registry.param_specs(settings or Settings())}
 
 

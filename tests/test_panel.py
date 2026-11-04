@@ -1809,6 +1809,22 @@ class TestProjectRoutesOverHttp(unittest.TestCase):
         self.assertEqual(status, 200)
         self.actions.remove.assert_called_once_with("rec9")
 
+    def test_blue_word_excludes_are_saved_from_the_panel(self):
+        self.actions.set_blue_word_excludes.return_value = {
+            "words": ["奥佳华", "sis"], "created_columns": []}
+        status, body = self._call("/api/projects/excludes",
+                                  data=json.dumps({"record_id": "rec9", "text": "奥佳华、sis"}).encode(),
+                                  headers=self._login(), method="POST")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["words"], ["奥佳华", "sis"])
+        self.actions.set_blue_word_excludes.assert_called_with("rec9", "奥佳华、sis")
+
+    def test_blue_word_excludes_must_be_text(self):
+        status, _ = self._call("/api/projects/excludes",
+                               data=json.dumps({"record_id": "rec9", "text": ["奥佳华"]}).encode(),
+                               headers=self._login(), method="POST")
+        self.assertEqual(status, 400)
+
     def test_create_passes_the_template_and_defaults_to_full(self):
         self.actions.create.return_value = {"target": "b:t", "columns": 37}
         status, body = self._call(
