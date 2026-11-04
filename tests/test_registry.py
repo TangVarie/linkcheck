@@ -200,6 +200,65 @@ class TestWrites(unittest.TestCase):
         self.assertEqual(table.deleted, ["rec1"])
 
 
+class ColumnMakingTable(FakeTable):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.made = []
+
+    def create_field(self, spec):
+        self.made.append(spec)
+
+
+class TestBlueWordExcludes(unittest.TestCase):
+    """「蓝词排除词」能在面板「参数」里改（以前只能去登记表里找那一格）。"""
+
+    COL = registry.COL_BLUE_WORD_EXCLUDES
+
+    def test_parse_splits_like_the_reader_and_dedupes(self):
+        self.assertEqual(registry.parse_blue_word_excludes("奥佳华，maurten、 sis\n奥佳华；"),
+                         ["奥佳华", "maurten", "sis"])
+        self.assertEqual(registry.parse_blue_word_excludes("  "), [])
+
+    def test_parse_refuses_what_would_not_take_effect_or_looks_pasted(self):
+        with self.assertRaisesRegex(ValueError, "不到 2 个字.*S"):
+            registry.parse_blue_word_excludes("奥佳华、S")
+        with self.assertRaisesRegex(ValueError, "超过"):
+            registry.parse_blue_word_excludes("长" * (registry.MAX_EXCLUDE_WORD_CHARS + 1))
+        with self.assertRaisesRegex(ValueError, "最多"):
+            registry.parse_blue_word_excludes(
+                "、".join(f"词{i:03d}" for i in range(registry.MAX_EXCLUDE_WORDS + 1)))
+
+    def test_saved_words_read_back_exactly(self):
+        table = ColumnMakingTable([], columns=FULL + (self.COL,))
+        made = registry.set_blue_word_excludes(table, "rec1", ["奥佳华", "sis"])
+        self.assertEqual(made, [])
+        self.assertEqual(table.updated, [{"record_id": "rec1", "fields": {self.COL: "奥佳华、sis"}}])
+        written = table.updated[0]["fields"][self.COL]
+        entry = registry.read(FakeTable([row(**{self.COL: written})], columns=FULL + (self.COL,)))[0]
+        self.assertEqual(entry.blue_word_excludes, ["奥佳华", "sis"], "存进去什么，下一轮读出来就是什么")
+
+    def test_an_old_registry_gets_the_column_made_but_clearing_makes_nothing(self):
+        table = ColumnMakingTable([])
+        self.assertEqual(registry.set_blue_word_excludes(table, "rec1", ["奥佳华"]), [self.COL])
+        self.assertEqual(table.made, [{"field_name": self.COL, "type": 1}])
+        empty = ColumnMakingTable([])
+        self.assertEqual(registry.set_blue_word_excludes(empty, "rec1", []), [])
+        self.assertEqual((empty.made, empty.updated), ([], []), "本来就没有这一格，谈不上清空")
+
+    def test_clearing_writes_an_empty_cell(self):
+        table = ColumnMakingTable([], columns=FULL + (self.COL,))
+        registry.set_blue_word_excludes(table, "rec1", [])
+        self.assertEqual(table.updated, [{"record_id": "rec1", "fields": {self.COL: None}}])
+
+    def test_a_column_changed_to_another_type_is_not_written(self):
+        meta = meta_for(FULL)
+        meta[self.COL] = {"type": 4, "ui_type": "MultiSelect", "options": []}
+        table = ColumnMakingTable([], meta=meta)
+        with self.assertRaisesRegex(registry.RegistryError, "不是文本列"):
+            registry.set_blue_word_excludes(table, "rec1", ["奥佳华"])
+        self.assertEqual(table.updated, [])
+
+
 class TestCliFallback(unittest.TestCase):
     """读不到注册表时的行为。**绝不静默降级成零张表。**"""
 

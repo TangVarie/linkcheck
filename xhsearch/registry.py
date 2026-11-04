@@ -468,6 +468,59 @@ def apply_overrides(base, entry: Entry, *, log=None):
     return settings
 
 
+# 面板上一次最多存多少个排除词、每个最长多少字。登记表那一格是运营共用的；上限只是
+# 挡住误粘（整段文章贴进来），正常用远远到不了。
+MAX_EXCLUDE_WORDS = 100
+MAX_EXCLUDE_WORD_CHARS = 40
+
+
+def parse_blue_word_excludes(text: str) -> list[str]:
+    """面板上填的那一段 → 要写进登记表「蓝词排除词」的词。**纯函数。**
+
+    拆法和读表时同一个（feishu.read_keywords：逗号 / 顿号 / 分号 / 换行，保序去重），
+    存进去什么、下一轮读出来就是什么。不到 2 个字的词**拒存**，不是存进去再在日志里
+    报一句「不生效」——运营在面板上当场看得到回执，当场改比事后翻日志好。
+    """
+    words = feishu.read_keywords(text or "")
+    short = [word for word in words if len(word) < MIN_EXCLUDE_CHARS]
+    if short:
+        raise ValueError(f"这些词不到 {MIN_EXCLUDE_CHARS} 个字，一个字的词几乎能排掉任何东西，"
+                         f"没有保存：{'、'.join(short)}")
+    long = [word for word in words if len(word) > MAX_EXCLUDE_WORD_CHARS]
+    if long:
+        raise ValueError(f"这些词超过 {MAX_EXCLUDE_WORD_CHARS} 个字，像是粘错了，没有保存："
+                         f"{'、'.join(word[:12] + '…' for word in long)}")
+    if len(words) > MAX_EXCLUDE_WORDS:
+        raise ValueError(f"一次最多 {MAX_EXCLUDE_WORDS} 个词（现在 {len(words)} 个），没有保存")
+    return words
+
+
+def set_blue_word_excludes(table: feishu.Bitable, record_id: str,
+                           words: list[str]) -> list[str]:
+    """写回这张表的「蓝词排除词」。空列表 = 清空。返回这次新建的列名。
+
+    老的登记表没有这一列就先建上（文本列，纯追加，不碰已有的列），不让人去飞书里
+    手工加列。这一列被人改成了别的类型（比如多选）就不写——往多选列写一串文字会被
+    飞书拒，就算写进去了，读的时候也对不上。
+    """
+    meta = table.fields_meta()
+    if meta is None:
+        raise RegistryError("读不到注册表的字段列表，没写")
+    made: list[str] = []
+    info = meta.get(COL_BLUE_WORD_EXCLUDES)
+    if info is None:
+        if not words:
+            return []                   # 本来就没有这一格，谈不上清空
+        table.create_field({"field_name": COL_BLUE_WORD_EXCLUDES, "type": 1})
+        made.append(COL_BLUE_WORD_EXCLUDES)
+    elif info.get("type") not in (None, 1):
+        raise RegistryError(f"注册表里「{COL_BLUE_WORD_EXCLUDES}」这一列不是文本列，没写——"
+                            "在飞书里把它改回文本列再保存")
+    table.batch_update([{"record_id": record_id,
+                         "fields": {COL_BLUE_WORD_EXCLUDES: "、".join(words) or None}}])
+    return made
+
+
 def set_thresholds(table: feishu.Bitable, record_id: str,
                    values: dict) -> list[str]:
     """写回逐表参数。`None` / 空 = 清掉那一格，回到全局默认。
