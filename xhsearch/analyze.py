@@ -373,18 +373,23 @@ def reply_targets(snapshot: Snapshot, limit: int) -> list[CommentView]:
     没有评论 ID 的展不了（接口要父评论 ID）。"""
     if limit <= 0:
         return []
-    seen: set[str] = set()
-    ranked: list[tuple[int, int, CommentView]] = []
+    # 同一条两页都有时，留藏着回复最多的那一份（位置按先出现的那一处）：两页可能
+    # 走了不同的通道——默认那一页降到备胎、不报回复数，最新那一页 TikHub 报了——
+    # 只认先出现的那份，这条评论下面折叠的回复就永远展不开。
+    best: dict[str, tuple[int, int, CommentView]] = {}
     for index, comment in enumerate([*snapshot.comments, *(snapshot.latest_comments or [])]):
-        if not comment.comment_id or comment.comment_id in seen:
+        if not comment.comment_id:
             continue
-        seen.add(comment.comment_id)
         hidden = (comment.reply_count or 0) - comment.replies_shown
         if hidden <= 0 and comment.replies_more:
             hidden = 1
-        if hidden > 0:
-            ranked.append((-hidden, index, comment))
-    ranked.sort(key=lambda t: (t[0], t[1]))
+        known = best.get(comment.comment_id)
+        if known is None:
+            best[comment.comment_id] = (hidden, index, comment)
+        elif hidden > known[0]:
+            best[comment.comment_id] = (hidden, known[1], comment)
+    ranked = sorted(((-hidden, index, comment) for hidden, index, comment in best.values()
+                     if hidden > 0), key=lambda t: (t[0], t[1]))
     return [c for _, _, c in ranked[:limit]]
 
 

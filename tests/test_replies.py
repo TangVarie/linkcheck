@@ -127,6 +127,14 @@ class TestReplyTargets(unittest.TestCase):
                          ["e", "b", "d", "c"])
         self.assertEqual(analyze.reply_targets(snap, 0), [])
 
+    def test_a_parent_on_both_pages_keeps_the_copy_that_reports_replies(self):
+        # 默认那一页降到备胎（不报回复数），最新那一页走 TikHub、报了 6 条回复
+        snap = analyze.Snapshot("xhs", comments=[view("a"), view("b")],
+                                latest_comments=[view("b", reply_count=6, replies_shown=1)])
+        targets = analyze.reply_targets(snap, 3)
+        self.assertEqual([c.comment_id for c in targets], ["b"])
+        self.assertEqual(targets[0].reply_count, 6)
+
     def test_expanded_replies_join_the_pool_once(self):
         parent = view("b", "这个牌子怎么样")
         page = analyze.read_reply_page({"items": [
