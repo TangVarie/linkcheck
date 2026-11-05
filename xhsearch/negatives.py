@@ -1,11 +1,13 @@
-"""开了「最新评论」的项目：扫到的负面评论攒着，点了「已处理」才收。
+"""开了「最新评论」或「展开楼中楼」的项目：扫到的负面评论攒着，点了「已处理」才收。
 
 ## 为什么要攒
 
 「最新」排序那一页翻得快：这一轮扫到的负面评论，下一轮可能已经被更新的评论
 挤出那一页了。只按「这一轮看到的」写「负面状态」，它就会自己从「有负面」变回
 「无负面」，面板上的待办跟着消失——评论还在、没人处理，只是机器这一轮没看到。
-所以开了最新评论的项目（Settings.latest_comments_over），负面评论按条攒着：
+所以开了最新评论的项目（Settings.latest_comments_over），负面评论按条攒着。
+展开楼中楼的项目（Settings.reply_pages_per_post）同理：每一轮挑回复最多的那几条
+评论去展开，挑中的不一定是同几条，回复的第一页也会被新回复挤走（见 accumulates）：
 
 * 扫到一条就记下（按平台评论 ID 认是不是同一条，记第一次扫到的时刻）；
 * 之后哪一轮没再看到它，也照样留在「负面评论快照」里、「负面状态」保持有负面；
@@ -34,7 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from .analyze import CommentView, KeywordHit, _normalize
+from .analyze import CommentView, KeywordHit, _normalize, reply_mark
 from .config import DigestFormat, Settings
 
 KEY_PREFIX = "negatives."
@@ -47,6 +49,14 @@ CONTENT_CHARS = 60
 MAX_ITEMS_PER_ROW = 40
 # 整份 JSON 在「面板设置」一格里（飞书上限 10 万字，每个键一格），留余量。
 MAX_CHARS = 95_000
+
+
+def accumulates(settings: Settings) -> bool:
+    """这张表的负面评论要不要攒着（cli 按它决定接不接 Ledger）。
+
+    跟着评论页露出来的楼中楼（每张表都查、不花钱）不算：那和第一页一级评论一样
+    是「这一屏现在长什么样」，没开这两项的表照老办法只按这一轮看到的写。"""
+    return settings.latest_comments_over is not None or settings.reply_pages_per_post > 0
 
 
 def store_key(table_id: str) -> str:
@@ -109,6 +119,9 @@ class Pending:
     first_seen_ms: int
     from_latest: bool = False
     hit: Optional[KeywordHit] = None
+    # 楼中楼里的一条回复；reply_to = 它回的那条一级评论开头几个字（可能为空）。
+    is_reply: bool = False
+    reply_to: str = ""
 
 
 def _valid_item(item: Any) -> bool:
@@ -154,6 +167,8 @@ def advance(memory: Optional[dict], *, post_key: str, hits: list[KeywordHit],
                           "c": (hit.comment.content or "")[:CONTENT_CHARS]}
             if hit.comment.from_latest:
                 items[key]["l"] = 1
+            if hit.comment.is_reply:
+                items[key]["r"] = hit.comment.reply_to or 1
     # 过期：扫到超过 KEEP_DAYS 天的不再记（处理过的、没处理的都是）。
     floor = now_ms - KEEP_DAYS * DAY_MS
     items = {k: v for k, v in items.items() if v["t"] >= floor or k in seen_now}
@@ -177,9 +192,11 @@ def advance(memory: Optional[dict], *, post_key: str, hits: list[KeywordHit],
 
 
 def _pending(item: dict, hit: Optional[KeywordHit]) -> Pending:
+    reply = item.get("r")
     return Pending(key=item["k"], keyword=str(item.get("w") or ""),
                    content=str(item.get("c") or ""), first_seen_ms=item["t"],
-                   from_latest=bool(item.get("l")), hit=hit)
+                   from_latest=bool(item.get("l")), hit=hit,
+                   is_reply=bool(reply), reply_to=reply if isinstance(reply, str) else "")
 
 
 def format_digest(pending: list[Pending], fmt: DigestFormat, *, minute: Callable[[datetime], str],
@@ -199,6 +216,8 @@ def format_digest(pending: list[Pending], fmt: DigestFormat, *, minute: Callable
         else:
             when = minute(datetime.fromtimestamp(item.first_seen_ms / 1000, timezone.utc))
             marks = [f"命中「{item.keyword}」", f"{when} 扫到", "这一轮没再看到"]
+            if item.is_reply:
+                marks.insert(1, reply_mark(item.reply_to))
             if item.from_latest:
                 marks.insert(1, "最新")
             text = " ".join((item.content or "").split())

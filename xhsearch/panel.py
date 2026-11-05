@@ -2622,7 +2622,8 @@ def _entry_json(entry, settings: Optional[Settings] = None) -> dict:
 def _forecast_json(forecast) -> dict:
     return {"yuan": round(forecast.yuan, 2), "per_day": round(forecast.per_day, 2),
             "refreshes": forecast.refreshes, "rows": forecast.rows,
-            "latest_yuan": round(forecast.latest_yuan, 2), "latest_rows": forecast.latest_rows}
+            "latest_yuan": round(forecast.latest_yuan, 2), "latest_rows": forecast.latest_rows,
+            "reply_yuan": round(forecast.reply_yuan, 2), "reply_rows": forecast.reply_rows}
 
 
 def _checkup_json(c) -> dict:

@@ -227,7 +227,7 @@ def _negative_ledger(settings: Settings):
     """开了最新评论的表要攒负面评论（xhsearch/negatives.py），存在注册表 base 的
     「面板设置」里。没配注册表就攒不了：照老办法只看这一轮的命中，说一声。"""
     if not os.environ.get("FEISHU_REGISTRY", "").strip():
-        print("⚠ 未配置 FEISHU_REGISTRY：开了「最新评论门槛」的表攒不了负面评论，"
+        print("⚠ 未配置 FEISHU_REGISTRY：开了「最新评论门槛」「楼中楼展开条数」的表攒不了负面评论，"
               "「负面状态」只按这一轮看到的写")
         return None
     app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
@@ -1208,7 +1208,7 @@ def _run_locked(mode: str, record_ids: list[str] | None,
                     worst = 1
                     print(f"❌ 日报批次开始留痕失败：{type(exc).__name__}: {exc}；本轮照常巡检，日报覆盖不完整")
             journal_kwargs = {"before_scan": begin_journal} if journal is not None else {}
-            if per_table.latest_comments_over is not None and mode != "estimate":
+            if negatives_mod.accumulates(per_table) and mode != "estimate":
                 if not ledger_tried:
                     ledger_tried = True
                     try:

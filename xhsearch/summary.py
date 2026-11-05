@@ -1140,6 +1140,10 @@ def describe_forecast(before: "rows_mod.Forecast", after: "rows_mod.Forecast") -
     if after.latest_yuan:
         text += (f"；其中多扫「最新」那一页 ¥{after.latest_yuan:.2f}"
                  f"（{after.latest_rows} 篇评论数超过门槛的小红书帖子）")
+    if after.reply_yuan:
+        text += (f"；其中展开楼中楼最多 ¥{after.reply_yuan:.2f}"
+                 f"（{after.reply_rows} 篇评论数超过 {rows_mod.REPLY_ESTIMATE_OVER} 条的小红书帖子，"
+                 "按每次都展开满算；回复不多的评论不展开，实际会少）")
     return text + "。之后新发的帖子另算。"
 
 
