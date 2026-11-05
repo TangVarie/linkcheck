@@ -66,7 +66,7 @@ INTERVAL_COLUMNS = (COL_INTERVAL_EARLY, COL_INTERVAL_WEEK, COL_INTERVAL_LATE)
 # —— 小红书加扫「最新」那一页（2026-10-30 加）：空着 = 不扫；填 N = 评论数超过
 # N 条的帖子每次多扫一页按时间倒序的评论。见 Settings.latest_comments_over。
 COL_LATEST_OVER = "最新评论门槛"
-# —— 小红书展开楼中楼（2026-11-05 加）：空着 / 0 = 不展开（露出来的那几条回复照样查，
+# —— 展开楼中楼（2026-11-05 加，小红书、抖音）：空着 / 0 = 不展开（露出来的那几条回复照样查，
 # 不花钱）；填 N = 每查一次最多展开 N 条回复比露出来的多的评论，每条多一次评论调用的钱。
 # 见 Settings.reply_pages_per_post。
 COL_REPLY_PAGES = "楼中楼展开条数"
@@ -398,7 +398,8 @@ def param_specs(base) -> list[dict]:
          **({"default_text": "默认不展开"} if not base.reply_pages_per_post else {}),
          "hint": "空着或 0 = 不展开：评论下面直接露出来的那几条回复照样查负面，不花钱。"
                  "填 N = 回复比露出来的多的评论，按藏着的回复数从多到少，每次最多展开 N 条，"
-                 "每展开一条多一次评论调用的钱。只对小红书。"
+                 "每展开一条多一次评论调用的钱（小红书约 ¥0.07，抖音约 ¥0.007）。"
+                 "小红书、抖音都管，没有折叠回复的帖子不多花钱。"
                  "开了之后扫到的负面评论会攒着，点了「已处理」才收。"},
         {"column": COL_TIER_EVALUATING, "group": "热度判定", "label": "评估中：评论数到几条",
          "default": th.tier_evaluating, "min": 1},

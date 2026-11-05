@@ -11,11 +11,13 @@
 
     评论页  {"items": [{content, like_count, is_pinned, is_author_comment,
                         ip_location, author,
-                        replies: [同形状的条目], reply_count, replies_more}],
+                        replies: [同形状的条目], reply_count, replies_more,
+                        author_ids}],
              "comment_count": int|None, "top_level_comment_count": int|None}
-            （replies / reply_count / replies_more 只有小红书 TikHub 那一路给：
-            一级评论下面跟着露出来的楼中楼，见 _xhs_comment_items）
-    楼中楼  {"items": [同形状的条目]}（小红书 TikHub，Settings.reply_pages_per_post）
+            （replies / reply_count / replies_more 只有 TikHub 那一路给：一级评论
+            下面跟着露出来的楼中楼，见 _xhs_comment_items / _douyin_comment_items；
+            author_ids 只有抖音给，抖音评论没有作者标记，贴主靠账号 ID 认）
+    楼中楼  {"items": [同形状的条目]}（TikHub，Settings.reply_pages_per_post）
 
     ⚠️ **通道能力由 `_capabilities` 声明**（见 XHS_COMMENT_CAPABILITIES）：小红书
     评论页的响应里要带上它，说清这一家的 `is_pinned` / `is_author_comment`
@@ -37,7 +39,7 @@
     **唯独不能补一个假的 False**，那等于让一家看不见的通道去证明
     「置顶没了」「这条不是自家回的」。
     详情    {"like_count", "collect_count", "share_count", "comment_count",
-             "_censored": bool|None}
+             "_censored": bool|None, "_post_author_ids": [str]（抖音：发视频的账号）}
 
 以下全部是 2026-08 用真 Key 实测得到的，不是读文档推的：
 
@@ -167,6 +169,8 @@ TIKHUB_PATHS = {
     # 只在 Settings.reply_pages_per_post 开了的表上用，要展开哪几条见 runner。
     ("xhs", "replies"): "/api/v1/xiaohongshu/app_v2/get_note_sub_comments",
     ("douyin", "comments"): "/api/v1/douyin/app/v3/fetch_video_comments",
+    # 抖音楼中楼：$0.001、allow_discount=1，和抖音评论接口同价。参数是 item_id（不是 aweme_id）。
+    ("douyin", "replies"): "/api/v1/douyin/app/v3/fetch_video_comment_replies",
     ("douyin", "detail"): "/api/v1/douyin/app/v3/fetch_one_video",
 }
 
@@ -276,7 +280,7 @@ def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -
     小红书不受影响：share_text 参数长链短链分享文案都吃（实测）。
     """
     if (platform, purpose) not in TIKHUB_PATHS:
-        return False          # 抖音楼中楼没接（抖音评论没有作者标记，见 runner）
+        return False
     if platform == "douyin" and not arguments.get("aweme_id"):
         return False
     return True
@@ -415,6 +419,13 @@ def _tikhub_build(api_key: str, platform: str, purpose: str, arguments: dict[str
             # 露出来的那几条也会在这一页里再出现一次，按评论 ID 去重（analyze.negative_pool）。
             params["comment_id"] = args.get("comment_id") or ""
             params["index"] = 1
+    elif purpose == REPLIES:
+        # 抖音楼中楼那一页：作品 ID 叫 item_id；只取第一页（cursor=0），count 保持默认
+        # （对方文档同样写着「请保持默认，否则会出现 BUG」）。
+        params["item_id"] = args.get("aweme_id") or ""
+        params["comment_id"] = args.get("comment_id") or ""
+        params["cursor"] = 0
+        params["count"] = 20
     else:
         if args.get("aweme_id"):
             params["aweme_id"] = args["aweme_id"]
@@ -598,6 +609,54 @@ def _xhs_comment_items(comments: list[Any], *, with_replies: bool = True) -> lis
     return items
 
 
+def _douyin_user_ids(user: Any, *extra: Any) -> list[str]:
+    """抖音账号的几个 ID（uid、sec_uid），认「是不是同一个人」用。哪个在就收哪个。"""
+    user = user if isinstance(user, dict) else {}
+    ids: list[str] = []
+    for value in (user.get("uid"), user.get("sec_uid"), *extra):
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            continue
+        text = str(value).strip()
+        if text and text != "0" and text not in ids:
+            ids.append(text)
+    return ids
+
+
+def _douyin_comment_items(comments: list[Any], *, with_replies: bool = True) -> list[dict[str, Any]]:
+    """抖音评论条目 → 归一化形状。
+
+    with_replies：一级评论下面跟着露出来的回复（原始的 `reply_comment`，实测多半是
+    作者的回复）收进 `replies`，`reply_comment_total` 是这条下面一共几条回复。
+    抖音评论**没有作者标记**，贴主的评论和回复靠账号 ID 对（`author_ids` 对
+    detail 里的 `_post_author_ids`，见 analyze.by_post_author）。
+    """
+    items = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        user = c.get("user") if isinstance(c.get("user"), dict) else {}
+        item = {
+            "content": c.get("text") or "",
+            "comment_id": c.get("cid") or c.get("comment_id") or "",
+            "create_time": c.get("create_time") or c.get("timestamp"),
+            "like_count": c.get("digg_count") or 0,
+            # 抖音一律不判置顶——接口里那个 label_type 的语义没验过，
+            # 而错判置顶比不判置顶伤害大得多。见 config.CommentStatus。
+            "is_pinned": False,
+            "is_author_comment": False,
+            "ip_location": _cn_location(c.get("ip_label")),
+            "author": {"nickname": user.get("nickname") or ""},
+            "author_ids": _douyin_user_ids(user),
+        }
+        if with_replies:
+            subs = c.get("reply_comment")
+            item["replies"] = (_douyin_comment_items(subs, with_replies=False)
+                               if isinstance(subs, list) else [])
+            item["reply_count"] = _reply_count(c.get("reply_comment_total"))
+        items.append(item)
+    return items
+
+
 def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
                       http_status: int, request_id: str, api_key: str) -> Result:
     inner = payload.get("data")
@@ -705,25 +764,21 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
 
     if platform == "douyin" and purpose == "comments":
         comments = inner.get("comments") if isinstance(inner.get("comments"), list) else []
-        items = []
-        for c in comments:
-            if not isinstance(c, dict):
-                continue
-            user = c.get("user") if isinstance(c.get("user"), dict) else {}
-            items.append({
-                "content": c.get("text") or "",
-                "comment_id": c.get("cid") or c.get("comment_id") or "",
-                "create_time": c.get("create_time") or c.get("timestamp"),
-                "like_count": c.get("digg_count") or 0,
-                # 抖音一律不判置顶——接口里那个 label_type 的语义没验过，
-                # 而错判置顶比不判置顶伤害大得多。见 config.CommentStatus。
-                "is_pinned": False,
-                "is_author_comment": False,
-                "ip_location": _cn_location(c.get("ip_label")),
-                "author": {"nickname": user.get("nickname") or ""},
-            })
         # 实测 total 是实打实的整数，不像 SocialDataX 那边是 integer|null。
-        return Ok({"items": items, "comment_count": inner.get("total")}, request_id=request_id)
+        return Ok({"items": _douyin_comment_items(comments), "comment_count": inner.get("total")},
+                  request_id=request_id)
+
+    if platform == "douyin" and purpose == REPLIES:
+        # 抖音楼中楼那一页：和评论页同一个信封（data.comments）。没有回复时上游给
+        # null，那是「这条下面没有」，不是坏了；键整个不在才是认不出来。
+        if "comments" not in inner or not isinstance(inner.get("comments"), (list, type(None))):
+            return Err(Failure.UNKNOWN, "no_replies",
+                       "楼中楼接口没回回复列表："
+                       + _redact(json.dumps(inner, ensure_ascii=False), api_key)[:200],
+                       http_status=http_status, request_id=request_id)
+        return Ok({"items": _douyin_comment_items(inner.get("comments") or [],
+                                                  with_replies=False)},
+                  request_id=request_id)
 
     if platform == "douyin" and purpose == "detail":
         aweme = inner.get("aweme_detail")
@@ -743,12 +798,16 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
         censored = None
         if status:
             censored = bool(status.get("is_prohibited") or status.get("in_reviewing"))
+        author = aweme.get("author") if isinstance(aweme.get("author"), dict) else {}
         return Ok({
             "like_count": stats.get("digg_count"),
             "collect_count": stats.get("collect_count"),
             "share_count": stats.get("share_count"),
             "comment_count": stats.get("comment_count"),
             "_censored": censored,
+            # 发这条视频的账号（贴主）。抖音评论没有「作者」标记，负面判定靠它认出
+            # 贴主自己的评论和回复（analyze.by_post_author）。
+            "_post_author_ids": _douyin_user_ids(author, aweme.get("author_user_id")),
         }, request_id=request_id)
 
     return Err(Failure.UNKNOWN, "unsupported", f"TikHub 不支持 {platform}/{purpose}",

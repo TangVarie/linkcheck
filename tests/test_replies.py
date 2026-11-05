@@ -95,12 +95,12 @@ class TestInlineReplies(unittest.TestCase):
         self.assertIsNone(verdict.seed_hit, "评论状态说的是一级评论那一屏")
         self.assertNotIn("求链接", analyze.format_digest(snap, Settings().digest))
 
-    def test_douyin_replies_are_not_read(self):
+    def test_douyin_replies_are_read_too(self):
         snap = analyze.read_comment_page("douyin", {"comment_count": 3, "items": [
-            {"content": "好", "comment_id": "c1",
+            {"content": "好", "comment_id": "c1", "reply_count": 4,
              "replies": [{"content": "有出入", "comment_id": "r1"}]}]})
-        self.assertEqual(snap.replies, [],
-                         "抖音没有作者标记，自家号的回复会原样算成负面")
+        self.assertEqual([r.comment_id for r in snap.replies], ["r1"])
+        self.assertEqual(snap.comments[0].reply_count, 4)
 
     def test_reply_excerpt_cannot_break_the_digest_marks(self):
         self.assertEqual(analyze.reply_excerpt("[笑哭R]「好」 用  的]"), "好 用 的")
@@ -178,12 +178,15 @@ class TestReplyEndpoint(unittest.TestCase):
         self.assertIn("index=1", request.url)
         self.assertIn("note_id=" + POST_ID, request.url)
 
-    def test_only_tikhub_on_xhs_takes_reply_pages(self):
-        self.assertFalse(providers.get_provider("socialdatax").can_handle(
-            "xhs", "replies", {"note_id": POST_ID}))
+    def test_only_tikhub_takes_reply_pages_and_douyin_needs_an_id(self):
+        sdx = providers.get_provider("socialdatax")
+        self.assertFalse(sdx.can_handle("xhs", "replies", {"note_id": POST_ID}))
+        self.assertFalse(sdx.can_handle("douyin", "replies", {"aweme_id": "1"}))
         tikhub = providers.get_provider("tikhub")
         self.assertTrue(tikhub.can_handle("xhs", "replies", {"note_id": POST_ID}))
-        self.assertFalse(tikhub.can_handle("douyin", "replies", {"aweme_id": "1"}))
+        self.assertTrue(tikhub.can_handle("douyin", "replies", {"aweme_id": "1"}))
+        self.assertFalse(tikhub.can_handle("douyin", "replies",
+                                           {"url": "https://v.douyin.com/x/"}))
 
     def parse(self, core):
         return providers._tikhub_parse("xhs", "replies", 200, "application/json",
@@ -222,7 +225,10 @@ class TestPlanAndCost(unittest.TestCase):
         self.assertFalse(any(c.reply_pages for c in rows.plan_calls(xhs_row(), Settings(), NOW)))
         douyin = Row("rec2", "https://www.douyin.com/video/7448118827402972455",
                      publish_time_ms=NOW_MS - 86_400_000)
-        self.assertFalse(any(c.reply_pages for c in rows.plan_calls(douyin, self.on, NOW)))
+        self.assertEqual([c.purpose for c in rows.plan_calls(douyin, self.on, NOW)],
+                         ["comments", "replies", "detail"], "抖音一样排上")
+        self.assertEqual([c.purpose for c in rows.plan_calls(douyin, Settings(), NOW)],
+                         ["comments", "detail"])
 
     def test_projects_with_different_caps_do_not_share_a_fetch(self):
         one = Settings()
@@ -350,7 +356,7 @@ class TestParameter(unittest.TestCase):
         self.assertEqual(spec["group"], "评论扫描")
         self.assertEqual(spec["max"], registry.MAX_REPLY_PAGES)
         self.assertEqual(spec["default_text"], "默认不展开")
-        self.assertIn("只对小红书", spec["hint"])
+        self.assertIn("小红书、抖音都管", spec["hint"])
 
 
 class TestLedger(unittest.TestCase):
@@ -367,6 +373,111 @@ class TestLedger(unittest.TestCase):
                                        minute=lambda dt: dt.strftime("%m-%d %H:%M"))
         self.assertIn("回复「随便艾特王嫂」", text)
         self.assertIn("这一轮没再看到", text)
+
+
+DOUYIN_ID = "7448118827402972455"
+
+
+def douyin_raw(cid, text, *, uid="u" , sec="s", replies=None, total=None):
+    out = {"cid": cid, "text": text, "digg_count": 0,
+           "user": {"nickname": "n" + cid, "uid": uid, "sec_uid": sec}}
+    if replies is not None:
+        out["reply_comment"] = replies
+    if total is not None:
+        out["reply_comment_total"] = total
+    return out
+
+
+def douyin_parse(purpose, inner):
+    return providers._tikhub_parse("douyin", purpose, 200, "application/json",
+                                   json.dumps({"code": 200, "data": inner}), "rid", "k")
+
+
+class TestDouyin(unittest.TestCase):
+    """抖音评论没有作者标记：贴主靠账号 ID 对 detail 里发视频的账号。"""
+
+    def snapshot(self, *, with_detail=True):
+        page = douyin_parse("comments", {"total": 30, "comments": [
+            douyin_raw("c1", "用了过敏", uid="9", sec="S9", total=3, replies=[
+                douyin_raw("r1", "亲，我们是温和配方，不会过敏哦", uid="1", sec="S1")]),
+            douyin_raw("c2", "好用", uid="8", sec="S8", total=0),
+            douyin_raw("c3", "过敏是正常的，用两周就好", uid="1", sec="S1")]})
+        snap = analyze.read_comment_page("douyin", page.data)
+        if with_detail:
+            detail = douyin_parse("detail", {"aweme_detail": {
+                "statistics": {"comment_count": 30}, "author": {"uid": "1", "sec_uid": "S1"},
+                "author_user_id": 1}})
+            analyze.merge_detail(snap, detail.data)
+        return snap
+
+    def test_tikhub_reads_inline_replies_counts_and_account_ids(self):
+        page = douyin_parse("comments", {"total": 2, "comments": [
+            douyin_raw("c1", "好", total=5, replies=[douyin_raw("r1", "谢谢")])]})
+        item = page.data["items"][0]
+        self.assertEqual(item["reply_count"], 5)
+        self.assertEqual([r["comment_id"] for r in item["replies"]], ["r1"])
+        self.assertEqual(item["author_ids"], ["u", "s"])
+        detail = douyin_parse("detail", {"aweme_detail": {
+            "statistics": {}, "author": {"uid": "1", "sec_uid": "S1"}, "author_user_id": 1}})
+        self.assertEqual(detail.data["_post_author_ids"], ["1", "S1"])
+
+    def test_the_posters_own_comments_and_replies_are_excluded(self):
+        verdict = analyze.decide(self.snapshot(), Settings(), previous_comment_count=30,
+                                 age_hours=24, negative_keywords=["过敏"])
+        self.assertEqual([h.comment.comment_id for h in verdict.negative_hits], ["c1"],
+                         "贴主在楼中楼里的回复和自己发的一级评论都不算")
+        self.assertNotIn("没有被排除", "；".join(verdict.notes))
+
+    def test_without_the_post_author_nothing_is_excluded_and_it_is_said(self):
+        verdict = analyze.decide(self.snapshot(with_detail=False), Settings(),
+                                 previous_comment_count=30, age_hours=24,
+                                 negative_keywords=["过敏"])
+        self.assertEqual([h.comment.comment_id for h in verdict.negative_hits],
+                         ["c1", "c3", "r1"], "认不出贴主就不排除，宁可多报")
+        self.assertIn("贴主自己的评论和回复没有被排除", "；".join(verdict.notes))
+
+    def test_reply_request_and_page(self):
+        request = providers._tikhub_build("k", "douyin", "replies",
+                                          {"aweme_id": DOUYIN_ID, "comment_id": "c9"})
+        self.assertIn("/douyin/app/v3/fetch_video_comment_replies?", request.url)
+        for part in ("item_id=" + DOUYIN_ID, "comment_id=c9", "cursor=0", "count=20"):
+            self.assertIn(part, request.url)
+        page = douyin_parse("replies", {"comments": [douyin_raw("r1", "过敏了")],
+                                        "has_more": 0})
+        self.assertEqual(page.data["items"][0]["comment_id"], "r1")
+        self.assertNotIn("replies", page.data["items"][0])
+        self.assertEqual(douyin_parse("replies", {"comments": None}).data["items"], [],
+                         "没有回复时上游给 null，不是坏了")
+        self.assertIsInstance(douyin_parse("replies", {"status_msg": "x"}), protocol.Err)
+
+    def test_expansion_runs_for_douyin(self):
+        settings = Settings()
+        settings.reply_pages_per_post = 1
+        row = Row("rec2", "https://www.douyin.com/video/" + DOUYIN_ID,
+                  publish_time_ms=NOW_MS - 86_400_000, negative_keywords=["过敏"])
+        sent = []
+
+        def fake_call(call, *args, **kwargs):
+            if call.reply_pages:
+                sent.append(call.arguments)
+                return protocol.Ok({"items": [{"content": "我也过敏", "comment_id": "r9",
+                                               "is_author_comment": False,
+                                               "author_ids": ["7"]}]})
+            if call.purpose == "detail":
+                return protocol.Ok({"comment_count": 30, "_post_author_ids": ["1"]})
+            return protocol.Ok({"comment_count": 30, "items": [
+                {"content": "好", "comment_id": "c1", "is_author_comment": False,
+                 "reply_count": 6, "replies": [], "author_ids": ["8"]}]})
+        with mock.patch.object(runner, "_call", side_effect=fake_call):
+            fetched = runner._fetch_calls(
+                rows.plan_calls(row, settings, NOW), {"tikhub": "k"}, settings,
+                deadline=None, timeout=1, disabled=set(), tally={}, lock=None, watch=None,
+                expand_failure="")
+        self.assertEqual(sent, [{"aweme_id": DOUYIN_ID, "comment_id": "c1"}])
+        self.assertEqual(fetched.snapshot.post_author_ids, ("1",))
+        verdict = analyze.decide(fetched.snapshot, settings, previous_comment_count=30,
+                                 age_hours=24, negative_keywords=["过敏"])
+        self.assertEqual([h.comment.comment_id for h in verdict.negative_hits], ["r9"])
 
 
 class TestProbe(unittest.TestCase):
@@ -395,12 +506,32 @@ class TestProbe(unittest.TestCase):
         self.assertIn("拿回 2 条", output)
         self.assertIn("和我知道的有出入", output)
 
+    def test_douyin_probe_shows_the_poster_ids_and_expands(self):
+        comments = json.dumps({"code": 200, "data": {"total": 9, "comments": [
+            douyin_raw("c1", "好", uid="8", total=6, replies=[douyin_raw("r1", "谢谢", uid="1")])]}})
+        detail = json.dumps({"code": 200, "data": {"aweme_detail": {
+            "statistics": {"comment_count": 9}, "author": {"uid": "1", "sec_uid": "S1"}}}})
+        replies = json.dumps({"code": 200, "data": {"comments": [douyin_raw("r2", "过敏了")]}})
+        settings = Settings()
+        settings.reply_pages_per_post = 1
+        with mock.patch.object(transport, "request", side_effect=[
+                transport.Response(200, "application/json", body, "x")
+                for body in (comments, detail, replies)]) as sent, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ok = probe_channel.probe("tikhub", "k", "https://www.douyin.com/video/" + DOUYIN_ID,
+                                     settings)
+        output = out.getvalue()
+        self.assertTrue(ok)
+        self.assertIn("fetch_video_comment_replies", sent.call_args.args[1])
+        self.assertIn("贴主账号 ID（详情接口）：1、S1", output)
+        self.assertIn("拿回 1 条", output)
+
     def test_socialdatax_skips_expansion_without_skipping_the_probe(self):
         body = json.dumps({"code": 0, "data": {"items": [], "comment_count": 0}})
         ok, output, sent = self.run_probe("socialdatax", [
             transport.Response(200, "application/json", body, "a")], 1)
         self.assertEqual(sent.call_count, 1, "评论页照常验，楼中楼不发")
-        self.assertIn("不接楼中楼", output)
+        self.assertIn("不接这条的楼中楼", output)
 
 
 if __name__ == "__main__":
