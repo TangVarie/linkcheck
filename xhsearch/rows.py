@@ -51,7 +51,7 @@ class ToolCall:
     # 有值 = 补充的那一页（小红书「最新」排序）：这一轮评论数超过它才发，
     # 发不成也不影响这一行的结论（和 detail 一样）。见 Settings.latest_comments_over。
     min_count: Optional[int] = None
-    # 有值 = 展开楼中楼（小红书）：不是一次请求，是「最多这么多次」。要展开哪几条
+    # 有值 = 展开楼中楼（小红书、抖音）：不是一次请求，是「最多这么多次」。要展开哪几条
     # 评论得等评论页回来才知道，由 runner 按这一轮的评论一条条发（每次带上
     # comment_id）。发不成也不影响这一行的结论。见 Settings.reply_pages_per_post。
     max_calls: Optional[int] = None
@@ -502,6 +502,10 @@ def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> 
     elif link.platform == "douyin":
         target = {"aweme_id": link.content_id} if link.content_id else {"url": link.url}
         calls.append(ToolCall("douyin", "comments", dict(target)))
+        # 展开楼中楼（同小红书）。抖音接口只吃作品 ID：短链展不开的行这一步不发。
+        if settings.reply_pages_per_post > 0:
+            calls.append(ToolCall("douyin", PURPOSE_REPLIES, dict(target),
+                                  max_calls=settings.reply_pages_per_post))
         # 恒定追加：抖音评论接口的 comment_count 类型是 integer|null，
         # 不兜底的话「评论数」这列会间歇性变空，比没有更糟。
         calls.append(ToolCall("douyin", "detail", dict(target)))
@@ -708,7 +712,7 @@ class Forecast:
     # 其中「最新」那一页的钱（小红书，评论数超过门槛的帖子才扫）。
     latest_yuan: float = 0.0
     latest_rows: int = 0
-    # 其中展开楼中楼的钱（小红书，按每次展开满额、评论数超过一页的帖子算——是上限）。
+    # 其中展开楼中楼的钱（按每次展开满额、评论数超过一页的帖子算——是上限）。
     reply_yuan: float = 0.0
     reply_rows: int = 0
 
@@ -787,7 +791,7 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
             if settings.latest_comments_over is not None and row.parsed.platform == "xhs" \
                     and _over(row.previous_comment_count, settings.latest_comments_over):
                 out.latest_rows += 1
-            if settings.reply_pages_per_post > 0 and row.parsed.platform == "xhs" \
+            if settings.reply_pages_per_post > 0 \
                     and _over(row.previous_comment_count, REPLY_ESTIMATE_OVER):
                 out.reply_rows += 1
     return out

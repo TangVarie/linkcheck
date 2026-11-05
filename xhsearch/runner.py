@@ -1028,6 +1028,10 @@ def _fetch_calls(
     return out
 
 
+UNABLE_TO_EXPAND = ("这一轮能用的数据通道不支持展开楼中楼"
+                    "（只有 TikHub 能；抖音还得有作品 ID，短链没展开的不行）")
+
+
 def _expand_replies(plan: ToolCall, snapshot: analyze.Snapshot,
                     attempt: Callable[[ToolCall], protocol.Result],
                     keys: dict[str, str], settings: Settings, *,
@@ -1052,7 +1056,7 @@ def _expand_replies(plan: ToolCall, snapshot: analyze.Snapshot,
     # 先看通道：评论页降到了备胎的那一轮，备胎不报回复数，挑不出要展开的——
     # 不先说一声的话，诊断信息里什么都没有，看着像是「没有要展开的」。
     if not able():
-        snapshot.reply_error = "这一轮能用的数据通道不支持展开楼中楼（只有 TikHub 能）"
+        snapshot.reply_error = UNABLE_TO_EXPAND
         return
     targets = analyze.reply_targets(snapshot, plan.requests)
     if not targets:
@@ -1063,7 +1067,7 @@ def _expand_replies(plan: ToolCall, snapshot: analyze.Snapshot,
             snapshot.reply_error = "已到软截止"
             return
         if not able():          # 前一条把 TikHub 的 Key / 余额用到头了
-            snapshot.reply_error = "这一轮能用的数据通道不支持展开楼中楼（只有 TikHub 能）"
+            snapshot.reply_error = UNABLE_TO_EXPAND
             return
         call = ToolCall(plan.platform, plan.purpose,
                         {**plan.arguments, "comment_id": target.comment_id})

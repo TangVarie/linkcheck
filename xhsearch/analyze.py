@@ -78,6 +78,8 @@ class CommentView:
     reply_count: Optional[int] = None
     replies_shown: int = 0
     replies_more: bool = False
+    # 发这条评论的账号 ID（只有抖音给：抖音评论没有作者标记，贴主靠它认，见 by_post_author）。
+    author_ids: tuple[str, ...] = ()
 
     def one_line(self, fmt: DigestFormat, extra_mark: str = "") -> str:
         text = re.sub(r"\s+", " ", self.content or "").strip()
@@ -186,6 +188,8 @@ class Snapshot:
     reply_error: str = ""
     # 展开那几页那家通道报不报可信的作者标记（同 latest_author_reported）。
     replies_author_reported: bool = True
+    # 发这条帖子的账号 ID（抖音，detail 回填，见 merge_detail）。空 = 这一轮不知道贴主是谁。
+    post_author_ids: tuple[str, ...] = ()
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -333,7 +337,23 @@ def _comment_view(item: dict[str, Any]) -> CommentView:
         comment_id=_comment_id(item.get("comment_id") or item.get("cid") or item.get("id")),
         created_at_ms=_comment_created_at_ms(
             item.get("created_at_ms") or item.get("create_time") or item.get("timestamp")),
+        author_ids=_ids(item.get("author_ids")),
     )
+
+
+def _ids(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(v) for v in value if isinstance(v, str) and v)
+
+
+def by_post_author(comment: CommentView, snapshot: "Snapshot") -> bool:
+    """这条是不是贴主自己发的。小红书看作者标记；抖音评论没有这个标记，对账号 ID
+    （评论人的 uid / sec_uid 和 detail 里发视频的账号）。"""
+    if comment.is_author:
+        return True
+    return bool(snapshot.post_author_ids and comment.author_ids
+                and set(comment.author_ids) & set(snapshot.post_author_ids))
 
 
 def _as_reply(item: dict[str, Any], parent: CommentView, *, from_page: bool) -> CommentView:
@@ -417,14 +437,13 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
             pin_reported = pin_reported or "is_pinned" in item
             author_reported = author_reported or "is_author_comment" in item
             comment = _comment_view(item)
-            if platform == "xhs":
-                # 跟着露出来的楼中楼。只认小红书：抖音评论条目没有作者标记，
-                # 楼中楼里自家号的回复（「不会过敏哦」）会原样算成负面。
-                shown = _replies_of(item, comment)
-                comment.reply_count = _int_or_none(item.get("reply_count"))
-                comment.replies_shown = len(shown)
-                comment.replies_more = item.get("replies_more") is True
-                replies.extend(shown)
+            # 跟着露出来的楼中楼。抖音的多半是贴主的回复（「不会过敏哦」）：抖音
+            # 没有作者标记，靠账号 ID 对出来排除（by_post_author）。
+            shown = _replies_of(item, comment)
+            comment.reply_count = _int_or_none(item.get("reply_count"))
+            comment.replies_shown = len(shown)
+            comment.replies_more = item.get("replies_more") is True
+            replies.extend(shown)
             comments.append(comment)
 
     points = data.get("points") if isinstance(data.get("points"), dict) else {}
@@ -479,6 +498,8 @@ def merge_detail(snapshot: Snapshot, data: dict[str, Any]) -> Snapshot:
     snapshot.share_count = _int_or_none(data.get("share_count"))
     if snapshot.comment_count is None:
         snapshot.comment_count = _int_or_none(data.get("comment_count"))
+    if _ids(data.get("_post_author_ids")):
+        snapshot.post_author_ids = _ids(data.get("_post_author_ids"))
     if isinstance(data.get("_censored"), bool):
         snapshot.censored = data["_censored"]
         reason = data.get("_censor_reason")
@@ -811,8 +832,9 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
     这么跳——自家置顶的引导评论正是它要找的东西，两个方向天生相反。
 
     只有小红书的评论条目带作者标记（`is_author_comment`），抖音一律
-    False，所以抖音行上这个开关等于没开——这是上游能力的边界，不是
-    这里可以补的。**通道也是一道边界**：降级到作者标记不可信的备胎时，
+    False。抖音靠账号 ID 认贴主（by_post_author：评论人的 uid / sec_uid 对
+    detail 里发视频的账号），detail 没取到、或者通道不给账号 ID 时就认不出，
+    decide 会说一声。**通道也是一道边界**：降级到作者标记不可信的备胎时，
     调用方（decide）会把 `skip_author` 直接关掉——不可信的标记不该拿来
     排除任何东西，排除就是信了它，而错标成作者的那条真负面会被静默丢掉。
     关掉之后自家回复也会算进命中，由诊断信息里那句提醒交给人工核一眼。
@@ -836,7 +858,7 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
             skip = skip_author_replies
         else:
             skip = skip_author_latest if comment.from_latest else skip_author
-        if skip and comment.is_author:
+        if skip and by_post_author(comment, snapshot):
             continue
         haystack = _normalize(comment.content)
         for keyword, needle in needles:
@@ -1337,6 +1359,12 @@ def decide(
                     "⚠ 本轮这条数据通道不报作者标记（多半是主通道余额/故障降到了"
                     "备胎），自家账号的回复没有被排除在上面的命中之外"
                     "——先过一眼快照，确认命中的不是自己回的")
+            elif snapshot.platform == "douyin" and not snapshot.post_author_ids:
+                # 抖音认贴主靠 detail 里发视频的账号 ID：这一轮没拿到（detail 没取到、
+                # 或者走的通道不给），贴主自己的评论和回复就排除不掉。同上，只说不改判。
+                verdict.notes.append(
+                    "⚠ 本轮没拿到发这条视频的账号（视频详情没取到），贴主自己的评论和回复"
+                    "没有被排除在上面的命中之外——先过一眼快照，确认命中的不是自己回的")
     elif negative_keywords:
         verdict.notes.append("本轮未取到评论页内容，负面词判定保持原样")
     if negative_keywords and snapshot.latest_error and verdict.negative_checked:

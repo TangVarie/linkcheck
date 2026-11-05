@@ -16,9 +16,9 @@
     # 正文里的 `#词[搜索高亮]#` 标记，抖音还没验过
     python3 tools/probe_channel.py <抖音链接> --only tikhub --raw
 
-    # 小红书再展开 N 条评论的楼中楼（每条一次调用，只有 TikHub 接）。验楼中楼的
+    # 再展开 N 条评论的楼中楼（每条一次调用，只有 TikHub 接；小红书、抖音都行）。验楼中楼的
     # 字段名：露出来的回复认没认到、展开那一页拿没拿回回复（docs/待验证清单.md §20）
-    python3 tools/probe_channel.py <小红书链接> --only tikhub --replies 1 --raw
+    python3 tools/probe_channel.py <小红书或抖音链接> --only tikhub --replies 1 --raw
 
     # 小红书额外调一次详情接口（线上默认不调，DETAIL_WITHIN_DAYS=0），并连
     # 原始的笔记级字段一起打出来。验「分享链接打开是『笔记不存在』、评论接口
@@ -230,6 +230,9 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
             print(f"  🔗 短链已展开（免费，{expansion.requests} 跳）：aweme_id={expansion.aweme_id}")
             calls = [dataclasses.replace(c, arguments=id_form(c.arguments, expansion.aweme_id))
                      for c in calls]
+            if reply_plan is not None:
+                reply_plan = dataclasses.replace(
+                    reply_plan, arguments=id_form(reply_plan.arguments, expansion.aweme_id))
             unsupported = [c for c in calls
                            if not provider.can_handle(c.platform, c.purpose, c.arguments)]
         else:
@@ -257,7 +260,8 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
           + (f"（另外最多展开 {extra} 条评论的楼中楼）" if extra else "")
           + f"，预计最多花费 ¥{yuan:.3f}")
     if reply_plan is not None and not expand:
-        print(f"  ⏭ {provider.label} 不接楼中楼（只有 TikHub 有这个接口），--replies 这一家不展开")
+        print(f"  ⏭ {provider.label} 不接这条的楼中楼（只有 TikHub 有这个接口；抖音还得有作品 ID），"
+              "--replies 这一家不展开")
 
     snapshot = None
     norm_items: list = []
@@ -304,14 +308,21 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     if snapshot is None:
         return False
 
-    if snapshot.platform == "xhs":
-        with_replies = [c for c in snapshot.comments if c.replies_shown]
-        hidden = analyze.reply_targets(snapshot, len(snapshot.comments))
-        print(f"\n  楼中楼（露出来的）：{len(with_replies)} 条一级评论带着回复，共露出 "
-              f"{len(snapshot.replies)} 条；回复比露出来的多的 {len(hidden)} 条")
-        if snapshot.comments and not any(c.reply_count for c in snapshot.comments):
-            print("    ⚠ 一条评论都没认到回复数（sub_comment_count）：要么这一页确实没人回，"
-                  "要么上游字段名变了——加 --raw 看原始条目，对照 providers._xhs_comment_items")
+    with_replies = [c for c in snapshot.comments if c.replies_shown]
+    hidden = analyze.reply_targets(snapshot, len(snapshot.comments))
+    print(f"\n  楼中楼（露出来的）：{len(with_replies)} 条一级评论带着回复，共露出 "
+          f"{len(snapshot.replies)} 条；回复比露出来的多的 {len(hidden)} 条")
+    if snapshot.comments and not any(c.reply_count for c in snapshot.comments):
+        field_name, parser = (("sub_comment_count", "_xhs_comment_items")
+                              if snapshot.platform == "xhs"
+                              else ("reply_comment_total", "_douyin_comment_items"))
+        print(f"    ⚠ 一条评论都没认到回复数（{field_name}）：要么这一页确实没人回，"
+              f"要么上游字段名变了——加 --raw 看原始条目，对照 providers.{parser}")
+    if snapshot.platform == "douyin":
+        # 抖音没有作者标记，贴主靠账号 ID 认：这两样有一样是空的，线上就排除不掉贴主的回复。
+        print(f"  贴主账号 ID（详情接口）：{'、'.join(snapshot.post_author_ids) or '（没拿到）'}；"
+              f"评论里带账号 ID 的 {sum(1 for c in snapshot.comments if c.author_ids)}"
+              f"/{len(snapshot.comments)} 条")
     if expand and snapshot is not None:
         snapshot.expanded_replies = []
         targets = analyze.reply_targets(snapshot, reply_plan.requests)
