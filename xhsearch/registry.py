@@ -66,10 +66,16 @@ INTERVAL_COLUMNS = (COL_INTERVAL_EARLY, COL_INTERVAL_WEEK, COL_INTERVAL_LATE)
 # —— 小红书加扫「最新」那一页（2026-10-30 加）：空着 = 不扫；填 N = 评论数超过
 # N 条的帖子每次多扫一页按时间倒序的评论。见 Settings.latest_comments_over。
 COL_LATEST_OVER = "最新评论门槛"
+# —— 小红书展开楼中楼（2026-11-05 加）：空着 / 0 = 不展开（露出来的那几条回复照样查，
+# 不花钱）；填 N = 每查一次最多展开 N 条回复比露出来的多的评论，每条多一次评论调用的钱。
+# 见 Settings.reply_pages_per_post。
+COL_REPLY_PAGES = "楼中楼展开条数"
+# 一次最多展开几条：每条 ¥0.07，填错一个 100 就是每篇每次多花 ¥7。
+MAX_REPLY_PAGES = 10
 
 THRESHOLD_COLUMNS = (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT,
                      COL_FLOP_HOURS, COL_ARCHIVE_DAYS, *INTERVAL_COLUMNS,
-                     COL_LATEST_OVER)
+                     COL_LATEST_OVER, COL_REPLY_PAGES)
 
 # —— 逐表蓝词排除词（2026-10-22 加）——
 # 这张表不往「蓝词字段」里记的词，主要是竞品名。文本列，逗号分隔（顿号、
@@ -349,7 +355,9 @@ def read_overrides(entry: Entry, base) -> Override:
                                    # 每轮都刷）；最慢两个月一次。
                                    *((c, 1, 24 * 60) for c in INTERVAL_COLUMNS),
                                    # 0 = 不管多少评论都扫。
-                                   (COL_LATEST_OVER, 0, 1_000_000)):
+                                   (COL_LATEST_OVER, 0, 1_000_000),
+                                   # 0 = 不展开（和空着一样）。
+                                   (COL_REPLY_PAGES, 0, MAX_REPLY_PAGES)):
         value = raw.get(column)
         if value is None:
             continue
@@ -383,6 +391,14 @@ def param_specs(base) -> list[dict]:
          "label": "评论数超过几条，就多扫一页「最新」评论",
          "default": base.latest_comments_over, "min": 0,
          "hint": "空着 = 只扫默认排序那一页。只对小红书（抖音接口没有按最新排序）。"
+                 "开了之后扫到的负面评论会攒着，点了「已处理」才收。"},
+        {"column": COL_REPLY_PAGES, "group": "评论扫描",
+         "label": "每次最多展开几条评论的楼中楼（回复）",
+         "default": base.reply_pages_per_post, "min": 0, "max": MAX_REPLY_PAGES,
+         **({"default_text": "默认不展开"} if not base.reply_pages_per_post else {}),
+         "hint": "空着或 0 = 不展开：评论下面直接露出来的那几条回复照样查负面，不花钱。"
+                 "填 N = 回复比露出来的多的评论，按藏着的回复数从多到少，每次最多展开 N 条，"
+                 "每展开一条多一次评论调用的钱。只对小红书。"
                  "开了之后扫到的负面评论会攒着，点了「已处理」才收。"},
         {"column": COL_TIER_EVALUATING, "group": "热度判定", "label": "评估中：评论数到几条",
          "default": th.tier_evaluating, "min": 1},
@@ -462,6 +478,8 @@ def apply_overrides(base, entry: Entry, *, log=None):
         settings.refresh.tiers = tiers
     if COL_LATEST_OVER in values:
         settings.latest_comments_over = values[COL_LATEST_OVER]
+    if COL_REPLY_PAGES in values:
+        settings.reply_pages_per_post = values[COL_REPLY_PAGES]
     if log:
         shown = "、".join(f"{k}={v}" for k, v in sorted(values.items()))
         log(f"⚙ 「{entry.label}」用的是这张表自己的参数：{shown}")
@@ -525,7 +543,7 @@ def set_thresholds(table: feishu.Bitable, record_id: str,
                    values: dict) -> list[str]:
     """写回逐表参数。`None` / 空 = 清掉那一格，回到全局默认。
 
-    老的注册表里没有后来加的那几列（刷新频率、最新评论门槛）：要写的列不在就
+    老的注册表里没有后来加的那几列（刷新频率、最新评论门槛、楼中楼展开条数）：要写的列不在就
     先建上（数字列，纯追加，不碰已有的列），不让人去飞书里手工加列。
     返回这次新建的列名。"""
     fields = {}

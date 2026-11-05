@@ -32,6 +32,25 @@ from typing import Any, Optional
 from .config import DigestFormat, Settings, Thresholds
 
 
+# 「回复「…」」标记里引用几个字的一级评论：够运营在 App 里认出是哪一条就行。
+REPLY_TO_CHARS = 10
+
+
+def reply_excerpt(text: str) -> str:
+    """一级评论正文 → 「回复」标记里引用的那几个字。
+
+    小红书正文里的方括号标记整段去掉（表情 `[笑哭R]`、蓝词的 `[搜索高亮]`）；剩下的
+    方括号和直角引号也去掉：快照那一格的标记段是 `[…]`，日报按它拆
+    （summary._DIGEST_LINE），引文里的 `]` 会把它截断。"""
+    clean = re.sub(r"\[[^\[\]]*\]", "", text or "")
+    clean = re.sub(r"[\[\]「」#]", "", re.sub(r"\s+", " ", clean)).strip()
+    return clean if len(clean) <= REPLY_TO_CHARS else clean[: REPLY_TO_CHARS - 1] + "…"
+
+
+def reply_mark(reply_to: str) -> str:
+    return f"回复「{reply_to}」" if reply_to else "回复"
+
+
 @dataclass
 class CommentView:
     content: str
@@ -46,6 +65,19 @@ class CommentView:
     # 只在「最新」排序那一页里看到的（默认那一页没有）。负面快照里标出来，
     # 运营去 App 里找的时候知道要切到「最新」。
     from_latest: bool = False
+    # 楼中楼里的一条回复（不是一级评论）。只拿来查负面：置顶、评论状态、评论区
+    # 快照、蓝词说的都是一级评论那一屏，不看它。reply_to = 它回的那条一级评论的
+    # 开头几个字，负面快照里标出来，运营知道去哪条评论下面点「展开」找。
+    is_reply: bool = False
+    reply_to: str = ""
+    # 是从「展开楼中楼」那一页拿到的（Settings.reply_pages_per_post），不是跟着
+    # 评论页露出来的。作者标记可不可信按那一页那家通道算（Snapshot.replies_author_reported）。
+    from_reply_page: bool = False
+    # 只对一级评论有意义：上游报的这条下面一共几条回复、这一页里跟着露出来几条、
+    # 上游说还有没有没露出来的。用来挑要展开的那几条（reply_targets）。
+    reply_count: Optional[int] = None
+    replies_shown: int = 0
+    replies_more: bool = False
 
     def one_line(self, fmt: DigestFormat, extra_mark: str = "") -> str:
         text = re.sub(r"\s+", " ", self.content or "").strip()
@@ -57,6 +89,8 @@ class CommentView:
             marks.append(extra_mark)
         if self.from_latest:
             marks.append("最新")
+        if self.is_reply:
+            marks.append(reply_mark(self.reply_to))
         if self.is_pinned:
             marks.append("置顶")
         if self.is_author:
@@ -140,6 +174,18 @@ class Snapshot:
     # 最新那一页那家通道报不报可信的作者标记（和 author_reported 同义）。两页可能
     # 走了不同的通道（默认那一页降到备胎、最新那一页主通道又好了），各按各的算。
     latest_author_reported: bool = True
+    # 楼中楼（只拿来查负面，和 latest_comments 一个待遇）：
+    # replies         默认那一页每条一级评论下面跟着露出来的那几条（不花钱）
+    # latest_replies  「最新」那一页跟着露出来的
+    # expanded_replies 展开楼中楼取回来的（Settings.reply_pages_per_post）；None = 这一轮没展开
+    replies: list[CommentView] = field(default_factory=list)
+    latest_replies: list[CommentView] = field(default_factory=list)
+    expanded_replies: Optional[list[CommentView]] = None
+    # 这一轮展开成功了几条评论的楼中楼；没展开完的原因（没开不算）。
+    replies_expanded: int = 0
+    reply_error: str = ""
+    # 展开那几页那家通道报不报可信的作者标记（同 latest_author_reported）。
+    replies_author_reported: bool = True
 
     @property
     def pinned(self) -> Optional[CommentView]:
@@ -272,6 +318,76 @@ def _comment_id(value: Any) -> str:
     return str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
 
 
+def _comment_view(item: dict[str, Any]) -> CommentView:
+    """归一化后的一条评论 → CommentView。评论页、楼中楼那一页共用。"""
+    return CommentView(
+        content=str(item.get("content") or ""),
+        like_count=item.get("like_count") or 0,
+        # 抖音没有这个字段，get 返回 None → False，语义正确：
+        # 「未标记为置顶」而不是「已知未置顶」，两者的区别由
+        # Snapshot.supports_pinned 承担。
+        is_pinned=bool(item.get("is_pinned")),
+        is_author=bool(item.get("is_author_comment")),
+        ip_location=str(item.get("ip_location") or ""),
+        author_name=_author_name(item.get("author")),
+        comment_id=_comment_id(item.get("comment_id") or item.get("cid") or item.get("id")),
+        created_at_ms=_comment_created_at_ms(
+            item.get("created_at_ms") or item.get("create_time") or item.get("timestamp")),
+    )
+
+
+def _as_reply(item: dict[str, Any], parent: CommentView, *, from_page: bool) -> CommentView:
+    # 回复不判置顶：置顶说的是一级评论那一屏（snapshot.pinned 也只看 comments）。
+    return replace(_comment_view(item), is_pinned=False, is_reply=True,
+                   reply_to=reply_excerpt(parent.content), from_reply_page=from_page)
+
+
+def _replies_of(item: dict[str, Any], parent: CommentView) -> list[CommentView]:
+    raw = item.get("replies")
+    if not isinstance(raw, list):
+        return []
+    return [_as_reply(r, parent, from_page=False) for r in raw if isinstance(r, dict)]
+
+
+@dataclass
+class ReplyPage:
+    replies: list[CommentView]
+    author_reported: bool = True
+
+
+def read_reply_page(data: dict[str, Any], parent: CommentView) -> ReplyPage:
+    """展开楼中楼取回来的那一页（providers 归一化成和评论页一样的 items）。"""
+    items = data.get("items")
+    replies = [_as_reply(i, parent, from_page=True)
+               for i in (items if isinstance(items, list) else []) if isinstance(i, dict)]
+    saw_key = any(isinstance(i, dict) and "is_author_comment" in i
+                  for i in (items if isinstance(items, list) else []))
+    return ReplyPage(replies, _trusted(data, "author", saw_key, replies))
+
+
+def reply_targets(snapshot: Snapshot, limit: int) -> list[CommentView]:
+    """要展开楼中楼的那几条一级评论：回复比跟着露出来的多的，按藏着的条数从多到少，
+    最多 limit 条（一样多的按页面顺序）。默认、最新两页都算，同一条只算一次。
+
+    藏着几条 = 上游报的回复数 − 露出来的；上游没报数、只说「还有」的算 1 条。
+    没有评论 ID 的展不了（接口要父评论 ID）。"""
+    if limit <= 0:
+        return []
+    seen: set[str] = set()
+    ranked: list[tuple[int, int, CommentView]] = []
+    for index, comment in enumerate([*snapshot.comments, *(snapshot.latest_comments or [])]):
+        if not comment.comment_id or comment.comment_id in seen:
+            continue
+        seen.add(comment.comment_id)
+        hidden = (comment.reply_count or 0) - comment.replies_shown
+        if hidden <= 0 and comment.replies_more:
+            hidden = 1
+        if hidden > 0:
+            ranked.append((-hidden, index, comment))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [c for _, _, c in ranked[:limit]]
+
+
 def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     """解析评论接口的一页返回。
 
@@ -288,28 +404,23 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
     # 「这一页恰好没有置顶 / 没有作者评论」——两者写进表里的后果天差地别。
     pin_reported = False
     author_reported = False
+    replies: list[CommentView] = []
     if isinstance(items, list):
         for item in items:
             if not isinstance(item, dict):
                 continue
             pin_reported = pin_reported or "is_pinned" in item
             author_reported = author_reported or "is_author_comment" in item
-            comments.append(
-                CommentView(
-                    content=str(item.get("content") or ""),
-                    like_count=item.get("like_count") or 0,
-                    # 抖音没有这个字段，get 返回 None → False，语义正确：
-                    # 「未标记为置顶」而不是「已知未置顶」，两者的区别由
-                    # Snapshot.supports_pinned 承担。
-                    is_pinned=bool(item.get("is_pinned")),
-                    is_author=bool(item.get("is_author_comment")),
-                    ip_location=str(item.get("ip_location") or ""),
-                    author_name=_author_name(item.get("author")),
-                    comment_id=_comment_id(item.get("comment_id") or item.get("cid") or item.get("id")),
-                    created_at_ms=_comment_created_at_ms(
-                        item.get("created_at_ms") or item.get("create_time") or item.get("timestamp")),
-                )
-            )
+            comment = _comment_view(item)
+            if platform == "xhs":
+                # 跟着露出来的楼中楼。只认小红书：抖音评论条目没有作者标记，
+                # 楼中楼里自家号的回复（「不会过敏哦」）会原样算成负面。
+                shown = _replies_of(item, comment)
+                comment.reply_count = _int_or_none(item.get("reply_count"))
+                comment.replies_shown = len(shown)
+                comment.replies_more = item.get("replies_more") is True
+                replies.extend(shown)
+            comments.append(comment)
 
     points = data.get("points") if isinstance(data.get("points"), dict) else {}
     count = _int_or_none(data.get("comment_count"))
@@ -323,6 +434,7 @@ def read_comment_page(platform: str, data: dict[str, Any]) -> Snapshot:
         hidden_comment_count=hidden,
         top_level_comment_count=0 if hidden else top_level,
         comments=comments,
+        replies=replies,
         points_balance=points.get("balance"),
         pin_reported=_trusted(data, "pinned", pin_reported, comments),
         author_reported=_trusted(data, "author", author_reported, comments),
@@ -645,21 +757,30 @@ class KeywordHit:
 
 
 def negative_pool(snapshot: Snapshot) -> list[CommentView]:
-    """查负面词要看的全部评论：默认那一页，加上「最新」那一页里默认那一页没有的。
+    """查负面词要看的全部评论，按这个顺序：默认那一页的一级评论、它们下面露出来的
+    回复，「最新」那一页里默认那一页没有的（一级评论、露出来的回复），最后是展开
+    楼中楼取回来的。
 
-    同一条评论两页都有时只算一次（按平台评论 ID；没有 ID 的按正文+昵称）。
-    只在最新那一页的打上 from_latest（拷一份，不改快照里的原件）。
+    同一条评论出现在好几处时只算第一处（按平台评论 ID；没有 ID 的按正文+昵称）：
+    露出来的回复在展开那一页里会再出现一次。只在最新那一页的打上 from_latest
+    （拷一份，不改快照里的原件）。
     """
-    pool = list(snapshot.comments)
-    if not snapshot.latest_comments:
-        return pool
-    seen = {_comment_identity(c) for c in pool}
-    for comment in snapshot.latest_comments:
-        identity = _comment_identity(comment)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        pool.append(replace(comment, from_latest=True))
+    # 默认那一页原样全收（同一页里的两条不互相去重，老行为），只记下身份。
+    pool: list[CommentView] = list(snapshot.comments)
+    seen: set[tuple] = {_comment_identity(c) for c in pool}
+
+    def add(comments, *, latest: bool = False) -> None:
+        for comment in comments or []:
+            identity = _comment_identity(comment)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pool.append(replace(comment, from_latest=True) if latest else comment)
+
+    add(snapshot.replies)
+    add(snapshot.latest_comments, latest=True)
+    add(snapshot.latest_replies, latest=True)
+    add(snapshot.expanded_replies)
     return pool
 
 
@@ -671,7 +792,8 @@ def _comment_identity(comment: CommentView) -> tuple:
 
 def match_all_keywords(snapshot: Snapshot, keywords: list[str],
                        *, skip_author: bool = False,
-                       skip_author_latest: Optional[bool] = None) -> list[KeywordHit]:
+                       skip_author_latest: Optional[bool] = None,
+                       skip_author_replies: Optional[bool] = None) -> list[KeywordHit]:
     """把关键词组 × 第一页评论的**全部**命中都找出来，按评论原序返回。
 
     和 match_seed_keywords 的区别只在「找第一个」还是「找全部」：
@@ -692,14 +814,23 @@ def match_all_keywords(snapshot: Snapshot, keywords: list[str],
 
     一条评论同时命中多个词时只记第一个命中的词（按关键词在表里的顺序），
     免得同一条评论在快照里出现好几遍。
+
+    楼中楼里的回复同样照这一套：跟着评论页露出来的按那一页算，展开取回来的按
+    展开那几页那家通道算（skip_author_replies）。自家号在楼中楼里回的「不会过敏」
+    正是 skip_author 要挡的那种。
     """
     hits: list[KeywordHit] = []
     needles = [(k, _normalize(k)) for k in keywords]
     if skip_author_latest is None:
         skip_author_latest = skip_author
+    if skip_author_replies is None:
+        skip_author_replies = skip_author
     for comment in negative_pool(snapshot):
         # 只在最新那一页的那几条，按那一页那家通道的作者标记可不可信来定。
-        skip = skip_author_latest if comment.from_latest else skip_author
+        if comment.from_reply_page:
+            skip = skip_author_replies
+        else:
+            skip = skip_author_latest if comment.from_latest else skip_author
         if skip and comment.is_author:
             continue
         haystack = _normalize(comment.content)
@@ -1155,7 +1286,8 @@ def decide(
     elif seed_keywords:
         verdict.notes.append("本轮未取到评论页内容，关键词命中与评论状态保持原样")
 
-    # —— 负面词/竞品词：**复用上面同一份第一页评论**，不额外发任何请求 ——
+    # —— 负面词/竞品词：**复用上面同一份第一页评论**（连同它们下面露出来的楼中楼），
+    # 不额外发任何请求；开了「最新」「展开楼中楼」的表再加上那几页 ——
     # 判定闸门和种子关键词完全一样：没填词不碰、没看到评论页不碰。
     # 后者尤其重要——拿上游缺数当「无负面」写进表里，等于给运营一个
     # 假的安全感，比不判还糟。
@@ -1169,14 +1301,19 @@ def decide(
         # 也不能漏掉真负面。
         verdict.negative_hits = match_all_keywords(
             snapshot, negative_keywords, skip_author=snapshot.author_reported,
-            skip_author_latest=snapshot.latest_author_reported)
+            skip_author_latest=snapshot.latest_author_reported,
+            skip_author_replies=snapshot.replies_author_reported)
         if verdict.negative_hits:
             words = "、".join(dict.fromkeys(h.keyword for h in verdict.negative_hits))
             newest = sum(1 for h in verdict.negative_hits if h.comment.from_latest)
+            in_replies = sum(1 for h in verdict.negative_hits if h.comment.is_reply)
+            expanded = any(h.comment.from_reply_page for h in verdict.negative_hits)
             where = ("第一页评论" if snapshot.latest_comments is None
                      else "默认、最新两页评论" + (f"（{newest} 条只在最新那一页）" if newest else ""))
+            # 楼中楼里的那几条单独说：运营要去对应评论下面点「展开」才看得到。
+            replies_part = f"；其中 {in_replies} 条在楼中楼回复里" if in_replies else ""
             verdict.notes.append(
-                f"⚠ {where}命中 {len(verdict.negative_hits)} 条负面/竞品词（{words}）"
+                f"⚠ {where}命中 {len(verdict.negative_hits)} 条负面/竞品词（{words}{replies_part}）"
                 f"→ {settings.negative_status.found}，详见「{settings.fields.negative_digest}」"
             )
             # 这一轮的通道不报作者标记 → skip_author 静默失效，自家账号回的
@@ -1187,7 +1324,8 @@ def decide(
             # 只在真有命中时才报——没命中就没有「排除没生效」这回事，
             # 每轮都挂一句只会把真正要看的那几条淹掉。
             if not snapshot.author_reported or (
-                    newest and not snapshot.latest_author_reported):
+                    newest and not snapshot.latest_author_reported) or (
+                    expanded and not snapshot.replies_author_reported):
                 # 措辞是给运营看的，别在这里用 markdown 记号——「诊断信息」是
                 # 飞书的纯文本格子，星号会原样显示出来（其余诊断语句也都不带）。
                 verdict.notes.append(
@@ -1199,6 +1337,10 @@ def decide(
     if negative_keywords and snapshot.latest_error and verdict.negative_checked:
         verdict.notes.append(f"「最新」排序那一页没取到（{snapshot.latest_error}），"
                              "这一轮负面词只查了默认排序那一页")
+    if negative_keywords and snapshot.reply_error and verdict.negative_checked:
+        done = (f"展开了 {snapshot.replies_expanded} 条，" if snapshot.replies_expanded else "")
+        verdict.notes.append(f"楼中楼没展开完（{done}{snapshot.reply_error}），"
+                             "没展开的那几条评论下面只查了露出来的回复")
 
     # —— 蓝词：评论正文里的 `#词[搜索高亮]#` 标记，同一份第一页评论 ——
     # 这一轮扫不扫、哪些是新词、要不要翻「是否截图」由调用方对着表里的现值

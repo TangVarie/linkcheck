@@ -10,8 +10,12 @@
 归一化后的形状（就是 SocialDataX 的原生形状，因为 analyze 是照它写的）：
 
     评论页  {"items": [{content, like_count, is_pinned, is_author_comment,
-                        ip_location, author}],
+                        ip_location, author,
+                        replies: [同形状的条目], reply_count, replies_more}],
              "comment_count": int|None, "top_level_comment_count": int|None}
+            （replies / reply_count / replies_more 只有小红书 TikHub 那一路给：
+            一级评论下面跟着露出来的楼中楼，见 _xhs_comment_items）
+    楼中楼  {"items": [同形状的条目]}（小红书 TikHub，Settings.reply_pages_per_post）
 
     ⚠️ **通道能力由 `_capabilities` 声明**（见 XHS_COMMENT_CAPABILITIES）：小红书
     评论页的响应里要带上它，说清这一家的 `is_pinned` / `is_author_comment`
@@ -158,9 +162,16 @@ TIKHUB_PATHS = {
     # 图文接口对视频笔记同样返回完整互动数据（只是没有播放地址，我们不需要），
     # 所以两种笔记共用一个端点，不必先判类型再选接口。实测已确认。
     ("xhs", "detail"): "/api/v1/xiaohongshu/app_v2/get_image_note_detail",
+    # 楼中楼：某条一级评论下面的回复（第一页）。和评论接口同价（$0.010、
+    # allow_discount=0），对方文档同样写着「传错评论 ID 也正常计费」。
+    # 只在 Settings.reply_pages_per_post 开了的表上用，要展开哪几条见 runner。
+    ("xhs", "replies"): "/api/v1/xiaohongshu/app_v2/get_note_sub_comments",
     ("douyin", "comments"): "/api/v1/douyin/app/v3/fetch_video_comments",
     ("douyin", "detail"): "/api/v1/douyin/app/v3/fetch_one_video",
 }
+
+# 抽象的用途名（rows.PURPOSE_REPLIES 是同一个字符串；providers 不反过来 import rows）。
+REPLIES = "replies"
 
 # 单价（元/次）。TikHub 的数字来自它自己公开免鉴权的计价接口
 # https://api.tikhub.dev/api/v1/tikhub/user/get_all_endpoints_info
@@ -244,6 +255,12 @@ def _handles_everything(platform: str, purpose: str, arguments: dict[str, Any]) 
     return True
 
 
+def _sdx_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
+    """SocialDataX 不接楼中楼：它那边一次真实调用都还没发过（docs/供应商对比.md），
+    楼中楼的字段更没人见过。降到它那一轮就不展开，由 runner 说一声。"""
+    return purpose != REPLIES
+
+
 def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
     """TikHub 吃不吃这种参数形态。
 
@@ -258,6 +275,8 @@ def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -
     那些（短链过期、落地页改版、网络抖动）。
     小红书不受影响：share_text 参数长链短链分享文案都吃（实测）。
     """
+    if (platform, purpose) not in TIKHUB_PATHS:
+        return False          # 抖音楼中楼没接（抖音评论没有作者标记，见 runner）
     if platform == "douyin" and not arguments.get("aweme_id"):
         return False
     return True
@@ -391,6 +410,11 @@ def _tikhub_build(api_key: str, platform: str, purpose: str, arguments: dict[str
             # 「最新」那一页是 latest_v2（按时间倒序，对方 OpenAPI 的枚举）。
             sort = args.get("sort", "default")
             params["sort_strategy"] = TIKHUB_SORTS.get(sort, sort)
+        elif purpose == REPLIES:
+            # 只取第一页回复：首次请求 cursor 留空、index 传 1（对方 OpenAPI 原文）。
+            # 露出来的那几条也会在这一页里再出现一次，按评论 ID 去重（analyze.negative_pool）。
+            params["comment_id"] = args.get("comment_id") or ""
+            params["index"] = 1
     else:
         if args.get("aweme_id"):
             params["aweme_id"] = args["aweme_id"]
@@ -523,14 +547,36 @@ def _cn_location(value: Any) -> str:
     return _CN_LOCATION.get(text.lower(), text)
 
 
-def _xhs_comment_items(comments: list[Any]) -> list[dict[str, Any]]:
+def _reply_count(value: Any) -> Optional[int]:
+    """楼中楼条数。小红书 web 端给的是字符串（"3"），App 端是整数，两种都认。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _xhs_comment_items(comments: list[Any], *, with_replies: bool = True) -> list[dict[str, Any]]:
+    """小红书评论条目 → 归一化形状。
+
+    with_replies：一级评论下面**跟着露出来**的那几条楼中楼（原始的 `sub_comments`，
+    App 里不用点「展开」就看得到的 1–3 条）也收进来，放在 `replies` 里，形状和
+    一级评论一样。这一页本来就带着它们，不多花一分钱；以前全丢了，负面藏在别人
+    评论下面的回复里时（途鸽，2026-11）一条都查不到。`reply_count` 是上游报的这条
+    下面一共几条回复，比露出来的多 = 还有折叠的（要不要展开见 runner）。
+    回复下面不再有楼中楼，只收一层。
+    """
     items = []
     for c in comments:
         if not isinstance(c, dict):
             continue
         types = _tag_types(c)
         user = c.get("user") if isinstance(c.get("user"), dict) else {}
-        items.append({
+        if not user and isinstance(c.get("user_info"), dict):
+            user = c["user_info"]
+        item = {
             "content": c.get("content") or "",
             "comment_id": c.get("id") or c.get("comment_id") or "",
             "create_time": c.get("create_time") or c.get("timestamp"),
@@ -541,7 +587,14 @@ def _xhs_comment_items(comments: list[Any]) -> list[dict[str, Any]]:
             # 好让两家通道在「评论区快照」这一列里长得一样。
             "ip_location": _cn_location(c.get("ip_location")),
             "author": {"nickname": user.get("nickname") or ""},
-        })
+        }
+        if with_replies:
+            subs = c.get("sub_comments")
+            item["replies"] = (_xhs_comment_items(subs, with_replies=False)
+                               if isinstance(subs, list) else [])
+            item["reply_count"] = _reply_count(c.get("sub_comment_count"))
+            item["replies_more"] = c.get("sub_comment_has_more") is True
+        items.append(item)
     return items
 
 
@@ -584,9 +637,30 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
                if TIKHUB in XHS_COMMENT_CAPABILITIES else {}),
         }, request_id=request_id)
 
+    if platform == "xhs" and purpose == REPLIES:
+        # 楼中楼那一页：`$.data.data.comments`（对方 OpenAPI 只写了游标在
+        # `$.data.data.cursor`，列表的键名没写，两种常见叫法都认）。
+        # 传错评论 ID 时对方「正常响应，data 里是上游的服务异常信息」，照样计费——
+        # 认不出回复列表就是这种，记一句、这条评论这一轮不算展开过。
+        # 不归 unexpected_shape：那个码会给通道记「契约坏了」的一击，而一条评论
+        # 被删了（评论 ID 失效）不该把整条通道往停用那边推。
+        core = inner.get("data") if isinstance(inner.get("data"), dict) else {}
+        raw_replies = next((core[k] for k in ("comments", "sub_comments")
+                            if isinstance(core.get(k), list)), None)
+        if raw_replies is None:
+            return Err(Failure.UNKNOWN, "no_replies",
+                       "楼中楼接口没回回复列表："
+                       + _redact(json.dumps(inner, ensure_ascii=False), api_key)[:200],
+                       http_status=http_status, request_id=request_id)
+        return Ok({
+            "items": _xhs_comment_items(raw_replies, with_replies=False),
+            **({"_capabilities": XHS_COMMENT_CAPABILITIES[TIKHUB]}
+               if TIKHUB in XHS_COMMENT_CAPABILITIES else {}),
+        }, request_id=request_id)
+
     if platform == "xhs" and purpose == "detail":
         core = inner.get("data")
-        note_list = core[0].get("note_list") if isinstance(core, list) and core and isinstance(core[0], dict) else None
+        note_list =core[0].get("note_list") if isinstance(core, list) and core and isinstance(core[0], dict) else None
         if note_list and not isinstance(note_list, list):
             # 有内容但形状不认识（比如上游把 list 改成了 dict）：这是协议漂移，
             # 不是「笔记没了」。硬下 [0] 会 KeyError 炸穿；按 GONE 定罪更是误杀。
@@ -722,7 +796,7 @@ def _sdx_yuan(platform: str, purpose: str) -> float:
 
 REGISTRY: dict[str, Provider] = {
     SOCIALDATAX: Provider(SOCIALDATAX, "SocialDataX", _sdx_build, _sdx_parse, _sdx_yuan,
-                          bills_failed_lookups=False),
+                          bills_failed_lookups=False, can_handle=_sdx_can_handle),
     TIKHUB: Provider(TIKHUB, "TikHub", _tikhub_build, _tikhub_parse, _tikhub_yuan,
                      bills_failed_lookups=True, can_handle=_tikhub_can_handle),
 }

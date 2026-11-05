@@ -1754,9 +1754,10 @@ _SCRIPT = r"""
     var body = groups.map(function(g){
       var inputs = byGroup[g].map(function(p){
         var v = e.thresholds && e.thresholds[p.column] != null ? e.thresholds[p.column] : "";
-        var def = p.default == null ? "默认不扫" : "默认 " + p.default;
+        var def = p.default_text || (p.default == null ? "默认不扫" : "默认 " + p.default);
         return "<label class=muted style='display:inline-block;margin:0 12px 6px 0'>" +
-          esc(p.label) + " <input type=number min=" + Number(p.min || 0) + " style='width:104px' data-col='" +
+          esc(p.label) + " <input type=number min=" + Number(p.min || 0) +
+          (p.max != null ? " max=" + Number(p.max) : "") + " style='width:104px' data-col='" +
           attr(p.column) + "' value='" + attr(String(v)) + "' placeholder='" + attr(def) + "'>" +
           (p.hint ? "<div class=muted style='font-size:12px;max-width:520px'>" + esc(p.hint) + "</div>" : "") +
           "</label>";

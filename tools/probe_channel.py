@@ -16,6 +16,10 @@
     # 正文里的 `#词[搜索高亮]#` 标记，抖音还没验过
     python3 tools/probe_channel.py <抖音链接> --only tikhub --raw
 
+    # 小红书再展开 N 条评论的楼中楼（每条一次调用，只有 TikHub 接）。验楼中楼的
+    # 字段名：露出来的回复认没认到、展开那一页拿没拿回回复（docs/待验证清单.md §20）
+    python3 tools/probe_channel.py <小红书链接> --only tikhub --replies 1 --raw
+
     # 小红书额外调一次详情接口（线上默认不调，DETAIL_WITHIN_DAYS=0），并连
     # 原始的笔记级字段一起打出来。验「分享链接打开是『笔记不存在』、评论接口
     # 却照常返回」这种**仅作者可见**的笔记，详情接口到底怎么说
@@ -57,7 +61,7 @@ ENV = {
 }
 
 
-def _raw_comments(body: str) -> list:
+def _raw_comments(body: str, keys: tuple = ("items", "comments")) -> list:
     """从评论接口的**原始**响应里挖出整页评论条目，不经过归一化。
 
     两家的信封不一样：SocialDataX 是顶层 items[]；TikHub 是 data.data.comments[]
@@ -71,7 +75,7 @@ def _raw_comments(body: str) -> list:
     for _ in range(3):
         if not isinstance(node, dict):
             break
-        for key in ("items", "comments"):
+        for key in keys:
             items = node.get(key)
             if isinstance(items, list) and items and isinstance(items[0], dict):
                 return items
@@ -200,6 +204,9 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
     provider = providers.get_provider(name)
     row = Row(record_id="probe", link_cell=link)
     calls = plan_calls(row, settings)
+    # 楼中楼不是一次请求，是「评论页回来之后挑几条评论各发一次」，单独走（见下）。
+    reply_plan = next((c for c in calls if c.reply_pages), None)
+    calls = [c for c in calls if not c.reply_pages]
     raw_comments: list = []
     raw_envelope: dict = {}
     raw_detail: dict | None = None
@@ -239,8 +246,18 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
               "失败很可能照样计费（TikHub 明确会计费）")
 
     print(f"  链接识别为：{row.parsed.platform} / {row.parsed.content_id or row.parsed.url}")
-    print(f"  本次会发 {len(calls)} 个请求，预计花费 ¥"
-          f"{sum(provider.yuan_per_call(c.platform, c.purpose) for c in calls):.3f}")
+    expand = (reply_plan is not None
+              and provider.can_handle(reply_plan.platform, reply_plan.purpose,
+                                      reply_plan.arguments))
+    extra = reply_plan.requests if expand else 0
+    yuan = sum(provider.yuan_per_call(c.platform, c.purpose) for c in calls)
+    if extra:
+        yuan += extra * provider.yuan_per_call(reply_plan.platform, reply_plan.purpose)
+    print(f"  本次会发 {len(calls)} 个请求"
+          + (f"（另外最多展开 {extra} 条评论的楼中楼）" if extra else "")
+          + f"，预计最多花费 ¥{yuan:.3f}")
+    if reply_plan is not None and not expand:
+        print(f"  ⏭ {provider.label} 不接楼中楼（只有 TikHub 有这个接口），--replies 这一家不展开")
 
     snapshot = None
     norm_items: list = []
@@ -286,6 +303,48 @@ def probe(name: str, key: str, link: str, settings: Settings, *, force: bool = F
 
     if snapshot is None:
         return False
+
+    if snapshot.platform == "xhs":
+        with_replies = [c for c in snapshot.comments if c.replies_shown]
+        hidden = analyze.reply_targets(snapshot, len(snapshot.comments))
+        print(f"\n  楼中楼（露出来的）：{len(with_replies)} 条一级评论带着回复，共露出 "
+              f"{len(snapshot.replies)} 条；回复比露出来的多的 {len(hidden)} 条")
+        if snapshot.comments and not any(c.reply_count for c in snapshot.comments):
+            print("    ⚠ 一条评论都没认到回复数（sub_comment_count）：要么这一页确实没人回，"
+                  "要么上游字段名变了——加 --raw 看原始条目，对照 providers._xhs_comment_items")
+    if expand and snapshot is not None:
+        snapshot.expanded_replies = []
+        targets = analyze.reply_targets(snapshot, reply_plan.requests)
+        if not targets:
+            print("  楼中楼（展开）：没有回复比露出来的多的评论，不展开、不花钱")
+        for target in targets:
+            call = ToolCall(reply_plan.platform, reply_plan.purpose,
+                            {**reply_plan.arguments, "comment_id": target.comment_id})
+            request = provider.build(key, call.platform, call.purpose, call.arguments)
+            response = transport.request(request.method, request.url, request.headers,
+                                         request.body, timeout=45)
+            result = provider.parse(call.platform, call.purpose, response.status,
+                                    response.content_type, response.body,
+                                    response.request_id, key)
+            head = f"  楼中楼（展开「{analyze.reply_excerpt(target.content)}」，上游报 {target.reply_count} 条）"
+            if isinstance(result, Err):
+                print(f"{head}：❌ [{result.kind.value}] {result.operator_text()[:150]}")
+                ok = False
+            else:
+                page = analyze.read_reply_page(result.data, target)
+                snapshot.expanded_replies.extend(page.replies)
+                snapshot.replies_expanded += 1
+                print(f"{head}：✅ 拿回 {len(page.replies)} 条")
+                for reply in page.replies[:5]:
+                    print(f"    {reply.one_line(settings.digest)}")
+            if raw:
+                items = _raw_comments(response.body, ("items", "comments", "sub_comments"))
+                print(f"    原始回复条目（--raw，{len(items)} 条）：")
+                for item in items:
+                    print("    " + json.dumps(_trim_raw(item), ensure_ascii=False))
+                if not items:
+                    print("    页级字段：" + json.dumps(_raw_envelope(response.body),
+                                                    ensure_ascii=False))
 
     print()
     print(f"  评论总数   {snapshot.comment_count}")
@@ -414,6 +473,14 @@ def main() -> int:
     force = "--force" in sys.argv
     raw = "--raw" in sys.argv
     detail = "--detail" in sys.argv
+    replies = 0
+    if "--replies" in sys.argv:
+        index = sys.argv.index("--replies") + 1
+        value = sys.argv[index] if index < len(sys.argv) else ""
+        if not value.isdigit() or not 1 <= int(value) <= 10:
+            print("--replies 后面要跟 1–10 的数字：最多展开几条评论的楼中楼", file=sys.stderr)
+            return 2
+        replies = int(value)
 
     unsafe = os.environ.get("ALLOW_UNSAFE_ENDPOINT_OVERRIDE", "").strip() in ("1", "true", "yes")
     try:
@@ -426,6 +493,7 @@ def main() -> int:
         # 线上默认不调小红书详情（占月成本 39%，见 config.Settings.detail_within_days）。
         # 探针上显式要了才调，而且不看帖龄——探针的行没有发布时间。
         settings.detail_within_days = 3650
+    settings.reply_pages_per_post = replies
     if not parse(link).usable:
         print(f"链接识别不了：{parse(link).describe_failure()}", file=sys.stderr)
         return 2

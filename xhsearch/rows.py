@@ -51,15 +51,33 @@ class ToolCall:
     # 有值 = 补充的那一页（小红书「最新」排序）：这一轮评论数超过它才发，
     # 发不成也不影响这一行的结论（和 detail 一样）。见 Settings.latest_comments_over。
     min_count: Optional[int] = None
+    # 有值 = 展开楼中楼（小红书）：不是一次请求，是「最多这么多次」。要展开哪几条
+    # 评论得等评论页回来才知道，由 runner 按这一轮的评论一条条发（每次带上
+    # comment_id）。发不成也不影响这一行的结论。见 Settings.reply_pages_per_post。
+    max_calls: Optional[int] = None
 
     @property
     def latest_page(self) -> bool:
         return self.purpose == "comments" and self.arguments.get("sort") == SORT_LATEST
 
+    @property
+    def reply_pages(self) -> bool:
+        return self.purpose == PURPOSE_REPLIES
+
+    @property
+    def requests(self) -> int:
+        """最多发几次请求（预算按它预留）。"""
+        return self.max_calls if self.max_calls is not None else 1
+
 
 # 评论排序的抽象名，两家各自翻译（providers._sdx_build / _tikhub_build）。
 SORT_DEFAULT = "default"
 SORT_LATEST = "latest"
+# 用途：楼中楼那一页（providers.REPLIES 是同一个字符串）。
+PURPOSE_REPLIES = "replies"
+# 「预计花费」（乐观口径）猜一篇帖子有没有折叠的楼中楼：表里评论数超过一页
+# （10 条）才算它会展开满。预算预留（悲观口径）一律按满额算。
+REPLY_ESTIMATE_OVER = 10
 
 
 # 「作品ID」那一格的写法：`7584415807459888384 ← https://v.douyin.com/abc/`
@@ -470,6 +488,10 @@ def plan_calls(row: Row, settings: Settings, now: Optional[datetime] = None) -> 
         if settings.latest_comments_over is not None:
             calls.append(ToolCall("xhs", "comments", {**target, "sort": SORT_LATEST},
                                   min_count=settings.latest_comments_over))
+        # 展开楼中楼：展开哪几条要等评论页回来才知道，这里只排上「最多几次」。
+        if settings.reply_pages_per_post > 0:
+            calls.append(ToolCall("xhs", PURPOSE_REPLIES, dict(target),
+                                  max_calls=settings.reply_pages_per_post))
 
         want_detail = settings.detail_within_days > 0 and (
             age_days is None or age_days <= settings.detail_within_days
@@ -497,7 +519,9 @@ def share_key(calls: list[ToolCall]) -> tuple:
     """
     # min_count 也算进去：同一篇登记在两个项目、「最新」门槛不同（一个 100、一个 5）
     # 时，门槛高的那边取回来的只有默认那一页，门槛低的那边不能拿它顶替。
-    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())), c.min_count)
+    # max_calls 同理：展开 1 条的那边不能顶替展开 5 条的。
+    return tuple((c.platform, c.purpose, tuple(sorted(c.arguments.items())), c.min_count,
+                  c.max_calls)
                  for c in calls)
 
 
@@ -584,7 +608,9 @@ def estimate_credits(rows: list[Row], settings: Settings, now: Optional[datetime
     批量跑之前先报数给人看，比事后对账单强。
     走 TikHub 时积分这个单位不成立，用 estimate_yuan() 看钱。
     """
-    return sum(len(plan_calls(row, settings, now)) for row in rows) * 10
+    # 楼中楼不算：SocialDataX 不接（providers._sdx_can_handle）。
+    return sum(1 for row in rows for call in plan_calls(row, settings, now)
+               if not call.reply_pages) * 10
 
 
 def estimate_yuan(
@@ -628,8 +654,19 @@ def estimate_yuan(
             if (call.min_count is not None and not worst_case
                     and not _over(row.previous_comment_count, call.min_count)):
                 continue
-            total += _call_price(call, settings, keys, dead, worst_case)
+            total += _call_price(call, settings, keys, dead, worst_case) * _times(
+                call, row, worst_case)
     return total
+
+
+def _times(call: ToolCall, row: Row, worst_case: bool) -> int:
+    """这个计划里的调用算几次钱。楼中楼是「最多 N 次」：悲观口径按满额；乐观口径
+    按表里的评论数猜（超过一页才算它会展开满，否则不算）。"""
+    if not call.reply_pages:
+        return 1
+    if worst_case or _over(row.previous_comment_count, REPLY_ESTIMATE_OVER):
+        return call.requests
+    return 0
 
 
 def _over(count: Optional[int], floor: int) -> bool:
@@ -671,6 +708,9 @@ class Forecast:
     # 其中「最新」那一页的钱（小红书，评论数超过门槛的帖子才扫）。
     latest_yuan: float = 0.0
     latest_rows: int = 0
+    # 其中展开楼中楼的钱（小红书，按每次展开满额、评论数超过一页的帖子算——是上限）。
+    reply_yuan: float = 0.0
+    reply_rows: int = 0
 
     @property
     def per_day(self) -> float:
@@ -732,10 +772,13 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
                 if call.min_count is not None and not _over(row.previous_comment_count,
                                                             call.min_count):
                     continue
-                price = _call_price(call, settings, keys, set(), False)
+                price = _call_price(call, settings, keys, set(), False) * _times(
+                    call, row, False)
                 out.yuan += price
                 if call.latest_page:
                     out.latest_yuan += price
+                if call.reply_pages:
+                    out.reply_yuan += price
             out.refreshes += 1
             counted = True
             at += timedelta(hours=step)
@@ -744,4 +787,7 @@ def forecast(rows: list[Row], settings: Settings, now: Optional[datetime] = None
             if settings.latest_comments_over is not None and row.parsed.platform == "xhs" \
                     and _over(row.previous_comment_count, settings.latest_comments_over):
                 out.latest_rows += 1
+            if settings.reply_pages_per_post > 0 and row.parsed.platform == "xhs" \
+                    and _over(row.previous_comment_count, REPLY_ESTIMATE_OVER):
+                out.reply_rows += 1
     return out

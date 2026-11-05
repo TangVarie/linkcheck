@@ -931,6 +931,12 @@ def _fetch_calls(
         return out
 
     for call in calls:
+        if call.reply_pages:
+            # 展开楼中楼：评论页（和「最新」那一页）已经回来了，按这一轮的评论挑。
+            if out.snapshot is not None:
+                _expand_replies(call, out.snapshot, attempt, keys, settings,
+                                deadline=deadline, disabled=disabled)
+            continue
         if call.min_count is not None:
             # 补充的那一页（小红书「最新」）：默认那一页回来了、评论数超过门槛才发。
             # 评论数没超的帖子，默认那一页本来就把评论装全了，多付一次钱买不到新东西。
@@ -1012,6 +1018,7 @@ def _fetch_calls(
             if out.snapshot is not None:
                 page = analyze.read_comment_page(call.platform, result.data)
                 out.snapshot.latest_comments = page.comments
+                out.snapshot.latest_replies = page.replies
                 out.snapshot.latest_author_reported = page.author_reported
         elif call.purpose == "comments":
             out.snapshot = analyze.read_comment_page(call.platform, result.data)
@@ -1019,6 +1026,58 @@ def _fetch_calls(
             analyze.merge_detail(out.snapshot, result.data)
 
     return out
+
+
+def _expand_replies(plan: ToolCall, snapshot: analyze.Snapshot,
+                    attempt: Callable[[ToolCall], protocol.Result],
+                    keys: dict[str, str], settings: Settings, *,
+                    deadline: Optional[float], disabled: set[str]) -> None:
+    """把回复比露出来的多的那几条一级评论，各取一页楼中楼，并进快照（只给负面用）。
+
+    发不成的一律不影响这一行的结论（和「最新」那一页一样）：评论页已经到手，
+    没展开的那几条评论下面还有露出来的回复查着。原因写进 snapshot.reply_error，
+    诊断信息里说出来（analyze.decide）。
+
+    * 限流：不退避重试——楼中楼是加餐，为它睡几十秒会拖慢整轮；这一轮到此为止。
+    * Key 失效 / 余额耗尽：_call 已经把那家标成本轮不可用；**不中止这个平台**——
+      楼中楼只有 TikHub 能接，它倒了，评论照样能从备胎来。
+    * 其余失败（这条评论被删了、上游服务异常）：只算这一条没展开，接着展开下一条。
+    """
+    def able() -> bool:
+        return any(providers.get_provider(n).can_handle(plan.platform, plan.purpose,
+                                                        plan.arguments)
+                   for n in providers.usable_order(settings.channels, plan.platform,
+                                                   keys, disabled))
+
+    # 先看通道：评论页降到了备胎的那一轮，备胎不报回复数，挑不出要展开的——
+    # 不先说一声的话，诊断信息里什么都没有，看着像是「没有要展开的」。
+    if not able():
+        snapshot.reply_error = "这一轮能用的数据通道不支持展开楼中楼（只有 TikHub 能）"
+        return
+    targets = analyze.reply_targets(snapshot, plan.requests)
+    if not targets:
+        return
+    snapshot.expanded_replies = []
+    for target in targets:
+        if deadline is not None and time.monotonic() >= deadline:
+            snapshot.reply_error = "已到软截止"
+            return
+        if not able():          # 前一条把 TikHub 的 Key / 余额用到头了
+            snapshot.reply_error = "这一轮能用的数据通道不支持展开楼中楼（只有 TikHub 能）"
+            return
+        call = ToolCall(plan.platform, plan.purpose,
+                        {**plan.arguments, "comment_id": target.comment_id})
+        result = attempt(call)
+        if isinstance(result, protocol.Err):
+            snapshot.reply_error = str(result)[:120]
+            if result.kind is protocol.Failure.RATE_LIMIT or result.kind in protocol.FATAL:
+                return
+            continue
+        page = analyze.read_reply_page(result.data, target)
+        snapshot.expanded_replies.extend(page.replies)
+        snapshot.replies_author_reported = (snapshot.replies_author_reported
+                                            and page.author_reported)
+        snapshot.replies_expanded += 1
 
 
 def _base_fields(settings: Settings, *, status: str, notes: list[str],
@@ -1491,7 +1550,8 @@ def refresh(
                                               disabled=disabled, worst_case=True)
                 # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
                 # （最多 3 次，且只在网络/5xx 上发生）不预留，但会在 settle 里如实计入。
-                reserved_calls = len(planned) * max(1, len(
+                # 展开楼中楼是「最多 N 次」，按 N 次预留（ToolCall.requests）。
+                reserved_calls = sum(c.requests for c in planned) * max(1, len(
                     providers.usable_order(settings.channels, platform, keys, disabled)))
                 if not budget.reserve(reserved_calls, reserved_yuan):
                     return Outcome(row.record_id, STATUS_DEFERRED, {},
