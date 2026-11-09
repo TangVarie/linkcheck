@@ -117,6 +117,18 @@ class TestTransientReadRetry(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(slept.call_count, 1)
 
+    def test_a_write_conflict_on_a_read_is_retried_too(self):
+        """1254291 写冲突：2026-11-09 sweep 读 sportsix 时撞上（有人在同时写这张表），
+        原来一次就放弃，整张表这一轮跳过、退出码 1，Railway 记成 Crashed。读不改表，
+        等一下重发就好。"""
+        records, sent, slept = self._search([
+            feishu_err(feishu.WRITE_CONFLICT_CODE, "LockNotObtainedError"),
+            ok({"items": [{"record_id": "rec1"}], "has_more": False}),
+        ])
+        self.assertEqual([r["record_id"] for r in records], ["rec1"])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(slept.call_count, 1)
+
     def test_it_gives_up_after_a_bounded_number_of_tries_and_says_so(self):
         with self.assertRaises(feishu.FeishuError) as ctx:
             self._search([feishu_err(1254002, "Fail")] * feishu._READ_ATTEMPTS)

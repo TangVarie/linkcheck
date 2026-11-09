@@ -104,12 +104,16 @@ RATE_LIMIT_CODE = 1254290
 #   抖动就是「这张表这一轮整张跳过」。
 # * 1254607 Data not ready ——「建议等待一段时间后重试」。HTTP 400，传输层同样不重试。
 # * 1254290 TooManyRequest ——「请求过快，稍后重试」，见 RATE_LIMIT_CODE。
+# * 1254291 写冲突 ——「表正在被别的请求写」。读本身不写，却也会撞上它：
+#   2026-11-09 线上，sweep 读 sportsix 时回了它（那一轮没有任何写，前一轮 queue
+#   已经结束——多半是有人在飞书里批量改、或者表上的自动化在写）。不在名单里的话
+#   一次撞车就是这张表这一轮整张跳过、退出码 1，Railway 记成 Crashed。
 # （1255040 请求超时是 HTTP 504，传输层已经按 5xx 重试过，这里不再叠一层。）
 #
 # **只用在读上。** 读重发多少次都改不坏表；写不一样——1254002 也可能是「其实
 # 写进去了、只是回包说失败」，盲目重发 batch_create 会多出重复行（写冲突
 # 1254291 和限流 1254290 另有自己的整块退避，见 _post_chunk）。
-_TRANSIENT_READ_CODES = frozenset({1254002, 1254607, RATE_LIMIT_CODE})
+_TRANSIENT_READ_CODES = frozenset({1254002, 1254607, RATE_LIMIT_CODE, WRITE_CONFLICT_CODE})
 # 总共试几次、退避基准（full jitter：第 1 次重试前等 0~2 秒、第 2 次 0~4 秒）。
 # 一张表最多多等几秒，换掉的是「这张表这一轮整张不巡查」。
 _READ_ATTEMPTS = 3
