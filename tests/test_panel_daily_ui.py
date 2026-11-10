@@ -60,7 +60,8 @@ class TestPanelDailyUI(unittest.TestCase):
         叫「仍有负面的帖子」、含已处理的，运营看着 10 篇、底下只剩 3 条（2026-11-10）。"""
         self.assertIn("id=metricNegativeLabel>还没处理完的负面帖子<", self.page())
         self.assertIn('setText("metricNegativeLabel", "还没处理完的负面帖子")', panel_view._SCRIPT)
-        self.assertIn('" 条负面评论 · 按最近一次检查"', panel_view._SCRIPT)
+        self.assertIn('"最近一次检查有负面的共 "', panel_view._SCRIPT)
+        self.assertNotIn("仍有负面共", panel_view._SCRIPT, "每篇按各自最近一次检查算，说不了「仍有」")
         self.assertNotIn("累计", self.page())
 
     def test_processing_is_a_shared_visible_state_and_preserves_record_identity(self):
@@ -229,7 +230,12 @@ process.stdout.write(JSON.stringify(values));
         numbers = self.render(self.report(
             negative_posts=10, post_states={"pending": 0, "processing": 3, "resolved": 7}))
         self.assertEqual(numbers["metricNegative"], "3")
-        self.assertEqual(numbers["metricNegativeTotal"], "评论区仍有负面共 10 篇，其中已处理 7 篇")
+        self.assertEqual(numbers["metricNegativeTotal"], "最近一次检查有负面的共 10 篇，其中已处理 7 篇")
+        numbers = self.render(self.report(
+            negative_posts=10, negative_comments=10, negative_comments_estimated=True,
+            post_states={"pending": 0, "processing": 3, "resolved": 7}))
+        self.assertEqual(numbers["metricComments"], "这 10 篇共约 10 条负面评论",
+                         "条数是这 10 篇加起来的，不是只算已处理的 7 篇")
         self.assertEqual(numbers["metricResolved"], "7")
 
     def test_unavailable_current_table_keeps_counts_unknown(self):
