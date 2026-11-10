@@ -55,10 +55,11 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertNotIn("open", dom.by_id("dailyPanel"), "日报不挤占默认监控视图")
 
     def test_the_negative_metric_says_what_it_counts(self):
-        """顶上那排是「最近一次检查仍有负面评论」的帖子，不是时段累计。上一版叫
-        「当前负面帖子（累计）」，读的人就问「从什么时候累计到什么时候」。"""
-        self.assertIn("id=metricNegativeLabel>仍有负面的帖子<", self.page())
-        self.assertIn('setText("metricNegativeLabel", "仍有负面的帖子")', panel_view._SCRIPT)
+        """顶上那个大数字是「还没处理完的」负面帖子（待处理 + 正在处理），不是时段累计。
+        上一版叫「当前负面帖子（累计）」，读的人就问「从什么时候累计到什么时候」；再上一版
+        叫「仍有负面的帖子」、含已处理的，运营看着 10 篇、底下只剩 3 条（2026-11-10）。"""
+        self.assertIn("id=metricNegativeLabel>还没处理完的负面帖子<", self.page())
+        self.assertIn('setText("metricNegativeLabel", "还没处理完的负面帖子")', panel_view._SCRIPT)
         self.assertIn('" 条负面评论 · 按最近一次检查"', panel_view._SCRIPT)
         self.assertNotIn("累计", self.page())
 
@@ -208,7 +209,7 @@ process.stdout.write(JSON.stringify(values));
     def test_existing_table_counts_survive_empty_journal(self):
         numbers = self.render(self.report())
         self.assertEqual(numbers["metricChecked"], "120")
-        self.assertEqual(numbers["metricNegative"], "9")
+        self.assertEqual(numbers["metricNegative"], "9", "待处理 7 + 正在处理 2")
         self.assertEqual(numbers["metricPending"], "7")
         self.assertEqual(numbers["metricProcessing"], "2")
         self.assertEqual(numbers["metricResolved"], "0")
@@ -223,11 +224,20 @@ process.stdout.write(JSON.stringify(values));
         self.assertEqual(numbers["metricPending"], "7", "明确标识的当前处置仍可查看")
         self.assertIn("当前快照", numbers["workSummary"])
 
+    def test_the_big_number_leaves_out_handled_posts(self):
+        """评论区里还看得到负面、但已经点了已处理的帖子不算进大数字，放到下面那行小字。"""
+        numbers = self.render(self.report(
+            negative_posts=10, post_states={"pending": 0, "processing": 3, "resolved": 7}))
+        self.assertEqual(numbers["metricNegative"], "3")
+        self.assertEqual(numbers["metricNegativeTotal"], "评论区仍有负面共 10 篇，其中已处理 7 篇")
+        self.assertEqual(numbers["metricResolved"], "7")
+
     def test_unavailable_current_table_keeps_counts_unknown(self):
         numbers = self.render(self.report(available=False))
         for name in ("metricChecked", "metricNegative", "metricPending",
                      "metricProcessing", "metricResolved"):
             self.assertEqual(numbers[name], "—")
+        self.assertEqual(numbers["metricNegativeTotal"], "")
 
 
 if __name__ == "__main__":
