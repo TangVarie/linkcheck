@@ -1606,12 +1606,21 @@ _SCRIPT = r"""
         (r.operations_unit || "行") + "；退回待处理 " + (r.operations.pending || 0) + " " + (r.operations_unit || "行"));
       (r.limitations || []).forEach(function(s){ limitations.push(r.label + "：" + s); });
     });
-    var ids = {checked:"metricChecked", negative:"metricNegative", pending:"metricPending",
+    var ids = {checked:"metricChecked", pending:"metricPending",
       processing:"metricProcessing", resolved:"metricResolved"};
-    Object.keys(ids).forEach(function(k){
-      setText(ids[k], !reportLoaded || !known[k] ? "—" :
-        (known[k] < currentReports.length ? "≥ " : "") + totals[k]);
-    });
+    function shown(k){
+      return !reportLoaded || !known[k] ? "—" : (known[k] < currentReports.length ? "≥ " : "") + totals[k];
+    }
+    Object.keys(ids).forEach(function(k){ setText(ids[k], shown(k)); });
+    // 大数字是「还没处理完的」（待处理 + 正在处理），和下面要人管的列表对得上。
+    // 评论区里仍看得到负面的总数含已处理的（点了已处理、负面评论还在评论区），
+    // 放到下面那行小字——日报正文「仍看到负面评论的帖子共 X 篇：已处理…」说的是它。
+    var openKnown = Math.min(known.pending, known.processing);
+    setText("metricNegative", !reportLoaded || !openKnown ? "—" :
+      (openKnown < currentReports.length ? "≥ " : "") + (totals.pending + totals.processing));
+    setText("metricNegativeTotal", !reportLoaded || !known.negative ? "" :
+      "评论区仍有负面共 " + shown("negative") + " 篇" +
+      (known.resolved ? "，其中已处理 " + shown("resolved") + " 篇" : ""));
     setText("metricCheckedLabel", checkedFromJournal ? "时段内已扫描" : "时段内已检查");
     var range = currentReports.length ? currentReports[0].window : null;
     var snapshotEnd = currentReports.length && currentReports[0].current_snapshot &&
@@ -1619,7 +1628,7 @@ _SCRIPT = r"""
     setText("metricCheckedPeriod", range && range.start_ms != null && range.end_ms != null ?
       chinaTime(range.start_ms, true) + "—" + chinaTime(Math.min(range.end_ms,
         currentWindow ? (snapshotEnd || Date.now()) : (range.as_of_ms || Date.now())), true) : "北京时间");
-    setText("metricNegativeLabel", "仍有负面的帖子");
+    setText("metricNegativeLabel", "还没处理完的负面帖子");
     setText("metricComments", commentKnown ? (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
       (commentsEstimated ? "约 " : "")) + comments + " 条负面评论 · 按最近一次检查" : "评论条数待核实");
     var source = !reportLoaded ? "正在读取" : (snapshotCount ? "现有表快照" : "当前表暂不可用");
@@ -2868,8 +2877,9 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
       <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
         <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
         <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
-      <div class=work-metric><span class=metric-label id=metricNegativeLabel>仍有负面的帖子</span>
+      <div class=work-metric><span class=metric-label id=metricNegativeLabel>还没处理完的负面帖子</span>
         <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
+        <span class=metric-note id=metricNegativeTotal></span>
         <span class=metric-note id=metricComments>评论条数待核实</span></div>
       <div class=work-metric><span class=metric-label>待处理</span>
         <span class=metric-value><span id=metricPending>—</span><small class=metric-unit>篇</small></span></div>
