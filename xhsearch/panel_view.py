@@ -1613,13 +1613,14 @@ _SCRIPT = r"""
     }
     Object.keys(ids).forEach(function(k){ setText(ids[k], shown(k)); });
     // 大数字是「还没处理完的」（待处理 + 正在处理），和下面要人管的列表对得上。
-    // 评论区里仍看得到负面的总数含已处理的（点了已处理、负面评论还在评论区），
+    // 最近一次检查有负面的总数含已处理的（点了已处理、负面评论还在评论区），
     // 放到下面那行小字——日报正文「仍看到负面评论的帖子共 X 篇：已处理…」说的是它。
+    // 不写「仍有」：每篇按各自最近一次检查算，说不了「现在」。
     var openKnown = Math.min(known.pending, known.processing);
     setText("metricNegative", !reportLoaded || !openKnown ? "—" :
       (openKnown < currentReports.length ? "≥ " : "") + (totals.pending + totals.processing));
     setText("metricNegativeTotal", !reportLoaded || !known.negative ? "" :
-      "评论区仍有负面共 " + shown("negative") + " 篇" +
+      "最近一次检查有负面的共 " + shown("negative") + " 篇" +
       (known.resolved ? "，其中已处理 " + shown("resolved") + " 篇" : ""));
     setText("metricCheckedLabel", checkedFromJournal ? "时段内已扫描" : "时段内已检查");
     var range = currentReports.length ? currentReports[0].window : null;
@@ -1630,7 +1631,7 @@ _SCRIPT = r"""
         currentWindow ? (snapshotEnd || Date.now()) : (range.as_of_ms || Date.now())), true) : "北京时间");
     setText("metricNegativeLabel", "还没处理完的负面帖子");
     setText("metricComments", commentKnown ? (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
-      (commentsEstimated ? "约 " : "")) + comments + " 条负面评论 · 按最近一次检查" : "评论条数待核实");
+      (commentsEstimated ? "约 " : "")) + comments + " 条负面评论" : "评论条数待核实");
     var source = !reportLoaded ? "正在读取" : (snapshotCount ? "现有表快照" : "当前表暂不可用");
     setText("workSource", source);
     setText("workSummary", !reportLoaded ? "正在读取现有数据…" : (snapshotCount ?
