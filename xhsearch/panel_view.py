@@ -1630,7 +1630,9 @@ _SCRIPT = r"""
       chinaTime(range.start_ms, true) + "—" + chinaTime(Math.min(range.end_ms,
         currentWindow ? (snapshotEnd || Date.now()) : (range.as_of_ms || Date.now())), true) : "北京时间");
     setText("metricNegativeLabel", "还没处理完的负面帖子");
-    setText("metricComments", commentKnown ? (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
+    // 条数是上面那「共 X 篇」全部加起来的（含已处理的），写明是这几篇，免得被读成只算已处理的。
+    setText("metricComments", commentKnown ? (known.negative ? "这 " + shown("negative") + " 篇共" : "共") +
+      (commentsLowerBound || commentKnown < currentReports.length ? "至少 " :
       (commentsEstimated ? "约 " : "")) + comments + " 条负面评论" : "评论条数待核实");
     var source = !reportLoaded ? "正在读取" : (snapshotCount ? "现有表快照" : "当前表暂不可用");
     setText("workSource", source);

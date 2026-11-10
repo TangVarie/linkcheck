@@ -231,6 +231,11 @@ process.stdout.write(JSON.stringify(values));
             negative_posts=10, post_states={"pending": 0, "processing": 3, "resolved": 7}))
         self.assertEqual(numbers["metricNegative"], "3")
         self.assertEqual(numbers["metricNegativeTotal"], "最近一次检查有负面的共 10 篇，其中已处理 7 篇")
+        numbers = self.render(self.report(
+            negative_posts=10, negative_comments=10, negative_comments_estimated=True,
+            post_states={"pending": 0, "processing": 3, "resolved": 7}))
+        self.assertEqual(numbers["metricComments"], "这 10 篇共约 10 条负面评论",
+                         "条数是这 10 篇加起来的，不是只算已处理的 7 篇")
         self.assertEqual(numbers["metricResolved"], "7")
 
     def test_unavailable_current_table_keeps_counts_unknown(self):
