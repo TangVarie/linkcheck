@@ -1641,24 +1641,28 @@ _SCRIPT = r"""
       "最近一次检查有负面的共 " + shown("negative") + " 篇" +
       (known.resolved ? "，其中已处理 " + shown("resolved") + " 篇" : ""));
     // —— 比上一期：现在的数 − 这一期开始那一刻（= 上一期结算时）面板记下的数（closes.start）。
-    // 每个项目都有基准、而且看的是当前这一期才显示：缺一个项目的基准，合计的差就是错的；
-    // 历史时段的处置数是此刻的快照，和当时的基准比没有意义。「已检查」是一期之内的量，
-    // 这一期没结算完就不比——拿半期的数和上一整期比，永远是「少」。
+    // 每个项目都有基准才显示：缺一个项目的基准，合计的差就是错的。
+    // 处置数（没处理完 / 待处理 / 正在处理 / 已处理）是此刻的快照，只在看的是最近这一期
+    // （closes.latest：还在进行，或刚结算完不到一天）时才比；更早的期和当时的基准比没有意义。
+    // 「已检查」是一期之内的量，这一期没结算完就不比——拿半期的数和上一整期比永远是「少」；
+    // 结算了就拿两次结算记下的数相比，哪一期都可以。这两种分开判，互不挡路。
     var stockKeys = ["pending", "processing", "resolved"];
     var base = {pending:0, processing:0, resolved:0}, live = 0, baseKnown = 0;
     var flowNow = 0, flowBefore = 0, flowKnown = 0;
     currentReports.forEach(function(r){
       var s = r.current_snapshot, c = r.closes || {}, before = c.start, after = c.end;
-      if (!s || !s.available || s.window_is_current === false) return;
-      live++;
-      if (before && stockKeys.every(function(k){ return typeof before[k] === "number"; })) {
-        baseKnown++; stockKeys.forEach(function(k){ base[k] += before[k]; }); }
+      if (s && s.available && c.latest) {
+        live++;
+        if (before && stockKeys.every(function(k){ return typeof before[k] === "number"; })) {
+          baseKnown++; stockKeys.forEach(function(k){ base[k] += before[k]; }); }
+      }
       if (r.window && r.window.complete && before && after &&
           typeof before.checked === "number" && typeof after.checked === "number") {
         flowKnown++; flowNow += after.checked; flowBefore += before.checked; }
     });
-    var everyone = reportLoaded && live > 0 && live === currentReports.length;
-    var stockOk = everyone && baseKnown === live && stockKeys.every(function(k){ return known[k] === live; });
+    var loaded = reportLoaded && currentReports.length > 0;
+    var stockOk = loaded && live === currentReports.length && baseKnown === live &&
+      stockKeys.every(function(k){ return known[k] === live; });
     function delta(id, value, tone, lead){
       var text = "", cls = "metric-delta";
       if (value !== null) {
@@ -1676,7 +1680,8 @@ _SCRIPT = r"""
     delta("metricPendingDelta", stockOk ? totals.pending - base.pending : null, "less", "");
     delta("metricProcessingDelta", stockOk ? totals.processing - base.processing : null, "", "");
     delta("metricResolvedDelta", stockOk ? totals.resolved - base.resolved : null, "more", "");
-    delta("metricCheckedDelta", everyone && flowKnown === live ? flowNow - flowBefore : null, "", "比上一期");
+    delta("metricCheckedDelta", loaded && flowKnown === currentReports.length ? flowNow - flowBefore : null,
+      "", "比上一期");
     setText("metricCheckedLabel", checkedFromJournal ? "时段内已扫描" : "时段内已检查");
     var range = currentReports.length ? currentReports[0].window : null;
     var snapshotEnd = currentReports.length && currentReports[0].current_snapshot &&

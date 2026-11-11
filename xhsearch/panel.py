@@ -1271,6 +1271,9 @@ class PeriodCloses:
     GRACE_SECONDS = 3600
     KEEP_DAYS = 35
     DAY_MS = 86_400_000
+    # 整份存在「面板设置」的一格里，飞书一格最多 10 万字（panel_settings.CELL_MAX_CHARS），
+    # 超了整笔写不进去。留余量；超了从最早的一期丢起（见 tick）。
+    MAX_CHARS = 90_000
 
     def __init__(self, projects: Projects, resolutions: Optional["Resolutions"] = None, *,
                  wall: Callable[[], float] = time.time,
@@ -1343,6 +1346,16 @@ class PeriodCloses:
                     merged[table_id] = kept
             for table_id, record in records.items():
                 merged.setdefault(table_id, {})[str(close_ms)] = record
+            # 项目多了（二十几个 × 35 天）一格装不下。超了就从最早的一期丢起，刚记的
+            # 这一期不丢：宁可历史短一点，不能让每天这一笔都写不进去、基准从此断掉。
+            while len(json.dumps(merged, ensure_ascii=False)) > self.MAX_CHARS:
+                oldest = min(int(k) for per in merged.values() for k in per)
+                if oldest >= close_ms:
+                    break
+                for table_id in list(merged):
+                    merged[table_id].pop(str(oldest), None)
+                    if not merged[table_id]:
+                        del merged[table_id]
             return merged
 
         value = self.projects._store().update_json(panel_settings.KEY_CLOSES, change, {})
@@ -1452,9 +1465,14 @@ class DailyReports:
         if self.closes is not None:
             # 「比上一期」的基准：这一期开始那一刻（= 上一期结算时）记下的数；这一期自己
             # 结算时的数也带上（已结算的期拿两期的「已检查」相比）。没记过就是 None。
+            # latest = 看的是最近这一期：还在进行，或者刚结算完不到一天（16 点到零点之间
+            # 默认打开的就是刚结算的那一期，运营正是这会儿来看）。页面上的处置数是此刻的
+            # 快照，只有最近这一期才拿它和开始那一刻比；更早的期比了没有意义。
+            latest = int(now * 1000) < end_ms + PeriodCloses.DAY_MS
             for shown in reports:
                 shown["closes"] = {"start": self.closes.get(shown["table_id"], start_ms),
-                                   "end": self.closes.get(shown["table_id"], end_ms)}
+                                   "end": self.closes.get(shown["table_id"], end_ms),
+                                   "latest": latest}
         if self.warning:
             # 加在 present_report **之后**：它会整段重写 text，加在前面就只剩页面上的
             # 限制说明里有，运营复制出去的那段汇报里看不到「可能不完整」。

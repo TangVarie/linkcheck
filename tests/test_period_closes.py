@@ -126,6 +126,21 @@ class TestPeriodCloses(unittest.TestCase):
         self.assertEqual(sorted(saved), ["tblA"])
         self.assertEqual(sorted(saved["tblA"]), [str(CLOSE_MS - DAY_MS), str(CLOSE_MS)])
 
+    def test_a_full_cell_drops_the_oldest_closes_not_the_new_one(self):
+        """二十几个项目 × 35 天会超过飞书一格 10 万字：超了整笔写不进去，基准从此断掉。"""
+        stored = {f"tbl{i}": {str(CLOSE_MS - d * DAY_MS): {"negative": d, "pending": 0,
+                                                           "processing": 0, "resolved": d}
+                              for d in range(1, 6)} for i in range(4)}
+        closes, cache = self.make(1, stored), FakeCache()
+        with mock.patch.object(panel.PeriodCloses, "MAX_CHARS", 900):
+            self.assertTrue(self.tick(closes, cache, [item(f"tbl{i}") for i in range(4)])[0])
+        saved = self.store.data[panel_settings.KEY_CLOSES]
+        self.assertLessEqual(len(json.dumps(saved, ensure_ascii=False)), 900)
+        for per in saved.values():
+            self.assertIn(str(CLOSE_MS), per, "刚记的这一期不丢")
+            self.assertNotIn(str(CLOSE_MS - 5 * DAY_MS), per, "从最早的一期丢起")
+        self.assertIsNotNone(closes.get("tbl0", CLOSE_MS))
+
     def test_get_never_reads_feishu(self):
         closes = self.make(1)
         self.assertIsNone(closes.get("tblA", CLOSE_MS))
@@ -154,6 +169,25 @@ class TestReportCarriesTheCloses(unittest.TestCase):
         window = shown["window"]
         self.assertEqual(shown["closes"]["start"]["at"], window["start_ms"])
         self.assertEqual(shown["closes"]["end"]["at"], window["end_ms"])
+        self.assertTrue(shown["closes"]["latest"])
+
+    def test_the_just_settled_period_still_counts_as_the_latest(self):
+        """16 点到零点之间默认打开的是刚结算的那一期（运营正是这会儿来看）：present_report
+        已经把它标成「不是当前窗口」了，处置数的变化却还得显示。再早一期就不比了。"""
+        from tests.test_panel_workflow import overview, todo
+        projects = mock.Mock()
+        projects.settings = Settings()
+        clock = [datetime(2026, 11, 10, 16, 58, tzinfo=TZ).timestamp()]
+        reports = panel.DailyReports(projects, journal=mock.Mock(read_window=lambda *a: []),
+                                     wall=lambda: clock[0])
+        reports.closes = mock.Mock()
+        reports.closes.get.return_value = None
+        settled = reports.get(overview(todo()), date="2026-11-10")["reports"][0]
+        self.assertTrue(settled["window"]["complete"])
+        self.assertFalse(settled["current_snapshot"]["window_is_current"])
+        self.assertTrue(settled["closes"]["latest"])
+        older = reports.get(overview(todo()), date="2026-11-09")["reports"][0]
+        self.assertFalse(older["closes"]["latest"])
 
 
 @unittest.skipUnless(shutil.which("node"), "浏览器脚本行为检查需要 Node")
@@ -185,8 +219,9 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
         return json.loads(result.stdout)
 
     def report(self, *, states, before=None, after=None, complete=False, current=True,
-               checked=62):
-        closes = {"start": before, "end": after}
+               latest=True, checked=62):
+        # 后端给的形状：结算了的期 complete=True 而 window_is_current=False，两个不会同时为真。
+        closes = {"start": before, "end": after, "latest": latest}
         return {"label": "途鸽", "display_mode": "snapshot", "scanned_posts": 0,
                 "closes": closes,
                 "window": {"start_ms": 1, "end_ms": 2, "complete": complete,
@@ -223,10 +258,17 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
 
     def test_checked_is_compared_only_between_two_settled_periods(self):
         after = dict(self.BEFORE, checked=62)
-        out = self.render([self.report(states={"pending": 0, "processing": 3, "resolved": 7},
-                                       before=self.BEFORE, after=after, complete=True)])
+        states = {"pending": 0, "processing": 3, "resolved": 7}
+        out = self.render([self.report(states=states, before=self.BEFORE, after=after,
+                                       complete=True, current=False)])
         self.assertEqual(out["values"]["metricCheckedDelta"], "↑ 比上一期多 8")
         self.assertEqual(out["classes"]["metricCheckedDelta"], "metric-delta")
+        self.assertEqual(out["values"]["metricNegativeDelta"], "↓ 比上一期少 2",
+                         "刚结算的这一期（16 点后来看）处置数照样和上一期比")
+        older = self.render([self.report(states=states, before=self.BEFORE, after=after,
+                                         complete=True, current=False, latest=False)])["values"]
+        self.assertEqual(older["metricCheckedDelta"], "↑ 比上一期多 8", "两次结算的数相比，哪一期都行")
+        self.assertEqual(older["metricNegativeDelta"], "", "更早的期：此刻的处置数不和当时比")
 
     def test_no_baseline_means_no_chip(self):
         states = {"pending": 0, "processing": 3, "resolved": 7}
@@ -234,7 +276,8 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
                 [self.report(states=states)],                                  # 没记过
                 [self.report(states=states, before=self.BEFORE),               # 两个项目缺一个
                  self.report(states=states)],
-                [self.report(states=states, before=self.BEFORE, current=False)]):  # 历史时段
+                [self.report(states=states, before=self.BEFORE, current=False,     # 历史时段
+                             latest=False)]):
             values = self.render(reports)["values"]
             for name in ("metricNegativeDelta", "metricPendingDelta", "metricProcessingDelta",
                          "metricResolvedDelta", "metricCheckedDelta"):
