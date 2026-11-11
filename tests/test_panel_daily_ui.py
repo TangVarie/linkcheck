@@ -185,6 +185,10 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertIn('var tr = inDrawer ? drawerRow : b.closest("tr");', script,
                       "抽屉里的切换条改的是抽屉开着的那一行")
         self.assertIn('ev.key === "Escape"', script)
+        upsert = script[script.index("  function upsertTodo(t, archived){"):
+                        script.index("  function upsertResolved(t){")]
+        self.assertTrue(upsert.rstrip().endswith("if (tr === drawerRow) fillDrawer(tr);\n  }"),
+                        "后台同步把这一行各格都写完之后再重画抽屉，不然抽屉里的诊断慢一拍")
         row = panel_view._todo_row(self.todo(), 8, False, main=True, resolvable=True)
         self.assertNotIn("<details", row, "行里不再有要点开的小三角")
 

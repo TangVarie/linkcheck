@@ -1327,6 +1327,12 @@ _SCRIPT = r"""
   // ---- 行详情抽屉：点「详情」或点这一行，在右侧看完整信息；Esc 或「关闭」收起。 ----
   var drawer = document.getElementById("rowDrawer"), drawerRow = null;
   function cellText(tr, selector){ var el = tr.querySelector(selector); return el ? el.textContent.trim() : ""; }
+  // 内容没变就不重写：后台同步每次都会重画抽屉，重写会把焦点和选中的文字弄丢。
+  var drawerHtml = {};
+  function setHtml(id, html){
+    var el = document.getElementById(id);
+    if (el && drawerHtml[id] !== html) { el.innerHTML = html; drawerHtml[id] = html; }
+  }
   function fillDrawer(tr){
     if (!drawer) return;
     var which = tr.querySelector("td.which"), persona = cellText(tr, ".persona");
@@ -1334,16 +1340,14 @@ _SCRIPT = r"""
     setText("drawerMeta", [tr.dataset.project || "", persona === "—" ? "" : persona]
       .filter(function(x){ return x; }).join(" · "));
     var reasons = tr.querySelector("td.reasons"), body = tr.querySelector(".diagnostic-body");
-    document.getElementById("drawerReasons").innerHTML = reasons ? reasons.innerHTML : "";
+    setHtml("drawerReasons", reasons ? reasons.innerHTML : "");
     setText("drawerComments", cellText(tr, "td.comments") || "—");
     setText("drawerWhen", cellText(tr, "td.when") || "—");
-    var out = document.getElementById("drawerBody");
-    if (body && body.textContent.trim()) out.innerHTML = body.innerHTML;
-    else out.textContent = "这一行没有诊断信息。";
+    setHtml("drawerBody", body && body.textContent.trim() ? body.innerHTML : "这一行没有诊断信息。");
     var seg = tr.querySelector(".seg"), row = tr.querySelector("a.act"), post = tr.querySelector(".post a");
-    document.getElementById("drawerActs").innerHTML = (seg ? seg.outerHTML : "") +
+    setHtml("drawerActs", (seg ? seg.outerHTML : "") +
       (row ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(row.getAttribute("href")) + '">去飞书这一行</a>' : "") +
-      (post ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(post.getAttribute("href")) + '">查看帖子</a>' : "");
+      (post ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(post.getAttribute("href")) + '">查看帖子</a>' : ""));
   }
   function openDrawer(tr){
     if (!drawer) return;
@@ -1505,6 +1509,9 @@ _SCRIPT = r"""
     var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
     if (d) { var nextDetail = detail + (digest ? "\n" + digest : ""); if (d.textContent !== nextDetail) d.textContent = nextDetail;
       tr.querySelector(".diagnostic-summary").textContent = detail.slice(0, 48) || "诊断与评论摘要"; }
+    // 抽屉正开着这一行：上面 updateRowState 重画时各格还是旧的，等全部写完再照新内容画一遍，
+    // 不然抽屉里的诊断比行上慢一拍，运营会照着旧诊断去点「已处理」。
+    if (tr === drawerRow) fillDrawer(tr);
   }
   function upsertResolved(t){
     var list = document.getElementById("resolvedList"); if (!list) return;
@@ -1737,25 +1744,28 @@ _SCRIPT = r"""
       setText("trendNote", j && j.error ? "趋势图暂时画不出来：" + j.error : "这几期还没有留痕记录，暂时画不出来。");
       return;
     }
-    var top = 1, partial = false;
-    known.forEach(function(p){ top = Math.max(top, p.found, p.handled); partial = partial || !!p.partial; });
+    var top = 1, partial = false, gaps = false;
+    known.forEach(function(p){ top = Math.max(top, p.found, p.handled); partial = partial || !!p.partial; gaps = gaps || !!p.gaps; });
     function bar(cls, value){
       return '<span class="t-bar"><b>' + value + '</b><i class="' + cls + '" style="height:' +
         (value / top * 76).toFixed(1) + '%"></i></span>';
     }
     chart.innerHTML = periods.map(function(p){
       var date = chinaTime(p.end_ms, true).slice(0, 5), has = typeof p.found === "number";
-      return '<div class="t-col' + (p.complete ? '' : ' live') + '" title="' + attr(date + (p.complete ? " 这一期" : " 这一期（进行中）") +
-        (has ? "：新出现负面 " + p.found + " 篇，标为已处理 " + p.handled + " 篇" : "：没有留痕记录")) + '">' +
+      var gappy = has && p.gaps;
+      return '<div class="t-col' + (p.complete ? '' : ' live') + (gappy ? ' gappy' : '') + '" title="' + attr(date + (p.complete ? " 这一期" : " 这一期（进行中）") +
+        (has ? "：新出现负面 " + p.found + " 篇，标为已处理 " + p.handled + " 篇" : "：没有留痕记录") +
+        (gappy ? "（留痕有缺口，数可能不准）" : "")) + '">' +
         '<div class="t-bars">' + (has ? bar("t-found", p.found) + bar("t-handled", p.handled) : '') + '</div>' +
-        '<span class="t-date">' + esc(p.complete ? date : "进行中") + '</span></div>';
+        '<span class="t-date">' + esc(p.complete ? date : "进行中") + (gappy ? "*" : "") + '</span></div>';
     }).join("");
     chart.setAttribute("aria-label", "近 " + periods.length + " 期，新出现负面 / 标为已处理的帖子数：" +
       periods.map(function(p){ return chinaTime(p.end_ms, true).slice(0, 5) + " " +
-        (typeof p.found === "number" ? p.found + " / " + p.handled : "无记录"); }).join("；"));
+        (typeof p.found === "number" ? p.found + " / " + p.handled + (p.gaps ? "（留痕有缺口）" : "") : "无记录"); }).join("；"));
     setText("trendNote", "每根柱是一期（前一天 16:00 到当天 16:00，日期是结束那天）。" +
       "新出现负面 = 这一期看到负面评论、此前 7 天没看到过的帖子；标为已处理 = 这一期在面板上点了「已处理」的帖子。" +
-      (partial ? "有的项目当时还没开始留痕，那几期没把它算进去。" : ""));
+      (partial ? "有的项目当时还没开始留痕，那几期没把它算进去。" : "") +
+      (gaps ? "日期带 * 的那几期留痕有缺口（记录没读全或没写进去），数可能不准。" : ""));
   }
   function loadTrend(force, poll){
     var details = document.getElementById("workDetails");

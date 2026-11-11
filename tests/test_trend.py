@@ -90,6 +90,38 @@ class TestTrend(unittest.TestCase):
         self.assertTrue(both[-6]["partial"], "只有一个项目有留痕：算它的，并标出来")
         self.assertFalse(both[-1]["partial"])
 
+    def test_a_scan_batch_that_could_not_be_read_marks_its_period_and_the_week_after(self):
+        """读不全的扫描分片 Journal 报成 gap 不抛错。以前趋势图不看它：那一期画成 0，
+        之后几期少了它做对照、老负面被当成新出现，图上却没有任何提示（2026-11-11）。"""
+        gap = {"type": "gap", "at": at(9), "end": at(9) + 1000, "table_id": "tblA",
+               "chunk": "abc", "reason": "留痕分片缺失或内容损坏"}
+        periods = self.run_trend([coverage(at(30)), gap, scan("p1", at(4))])
+        flagged = [i for i, p in enumerate(periods) if p["gaps"]]
+        self.assertEqual(flagged, list(range(4, 12)), "坏的那一期 + 之后往前看得到它的 7 期")
+        self.assertEqual(periods[9]["found"], 1, "数照样给，只是标出来可能不准")
+
+    def test_lost_status_records_mark_only_the_periods_they_cover(self):
+        dropped = {"type": "gap", "at": at(3), "end": at(2), "table_id": "tblA",
+                   "reason": "丢了待补写的处理状态记录"}
+        corrupt = {"type": "gap", "at": at(8), "end": at(8), "table_id": "tblA",
+                   "chunk": "def", "history": True, "reason": "留痕分片缺失或内容损坏"}
+        periods = self.run_trend([coverage(at(30)), dropped, corrupt])
+        self.assertEqual([i for i, p in enumerate(periods) if p["gaps"]], [5, 10, 11],
+                         "状态记录不参与「此前 7 天」的对照，不往后牵连")
+        open_ended = dict(corrupt)
+        del open_ended["end"]
+        periods = self.run_trend([coverage(at(30)), open_ended])
+        self.assertEqual([i for i, p in enumerate(periods) if p["gaps"]], list(range(5, 14)),
+                         "没记到哪为止的状态缺口：从那一期到现在都标")
+
+    def test_gaps_of_tables_not_drawn_or_not_yet_journaling_do_not_mark_the_chart(self):
+        gap = {"type": "gap", "at": at(5), "end": at(5), "table_id": "tblB", "chunk": "abc"}
+        events = [coverage(at(30)), coverage(at(2), "tblB"), gap]
+        self.assertFalse(any(p["gaps"] for p in self.run_trend(events)), "别的项目的缺口")
+        both = self.run_trend(events, ("tblA", "tblB"))
+        self.assertEqual([i for i, p in enumerate(both) if p["gaps"]], [12, 13],
+                         "那张表开始留痕之后的各期才把它的缺口算进来（往前看的 7 天里有缺口）")
+
     def test_other_tables_and_future_events_are_ignored(self):
         events = [coverage(at(30)), scan("p1", at(1), table="tblZ"), scan("p2", NOW_MS + 1000)]
         self.assertEqual([p["found"] for p in self.run_trend(events)[-2:]], [0, 0])
@@ -173,6 +205,19 @@ process.stdout.write(JSON.stringify({note: values.trendNote, html: nodes.trendCh
         self.assertIn("11/09 4 / 2；11/10 无记录；11/11 1 / 0", out["label"])
         self.assertIn("此前 7 天没看到过", out["note"])
         self.assertIn("有的项目当时还没开始留痕", out["note"])
+
+    def test_periods_with_journal_gaps_are_marked_and_explained(self):
+        periods = [{"end_ms": 9, "complete": True, "found": 0, "handled": 1, "gaps": True},
+                   {"end_ms": 10, "complete": True, "found": 2, "handled": 0, "gaps": False}]
+        out = self.render({"periods": periods, "error": ""})
+        self.assertIn('class="t-col gappy"', out["html"])
+        self.assertEqual(out["html"].count("gappy"), 1)
+        self.assertIn("留痕有缺口，数可能不准", out["html"])
+        self.assertIn(">11/09*<", out["html"])
+        self.assertIn("11/09 0 / 1（留痕有缺口）；11/10 2 / 0", out["label"])
+        self.assertIn("日期带 * 的那几期留痕有缺口", out["note"])
+        clean = self.render({"periods": periods[1:], "error": ""})
+        self.assertNotIn("缺口", clean["note"] + clean["html"])
 
     def test_nothing_to_draw_says_why(self):
         out = self.render({"periods": [], "error": "读取留痕失败：boom"})

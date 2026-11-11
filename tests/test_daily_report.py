@@ -372,6 +372,23 @@ class TestJournal(unittest.TestCase):
         self.assertIn("统计可能不全", report(events)["text"] if "统计可能不全" in report(events)["text"]
                       else "".join(report(events)["limitations"]))
 
+    def test_trend_read_carries_the_gap_of_a_scan_batch_that_could_not_be_read(self):
+        """趋势图读扫描留痕时，读不全的那批不能悄悄当成「没扫到」：带着缺口回来，
+        并记到这一批的最后一条为止（2026-11-11）。"""
+        first = scan(hits=[{"content": "超长" * 20_000}])
+        self.journal.append([first, dict(first, at=first["at"] + 5000, record_id="rec2")])
+        self.table.rows.pop()
+        events = self.journal.read_scans(START, END)
+        self.assertEqual([e["type"] for e in events], ["gap"])
+        self.assertEqual(events[0]["table_id"], "tbl1")
+        self.assertEqual((events[0]["at"], events[0]["end"]), (first["at"], first["at"] + 5000))
+
+    def test_trend_read_includes_gaps_the_panel_wrote(self):
+        gap = {"type": "gap", "at": START + 1000, "end": START + 2000, "table_id": "tbl1",
+               "reason": "丢了待补写的处理状态记录"}
+        self.journal.append([gap])
+        self.assertEqual(self.journal.read_scans(START, END), [gap])
+
     def test_flying_numeric_columns_accept_integral_float(self):
         self.journal.append([scan()])
         for row in self.table.rows:

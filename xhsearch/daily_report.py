@@ -115,7 +115,10 @@ def trend(events: list[dict], table_ids: list[str], now_ms: int, *,
 
     某个项目在那一期开始时还没启用留痕，它那一期的数是未知，不当成 0：这种项目不计入，
     `partial` 标出来；一个有留痕的项目都没有时两个数都是 None。
-    `events` 要含这段时间（连同往前 `lookback_days` 天）的扫描和全部状态、留痕起点事件。
+    留痕有缺口（分片缺失/损坏，或面板补写的「丢了处理状态记录」）的那几期照样给数，但标
+    `gaps`——数可能不准，不能当成完整的。扫描分片坏了连它之后 `lookback_days` 天的各期
+    一起标：那几期判「此前没看到过」要用到它，少了它老负面会被当成新出现。
+    `events` 要含这段时间（连同往前 `lookback_days` 天）的扫描、缺口和全部状态、留痕起点事件。
     """
     end = last_close_ms(now_ms) + DAY_MS
     windows = [(end - (i + 1) * DAY_MS, end - i * DAY_MS) for i in range(periods - 1, -1, -1)]
@@ -125,7 +128,7 @@ def trend(events: list[dict], table_ids: list[str], now_ms: int, *,
               and e.get("table_id") in wanted and _ms(e.get("at")) is not None
               and e["at"] < now_ms}
     per_table: dict[str, dict] = {t: {"started": None, "negative": defaultdict(list),
-                                      "handled": []} for t in wanted}
+                                      "handled": [], "gaps": []} for t in wanted}
     aliases: dict[tuple[str, str], str] = {}
     for event in unique.values():
         if event.get("type") == "scan" and event.get("post_alias") and event.get("post_key"):
@@ -144,14 +147,24 @@ def trend(events: list[dict], table_ids: list[str], now_ms: int, *,
         elif kind == "status" and event.get("state") == "resolved" and not event.get("auto"):
             post = str(event.get("post_key") or f"row:{event.get('record_id', '')}")
             table["handled"].append((event["at"], aliases.get((event["table_id"], post), post)))
+        elif kind == "gap":
+            last = _ms(event.get("end"))
+            if last is None:
+                # 没记到哪为止：状态分片坏了按「到现在」算（宁可多标），其余按那一刻。
+                last = now_ms if event.get("history") else event["at"]
+            # 坏的是扫描分片（有分片键、不是状态历史）才牵连之后往前看的那几天。
+            reach = lookback if event.get("chunk") and not event.get("history") else 0
+            table["gaps"].append((event["at"], max(last, event["at"]) + reach))
     out = []
     for start, stop in windows:
         found = handled = 0
         covered = 0
+        gaps = False
         for table in per_table.values():
             if table["started"] is None or table["started"] > start:
                 continue
             covered += 1
+            gaps = gaps or any(first < stop and last >= start for first, last in table["gaps"])
             for times in table["negative"].values():
                 if (any(start <= t < stop for t in times)
                         and not any(start - lookback <= t < start for t in times)):
@@ -160,7 +173,7 @@ def trend(events: list[dict], table_ids: list[str], now_ms: int, *,
         out.append({"start_ms": start, "end_ms": stop, "complete": now_ms >= stop,
                     "found": found if covered else None,
                     "handled": handled if covered else None,
-                    "partial": 0 < covered < len(per_table)})
+                    "partial": 0 < covered < len(per_table), "gaps": gaps})
     return out
 
 
@@ -466,8 +479,10 @@ class Journal:
                     or first is None or last is None or first >= end_ms
                     or (start_ms is not None and last < start_ms)):
                 continue
-            group = chunks.setdefault(key, {"project": project, "at": first, "parts": {},
-                                            "count": cells.get(COL_PARTS), "bad": False})
+            group = chunks.setdefault(key, {"project": project, "at": first, "last": last,
+                                            "parts": {}, "count": cells.get(COL_PARTS),
+                                            "bad": False})
+            group["last"] = max(group["last"], last)
             index = _ms(cells.get(COL_PART))
             text = feishu.read_text(cells.get(COL_DATA))
             if (not key or index is None or group["count"] != cells.get(COL_PARTS)
@@ -496,6 +511,7 @@ class Journal:
                     whole[key] = parsed
             except (ValueError, TypeError):
                 gap = {"type": "gap", "at": max(start_ms or 0, group["at"]),
+                       "end": max(start_ms or 0, group["at"], group["last"]),
                        "table_id": group["project"], "chunk": key,
                        "reason": "留痕分片缺失或内容损坏，统计可能不全"}
                 if kind in HISTORY_KINDS:
@@ -529,10 +545,13 @@ class Journal:
         return events
 
     def read_scans(self, start_ms: int, end_ms: int) -> list[dict]:
-        """一段时间里的扫描事件（所有项目）。趋势图一次读三周，读回来由调用方缓存。"""
+        """一段时间里的扫描事件（所有项目），连同这段时间的留痕缺口：读不全的扫描分片
+        （_read_kind 报成 gap）和面板补写的缺口记录。趋势图一次读三周，由调用方缓存。"""
         if end_ms <= start_ms:
             raise ValueError("结束时间必须晚于开始时间")
-        return self._read_kind("scan", start_ms, end_ms, "")
+        events = self._read_kind("scan", start_ms, end_ms, "")
+        events.extend(self._read_kind("gap", start_ms - 86_400_000, end_ms + 86_400_000, ""))
+        return events
 
     def read_history(self, end_ms: int) -> list[dict]:
         """到 end_ms 为止的全部处理状态和留痕起点（内存里攒着，只补读最近一段）。"""
