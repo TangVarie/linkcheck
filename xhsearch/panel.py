@@ -1250,6 +1250,119 @@ class Projects:
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+class PeriodCloses:
+    """每一期日报结算那一刻（北京时间 16:00）各项目的负面处置数，给工作台指标卡的
+    「比上一期」用（2026-11-11）。
+
+    以前没有任何地方存「上一期结算时是几篇」：表里的状态每次检查都被覆盖，「已处理」
+    记录也只有现在的样子。所以面板在每期结算后自己记一笔。**不靠有人开着面板**：
+    没人看的时候后台不读表（见 Cache），所以另有一个线程每分钟看一眼钟（run），
+    过了结算时刻而这一期还没记，就取一趟数、记下来——一天多读一趟表。
+
+    只在结算后 GRACE_SECONDS 内记：面板那会儿停着（部署、宕机）的话，过了这段时间
+    再记的就不是「结算时」的数了，这一期宁可没有——页面上没有基准就不显示变化，
+    不拿一个晚了几小时的数冒充。
+
+    存在注册表 base「面板设置」的 metrics.closes：`{table_id: {结算时刻毫秒: {at,
+    checked, negative, pending, processing, resolved}}}`，留 KEEP_DAYS 天。只有这个
+    线程写它；get() 只看内存，出页面的请求从不为它等飞书。
+    """
+
+    GRACE_SECONDS = 3600
+    KEEP_DAYS = 35
+    DAY_MS = 86_400_000
+
+    def __init__(self, projects: Projects, resolutions: Optional["Resolutions"] = None, *,
+                 wall: Callable[[], float] = time.time,
+                 log: Callable[[str], None] = print):
+        self.projects = projects
+        self.resolutions = resolutions
+        self._wall = wall
+        self.log = log
+        self._lock = threading.Lock()
+        self._data: Optional[dict] = None
+        self._recorded: Optional[int] = None
+
+    def load(self) -> dict:
+        """把存着的读进内存（只读成一次；读失败照抛，run 记一句、下一分钟再试）。"""
+        with self._lock:
+            if self._data is not None:
+                return self._data
+        raw = self.projects._store().get_json(panel_settings.KEY_CLOSES, {})
+        with self._lock:
+            if self._data is None:
+                self._data = raw if isinstance(raw, dict) else {}
+            return self._data
+
+    def get(self, table_id: str, close_ms: int) -> Optional[dict]:
+        """这张表在那一次结算时记下的数；没记过 → None。只看内存。"""
+        with self._lock:
+            per_table = (self._data or {}).get(table_id)
+        record = per_table.get(str(close_ms)) if isinstance(per_table, dict) else None
+        return dict(record) if isinstance(record, dict) else None
+
+    def tick(self, cache: "Cache") -> bool:
+        """到点了就记一笔。返回这一次有没有记。"""
+        now_ms = int(self._wall() * 1000)
+        from . import daily_report
+        close_ms = daily_report.last_close_ms(now_ms)
+        data = self.load()
+        if self._recorded == close_ms:
+            return False
+        if now_ms - close_ms > self.GRACE_SECONDS * 1000:
+            return False
+        if any(isinstance(per, dict) and str(close_ms) in per for per in data.values()):
+            self._recorded = close_ms           # 重启之前已经记过这一期
+            return False
+        cache.refresh()
+        overview, error, _ = cache.snapshot()
+        if overview is None or error:
+            return False                        # 这一趟没读成，下一分钟再试（还在宽限内的话）
+        resolved = self.resolutions.snapshot() if self.resolutions is not None else {}
+        records = {}
+        for item in summary.snapshot_report(overview, resolved, self.projects.settings,
+                                            close_ms - self.DAY_MS, close_ms, now_ms):
+            states = item.get("post_states") or {}
+            record = {"at": now_ms, "checked": item.get("window_checked_posts"),
+                      "negative": item.get("negative_posts"),
+                      **{k: states.get(k) for k in ("pending", "processing", "resolved")}}
+            if item.get("available") and all(
+                    isinstance(record[k], int) and not isinstance(record[k], bool)
+                    for k in ("negative", "pending", "processing", "resolved")):
+                records[item["table_id"]] = record
+        if not records:
+            return False
+        floor = close_ms - self.KEEP_DAYS * self.DAY_MS
+
+        def change(current):
+            merged = {}
+            for table_id, per in (current if isinstance(current, dict) else {}).items():
+                kept = {k: v for k, v in (per if isinstance(per, dict) else {}).items()
+                        if k.isdigit() and int(k) >= floor}
+                if kept:
+                    merged[table_id] = kept
+            for table_id, record in records.items():
+                merged.setdefault(table_id, {})[str(close_ms)] = record
+            return merged
+
+        value = self.projects._store().update_json(panel_settings.KEY_CLOSES, change, {})
+        with self._lock:
+            self._data = value
+        self._recorded = close_ms
+        self.log(f"📌 记下这一期结算时的负面处置数（{len(records)} 个项目），工作台「比上一期」用")
+        return True
+
+    def run(self, cache: "Cache", stop: Optional[threading.Event] = None) -> None:
+        """后台线程：每分钟看一眼。任何失败只记一句日志，不能把线程带走。"""
+        stop = stop or threading.Event()
+        while not stop.is_set():
+            try:
+                self.tick(cache)
+            except Exception as exc:                            # noqa: BLE001
+                self.log(f"⚠ 记这一期结算数失败（不影响面板，下一分钟再试）：{exc}")
+            stop.wait(60)
+
+
 class DailyReports:
     """日报免费读取与短缓存；与主页面读表解耦，不在请求中触发巡检。"""
 
@@ -1264,6 +1377,8 @@ class DailyReports:
         self._version = 0
         self.warning = ""
         self.resolutions = None
+        # 每期结算时记下的数（PeriodCloses）。没接 = 页面上不显示「比上一期」。
+        self.closes: Optional[PeriodCloses] = None
 
     def _journal(self):
         if self._journal_value is None:
@@ -1334,6 +1449,12 @@ class DailyReports:
         reports = [daily_report.present_report(report, snapshots.get(report["table_id"]),
                                                int(now * 1000), journal_error=journal_error)
                    for report in reports]
+        if self.closes is not None:
+            # 「比上一期」的基准：这一期开始那一刻（= 上一期结算时）记下的数；这一期自己
+            # 结算时的数也带上（已结算的期拿两期的「已检查」相比）。没记过就是 None。
+            for shown in reports:
+                shown["closes"] = {"start": self.closes.get(shown["table_id"], start_ms),
+                                   "end": self.closes.get(shown["table_id"], end_ms)}
         if self.warning:
             # 加在 present_report **之后**：它会整段重写 text，加在前面就只剩页面上的
             # 限制说明里有，运营复制出去的那段汇报里看不到「可能不完整」。
@@ -2748,8 +2869,10 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     projects = Projects(config, resolved)
     resolutions = Resolutions(projects)
     reports = DailyReports(projects) if projects.enabled else None
+    closes = PeriodCloses(projects, resolutions) if reports is not None else None
     if reports is not None:
         reports.resolutions = resolutions
+        reports.closes = closes
         resolutions.journaling = True
     report_drafts = (report_ai_mod.ReportDrafts(
         config.deepseek_api_key, reports, timeout=config.deepseek_timeout)
@@ -2772,6 +2895,10 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     if resolutions.enabled:
         # 先把「已解决」读进来，第一个打开面板的人就不用等这一趟飞书。
         threading.Thread(target=resolutions.snapshot, daemon=True).start()
+    if closes is not None:
+        # 每期结算（北京时间 16:00）后记一笔各项目的数，给「比上一期」用。
+        threading.Thread(target=closes.run, args=(cache,), name="panel-closes",
+                         daemon=True).start()
     print(f"面板已启动：0.0.0.0:{config.port}"
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"
           + (f"{config.idle_minutes:g} 分钟没人看就停，有人来先取一趟新的，"

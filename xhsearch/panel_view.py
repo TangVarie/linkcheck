@@ -526,6 +526,13 @@ textarea{width:100%;resize:vertical;min-height:72px}
   color:var(--text-dark);margin-top:4px}
 .work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:4px}
 .work-metric .metric-note{display:block;font-size:12px;color:var(--text-light);margin-top:2px}
+/* 「比上一期」：数字后面的小标签。往好的方向变是绿的，往坏的方向变是红的，其余灰的；
+ * 方向同时写在字里（少 / 多、箭头），不只靠颜色。没有基准时整个不显示。 */
+.metric-delta{display:inline-block;height:20px;padding:0 8px;margin-left:8px;
+  font:500 12px/20px var(--font-sans);vertical-align:middle;white-space:nowrap;
+  background:var(--fill);color:var(--text)}
+.metric-delta.good{background:var(--tint-success);color:var(--success-deep)}
+.metric-delta.bad{background:var(--tint-danger);color:var(--danger-deep)}
 .work-source{font-size:12px;color:var(--primary);background:var(--tint-primary);padding:2px 8px}
 .work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 16px}
 .work-states .caption{font-size:12px;color:var(--text-light);margin-right:4px}
@@ -1633,6 +1640,43 @@ _SCRIPT = r"""
     setText("metricNegativeTotal", !reportLoaded || !known.negative ? "" :
       "最近一次检查有负面的共 " + shown("negative") + " 篇" +
       (known.resolved ? "，其中已处理 " + shown("resolved") + " 篇" : ""));
+    // —— 比上一期：现在的数 − 这一期开始那一刻（= 上一期结算时）面板记下的数（closes.start）。
+    // 每个项目都有基准、而且看的是当前这一期才显示：缺一个项目的基准，合计的差就是错的；
+    // 历史时段的处置数是此刻的快照，和当时的基准比没有意义。「已检查」是一期之内的量，
+    // 这一期没结算完就不比——拿半期的数和上一整期比，永远是「少」。
+    var stockKeys = ["pending", "processing", "resolved"];
+    var base = {pending:0, processing:0, resolved:0}, live = 0, baseKnown = 0;
+    var flowNow = 0, flowBefore = 0, flowKnown = 0;
+    currentReports.forEach(function(r){
+      var s = r.current_snapshot, c = r.closes || {}, before = c.start, after = c.end;
+      if (!s || !s.available || s.window_is_current === false) return;
+      live++;
+      if (before && stockKeys.every(function(k){ return typeof before[k] === "number"; })) {
+        baseKnown++; stockKeys.forEach(function(k){ base[k] += before[k]; }); }
+      if (r.window && r.window.complete && before && after &&
+          typeof before.checked === "number" && typeof after.checked === "number") {
+        flowKnown++; flowNow += after.checked; flowBefore += before.checked; }
+    });
+    var everyone = reportLoaded && live > 0 && live === currentReports.length;
+    var stockOk = everyone && baseKnown === live && stockKeys.every(function(k){ return known[k] === live; });
+    function delta(id, value, tone, lead){
+      var text = "", cls = "metric-delta";
+      if (value !== null) {
+        if (!value) text = lead ? "和上一期持平" : "持平";
+        else { text = (value < 0 ? "↓ " : "↑ ") + lead + (value < 0 ? "少 " : "多 ") + Math.abs(value);
+          if (tone === "less") cls += value < 0 ? " good" : " bad";
+          else if (tone === "more" && value > 0) cls += " good"; }
+      }
+      setText(id, text);
+      var el = document.getElementById(id);
+      if (el) { el.className = cls; el.hidden = !text; }
+    }
+    delta("metricNegativeDelta", stockOk ? totals.pending + totals.processing - base.pending - base.processing : null,
+      "less", "比上一期");
+    delta("metricPendingDelta", stockOk ? totals.pending - base.pending : null, "less", "");
+    delta("metricProcessingDelta", stockOk ? totals.processing - base.processing : null, "", "");
+    delta("metricResolvedDelta", stockOk ? totals.resolved - base.resolved : null, "more", "");
+    delta("metricCheckedDelta", everyone && flowKnown === live ? flowNow - flowBefore : null, "", "比上一期");
     setText("metricCheckedLabel", checkedFromJournal ? "时段内已扫描" : "时段内已检查");
     var range = currentReports.length ? currentReports[0].window : null;
     var snapshotEnd = currentReports.length && currentReports[0].current_snapshot &&
@@ -1651,6 +1695,8 @@ _SCRIPT = r"""
       (monitoringKnown === currentReports.length ? "已纳入监测 " + monitoring + " 篇帖子。" : "") +
       "按发布时间分批巡检：新帖高频检查，历史帖分批复查。" +
       (!currentWindow && !checkedFromJournal ? "所选历史时段的检查数暂无记录；负面处置为当前快照。" : "") +
+      (stockOk && range && range.start_ms != null ?
+        "数字后面的变化是和上一期结算时（" + chinaTime(range.start_ms, true) + "）比。" : "") +
       (missing ? "部分项目暂未取得数据。" : "") :
       "当前业务表暂不可用，未知项不能按 0 计算。"));
     var w = currentReports.length ? currentReports[0].window : null;
@@ -2893,18 +2939,18 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
     <div class=work-context>当前负面处理概览按帖子去重；上方全部异常按表行计数，两者不是同一口径。</div>
     <div class=work-metrics aria-label='负面帖子处理概览' aria-live=polite>
       <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
-        <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
+        <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricCheckedDelta hidden></span></span>
         <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
       <div class=work-metric><span class=metric-label id=metricNegativeLabel>还没处理完的负面帖子</span>
-        <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small></span>
+        <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricNegativeDelta hidden></span></span>
         <span class=metric-note id=metricNegativeTotal></span>
         <span class=metric-note id=metricComments>评论条数待核实</span></div>
       <div class=work-metric><span class=metric-label>待处理</span>
-        <span class=metric-value><span id=metricPending>—</span><small class=metric-unit>篇</small></span></div>
+        <span class=metric-value><span id=metricPending>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricPendingDelta hidden></span></span></div>
       <div class=work-metric><span class=metric-label>正在处理</span>
-        <span class=metric-value><span id=metricProcessing>—</span><small class=metric-unit>篇</small></span></div>
+        <span class=metric-value><span id=metricProcessing>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricProcessingDelta hidden></span></span></div>
       <div class=work-metric><span class=metric-label>已处理</span>
-        <span class=metric-value><span id=metricResolved>—</span><small class=metric-unit>篇</small></span></div>
+        <span class=metric-value><span id=metricResolved>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricResolvedDelta hidden></span></span></div>
     </div>
     <div class=work-summary id=workSummary aria-live=polite>正在读取现有数据…</div>
     <details class=daily id=dailyPanel>
