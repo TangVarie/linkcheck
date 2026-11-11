@@ -886,6 +886,7 @@ _SCRIPT = r"""
       }
       p.hidden = !on;
     });
+    closeDrawerIfRowGone();
     var t = activeTab();
     if (t && t.parentNode) {
       var strip = t.parentNode, left = t.offsetLeft, right = left + t.offsetWidth;
@@ -1289,8 +1290,7 @@ _SCRIPT = r"""
       tr.style.display = hit && severityHit && (workFilter === "all" || state === workFilter) ? "" : "none";
       tr.hidden = state === "resolved" || tr.dataset.obsolete === "true";
     });
-    // 抽屉开着的那一行被重画换掉了（后台同步）、或者被收起来了：抽屉跟着关。
-    if (drawerRow && (!document.contains(drawerRow) || drawerRow.hidden)) closeDrawer();
+    closeDrawerIfRowGone();
     var wanted = workProject ? projectLabel() : "", matched = false;
     if (wanted) {
       panels.forEach(function(p){ if (panelHasTable(p, workProject.value)) matched = true; });
@@ -1364,6 +1364,12 @@ _SCRIPT = r"""
     drawer.hidden = true;
     if (drawerRow) drawerRow.classList.remove("in-drawer");
     drawerRow = null;
+  }
+  // 抽屉开着的那一行不在眼前了：被重画换掉（后台同步）、收进已处理、被筛选或搜索滤掉、
+  // 或者切到了别的项目。抽屉跟着关，不然里面的切换条还能改一行看不见的帖子。
+  // 看的是「实际有没有画出来」，自己或哪一层上级被藏起来都算。
+  function closeDrawerIfRowGone(){
+    if (drawerRow && (!document.contains(drawerRow) || !drawerRow.getClientRects().length)) closeDrawer();
   }
   document.addEventListener("click", function(ev){
     var t = ev.target;

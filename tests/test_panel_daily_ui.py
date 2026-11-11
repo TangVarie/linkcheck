@@ -189,6 +189,14 @@ class TestPanelDailyUI(unittest.TestCase):
                         script.index("  function upsertResolved(t){")]
         self.assertTrue(upsert.rstrip().endswith("if (tr === drawerRow) fillDrawer(tr);\n  }"),
                         "后台同步把这一行各格都写完之后再重画抽屉，不然抽屉里的诊断慢一拍")
+        self.assertIn("!drawerRow.getClientRects().length", script,
+                      "这一行被筛选滤掉、或所在项目被切走，都算不在眼前")
+        show_tab = script[script.index("  function showTab(id, remember){"):
+                          script.index("  var box = document.getElementById(\"filter\");")]
+        self.assertIn("closeDrawerIfRowGone();", show_tab, "切项目时抽屉跟着关")
+        filtering = script[script.index("  function applyWorkFilter(){"):
+                           script.index("  function updateRowState(tr, state){")]
+        self.assertIn("closeDrawerIfRowGone();", filtering, "筛选/搜索把这一行滤掉时抽屉跟着关")
         cleanup = script[script.index('      tr.querySelectorAll("button").forEach(function(x){ x.disabled = false; });'):]
         self.assertLess(cleanup.index("drawerHtml.drawerActs = null;"),
                         cleanup.index('updateRowState(tr, tr.dataset.workState || "pending");'),
