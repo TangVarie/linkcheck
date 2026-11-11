@@ -42,6 +42,8 @@ FIELDS = [{"field_name": COL_KEY, "type": 1}, {"field_name": COL_VALUE, "type": 
 
 KEY_EDITOR_CHATS = "share.editor_chats"
 KEY_RESOLVED = "todo.resolved"
+# 每期日报结算时各项目的负面处置数（panel.PeriodCloses 写，工作台「比上一期」读）。
+KEY_CLOSES = "metrics.closes"
 # 飞书多维表格一个文本单元格最多 100,000 字（帮助中心「多维表格常见上限」）。
 # 超了飞书直接拒写；在本地先拦下，报一句看得懂的话。
 CELL_MAX_CHARS = 100_000

@@ -865,7 +865,7 @@ class TestRendering(unittest.TestCase):
                                link_cell="", reasons=["有负面"])
         page = self._page(self._snap(todos=[todo]))
         self.assertIn("record=rec1", page)
-        self.assertIn("去这一行", page)
+        self.assertIn("去飞书这一行", page)
 
     def test_generic_domain_warning_shown_when_unset(self):
         page = self._page(self._snap())
@@ -3053,10 +3053,10 @@ class TestAdhocAndArchivedSections(unittest.TestCase):
         self.assertNotIn("<b><b>x</b></b>", block)
 
     def test_resolve_buttons_only_when_there_is_somewhere_to_store_them(self):
-        self.assertNotIn("class='link resolve'", self._page(self._two_projects()))
+        self.assertNotIn("class='resolve'", self._page(self._two_projects()))
         page = self._page(self._two_projects(), resolvable=True)
         tugo = self._panel(page, "途鸽")
-        self.assertEqual(tugo.count("class='link resolve'"), 3, "主列表和折叠区都有")
+        self.assertEqual(tugo.count("class='resolve'"), 3, "主列表和折叠区都有")
         self.assertIn("data-reasons='[&quot;有负面&quot;]'", tugo)
         self.assertIn(f"data-checked='{int(NOW.timestamp() * 1000)}'", tugo)
 
@@ -3590,7 +3590,7 @@ class TestResolveRoute(unittest.TestCase):
         auth = self._auth()
         status, page = self._req("/", headers={"Cookie": auth["Cookie"]})
         self.assertIn("那条笔记", page)
-        self.assertIn("class='link resolve'", page)
+        self.assertIn("class='resolve'", page)
         status, _ = self._resolve({"table_id": "tblA", "record_id": "rec1",
                                    "reasons": ["有负面"], "checked_at_ms": self.TS}, auth)
         self.assertEqual(status, 200)
@@ -3653,4 +3653,4 @@ class TestResolveWithoutRegistry(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("FEISHU_REGISTRY", out)
         _, page = TestResolveRoute._req(holder, "/", headers={"Cookie": auth["Cookie"]})
-        self.assertNotIn("class='link resolve'", page)
+        self.assertNotIn("class='resolve'", page)

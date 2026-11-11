@@ -91,6 +91,13 @@ def window_for_date(day: date | str) -> tuple[int, int]:
     return int((end - timedelta(days=1)).timestamp() * 1000), int(end.timestamp() * 1000)
 
 
+def last_close_ms(now_ms: int) -> int:
+    """此刻之前最近的一次日报结算时刻（北京时间 16:00，含正好等于的那一刻），毫秒。"""
+    moment = datetime.fromtimestamp(now_ms / 1000, SHANGHAI)
+    _, end = window_for_date(moment.date() - timedelta(days=int(moment.hour < 16)))
+    return end
+
+
 def gap_events(table_id: str, first_ms: int, last_ms: int, reason: str) -> list[dict]:
     """一段留痕缺口按日报窗口切开写：每一期只往前后各多读一天的 gap，
     跨了好几天的缺口只写一条，中间那几期就读不到它。"""

@@ -75,12 +75,32 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertEqual(json.loads(attrs["data-reasons"]), ["有负面"])
         self.assertEqual(int(attrs["data-checked"]), row.checked_at_ms)
         self.assertEqual(dom.buttons("processing")[0]["aria-pressed"], "true")
+        self.assertEqual(dom.buttons("pending")[0]["aria-pressed"], "false")
         self.assertEqual(len(dom.buttons("resolve")), 1)
         self.assertIn("正在处理", markup)
 
     def test_pending_state_does_not_render_as_processing(self):
         markup = panel_view._todo_row(self.todo(), 8, False, main=True, resolvable=True)
         self.assertEqual(Elements(markup).buttons("processing")[0]["aria-pressed"], "false")
+        self.assertEqual(Elements(markup).buttons("pending")[0]["aria-pressed"], "true")
+
+    def test_the_state_is_one_three_way_switch_not_a_badge_plus_buttons(self):
+        """以前一行里是「正在处理」徽标 + 「正在处理」「已处理」两个文字按钮：同一行两个
+        「正在处理」，一个是状态、一个是按钮（2026-11-11 运营看混）。现在一个三段切换，
+        每个状态只出现一次，当前那一段亮着；点亮着的那一段不发请求。"""
+        markup = panel_view._todo_row(self.todo("processing"), 8, False, main=True, resolvable=True)
+        self.assertEqual(markup.count("正在处理"), 2, "按钮文字一次 + 它的 title 一次，没有第二个徽标")
+        self.assertNotIn("work-state'", markup)
+        labels = [a["class"] for tag, a in Elements(markup).tags if tag == "button"]
+        self.assertEqual(labels, ["pending", "processing", "resolve"])
+        pressed = [a["class"] for tag, a in Elements(markup).tags
+                   if tag == "button" and a.get("aria-pressed") == "true"]
+        self.assertEqual(pressed, ["processing"])
+        script = panel_view._SCRIPT
+        self.assertIn('if (b.getAttribute("aria-pressed") === "true") return;', script)
+        self.assertIn('".seg button.pending, .seg button.processing, .seg button.resolve, button.unresolve"',
+                      script)
+        self.assertIn("去飞书这一行", markup)
 
     def test_unavailable_storage_has_no_write_controls(self):
         dom = Elements(panel_view._todo_row(self.todo(), 8, False, main=True, resolvable=False))
