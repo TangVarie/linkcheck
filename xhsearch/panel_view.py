@@ -563,13 +563,16 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .draft-bar button{flex:none}
 .diagnostic>summary{font-size:13px;color:var(--text);max-width:26em}
 .diagnostic .diagnostic-body{margin-top:8px;font-size:13px;white-space:pre-wrap;max-width:40em}
-/* 「处理」一格排成一行：去这一行 · 状态 · 正在处理 · 已处理。
- * 以前状态徽标独占一行、按钮再起一行，每条待办被撑到三行高。 */
-.work-state{display:inline-block;min-width:44px;text-align:center;
-  padding:0 6px;line-height:20px;font-size:12px;color:var(--text-light);
-  background:var(--fill);margin-left:12px}
-.work-state.processing{color:var(--primary);font-weight:600;background:var(--tint-primary)}
-button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-decoration:underline}
+/* 「处理」一格：三段切换「待处理 | 正在处理 | 已处理」，当前状态那一段高亮；下面一行
+ * 「去飞书这一行」。以前是一个状态徽标 + 「正在处理」「已处理」两个文字按钮——同一行
+ * 两个「正在处理」，一个是状态一个是按钮，运营分不清（2026-11-11）。 */
+.seg{display:inline-flex;gap:2px;padding:2px;background:var(--fill);vertical-align:middle}
+.seg button{height:28px;padding:0 10px;font-size:13px;font-weight:500;background:none;
+  color:var(--text);border:1px solid transparent}
+.seg button:hover:not(:disabled):not([aria-pressed=true]){background:var(--bg-secondary)}
+.seg button[aria-pressed=true]{background:var(--surface);color:var(--primary);font-weight:600;
+  border-color:var(--border-strong);cursor:default}
+.todos td.acts .seg+.act{display:block;margin-top:6px}
 .work-error{display:block;font-size:12px;color:var(--danger-deep);max-width:22em;white-space:normal}
 .monitor-help{margin:8px 0 16px;font-size:13px;color:var(--text-light)}
 .monitor-help p{margin:8px 0}
@@ -633,7 +636,8 @@ button.processing[aria-pressed=true]{color:var(--primary);font-weight:600;text-d
   .todos tbody td.acts{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;
     border-top:1px solid var(--border);margin-top:8px;padding-top:12px;white-space:normal}
   .todos tbody td.comments{text-align:left}
-  .todos tbody td.acts .work-state{flex-basis:auto;margin-left:0}
+  .todos tbody td.acts .seg+.act{display:inline;margin-top:0}
+  .todos tbody td.acts .seg button{height:32px}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
   .todos .diagnostic>summary,.todos .diagnostic .diagnostic-body{max-width:none}
   .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
@@ -1027,20 +1031,23 @@ _SCRIPT = r"""
         return j; }); });
   }
   document.addEventListener("click", function(ev){
-    var b = ev.target.closest ? ev.target.closest("button.resolve, button.processing, button.unresolve") : null;
+    var b = ev.target.closest ? ev.target.closest(
+      ".seg button.pending, .seg button.processing, .seg button.resolve, button.unresolve") : null;
     if (!b) return;
     var tr = b.closest("tr");
     if (!tr) return;
     if (tr.dataset.busy) return;
+    // 三段切换：点哪一段就是哪个状态；点已经亮着的那一段什么都不做。
+    if (b.getAttribute("aria-pressed") === "true") return;
     var next = b.classList.contains("resolve") ? "resolved" :
-      (b.classList.contains("unresolve") || tr.dataset.workState === "processing" ? "pending" : "processing");
+      (b.classList.contains("processing") ? "processing" : "pending");
     var original = b.textContent;
     tr.dataset.busy = "true";
     tr.querySelectorAll("button").forEach(function(x){ x.disabled = true; });
     b.textContent = "保存中…";
     var errorBox = tr.querySelector(".work-error");
     if (!errorBox) { errorBox = document.createElement("span"); errorBox.className = "work-error";
-      errorBox.setAttribute("role", "status"); b.parentNode.appendChild(errorBox); }
+      errorBox.setAttribute("role", "status"); (b.closest("td") || b.parentNode).appendChild(errorBox); }
     errorBox.textContent = "";
     overviewEpoch++; reportEpoch++;
     resolveCall(tr, next).then(function(j){
@@ -1193,12 +1200,10 @@ _SCRIPT = r"""
   function updateRowState(tr, state){
     tr.dataset.workState = state;
     if (state === "resolved") { var pk = tr.querySelector(".todoPick"); if (pk) pk.checked = false; }
-    var badge = tr.querySelector(".work-state");
-    if (badge) { badge.textContent = state === "processing" ? "正在处理" : (state === "resolved" ? "已处理" : "待处理");
-      badge.className = "work-state" + (state === "processing" ? " processing" : ""); }
-    var b = tr.querySelector("button.processing");
-    if (b) { b.setAttribute("aria-pressed", state === "processing" ? "true" : "false");
-      b.title = state === "processing" ? "再次点击退回待处理" : "标记这篇帖子正在处理"; }
+    var on = state === "resolved" ? "resolve" : (state === "processing" ? "processing" : "pending");
+    tr.querySelectorAll(".seg button").forEach(function(b){
+      b.setAttribute("aria-pressed", b.classList.contains(on) ? "true" : "false");
+    });
   }
   function findTodo(table, rec, resolved){
     var found = null;
@@ -1211,9 +1216,15 @@ _SCRIPT = r"""
     var pick = main ? '<td class="nowrap"><input type="checkbox" aria-label="选择 ' + attr(t.label || t.record_id) +
       ' 排队刷新" class="todoPick' + (t.archived || t.adhoc ? ' solo' : '') + '"></td>' : '';
     var diagnostic = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
+    var on = state === "processing" ? "processing" : "pending";
+    function segment(cls, label, title){
+      return '<button type="button" class="' + cls + '" aria-pressed="' + (cls === on ? "true" : "false") +
+        '" title="' + title + '">' + label + '</button>';
+    }
     var controls = workbench && workbench.dataset.resolvable === "true" ?
-      '<span class="work-state"></span><button type="button" class="link processing">正在处理</button>' +
-      '<button type="button" class="link resolve">已处理</button>' : '';
+      '<span class="seg" role="group" aria-label="处理状态">' + segment("pending", "待处理", "退回待处理") +
+      segment("processing", "正在处理", "标记这篇帖子正在处理") +
+      segment("resolve", "已处理", "标记这篇帖子的问题已处理") + '</span>' : '';
     return '<tr data-rec="' + attr(t.record_id) + '" data-app="' + attr(t.app_token) +
       '" data-tbl="' + attr(t.table_id) + '" data-project="' + attr(t.project) +
       '" data-key="' + attr(t.key) + '" data-work-state="' + attr(state) +
@@ -1230,7 +1241,7 @@ _SCRIPT = r"""
       '</summary><div class="diagnostic-body">' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></details></td>' +
       '<td class="nowrap right comments num">' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
       chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '') + '</td>' +
-      '<td class="nowrap acts">' + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去这一行</a>' : '') + controls + '</td></tr>';
+      '<td class="nowrap acts">' + controls + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去飞书这一行</a>' : '') + '</td></tr>';
   }
   function ensurePanel(t, archived){
     var p = null;
@@ -1335,7 +1346,7 @@ _SCRIPT = r"""
     tr.innerHTML = '<td class="nowrap">' + esc(t.project) + '</td><td class="which">' + esc(t.label || t.record_id) +
       '</td><td>' + esc((t.reasons || []).join('、')) + '</td><td class="nowrap">' +
       chinaTime(t.resolved_at_ms, true) + '</td><td class="nowrap acts">' +
-      (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去这一行</a> ' : '') +
+      (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去飞书这一行</a> ' : '') +
       '<button type="button" class="link unresolve">撤销</button></td>';
     var main = findTodo(t.table_id, t.record_id, false); if (main && !main.dataset.busy) updateRowState(main, "resolved");
   }
@@ -2344,12 +2355,16 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
     checked = "" if todo.checked_at_ms is None else str(todo.checked_at_ms)
     state = getattr(todo, "work_state", "pending")
     working = state == "processing"
-    resolve = (f"<span class='work-state{' processing' if working else ''}'>"
-               f"{'正在处理' if working else '待处理'}</span>"
-               f" <button type=button class='link processing' aria-pressed={'true' if working else 'false'} "
-               "title='标记这篇帖子正在处理；再次点击退回待处理'>正在处理</button>"
-               " <button type=button class='link resolve' title='标记这篇帖子的问题已处理'>已处理</button>"
-               if resolvable else "")
+    # 三段切换：当前状态那一段 aria-pressed=true（样式高亮）。主列表里只有待处理 /
+    # 正在处理两种行；点「已处理」的行收进下方「已处理记录」。
+    def segment(cls: str, label: str, on: bool, title: str) -> str:
+        return (f"<button type=button class='{cls}' aria-pressed={'true' if on else 'false'} "
+                f"title='{title}'>{label}</button>")
+    resolve = ("<span class=seg role=group aria-label='处理状态'>"
+               + segment("pending", "待处理", not working, "退回待处理")
+               + segment("processing", "正在处理", working, "标记这篇帖子正在处理")
+               + segment("resolve", "已处理", False, "标记这篇帖子的问题已处理")
+               + "</span>" if resolvable else "")
     diagnosis = ("<details class=diagnostic><summary>"
                  f"{_e(_clip(todo.diagnosis or '查看诊断与评论摘要', 48))}</summary>"
                  f"<div class=diagnostic-body>{_e(todo.diagnosis)}{extra}</div></details>"
@@ -2371,8 +2386,8 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         # 前端勾完之后也会就地补上同一个标记（见 _SCRIPT，按 td.when 找格子）。
         f"<td class='nowrap when'>{_e(_stamp(todo.checked_at_ms, offset_hours))}"
         f"{' <span class=chip>排队中</span>' if todo.queued else ''}</td>"
-        f"<td class='nowrap acts'><a href='{_e(todo.record_url)}' "
-        f"target=_blank rel='noopener noreferrer' class=act>去这一行</a>{resolve}</td>"
+        f"<td class='nowrap acts'>{resolve}<a href='{_e(todo.record_url)}' "
+        f"target=_blank rel='noopener noreferrer' class=act>去飞书这一行</a></td>"
         "</tr>")
 
 
@@ -2437,7 +2452,7 @@ def _resolved_list(rows, offset_hours: float) -> str:
         f"<td>{_chips(t.reasons, _REASON_CLASS)}</td>"
         f"<td class=nowrap>{_e(_stamp(t.resolved_at_ms, offset_hours))}</td>"
         f"<td class='nowrap acts'><a href='{_e(t.record_url)}' target=_blank "
-        "rel='noopener noreferrer' class=act>去这一行</a> "
+        "rel='noopener noreferrer' class=act>去飞书这一行</a> "
         "<button type=button class='link unresolve'>撤销</button></td></tr>"
         for t in rows)
     return (
@@ -3002,7 +3017,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     if config.feishu_base.rstrip("/") == "https://feishu.cn":
         domain_note = (f"<div class=note>{_icon('alert-triangle')}<span>"
                        "没设 <code>FEISHU_DOMAIN</code>，"
-                       "「去这一行」的链接用的是通用域名，不一定跳得准。"
+                       "「去飞书这一行」的链接用的是通用域名，不一定跳得准。"
                        "把你们租户的域名（形如 <code>https://xxx.feishu.cn</code>）"
                        "设进去就好了。</span></div>")
 
@@ -3084,7 +3099,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     <h2 id=s-todo>要人管的行 <span class=n>{len(todos)}{'+' if todos_hidden else ''}</span></h2>
     <details class=monitor-help><summary>查看与处理说明</summary><p>按项目分开看：每个项目一个标签，标签上的数字是这个项目要人管的行数
       （红 = 有风控 / 失效 / 刷新失败），每一页里按严重度排序；筛选时各标签上显示命中数。
-      点「去这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做{resolve_hint}。
+      点「去飞书这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做{resolve_hint}。
       已归档的老帖收在各自项目那一页的底下。{hidden_note}</p></details>
     {_todo_table(todos, offset_hours, config.show_digest,
                  project_order=[p.label for p in projects],
