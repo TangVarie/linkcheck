@@ -1514,9 +1514,11 @@ class DailyReports:
                 history = self._journal().read_history(now_ms)
         except Exception as exc:                                # noqa: BLE001
             return {"periods": [], "error": f"读取留痕失败：{exc}"}
+        # warning：点了「已处理」、状态存下了，但留痕没写进去（flush_journal 不抛错，只记在
+        # self.warning 里）。那几条还不在留痕里，「标为已处理」会少算——和日报一样说出来。
         return {"periods": daily_report.trend([*scans, *history],
                                               [p.table_id for p in projects], now_ms),
-                "error": "", "as_of": now}
+                "error": "", "warning": self.warning, "as_of": now}
 
     def record_status(self, table_id: str, record_id: str, state: str, *,
                       at_ms: Optional[int] = None) -> None:

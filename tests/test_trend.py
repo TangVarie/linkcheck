@@ -154,6 +154,22 @@ class TestTrendRequests(unittest.TestCase):
         self.reports.trend(self.overview)
         self.assertEqual(self.journal.read_scans.call_count, 2)
 
+    def test_status_writes_still_waiting_for_the_journal_are_said_out_loud(self):
+        """点了「已处理」、状态存下了，留痕却没写进去：flush_journal 不抛错，只留一句
+        warning。那几条不在留痕里，图上会少算，得说出来（2026-11-11）。"""
+        self.assertEqual(self.reports.trend(self.overview)["warning"], "")
+
+        def flush(reports):
+            reports.warning = "状态已保存，日报留痕待同步；系统会自动重试。"
+            return reports.warning
+
+        self.reports.resolutions = mock.Mock()
+        self.reports.resolutions.flush_journal.side_effect = flush
+        out = self.reports.trend(self.overview)
+        self.assertEqual(out["error"], "")
+        self.assertEqual(len(out["periods"]), 14)
+        self.assertIn("留痕待同步", out["warning"])
+
     def test_a_failed_read_comes_back_as_an_error_not_an_exception(self):
         self.journal.read_scans.side_effect = RuntimeError("飞书挂了")
         out = self.reports.trend(self.overview)
@@ -218,6 +234,12 @@ process.stdout.write(JSON.stringify({note: values.trendNote, html: nodes.trendCh
         self.assertIn("日期带 * 的那几期留痕有缺口", out["note"])
         clean = self.render({"periods": periods[1:], "error": ""})
         self.assertNotIn("缺口", clean["note"] + clean["html"])
+
+    def test_a_pending_journal_write_is_explained_under_the_chart(self):
+        periods = [{"end_ms": 9, "complete": True, "found": 0, "handled": 0}]
+        out = self.render({"periods": periods, "error": "", "warning": "留痕待同步；系统会自动重试。"})
+        self.assertIn("「标为已处理」可能少算：留痕待同步", out["note"])
+        self.assertNotIn("少算", self.render({"periods": periods, "error": "", "warning": ""})["note"])
 
     def test_nothing_to_draw_says_why(self):
         out = self.render({"periods": [], "error": "读取留痕失败：boom"})

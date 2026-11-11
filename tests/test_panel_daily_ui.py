@@ -189,6 +189,10 @@ class TestPanelDailyUI(unittest.TestCase):
                         script.index("  function upsertResolved(t){")]
         self.assertTrue(upsert.rstrip().endswith("if (tr === drawerRow) fillDrawer(tr);\n  }"),
                         "后台同步把这一行各格都写完之后再重画抽屉，不然抽屉里的诊断慢一拍")
+        cleanup = script[script.index('      tr.querySelectorAll("button").forEach(function(x){ x.disabled = false; });'):]
+        self.assertLess(cleanup.index("drawerHtml.drawerActs = null;"),
+                        cleanup.index('updateRowState(tr, tr.dataset.workState || "pending");'),
+                        "保存失败后抽屉里的切换条要重画，不然一直灰着没法再试")
         row = panel_view._todo_row(self.todo(), 8, False, main=True, resolvable=True)
         self.assertNotIn("<details", row, "行里不再有要点开的小三角")
 

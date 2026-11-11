@@ -1161,6 +1161,9 @@ _SCRIPT = r"""
       delete tr.dataset.busy;
       b.textContent = original;
       tr.querySelectorAll("button").forEach(function(x){ x.disabled = false; });
+      // 抽屉里的切换条在保存时被禁用了。没保存成功的话这一行的标记和保存前一样，
+      // setHtml 会当成「没变」跳过，按钮就一直灰着、没法再试：作废那份记录，强制重画。
+      drawerHtml.drawerActs = null;
       updateRowState(tr, tr.dataset.workState || "pending");
       if (tr.closest("#resolvedList") && tr.dataset.workState !== "resolved") tr.remove();
       applyWorkFilter();
@@ -1765,7 +1768,8 @@ _SCRIPT = r"""
     setText("trendNote", "每根柱是一期（前一天 16:00 到当天 16:00，日期是结束那天）。" +
       "新出现负面 = 这一期看到负面评论、此前 7 天没看到过的帖子；标为已处理 = 这一期在面板上点了「已处理」的帖子。" +
       (partial ? "有的项目当时还没开始留痕，那几期没把它算进去。" : "") +
-      (gaps ? "日期带 * 的那几期留痕有缺口（记录没读全或没写进去），数可能不准。" : ""));
+      (gaps ? "日期带 * 的那几期留痕有缺口（记录没读全或没写进去），数可能不准。" : "") +
+      (j.warning ? "有处理状态还没写进留痕，「标为已处理」可能少算：" + j.warning : ""));
   }
   function loadTrend(force, poll){
     var details = document.getElementById("workDetails");
