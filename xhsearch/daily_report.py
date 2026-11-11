@@ -98,6 +98,72 @@ def last_close_ms(now_ms: int) -> int:
     return end
 
 
+# 趋势图：画最近几期；判「新出现负面」时往前看几天。
+TREND_PERIODS = 14
+TREND_LOOKBACK_DAYS = 7
+DAY_MS = 86_400_000
+
+
+def trend(events: list[dict], table_ids: list[str], now_ms: int, *,
+          periods: int = TREND_PERIODS, lookback_days: int = TREND_LOOKBACK_DAYS) -> list[dict]:
+    """最近 `periods` 期（最后一期是进行中的这一期），每期两个数。**纯函数。**
+
+    * found   新出现负面的帖子：这一期有扫描看到负面评论，而此前 `lookback_days` 天里
+              没看到过（第一次看到也算）。同一篇负面一直挂着，只在冒出来的那一期算一次——
+              不然一篇老负面每查一次都算一遍，图上全是它。
+    * handled 标为已处理的帖子：这一期里运营在面板上点了「已处理」（面板自己补的不算）。
+
+    某个项目在那一期开始时还没启用留痕，它那一期的数是未知，不当成 0：这种项目不计入，
+    `partial` 标出来；一个有留痕的项目都没有时两个数都是 None。
+    `events` 要含这段时间（连同往前 `lookback_days` 天）的扫描和全部状态、留痕起点事件。
+    """
+    end = last_close_ms(now_ms) + DAY_MS
+    windows = [(end - (i + 1) * DAY_MS, end - i * DAY_MS) for i in range(periods - 1, -1, -1)]
+    lookback = lookback_days * DAY_MS
+    wanted = set(table_ids)
+    unique = {event_key(e): e for e in events if isinstance(e, dict)
+              and e.get("table_id") in wanted and _ms(e.get("at")) is not None
+              and e["at"] < now_ms}
+    per_table: dict[str, dict] = {t: {"started": None, "negative": defaultdict(list),
+                                      "handled": []} for t in wanted}
+    aliases: dict[tuple[str, str], str] = {}
+    for event in unique.values():
+        if event.get("type") == "scan" and event.get("post_alias") and event.get("post_key"):
+            aliases[(event["table_id"], str(event["post_alias"]))] = str(event["post_key"])
+    for event in unique.values():
+        table = per_table[event["table_id"]]
+        kind = event.get("type")
+        if kind == "coverage":
+            table["started"] = (event["at"] if table["started"] is None
+                                else min(table["started"], event["at"]))
+        elif kind == "scan":
+            if any(isinstance(hit, dict) for hit in event.get("hits") or []):
+                post = str(event.get("post_key") or f"row:{event.get('record_id', '')}")
+                post = aliases.get((event["table_id"], post), post)
+                table["negative"][post].append(event["at"])
+        elif kind == "status" and event.get("state") == "resolved" and not event.get("auto"):
+            post = str(event.get("post_key") or f"row:{event.get('record_id', '')}")
+            table["handled"].append((event["at"], aliases.get((event["table_id"], post), post)))
+    out = []
+    for start, stop in windows:
+        found = handled = 0
+        covered = 0
+        for table in per_table.values():
+            if table["started"] is None or table["started"] > start:
+                continue
+            covered += 1
+            for times in table["negative"].values():
+                if (any(start <= t < stop for t in times)
+                        and not any(start - lookback <= t < start for t in times)):
+                    found += 1
+            handled += len({post for at, post in table["handled"] if start <= at < stop})
+        out.append({"start_ms": start, "end_ms": stop, "complete": now_ms >= stop,
+                    "found": found if covered else None,
+                    "handled": handled if covered else None,
+                    "partial": 0 < covered < len(per_table)})
+    return out
+
+
 def gap_events(table_id: str, first_ms: int, last_ms: int, reason: str) -> list[dict]:
     """一段留痕缺口按日报窗口切开写：每一期只往前后各多读一天的 gap，
     跨了好几天的缺口只写一条，中间那几期就读不到它。"""
@@ -460,6 +526,19 @@ class Journal:
         for kind in ("run_start", "run_end", "gap"):
             events.extend(self._read_kind(kind, start_ms - 86_400_000,
                                           end_ms + 86_400_000, table_id))
+        return events
+
+    def read_scans(self, start_ms: int, end_ms: int) -> list[dict]:
+        """一段时间里的扫描事件（所有项目）。趋势图一次读三周，读回来由调用方缓存。"""
+        if end_ms <= start_ms:
+            raise ValueError("结束时间必须晚于开始时间")
+        return self._read_kind("scan", start_ms, end_ms, "")
+
+    def read_history(self, end_ms: int) -> list[dict]:
+        """到 end_ms 为止的全部处理状态和留痕起点（内存里攒着，只补读最近一段）。"""
+        events: list[dict] = []
+        for kind in HISTORY_KINDS:
+            events.extend(self._read_history(kind, end_ms, ""))
         return events
 
     def _read_history(self, kind: str, end_ms: int, table_id: str) -> list[dict]:

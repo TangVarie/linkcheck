@@ -2488,7 +2488,8 @@ class TestTodosAreSplitByProject(unittest.TestCase):
             r"<button type=button role=tab (?:id='tab-p\d+' )?class='tab( on)?' "
             r"aria-selected=(true|false) "
             r"data-tab='(p\d+)' data-project='([^']*)' aria-controls='todos-\3'>"
-            r"\4 <span class='(cnt[^']*)'>(\d+)</span></button>", page)
+            r"<span class=tab-name>\4</span><span class=tab-count>"
+            r"<span class='(cnt[^']*)'>(\d+)</span> 行要管</span>", page)
 
     def _panels(self, page):
         return re.findall(
@@ -3006,9 +3007,10 @@ class TestAdhocAndArchivedSections(unittest.TestCase):
 
     def test_a_project_with_only_old_problems_still_gets_a_tab(self):
         page = self._page(self._two_projects())
-        tab = re.search(r"data-project='西屋'[^>]*>西屋 <span class='cnt[^']*'>(\d+)</span>"
-                        r"<span class=more[^>]*>\+(\d+)</span>", page)
-        self.assertIsNotNone(tab, "只有老帖的项目也要有 tab，tab 上带 +N")
+        tab = re.search(r"data-project='西屋'[^>]*><span class=tab-name>西屋</span>"
+                        r"<span class=tab-count><span class='cnt[^']*'>(\d+)</span> 行要管"
+                        r"<span class=more[^>]*>另 (\d+) 行已归档</span>", page)
+        self.assertIsNotNone(tab, "只有老帖的项目也要有 tab，上面写着另有几行已归档")
         self.assertEqual(tab.groups(), ("0", "1"))
         self.assertIn("class=tab-empty", self._panel(page, "西屋"))
         self.assertNotIn("没有需要处理的行", page)
@@ -3032,7 +3034,7 @@ class TestAdhocAndArchivedSections(unittest.TestCase):
         self.assertEqual(rows, {"n": "todoPick", "old": "todoPick solo", "ad": "todoPick solo"})
         self.assertIn(">已归档</span>", main)
         self.assertIn(">未巡查</span>", main)
-        self.assertIn(">3</span></button>", page, "tab 上的数把它们算进去")
+        self.assertIn(">3</span> 行要管</span>", page, "tab 上的数把它们算进去")
 
     def test_select_all_skips_solo_rows_in_the_script(self):
         script = panel_view._SCRIPT
