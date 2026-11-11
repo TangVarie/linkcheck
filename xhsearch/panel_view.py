@@ -74,6 +74,8 @@ _STYLE = """
   --font-num:'DIN Alternate','Bahnschrift','Roboto Condensed','Helvetica Neue',
     var(--font-sans);
   color-scheme:light;
+  /* 唯一一档阴影：右侧抽屉（行详情）。别处一律不用阴影（见 tests/test_design）。 */
+  --shadow-sheet:-8px 0 24px rgba(0,0,0,.10);
 }
 /* 深色模式：只翻 token。画布仍比表面深一档；深青主块照旧白字（block-primary
  * 不翻，palette.json 深色组它也是 #1E5754）；主按钮换亮青底 + 墨字；
@@ -404,16 +406,38 @@ input::placeholder,textarea::placeholder{color:var(--text-faint)}
 /* 设计系统只定了一条：激活 Tab 用主色（DESIGN.md §2）。其余按后台轨控件
  * 规格来：高 40、14/500、直角、发丝线承重；激活 = 主色字 + 2px 主色底线。
  * 不做深底白字的 tab——那是按钮的样子，不是导航的样子。 */
-.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);
-  margin-bottom:12px;overflow-x:auto;-webkit-overflow-scrolling:touch}
-.tabs .tab{height:40px;padding:0 12px;background:none;border:0;
-  border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:500;
-  color:var(--text);white-space:nowrap;display:inline-flex;align-items:center;
-  gap:8px;flex:none;transition:background-color .16s ease-out,color .16s ease-out,
-  border-color .16s ease-out}
+/* 项目切换：一行一个项目（仍然是 tablist，点哪行看哪个项目的待办）。每行：名字、
+ * 要管几行、处理进度条（待处理 / 正在处理 / 已处理各占多长）和三个数、最近检查时间。
+ * 以前是一排横着的标签，上面只有「2 +1」「14 +26」两个数，不解释看不懂（2026-11-11）。 */
+.tabs{display:flex;flex-direction:column;margin-bottom:12px;background:var(--surface);
+  border:1px solid var(--border)}
+.tabs:empty{display:none}
+.tabs .tab{height:auto;min-height:44px;padding:8px 16px;background:none;border:0;
+  border-top:1px solid var(--border);font-weight:500;color:var(--text);width:100%;
+  text-align:left;display:grid;align-items:center;gap:4px 16px;
+  grid-template-columns:minmax(120px,1.1fr) minmax(150px,1fr) minmax(72px,.8fr) minmax(250px,1.7fr) minmax(130px,.9fr);
+  transition:background-color .16s ease-out,color .16s ease-out}
+.tabs .tab:first-child{border-top:0}
 .tabs .tab:hover:not(:disabled){background:var(--fill)}
-.tabs .tab.on{color:var(--primary);border-bottom-color:var(--primary);
-  font-weight:600}
+.tabs .tab.on{color:var(--primary);background:var(--tint-primary);font-weight:600}
+.tabs .tab-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tabs .tab-count,.tabs .tab-states,.tabs .tab-latest{font-size:12px;font-weight:400;
+  color:var(--text-light);white-space:nowrap}
+.tabs .tab-latest{text-align:right;font-family:var(--font-num)}
+.pbar{display:flex;height:8px;background:var(--fill);overflow:hidden}
+.pbar[hidden]{display:block;visibility:hidden}
+.pbar i,.tab-states i{display:block;background:var(--text-faint)}
+.pbar i{height:100%;transition:width .18s ease-out}
+.tab-states i{display:inline-block;width:8px;height:8px;margin:0 4px 0 10px}
+.tab-states i:first-child{margin-left:0}
+.pbar .p-pending,.tab-states .p-pending{background:var(--warning)}
+.pbar .p-processing,.tab-states .p-processing{background:var(--primary)}
+@media (max-width:1100px){
+  /* 窄了排成两行：名字 + 要管几行；进度条通栏；三个数 + 最近检查。 */
+  .tabs .tab{grid-template-columns:minmax(0,1fr) auto}
+  .tabs .pbar{grid-column:1 / -1}
+  .tabs .tab-states{white-space:normal}
+}
 /* tab 上的条数：颜色说的是这个项目最坏的一档（同徽标的加深档），
  * 所以严重度色要压过激活态的主色——信息先于装饰。 */
 .tabs .cnt{display:inline-flex;align-items:center;justify-content:center;min-width:22px;
@@ -453,7 +477,6 @@ details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
 details[open]>:not(summary){animation:detail-in .18s ease-out both}
 .work-details>summary:hover,.daily>summary:hover,.fold>summary:hover,
 .project-detail>summary:hover{background:var(--fill)}
-.diagnostic>summary:hover{color:var(--primary)}
 /* ---------- 每个项目那一页底下的归档折叠区 ----------
  * **默认收起**，但要让人知道有这一块：以前是一行灰色小字，运营根本看不到。
  * 现在是一条白底、警示色左边线的条（同 .note 的语义色用法），条上写着几行、
@@ -480,9 +503,8 @@ details[open]>:not(summary){animation:detail-in .18s ease-out both}
 .fold table{border:0}
 .tab-empty{padding:16px;font-size:13px;color:var(--text-light);
   background:var(--surface);border:1px solid var(--border)}
-/* tab 上「+N」：这个项目底下还收着几行已归档的。淡色，不和主数字抢。 */
-.tabs .more{font-size:12px;font-family:var(--font-num);color:var(--text-faint);
-  margin-left:-4px}
+/* 「另 N 行已归档」：这个项目底下还收着几行已归档的。淡色，不和主数字抢。 */
+.tabs .more{margin-left:8px}
 /* 已归档 / 未巡查：说的是「这一行归谁管」，不是问题本身——描边、不上色。 */
 .chip.o{background:none;border:1px solid var(--border-strong);line-height:18px;
   color:var(--text-light)}
@@ -526,6 +548,34 @@ textarea{width:100%;resize:vertical;min-height:72px}
   color:var(--text-dark);margin-top:4px}
 .work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:4px}
 .work-metric .metric-note{display:block;font-size:12px;color:var(--text-light);margin-top:2px}
+/* ---------- 趋势图：近 14 期，每期两根柱 ----------
+ * 赭色 = 这一期新出现负面的帖子，深青 = 这一期标为已处理的帖子。每根柱顶上写着数，
+ * 不靠坐标轴读；两个系列颜色之外明度也不同。纯 div 画，零依赖。 */
+.trend{padding:4px 16px 16px;border-top:1px solid var(--border)}
+.trend-head{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;padding:12px 0 8px}
+.trend-title{font-size:13px;color:var(--text-dark)}
+.trend-legend{font-size:12px;color:var(--text-light)}
+.trend-legend i{display:inline-block;width:8px;height:8px;margin:0 4px 0 12px}
+.trend-legend i:first-child{margin-left:0}
+.t-found{background:var(--accent)}
+.t-handled{background:var(--primary)}
+.trend-chart{display:grid;grid-template-columns:repeat(14,minmax(0,1fr));gap:8px}
+.t-col{min-width:0;text-align:center}
+.t-bars{display:flex;align-items:flex-end;gap:2px;height:96px;border-bottom:1px solid var(--border-strong)}
+.t-bar{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;
+  align-items:center}
+.t-bar b{font:500 11px/16px var(--font-num);color:var(--text)}
+.t-bar i{display:block;width:100%;max-width:18px;min-height:1px}
+.t-date{display:block;margin-top:4px;font:400 11px/16px var(--font-num);color:var(--text-light);
+  white-space:nowrap}
+.t-col.live .t-bar i{opacity:.55}
+.t-col.live .t-date{color:var(--primary)}
+.trend-note{margin-top:8px;font-size:12px;color:var(--text-light)}
+@media (max-width:700px){
+  /* 窄屏只留最近 7 期：14 期挤在手机上数字会叠在一起。 */
+  .trend-chart{grid-template-columns:repeat(7,minmax(0,1fr))}
+  .t-col:nth-child(-n+7){display:none}
+}
 /* 「比上一期」：数字后面的小标签。往好的方向变是绿的，往坏的方向变是红的，其余灰的；
  * 方向同时写在字里（少 / 多、箭头），不只靠颜色。没有基准时整个不显示。 */
 .metric-delta{display:inline-block;height:20px;padding:0 8px;margin-left:8px;
@@ -568,8 +618,35 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .draft-state[data-state=ok]{color:var(--success-deep)}
 .draft-state[data-state=err]{color:var(--danger-deep)}
 .draft-bar button{flex:none}
-.diagnostic>summary{font-size:13px;color:var(--text);max-width:26em}
-.diagnostic .diagnostic-body{margin-top:8px;font-size:13px;white-space:pre-wrap;max-width:40em}
+/* 诊断信息那一格：一句摘要 +「详情」。完整内容（.diagnostic-body）不在格子里展开，
+ * 点「详情」或点这一行，在右侧抽屉里看——以前挤在窄列里点小三角展开，一行被撑得很高。 */
+.diagnostic{font-size:13px;color:var(--text);max-width:26em}
+.diagnostic .diagnostic-summary{margin-right:8px}
+.todos tbody tr[data-rec]{cursor:pointer}
+.todos tbody tr.in-drawer td{background:var(--tint-primary)}
+/* ---------- 行详情抽屉 ----------
+ * 这一行的全部信息：完整标题、原因、完整诊断与评论摘要、处理状态、直达链接。
+ * 不遮罩、不锁页面：开着它也能点别的行（内容跟着换）。 */
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);z-index:40;
+  background:var(--surface);border-left:1px solid var(--border);
+  box-shadow:var(--shadow-sheet);padding:20px 20px 32px;overflow-y:auto;
+  animation:drawer-in .18s ease-out both}
+.drawer[hidden]{display:none}
+@keyframes drawer-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+.drawer-head{display:flex;align-items:flex-start;gap:12px}
+.drawer-head h3{flex:1;margin:0;font-size:16px;font-weight:600;line-height:1.5;
+  color:var(--text-dark);overflow-wrap:anywhere}
+.drawer-meta{margin-top:4px;font-size:13px;color:var(--text-light)}
+.drawer-chips{margin-top:12px}
+.drawer-facts{display:flex;gap:32px;margin:16px 0 0;font-size:13px}
+.drawer-facts dt{color:var(--text-light)}
+.drawer-facts dd{margin:2px 0 0;color:var(--text-dark);font-family:var(--font-num);font-size:15px}
+.drawer-acts{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;margin-top:16px;
+  padding:12px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.drawer-acts a{font-size:13px;color:var(--primary)}
+.drawer h4{margin:16px 0 8px;font-size:13px;font-weight:600;color:var(--text-dark)}
+.drawer-body{font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;
+  color:var(--text)}
 /* 「处理」一格：三段切换「待处理 | 正在处理 | 已处理」，当前状态那一段高亮；下面一行
  * 「去飞书这一行」。以前是一个状态徽标 + 「正在处理」「已处理」两个文字按钮——同一行
  * 两个「正在处理」，一个是状态一个是按钮，运营分不清（2026-11-11）。 */
@@ -646,7 +723,7 @@ textarea{width:100%;resize:vertical;min-height:72px}
   .todos tbody td.acts .seg+.act{display:inline;margin-top:0}
   .todos tbody td.acts .seg button{height:32px}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
-  .todos .diagnostic>summary,.todos .diagnostic .diagnostic-body{max-width:none}
+  .todos .diagnostic{max-width:none}
   .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
   .fold-t tbody tr{grid-template-columns:minmax(0,1fr)}
   .fold-t tbody td,.fold-t tbody td.which{grid-column:1}
@@ -785,7 +862,7 @@ _SCRIPT = r"""
       var foldN = p.querySelector(".foldN");
       if (foldN) foldN.textContent = old;
       var more = tab ? tab.querySelector(".more") : null;
-      if (more) { more.textContent = "+" + old; more.hidden = !old; }
+      if (more) { more.textContent = "另 " + old + " 行已归档"; more.hidden = !old; }
     });
   }
   // remember=true 只在人亲手切页时给：存的是「你选的是哪个项目」。
@@ -809,6 +886,7 @@ _SCRIPT = r"""
       }
       p.hidden = !on;
     });
+    closeDrawerIfRowGone();
     var t = activeTab();
     if (t && t.parentNode) {
       var strip = t.parentNode, left = t.offsetLeft, right = left + t.offsetWidth;
@@ -1041,7 +1119,9 @@ _SCRIPT = r"""
     var b = ev.target.closest ? ev.target.closest(
       ".seg button.pending, .seg button.processing, .seg button.resolve, button.unresolve") : null;
     if (!b) return;
-    var tr = b.closest("tr");
+    // 抽屉里的那条切换条是这一行的分身：点它改的是抽屉正开着的那一行。
+    var inDrawer = !!b.closest("#rowDrawer");
+    var tr = inDrawer ? drawerRow : b.closest("tr");
     if (!tr) return;
     if (tr.dataset.busy) return;
     // 三段切换：点哪一段就是哪个状态；点已经亮着的那一段什么都不做。
@@ -1051,8 +1131,10 @@ _SCRIPT = r"""
     var original = b.textContent;
     tr.dataset.busy = "true";
     tr.querySelectorAll("button").forEach(function(x){ x.disabled = true; });
+    if (inDrawer) b.parentNode.querySelectorAll("button").forEach(function(x){ x.disabled = true; });
     b.textContent = "保存中…";
-    var errorBox = tr.querySelector(".work-error");
+    // 从抽屉里点的，行上的「处理」那一格被抽屉挡着：出错的话写在抽屉里。
+    var errorBox = inDrawer ? document.getElementById("drawerError") : tr.querySelector(".work-error");
     if (!errorBox) { errorBox = document.createElement("span"); errorBox.className = "work-error";
       errorBox.setAttribute("role", "status"); (b.closest("td") || b.parentNode).appendChild(errorBox); }
     errorBox.textContent = "";
@@ -1072,7 +1154,7 @@ _SCRIPT = r"""
         if (qOut) qOut.textContent = persistentWarning || "已处理，记录收在下方「已处理记录」中，可撤销。";
       }
       applyWorkFilter(); recount(); sync();
-      refreshWork(); loadReports();
+      refreshWork(); loadReports(); loadTrend(true);
     }).catch(function(err){
       errorBox.textContent = errText(err);
       if (err.status === 409) refreshWork();
@@ -1080,6 +1162,9 @@ _SCRIPT = r"""
       delete tr.dataset.busy;
       b.textContent = original;
       tr.querySelectorAll("button").forEach(function(x){ x.disabled = false; });
+      // 抽屉里的切换条在保存时被禁用了。没保存成功的话这一行的标记和保存前一样，
+      // setHtml 会当成「没变」跳过，按钮就一直灰着、没法再试：作废那份记录，强制重画。
+      drawerHtml.drawerActs = null;
       updateRowState(tr, tr.dataset.workState || "pending");
       if (tr.closest("#resolvedList") && tr.dataset.workState !== "resolved") tr.remove();
       applyWorkFilter();
@@ -1163,6 +1248,33 @@ _SCRIPT = r"""
     setText("workPending", totals.pending); setText("workProcessing", totals.processing);
     setText("workResolved", totals.resolved);
     if (workLive && persistentWarning) workLive.textContent = persistentWarning;
+    renderProjectRows();
+  }
+  // 项目行上的进度条、三个数、最近检查时间：按 work_stats（和上面那排筛选按钮同一份数，
+  // 单位是行，含归档 / 临时检查的行）。一个项目名下有几张表就加起来。
+  function renderProjectRows(){
+    var keys = ["pending", "processing", "resolved"], names = {pending:"待处理", processing:"正在处理", resolved:"已处理"};
+    tabs.forEach(function(tab){
+      var bar = tab.querySelector(".pbar"), states = tab.querySelector(".tab-states"), when = tab.querySelector(".tab-latest");
+      if (!bar || !states || !when) return;
+      var sum = {pending:0, processing:0, resolved:0}, latest = null, found = false;
+      workStats.forEach(function(s){
+        if (s.label !== tab.dataset.project) return;
+        found = true;
+        keys.forEach(function(k){ sum[k] += Number(s[k] || 0); });
+        if (typeof s.latest_checked_ms === "number" && (latest === null || s.latest_checked_ms > latest))
+          latest = s.latest_checked_ms;
+      });
+      var total = sum.pending + sum.processing + sum.resolved;
+      bar.hidden = !found || !total;
+      keys.forEach(function(k){
+        var seg = bar.querySelector(".p-" + k);
+        if (seg) seg.style.width = total ? (sum[k] / total * 100) + "%" : "0";
+      });
+      states.innerHTML = !found ? "" : keys.map(function(k){
+        return '<i class="p-' + k + '"></i>' + names[k] + " " + sum[k]; }).join("");
+      when.textContent = latest === null ? "" : "最近检查 " + chinaTime(latest, true);
+    });
   }
   function applyWorkFilter(){
     var terms = searchTerms(box ? box.value : "");
@@ -1178,6 +1290,7 @@ _SCRIPT = r"""
       tr.style.display = hit && severityHit && (workFilter === "all" || state === workFilter) ? "" : "none";
       tr.hidden = state === "resolved" || tr.dataset.obsolete === "true";
     });
+    closeDrawerIfRowGone();
     var wanted = workProject ? projectLabel() : "", matched = false;
     if (wanted) {
       panels.forEach(function(p){ if (panelHasTable(p, workProject.value)) matched = true; });
@@ -1211,7 +1324,68 @@ _SCRIPT = r"""
     tr.querySelectorAll(".seg button").forEach(function(b){
       b.setAttribute("aria-pressed", b.classList.contains(on) ? "true" : "false");
     });
+    // 抽屉正开着这一行：点了「已处理」这一行就收进已处理记录了，抽屉跟着关；否则照新状态重画。
+    if (tr === drawerRow) { if (state === "resolved") closeDrawer(); else fillDrawer(tr); }
   }
+  // ---- 行详情抽屉：点「详情」或点这一行，在右侧看完整信息；Esc 或「关闭」收起。 ----
+  var drawer = document.getElementById("rowDrawer"), drawerRow = null;
+  function cellText(tr, selector){ var el = tr.querySelector(selector); return el ? el.textContent.trim() : ""; }
+  // 内容没变就不重写：后台同步每次都会重画抽屉，重写会把焦点和选中的文字弄丢。
+  var drawerHtml = {};
+  function setHtml(id, html){
+    var el = document.getElementById(id);
+    if (el && drawerHtml[id] !== html) { el.innerHTML = html; drawerHtml[id] = html; }
+  }
+  function fillDrawer(tr){
+    if (!drawer) return;
+    var which = tr.querySelector("td.which"), persona = cellText(tr, ".persona");
+    setText("drawerTitle", which ? (which.getAttribute("title") || cellText(tr, ".todo-title")) : "");
+    setText("drawerMeta", [tr.dataset.project || "", persona === "—" ? "" : persona]
+      .filter(function(x){ return x; }).join(" · "));
+    var reasons = tr.querySelector("td.reasons"), body = tr.querySelector(".diagnostic-body");
+    setHtml("drawerReasons", reasons ? reasons.innerHTML : "");
+    setText("drawerComments", cellText(tr, "td.comments") || "—");
+    setText("drawerWhen", cellText(tr, "td.when") || "—");
+    setHtml("drawerBody", body && body.textContent.trim() ? body.innerHTML : "这一行没有诊断信息。");
+    var seg = tr.querySelector(".seg"), row = tr.querySelector("a.act"), post = tr.querySelector(".post a");
+    setHtml("drawerActs", (seg ? seg.outerHTML : "") +
+      (row ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(row.getAttribute("href")) + '">去飞书这一行</a>' : "") +
+      (post ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(post.getAttribute("href")) + '">查看帖子</a>' : ""));
+  }
+  function openDrawer(tr){
+    if (!drawer) return;
+    if (drawerRow) drawerRow.classList.remove("in-drawer");
+    drawerRow = tr; tr.classList.add("in-drawer");
+    setText("drawerError", "");
+    fillDrawer(tr); drawer.hidden = false;
+  }
+  function closeDrawer(){
+    if (!drawer) return;
+    drawer.hidden = true;
+    if (drawerRow) drawerRow.classList.remove("in-drawer");
+    drawerRow = null;
+  }
+  // 抽屉开着的那一行不在眼前了：被重画换掉（后台同步）、收进已处理、被筛选或搜索滤掉、
+  // 或者切到了别的项目。抽屉跟着关，不然里面的切换条还能改一行看不见的帖子。
+  // 看的是「实际有没有画出来」，自己或哪一层上级被藏起来都算。
+  function closeDrawerIfRowGone(){
+    if (drawerRow && (!document.contains(drawerRow) || !drawerRow.getClientRects().length)) closeDrawer();
+  }
+  document.addEventListener("click", function(ev){
+    var t = ev.target;
+    if (!drawer || !t.closest) return;
+    if (t.closest("#drawerClose")) { closeDrawer(); return; }
+    var tr = t.closest("#todos tr[data-rec]");
+    if (!tr) return;
+    if (t.closest("button.detail")) { openDrawer(tr); return; }
+    // 点行里的链接、按钮、勾选框是在用它们；拖选文字是在复制。都不算「点这一行」。
+    if (t.closest("a, button, input, label, select, summary")) return;
+    if (window.getSelection && String(window.getSelection())) return;
+    openDrawer(tr);
+  });
+  document.addEventListener("keydown", function(ev){
+    if (ev.key === "Escape" && drawer && !drawer.hidden) closeDrawer();
+  });
   function findTodo(table, rec, resolved){
     var found = null;
     document.querySelectorAll((resolved ? "#resolvedList" : "#todos") + " tr[data-rec]").forEach(function(tr){
@@ -1244,8 +1418,10 @@ _SCRIPT = r"""
       '</span></div></td>' +
       '<td class="reasons">' + (t.reasons || []).map(reasonChip).join('') +
       (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : '')) + '</td>' +
-      '<td class="diagnosis"><details class="diagnostic"><summary>' + esc(diagnostic.slice(0, 48) || '查看诊断与评论摘要') +
-      '</summary><div class="diagnostic-body">' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></details></td>' +
+      '<td class="diagnosis"><div class="diagnostic"><span class="diagnostic-summary">' +
+      esc(diagnostic.slice(0, 48) || '诊断与评论摘要') + '</span>' +
+      '<button type="button" class="link detail" title="在右侧打开这一行的完整信息">详情</button>' +
+      '<div class="diagnostic-body" hidden>' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></div></td>' +
       '<td class="nowrap right comments num">' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
       chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '') + '</td>' +
       '<td class="nowrap acts">' + controls + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去飞书这一行</a>' : '') + '</td></tr>';
@@ -1260,8 +1436,10 @@ _SCRIPT = r"""
       tab.type = "button"; tab.className = "tab"; tab.setAttribute("role", "tab");
       tab.id = "tab-" + id; tab.dataset.tab = id; tab.dataset.project = t.project;
       tab.setAttribute("aria-controls", "todos-" + id); tab.setAttribute("aria-selected", "false"); tab.tabIndex = -1;
-      tab.appendChild(document.createTextNode(t.project + " "));
-      var n = document.createElement("span"); n.className = "cnt"; n.textContent = "0"; tab.appendChild(n);
+      tab.innerHTML = '<span class="tab-name">' + esc(t.project) + '</span>' +
+        '<span class="tab-count"><span class="cnt">0</span> 行要管</span>' +
+        '<span class="pbar" hidden aria-hidden="true"><i class="p-pending"></i><i class="p-processing"></i>' +
+        '<i class="p-resolved"></i></span><span class="tab-states"></span><span class="tab-latest"></span>';
       host.querySelector(".tabs").appendChild(tab);
       p = document.createElement("div"); p.className = "tabpanel"; p.dataset.tab = id;
       p.dataset.project = t.project; p.dataset.tableId = t.table_id;
@@ -1339,7 +1517,10 @@ _SCRIPT = r"""
     if (cells[offset + 3]) cells[offset + 3].textContent = t.comment_count == null ? "—" : t.comment_count;
     var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
     if (d) { var nextDetail = detail + (digest ? "\n" + digest : ""); if (d.textContent !== nextDetail) d.textContent = nextDetail;
-      tr.querySelector(".diagnostic>summary").textContent = detail.slice(0, 48) || "查看诊断与评论摘要"; }
+      tr.querySelector(".diagnostic-summary").textContent = detail.slice(0, 48) || "诊断与评论摘要"; }
+    // 抽屉正开着这一行：上面 updateRowState 重画时各格还是旧的，等全部写完再照新内容画一遍，
+    // 不然抽屉里的诊断比行上慢一拍，运营会照着旧诊断去点「已处理」。
+    if (tr === drawerRow) fillDrawer(tr);
   }
   function upsertResolved(t){
     var list = document.getElementById("resolvedList"); if (!list) return;
@@ -1560,6 +1741,56 @@ _SCRIPT = r"""
         if (key === reportKey()) syncDraftState();
       });
   }
+  // ---- 趋势图：「项目数据与每日汇报」展开着才去取（读三周留痕，服务端缓存半小时）。 ----
+  var trendKey = null, trendAt = 0, trendEpoch = 0;
+  function renderTrend(j){
+    var box = document.getElementById("trend"), chart = document.getElementById("trendChart");
+    if (!box || !chart) return;
+    var periods = (j && j.periods) || [], known = periods.filter(function(p){ return typeof p.found === "number"; });
+    box.hidden = !periods.length && !(j && j.error);
+    if (!known.length) {
+      chart.textContent = "";
+      setText("trendNote", j && j.error ? "趋势图暂时画不出来：" + j.error : "这几期还没有留痕记录，暂时画不出来。");
+      return;
+    }
+    var top = 1, partial = false, gaps = false;
+    known.forEach(function(p){ top = Math.max(top, p.found, p.handled); partial = partial || !!p.partial; gaps = gaps || !!p.gaps; });
+    function bar(cls, value){
+      return '<span class="t-bar"><b>' + value + '</b><i class="' + cls + '" style="height:' +
+        (value / top * 76).toFixed(1) + '%"></i></span>';
+    }
+    chart.innerHTML = periods.map(function(p){
+      var date = chinaTime(p.end_ms, true).slice(0, 5), has = typeof p.found === "number";
+      var gappy = has && p.gaps;
+      return '<div class="t-col' + (p.complete ? '' : ' live') + (gappy ? ' gappy' : '') + '" title="' + attr(date + (p.complete ? " 这一期" : " 这一期（进行中）") +
+        (has ? "：新出现负面 " + p.found + " 篇，标为已处理 " + p.handled + " 篇" : "：没有留痕记录") +
+        (gappy ? "（留痕有缺口，数可能不准）" : "")) + '">' +
+        '<div class="t-bars">' + (has ? bar("t-found", p.found) + bar("t-handled", p.handled) : '') + '</div>' +
+        '<span class="t-date">' + esc(p.complete ? date : "进行中") + (gappy ? "*" : "") + '</span></div>';
+    }).join("");
+    chart.setAttribute("aria-label", "近 " + periods.length + " 期，新出现负面 / 标为已处理的帖子数：" +
+      periods.map(function(p){ return chinaTime(p.end_ms, true).slice(0, 5) + " " +
+        (typeof p.found === "number" ? p.found + " / " + p.handled + (p.gaps ? "（留痕有缺口）" : "") : "无记录"); }).join("；"));
+    setText("trendNote", "每根柱是一期（前一天 16:00 到当天 16:00，日期是结束那天）。" +
+      "新出现负面 = 这一期看到负面评论、此前 7 天没看到过的帖子；标为已处理 = 这一期在面板上点了「已处理」的帖子。" +
+      (partial ? "有的项目当时还没开始留痕，那几期没把它算进去。" : "") +
+      (gaps ? "日期带 * 的那几期留痕有缺口（记录没读全或没写进去），数可能不准。" : "") +
+      (j.warning ? "有处理状态还没写进留痕，「标为已处理」可能少算：" + j.warning : ""));
+  }
+  function loadTrend(force, poll){
+    var details = document.getElementById("workDetails");
+    if (!workbench || !details || !details.open || document.hidden) return;
+    var key = workProject ? workProject.value : "";
+    if (!force && key === trendKey && Date.now() - trendAt < 60000) return;
+    trendKey = key; trendAt = Date.now();
+    var epoch = ++trendEpoch;
+    // 后台轮询带上 X-Panel-Poll：它不算「有人在看」，不然开着不动的页面会让后台一直读表。
+    fetch("/api/trend" + (key ? "?table_id=" + encodeURIComponent(key) : ""),
+          poll ? {headers: {"X-Panel-Poll": "1"}} : undefined)
+      .then(function(r){ return r.json(); })
+      .then(function(j){ if (epoch === trendEpoch) renderTrend(j); })
+      .catch(function(err){ if (epoch === trendEpoch) renderTrend({periods: [], error: errText(err)}); });
+  }
   // 每日汇报展开着才算「打开了这一期日报」。只是点项目标签去处理待办，不该花钱。
   function reportOpen(){
     var details = document.getElementById("workDetails"), daily = document.getElementById("dailyPanel");
@@ -1710,6 +1941,7 @@ _SCRIPT = r"""
   }
   function loadReports(poll){
     if (!workbench || document.hidden) return Promise.resolve();
+    loadTrend(false, poll);
     var key = reportKey(), epoch = ++reportEpoch;
     currentReports = reportCache[key] || []; reportLoaded = Object.prototype.hasOwnProperty.call(reportCache, key);
     renderReports();
@@ -1756,7 +1988,7 @@ _SCRIPT = r"""
     }); });
     ["workDetails", "dailyPanel"].forEach(function(id){
       var fold = document.getElementById(id);
-      if (fold) fold.addEventListener("toggle", function(){ if (fold.open) maybeDraft(); });
+      if (fold) fold.addEventListener("toggle", function(){ if (fold.open) { maybeDraft(); loadTrend(false); } });
     });
     var draftButton = document.getElementById("draftReport");
     if (draftButton) draftButton.addEventListener("click", function(){
@@ -2236,6 +2468,20 @@ _MARK = (
 )
 
 
+# 行详情抽屉的骨架：内容由脚本在点「详情」/ 点行时从那一行搬进来（fillDrawer）。
+_DRAWER = (
+    "<aside class=drawer id=rowDrawer hidden aria-labelledby=drawerTitle>"
+    "<div class=drawer-head><h3 id=drawerTitle></h3>"
+    "<button type=button class=link id=drawerClose>关闭</button></div>"
+    "<div class=drawer-meta id=drawerMeta></div>"
+    "<div class=drawer-chips id=drawerReasons></div>"
+    "<dl class=drawer-facts><div><dt>评论数</dt><dd id=drawerComments></dd></div>"
+    "<div><dt>最近检查</dt><dd id=drawerWhen></dd></div></dl>"
+    "<div class=drawer-acts id=drawerActs></div>"
+    "<span class=work-error id=drawerError role=status></span>"
+    "<h4>诊断信息</h4><div class=drawer-body id=drawerBody></div></aside>")
+
+
 def _shell(title: str, body: str, *, csrf: str = "") -> str:
     # 深浅模式开关挂在 body 直下（模板同款）——登录页、骨架页、概览页都有，
     # 不能只有取到数的那一屏。图标固定月亮，两种模式下都是它（模板如此）。
@@ -2410,9 +2656,13 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
                + segment("processing", "正在处理", working, "标记这篇帖子正在处理")
                + segment("resolve", "已处理", False, "标记这篇帖子的问题已处理")
                + "</span>" if resolvable else "")
-    diagnosis = ("<details class=diagnostic><summary>"
-                 f"{_e(_clip(todo.diagnosis or '查看诊断与评论摘要', 48))}</summary>"
-                 f"<div class=diagnostic-body>{_e(todo.diagnosis)}{extra}</div></details>"
+    # 格子里只放一句摘要；完整诊断（和评论摘要）留在 .diagnostic-body 里不显示，
+    # 点「详情」或点这一行时由脚本搬进右侧抽屉。
+    diagnosis = ("<div class=diagnostic><span class=diagnostic-summary>"
+                 f"{_e(_clip(todo.diagnosis or '诊断与评论摘要', 48))}</span>"
+                 "<button type=button class='link detail' "
+                 "title='在右侧打开这一行的完整信息'>详情</button>"
+                 f"<div class=diagnostic-body hidden>{_e(todo.diagnosis)}{extra}</div></div>"
                  if todo.diagnosis or extra else "<span class=muted>—</span>")
     return (
         f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
@@ -2435,6 +2685,11 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
         f"target=_blank rel='noopener noreferrer' class=act>去飞书这一行</a></td>"
         "</tr>")
 
+
+# 项目行后半截的骨架：进度条（三段）、三个数、最近检查时间。
+_TAB_PROGRESS = ("<span class=pbar hidden aria-hidden=true><i class=p-pending></i>"
+                 "<i class=p-processing></i><i class=p-resolved></i></span>"
+                 "<span class=tab-states></span><span class=tab-latest></span>")
 
 _TODO_COLUMNS = ("<th>帖子 / 素人</th><th>为什么</th>"
                  "<th>诊断信息</th><th class=right>评论数</th><th>最近检查</th><th>处理</th>")
@@ -2552,13 +2807,17 @@ def _todo_table(todos, offset_hours: float, show_digest: bool,
         first = index == 0
         cnt_cls = ("cnt " + _worst_class(items)).strip()
         more = (f"<span class=more title='另有 {len(old)} 行已归档的老帖有异常，"
-                f"在这一页底下收着'>+{len(old)}</span>" if old else "")
+                f"在这一页底下收着'>另 {len(old)} 行已归档</span>" if old else "")
+        # 进度条、三个数和最近检查时间由脚本按 work_stats 填（renderProjectRows）：
+        # 它们跟着后台同步变，服务端只摆骨架。
         tabs.append(
             f"<button type=button role=tab id='tab-{tid}' "
             f"class='tab{' on' if first else ''}' "
             f"aria-selected={'true' if first else 'false'} data-tab='{tid}' "
             f"data-project='{_e(label)}' aria-controls='todos-{tid}'>"
-            f"{_e(label)} <span class='{cnt_cls}'>{len(items)}</span>{more}</button>")
+            f"<span class=tab-name>{_e(label)}</span>"
+            f"<span class=tab-count><span class='{cnt_cls}'>{len(items)}</span> 行要管{more}</span>"
+            f"{_TAB_PROGRESS}</button>")
         if items:
             body = "".join(_todo_row(t, offset_hours, show_digest, main=True,
                                      resolvable=resolvable) for t in items)
@@ -2952,6 +3211,12 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
         <span class=metric-value><span id=metricResolved>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricResolvedDelta hidden></span></span></div>
     </div>
     <div class=work-summary id=workSummary aria-live=polite>正在读取现有数据…</div>
+    <div class=trend id=trend hidden>
+      <div class=trend-head><span class=trend-title>近 14 期</span>
+        <span class=trend-legend><i class=t-found></i>新出现负面的帖子<i class=t-handled></i>标为已处理的帖子</span></div>
+      <div class=trend-chart id=trendChart role=img aria-label='近 14 期新出现负面与标为已处理的帖子数'></div>
+      <div class=trend-note id=trendNote></div>
+    </div>
     <details class=daily id=dailyPanel>
       <summary>每日汇报<span class=muted id=reportPeriod>每日 16:00 结算 · 北京时间</span></summary>
       <div class=daily-body>
@@ -3161,7 +3426,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
     {_runs_section(runs or [], log_error, offset_hours)}
   </div>
 </div>
-</div>"""
+</div>{_DRAWER}"""
     return _shell("监控面板", inner, csrf=csrf)
 
 

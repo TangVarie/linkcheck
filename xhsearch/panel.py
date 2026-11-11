@@ -1392,6 +1392,9 @@ class DailyReports:
         self.resolutions = None
         # 每期结算时记下的数（PeriodCloses）。没接 = 页面上不显示「比上一期」。
         self.closes: Optional[PeriodCloses] = None
+        # 趋势图读回来的三周扫描事件：(起点, 读的时刻, 事件)。见 trend()。
+        self._trend_scans: Optional[tuple] = None
+        self._trend_lock = threading.Lock()
 
     def _journal(self):
         if self._journal_value is None:
@@ -1480,6 +1483,42 @@ class DailyReports:
         payload = {"reports": reports, "error": self.warning, "as_of": events_wall}
         # 原始留痕只供服务端 AI 证据抽取；普通日报 API 永远不返回它。
         return (payload, events) if with_events else payload
+
+    # 趋势图的扫描事件隔多久重读一次。三周的扫描是一次不小的读；图上的「新出现负面」
+    # 半小时变不了多少。处理状态不走这份缓存（见下），点了「已处理」马上就在图上。
+    TREND_TTL_SECONDS = 1800
+
+    def trend(self, overview: Optional[summary.Overview], *, table_id: str = "") -> dict:
+        """工作台趋势图：最近 14 期每期新出现负面、标为已处理各几篇（daily_report.trend）。
+        只读留痕、不发付费请求。读失败不抛，带着错误原因回去——图画不出来不该弄坏页面。"""
+        from . import daily_report
+        if overview is None:
+            return {"periods": [], "error": "监控数据还未就绪，请稍后再试"}
+        projects = [p for p in overview.projects if not table_id or p.table_id == table_id]
+        if table_id and not projects:
+            raise ValueError("项目不在当前监控清单里")
+        now = self._wall()
+        now_ms = int(now * 1000)
+        span = daily_report.TREND_PERIODS + daily_report.TREND_LOOKBACK_DAYS
+        start = daily_report.last_close_ms(now_ms) + daily_report.DAY_MS - span * daily_report.DAY_MS
+        try:
+            if self.resolutions is not None:
+                self.resolutions.flush_journal(self)
+            with self._trend_lock:
+                cached = self._trend_scans
+                if cached and cached[0] == start and now - cached[1] < self.TREND_TTL_SECONDS:
+                    scans = cached[2]
+                else:
+                    scans = self._journal().read_scans(start, now_ms)
+                    self._trend_scans = (start, now, scans)
+                history = self._journal().read_history(now_ms)
+        except Exception as exc:                                # noqa: BLE001
+            return {"periods": [], "error": f"读取留痕失败：{exc}"}
+        # warning：点了「已处理」、状态存下了，但留痕没写进去（flush_journal 不抛错，只记在
+        # self.warning 里）。那几条还不在留痕里，「标为已处理」会少算——和日报一样说出来。
+        return {"periods": daily_report.trend([*scans, *history],
+                                              [p.table_id for p in projects], now_ms),
+                "error": "", "warning": self.warning, "as_of": now}
 
     def record_status(self, table_id: str, record_id: str, state: str, *,
                       at_ms: Optional[int] = None) -> None:
@@ -2108,6 +2147,21 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"reports": [], "error": str(exc)})
             except Exception as exc:                            # noqa: BLE001
                 return self._send_json(503, {"reports": [], "error": f"读取日报失败：{exc}"})
+        if path == "/api/trend":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            reports = self.deps.reports
+            if reports is None:
+                return self._send_json(200, {"periods": [], "error": "日报留痕尚未接入；需配置 FEISHU_REGISTRY"})
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                overview, _, _ = self._cached_view()
+                return self._send_json(200, reports.trend(
+                    overview, table_id=(query.get("table_id") or [""])[0]))
+            except ValueError as exc:
+                return self._send_json(400, {"periods": [], "error": str(exc)})
+            except Exception as exc:                            # noqa: BLE001
+                return self._send_json(503, {"periods": [], "error": f"读取趋势失败：{exc}"})
         if path == "/api/logs":
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})

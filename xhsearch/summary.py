@@ -125,6 +125,9 @@ class ProjectSnapshot:
     estimate_blocked: str = ""
     stale_rows: int = 0
     oldest_checked_ms: Optional[int] = None
+    # 这张表里最近一次检查的时刻（任何一行）。工作台的项目行上摆出来：
+    # 一眼看得出机器最近有没有来过这张表。
+    latest_checked_ms: Optional[int] = None
     never_checked_rows: int = 0
 
     # 「发布时间」那一格空着（或读不出来）、链接里也解不出发布时刻的在管行。
@@ -411,6 +414,9 @@ def build_snapshot(
         elif (snap.oldest_checked_ms is None
               or row.last_updated_ms < snap.oldest_checked_ms):
             snap.oldest_checked_ms = row.last_updated_ms
+        if row.last_updated_ms is not None and (
+                snap.latest_checked_ms is None or row.last_updated_ms > snap.latest_checked_ms):
+            snap.latest_checked_ms = row.last_updated_ms
         # `queued` 也要算：`runner.load_rows` 决定花钱时写的是
         # `wanted or row.queued or not only_due or row.is_due(...)`。
         # 光看 is_due 会漏掉「人工勾了、但还没到自然间隔」的行——**恰恰是
@@ -911,6 +917,7 @@ def work_stats(overview: Overview, resolved: dict, settings: Settings) -> list[d
             counts[todo.work_state] += 1
         counts["resolved"] = sum(t.table_id == project.table_id for t in shown.resolved)
         result.append({"table_id": project.table_id, "label": project.label, **counts,
+                       "latest_checked_ms": project.latest_checked_ms,
                        "error": project.error})
     return result
 

@@ -137,12 +137,72 @@ class TestPanelDailyUI(unittest.TestCase):
         diagnosis = "需人工核实的情况" * 30 + "<script>alert(1)</script>"
         markup = panel_view._todo_row(self.todo(diagnosis=diagnosis), 8, False,
                                       main=True, resolvable=True)
-        details = [a for tag, a in Elements(markup).tags
-                   if tag == "details" and a.get("class") == "diagnostic"]
-        self.assertEqual(len(details), 1)
-        self.assertNotIn("open", details[0])
+        dom = Elements(markup)
+        body = [a for tag, a in dom.tags if a.get("class") == "diagnostic-body"]
+        self.assertEqual(len(body), 1)
+        self.assertIn("hidden", body[0], "完整诊断不在格子里展开，点「详情」在右侧抽屉里看")
+        self.assertEqual(len(dom.buttons("detail")), 1)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", markup)
         self.assertNotIn("<script>", markup)
+
+    def test_each_project_is_a_row_with_progress_not_a_bare_number_tab(self):
+        """以前是一排横着的标签，上面只有「2 +1」「14 +26」，不解释看不懂。现在一行一个
+        项目：要管几行、另几行已归档写成字；进度条、三个数、最近检查时间由脚本按
+        work_stats 填（2026-11-11）。"""
+        page = self.page()
+        tab = page[page.index("<button type=button role=tab"):]
+        tab = tab[:tab.index("</button>")]
+        self.assertIn("<span class=tab-name>途鸽</span>", tab)
+        self.assertIn("行要管", tab)
+        for part in ("class=pbar", "class=p-pending", "class=p-processing", "class=p-resolved",
+                     "class=tab-states", "class=tab-latest"):
+            self.assertIn(part, tab)
+        script = panel_view._SCRIPT
+        self.assertIn("function renderProjectRows(){", script)
+        self.assertIn('"最近检查 " + chinaTime(latest, true)', script)
+        self.assertIn('more.textContent = "另 " + old + " 行已归档"', script)
+
+    def test_work_stats_carry_the_latest_check_per_project(self):
+        from tests.test_panel_workflow import overview, todo
+        source = overview(todo())
+        source.projects[0].latest_checked_ms = 1234
+        stats = summary.work_stats(source, {}, panel.Settings())
+        self.assertEqual(stats[0]["latest_checked_ms"], 1234)
+
+    def test_row_details_open_in_a_side_drawer(self):
+        """诊断信息以前挤在窄列里点小三角展开。现在点「详情」或点这一行，在右侧抽屉里看
+        完整标题、原因、诊断、处理状态和直达链接（2026-11-11）。"""
+        page = self.page()
+        dom = Elements(page)
+        self.assertIn("hidden", dom.by_id("rowDrawer"))
+        for name in ("drawerTitle", "drawerReasons", "drawerActs", "drawerBody", "drawerError",
+                     "drawerClose"):
+            dom.by_id(name)
+        script = panel_view._SCRIPT
+        self.assertIn('if (t.closest("button.detail")) { openDrawer(tr); return; }', script)
+        self.assertIn('if (t.closest("a, button, input, label, select, summary")) return;', script,
+                      "点行里的链接、按钮、勾选框不算点这一行")
+        self.assertIn('var tr = inDrawer ? drawerRow : b.closest("tr");', script,
+                      "抽屉里的切换条改的是抽屉开着的那一行")
+        self.assertIn('ev.key === "Escape"', script)
+        upsert = script[script.index("  function upsertTodo(t, archived){"):
+                        script.index("  function upsertResolved(t){")]
+        self.assertTrue(upsert.rstrip().endswith("if (tr === drawerRow) fillDrawer(tr);\n  }"),
+                        "后台同步把这一行各格都写完之后再重画抽屉，不然抽屉里的诊断慢一拍")
+        self.assertIn("!drawerRow.getClientRects().length", script,
+                      "这一行被筛选滤掉、或所在项目被切走，都算不在眼前")
+        show_tab = script[script.index("  function showTab(id, remember){"):
+                          script.index("  var box = document.getElementById(\"filter\");")]
+        self.assertIn("closeDrawerIfRowGone();", show_tab, "切项目时抽屉跟着关")
+        filtering = script[script.index("  function applyWorkFilter(){"):
+                           script.index("  function updateRowState(tr, state){")]
+        self.assertIn("closeDrawerIfRowGone();", filtering, "筛选/搜索把这一行滤掉时抽屉跟着关")
+        cleanup = script[script.index('      tr.querySelectorAll("button").forEach(function(x){ x.disabled = false; });'):]
+        self.assertLess(cleanup.index("drawerHtml.drawerActs = null;"),
+                        cleanup.index('updateRowState(tr, tr.dataset.workState || "pending");'),
+                        "保存失败后抽屉里的切换条要重画，不然一直灰着没法再试")
+        row = panel_view._todo_row(self.todo(), 8, False, main=True, resolvable=True)
+        self.assertNotIn("<details", row, "行里不再有要点开的小三角")
 
     def test_report_loading_does_not_present_unknown_counts_as_zero(self):
         dom = Elements(self.page())
