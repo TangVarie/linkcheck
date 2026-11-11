@@ -1463,15 +1463,13 @@ class DailyReports:
                                                int(now * 1000), journal_error=journal_error)
                    for report in reports]
         if self.closes is not None:
-            # 「比上一期」的基准：这一期开始那一刻（= 上一期结算时）记下的数；这一期自己
-            # 结算时的数也带上（已结算的期拿两期的「已检查」相比）。没记过就是 None。
+            # 「比上一期」的基准：这一期开始那一刻（= 上一期结算时）记下的数。没记过就是 None。
             # latest = 看的是最近这一期：还在进行，或者刚结算完不到一天（16 点到零点之间
             # 默认打开的就是刚结算的那一期，运营正是这会儿来看）。页面上的处置数是此刻的
             # 快照，只有最近这一期才拿它和开始那一刻比；更早的期比了没有意义。
             latest = int(now * 1000) < end_ms + PeriodCloses.DAY_MS
             for shown in reports:
                 shown["closes"] = {"start": self.closes.get(shown["table_id"], start_ms),
-                                   "end": self.closes.get(shown["table_id"], end_ms),
                                    "latest": latest}
         if self.warning:
             # 加在 present_report **之后**：它会整段重写 text，加在前面就只剩页面上的

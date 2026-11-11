@@ -156,7 +156,7 @@ class TestPeriodCloses(unittest.TestCase):
 
 
 class TestReportCarriesTheCloses(unittest.TestCase):
-    def test_each_report_gets_its_start_and_end_close(self):
+    def test_each_report_gets_the_close_it_started_from(self):
         from tests.test_panel_workflow import NOW, overview, todo
         projects = mock.Mock()
         projects.settings = Settings()
@@ -168,7 +168,6 @@ class TestReportCarriesTheCloses(unittest.TestCase):
         shown = reports.get(overview(todo()))["reports"][0]
         window = shown["window"]
         self.assertEqual(shown["closes"]["start"]["at"], window["start_ms"])
-        self.assertEqual(shown["closes"]["end"]["at"], window["end_ms"])
         self.assertTrue(shown["closes"]["latest"])
 
     def test_the_just_settled_period_still_counts_as_the_latest(self):
@@ -218,10 +217,10 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
                                 text=True, check=True)
         return json.loads(result.stdout)
 
-    def report(self, *, states, before=None, after=None, complete=False, current=True,
+    def report(self, *, states, before=None, complete=False, current=True,
                latest=True, checked=62):
         # 后端给的形状：结算了的期 complete=True 而 window_is_current=False，两个不会同时为真。
-        closes = {"start": before, "end": after, "latest": latest}
+        closes = {"start": before, "latest": latest}
         return {"label": "途鸽", "display_mode": "snapshot", "scanned_posts": 0,
                 "closes": closes,
                 "window": {"start_ms": 1, "end_ms": 2, "complete": complete,
@@ -245,7 +244,7 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
                          "正在处理变少不说明好坏：可能处理完了，也可能退回待处理")
         self.assertEqual(values["metricResolvedDelta"], "↑ 多 2")
         self.assertEqual(classes["metricResolvedDelta"], "metric-delta good")
-        self.assertEqual(values["metricCheckedDelta"], "", "这一期没结算完，半期的检查数不和上一整期比")
+        self.assertNotIn("metricCheckedDelta", values, "「已检查」不比：页面上的数和结算时记的不是一个口径")
         self.assertIn("数字后面的变化是和上一期结算时（11/09 16:00）比", values["workSummary"])
 
     def test_getting_worse_is_red_and_no_change_says_so(self):
@@ -256,18 +255,14 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
         self.assertEqual(out["values"]["metricProcessingDelta"], "持平")
         self.assertEqual(out["values"]["metricResolvedDelta"], "持平")
 
-    def test_checked_is_compared_only_between_two_settled_periods(self):
-        after = dict(self.BEFORE, checked=62)
+    def test_the_just_settled_period_is_compared_and_older_ones_are_not(self):
         states = {"pending": 0, "processing": 3, "resolved": 7}
-        out = self.render([self.report(states=states, before=self.BEFORE, after=after,
+        out = self.render([self.report(states=states, before=self.BEFORE,
                                        complete=True, current=False)])
-        self.assertEqual(out["values"]["metricCheckedDelta"], "↑ 比上一期多 8")
-        self.assertEqual(out["classes"]["metricCheckedDelta"], "metric-delta")
         self.assertEqual(out["values"]["metricNegativeDelta"], "↓ 比上一期少 2",
                          "刚结算的这一期（16 点后来看）处置数照样和上一期比")
-        older = self.render([self.report(states=states, before=self.BEFORE, after=after,
+        older = self.render([self.report(states=states, before=self.BEFORE,
                                          complete=True, current=False, latest=False)])["values"]
-        self.assertEqual(older["metricCheckedDelta"], "↑ 比上一期多 8", "两次结算的数相比，哪一期都行")
         self.assertEqual(older["metricNegativeDelta"], "", "更早的期：此刻的处置数不和当时比")
 
     def test_no_baseline_means_no_chip(self):
@@ -280,7 +275,7 @@ process.stdout.write(JSON.stringify({values: values, classes: classes}));
                              latest=False)]):
             values = self.render(reports)["values"]
             for name in ("metricNegativeDelta", "metricPendingDelta", "metricProcessingDelta",
-                         "metricResolvedDelta", "metricCheckedDelta"):
+                         "metricResolvedDelta"):
                 self.assertEqual(values[name], "", name)
             self.assertNotIn("和上一期结算时", values["workSummary"])
 

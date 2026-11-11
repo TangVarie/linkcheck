@@ -1644,21 +1644,17 @@ _SCRIPT = r"""
     // 每个项目都有基准才显示：缺一个项目的基准，合计的差就是错的。
     // 处置数（没处理完 / 待处理 / 正在处理 / 已处理）是此刻的快照，只在看的是最近这一期
     // （closes.latest：还在进行，或刚结算完不到一天）时才比；更早的期和当时的基准比没有意义。
-    // 「已检查」是一期之内的量，这一期没结算完就不比——拿半期的数和上一整期比永远是「少」；
-    // 结算了就拿两次结算记下的数相比，哪一期都可以。这两种分开判，互不挡路。
+    // 「时段内已检查」不比：进行中的期是半期的数；结算了的期页面上的数来自巡检留痕
+    // （scanned_posts），而结算时记下的是「最近一次检查落在这一期的帖子数」，两个口径
+    // 不一样，标签说的就不是旁边那个数。
     var stockKeys = ["pending", "processing", "resolved"];
     var base = {pending:0, processing:0, resolved:0}, live = 0, baseKnown = 0;
-    var flowNow = 0, flowBefore = 0, flowKnown = 0;
     currentReports.forEach(function(r){
-      var s = r.current_snapshot, c = r.closes || {}, before = c.start, after = c.end;
-      if (s && s.available && c.latest) {
-        live++;
-        if (before && stockKeys.every(function(k){ return typeof before[k] === "number"; })) {
-          baseKnown++; stockKeys.forEach(function(k){ base[k] += before[k]; }); }
-      }
-      if (r.window && r.window.complete && before && after &&
-          typeof before.checked === "number" && typeof after.checked === "number") {
-        flowKnown++; flowNow += after.checked; flowBefore += before.checked; }
+      var s = r.current_snapshot, c = r.closes || {}, before = c.start;
+      if (!s || !s.available || !c.latest) return;
+      live++;
+      if (before && stockKeys.every(function(k){ return typeof before[k] === "number"; })) {
+        baseKnown++; stockKeys.forEach(function(k){ base[k] += before[k]; }); }
     });
     var loaded = reportLoaded && currentReports.length > 0;
     var stockOk = loaded && live === currentReports.length && baseKnown === live &&
@@ -1680,8 +1676,6 @@ _SCRIPT = r"""
     delta("metricPendingDelta", stockOk ? totals.pending - base.pending : null, "less", "");
     delta("metricProcessingDelta", stockOk ? totals.processing - base.processing : null, "", "");
     delta("metricResolvedDelta", stockOk ? totals.resolved - base.resolved : null, "more", "");
-    delta("metricCheckedDelta", loaded && flowKnown === currentReports.length ? flowNow - flowBefore : null,
-      "", "比上一期");
     setText("metricCheckedLabel", checkedFromJournal ? "时段内已扫描" : "时段内已检查");
     var range = currentReports.length ? currentReports[0].window : null;
     var snapshotEnd = currentReports.length && currentReports[0].current_snapshot &&
@@ -2944,7 +2938,7 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
     <div class=work-context>当前负面处理概览按帖子去重；上方全部异常按表行计数，两者不是同一口径。</div>
     <div class=work-metrics aria-label='负面帖子处理概览' aria-live=polite>
       <div class=work-metric><span class=metric-label id=metricCheckedLabel>时段内已检查</span>
-        <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricCheckedDelta hidden></span></span>
+        <span class=metric-value><span id=metricChecked>—</span><small class=metric-unit>篇</small></span>
         <span class=metric-note id=metricCheckedPeriod>北京时间</span></div>
       <div class=work-metric><span class=metric-label id=metricNegativeLabel>还没处理完的负面帖子</span>
         <span class=metric-value><span id=metricNegative>—</span><small class=metric-unit>篇</small><span class=metric-delta id=metricNegativeDelta hidden></span></span>
