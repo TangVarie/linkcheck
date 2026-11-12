@@ -625,28 +625,47 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .todos tbody tr[data-rec]{cursor:pointer}
 .todos tbody tr.in-drawer td{background:var(--tint-primary)}
 /* ---------- 行详情抽屉 ----------
- * 这一行的全部信息：完整标题、原因、完整诊断与评论摘要、处理状态、直达链接。
- * 不遮罩、不锁页面：开着它也能点别的行（内容跟着换）。 */
-.drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);z-index:40;
+ * 这一行的全部信息：原因、处理状态、直达链接、完整诊断与评论摘要，最下面才是标题正文
+ * ——它是整段笔记文案，放最上面会把要看的东西全挤下去（2026-11-12）。
+ * 不遮罩、不锁页面：开着它也能点别的行（内容跟着换）。
+ * 上、中、下各一个「关闭」，都钉在抽屉上不跟着内容滚：上面一条、左边沿中间一个把手、
+ * 下面一条。内容再长，手边总有一个。
+ * z-index 压过右下角的深浅模式按钮（窄屏时它正好落在下面那条「关闭」上）。 */
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);z-index:100;
   background:var(--surface);border-left:1px solid var(--border);
-  box-shadow:var(--shadow-sheet);padding:20px 20px 32px;overflow-y:auto;
+  box-shadow:var(--shadow-sheet);display:flex;flex-direction:column;
   animation:drawer-in .18s ease-out both}
 .drawer[hidden]{display:none}
 @keyframes drawer-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
-.drawer-head{display:flex;align-items:flex-start;gap:12px}
-.drawer-head h3{flex:1;margin:0;font-size:16px;font-weight:600;line-height:1.5;
-  color:var(--text-dark);overflow-wrap:anywhere}
-.drawer-meta{margin-top:4px;font-size:13px;color:var(--text-light)}
-.drawer-chips{margin-top:12px}
-.drawer-facts{display:flex;gap:32px;margin:16px 0 0;font-size:13px}
+.drawer-head{flex:none;display:flex;align-items:center;gap:12px;padding:12px 20px;
+  border-bottom:1px solid var(--border)}
+.drawer-meta{flex:1;min-width:0;font-size:14px;font-weight:600;color:var(--text-dark);
+  overflow-wrap:anywhere}
+.drawer-scroll{flex:1;min-height:0;overflow-y:auto;padding:16px 20px 24px}
+.drawer-foot{flex:none;padding:12px 20px;border-top:1px solid var(--border)}
+.drawer-foot button{width:100%;height:36px;font-size:13px;font-weight:500;
+  background:none;border:1px solid var(--border-input);color:var(--text)}
+.drawer-foot button:hover:not(:disabled){background:var(--bg-secondary)}
+.drawer-handle{position:absolute;left:-29px;top:50%;margin-top:-36px;width:28px;height:72px;
+  padding:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+  font-size:12px;font-weight:500;
+  background:var(--surface);border:1px solid var(--border);border-right:0;color:var(--text-light)}
+.drawer-handle:hover:not(:disabled){background:var(--bg-secondary);color:var(--text-dark)}
+.drawer-handle:active:not(:disabled){transform:none}
+.drawer-facts{display:flex;gap:32px;margin:12px 0 0;font-size:13px}
 .drawer-facts dt{color:var(--text-light)}
 .drawer-facts dd{margin:2px 0 0;color:var(--text-dark);font-family:var(--font-num);font-size:15px}
 .drawer-acts{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;margin-top:16px;
   padding:12px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
 .drawer-acts a{font-size:13px;color:var(--primary)}
 .drawer h4{margin:16px 0 8px;font-size:13px;font-weight:600;color:var(--text-dark)}
-.drawer-body{font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;
-  color:var(--text)}
+.drawer-body,.drawer-title{font-size:13px;line-height:1.7;white-space:pre-wrap;
+  overflow-wrap:anywhere;color:var(--text)}
+/* 抽屉占满整屏宽时左边沿外面没有地方了：把手收进来，内容让出位置。 */
+@media (max-width:480px){
+  .drawer-handle{left:0;border-left:0;border-right:1px solid var(--border)}
+  .drawer-scroll,.drawer-head,.drawer-foot{padding-left:40px}
+}
 /* 「处理」一格：三段切换「待处理 | 正在处理 | 已处理」，当前状态那一段高亮；下面一行
  * 「去飞书这一行」。以前是一个状态徽标 + 「正在处理」「已处理」两个文字按钮——同一行
  * 两个「正在处理」，一个是状态一个是按钮，运营分不清（2026-11-11）。 */
@@ -1358,6 +1377,8 @@ _SCRIPT = r"""
     drawerRow = tr; tr.classList.add("in-drawer");
     setText("drawerError", "");
     fillDrawer(tr); drawer.hidden = false;
+    // 换了一行就从头看：上一行滚到哪儿和这一行没关系。
+    var scroller = drawer.querySelector(".drawer-scroll"); if (scroller) scroller.scrollTop = 0;
   }
   function closeDrawer(){
     if (!drawer) return;
@@ -1374,7 +1395,7 @@ _SCRIPT = r"""
   document.addEventListener("click", function(ev){
     var t = ev.target;
     if (!drawer || !t.closest) return;
-    if (t.closest("#drawerClose")) { closeDrawer(); return; }
+    if (t.closest("#rowDrawer .drawer-close")) { closeDrawer(); return; }
     var tr = t.closest("#todos tr[data-rec]");
     if (!tr) return;
     if (t.closest("button.detail")) { openDrawer(tr); return; }
@@ -2470,16 +2491,22 @@ _MARK = (
 
 # 行详情抽屉的骨架：内容由脚本在点「详情」/ 点行时从那一行搬进来（fillDrawer）。
 _DRAWER = (
-    "<aside class=drawer id=rowDrawer hidden aria-labelledby=drawerTitle>"
-    "<div class=drawer-head><h3 id=drawerTitle></h3>"
-    "<button type=button class=link id=drawerClose>关闭</button></div>"
-    "<div class=drawer-meta id=drawerMeta></div>"
+    "<aside class=drawer id=rowDrawer hidden aria-label=帖子详情>"
+    "<div class=drawer-head><div class=drawer-meta id=drawerMeta></div>"
+    "<button type=button class='link drawer-close' id=drawerClose>关闭</button></div>"
+    "<button type=button class='drawer-close drawer-handle' aria-label=关闭>"
+    "<span>关</span><span>闭</span></button>"
+    "<div class=drawer-scroll>"
     "<div class=drawer-chips id=drawerReasons></div>"
     "<dl class=drawer-facts><div><dt>评论数</dt><dd id=drawerComments></dd></div>"
     "<div><dt>最近检查</dt><dd id=drawerWhen></dd></div></dl>"
     "<div class=drawer-acts id=drawerActs></div>"
     "<span class=work-error id=drawerError role=status></span>"
-    "<h4>诊断信息</h4><div class=drawer-body id=drawerBody></div></aside>")
+    "<h4>诊断信息</h4><div class=drawer-body id=drawerBody></div>"
+    "<h4>标题与正文</h4><div class=drawer-title id=drawerTitle></div>"
+    "</div>"
+    "<div class=drawer-foot><button type=button class=drawer-close>关闭</button></div>"
+    "</aside>")
 
 
 def _shell(title: str, body: str, *, csrf: str = "") -> str:

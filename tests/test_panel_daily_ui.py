@@ -180,6 +180,7 @@ class TestPanelDailyUI(unittest.TestCase):
             dom.by_id(name)
         script = panel_view._SCRIPT
         self.assertIn('if (t.closest("button.detail")) { openDrawer(tr); return; }', script)
+        self.assertIn('if (t.closest("#rowDrawer .drawer-close")) { closeDrawer(); return; }', script)
         self.assertIn('if (t.closest("a, button, input, label, select, summary")) return;', script,
                       "点行里的链接、按钮、勾选框不算点这一行")
         self.assertIn('var tr = inDrawer ? drawerRow : b.closest("tr");', script,
@@ -203,6 +204,27 @@ class TestPanelDailyUI(unittest.TestCase):
                         "保存失败后抽屉里的切换条要重画，不然一直灰着没法再试")
         row = panel_view._todo_row(self.todo(), 8, False, main=True, resolvable=True)
         self.assertNotIn("<details", row, "行里不再有要点开的小三角")
+
+    def test_drawer_puts_the_post_text_last_and_has_three_close_buttons(self):
+        """标题正文是整段笔记文案，放在抽屉最上面会把原因、处理状态、诊断全挤下去：
+        挪到最下面。「关闭」上、中、下各一个，都不跟着内容滚（2026-11-12）。"""
+        drawer = panel_view._DRAWER
+        scroll = drawer[drawer.index("<div class=drawer-scroll>"):drawer.index("<div class=drawer-foot>")]
+        order = [scroll.index(mark) for mark in (
+            "id=drawerReasons", "id=drawerComments", "id=drawerActs", "id=drawerError",
+            "id=drawerBody", "<h4>标题与正文</h4>", "id=drawerTitle")]
+        self.assertEqual(order, sorted(order))
+        self.assertTrue(scroll.rstrip().endswith("id=drawerTitle></div></div>"), "标题正文后面什么都没有")
+        self.assertEqual(drawer.count("drawer-close"), 3)
+        head = drawer[drawer.index("<div class=drawer-head>"):drawer.index("<div class=drawer-scroll>")]
+        self.assertIn("id=drawerClose", head)
+        self.assertIn("drawer-handle", head, "中间那个是抽屉左边沿的把手，在滚动区外面")
+        self.assertNotIn("drawer-close", scroll, "三个都钉在抽屉上，不在滚动的内容里")
+        self.assertIn("drawer-close", drawer[drawer.index("<div class=drawer-foot>"):])
+        style = panel_view._STYLE
+        self.assertIn(".drawer-scroll{flex:1;min-height:0;overflow-y:auto", style)
+        self.assertIn(".drawer-head{flex:none", style)
+        self.assertIn(".drawer-foot{flex:none", style)
 
     def test_report_loading_does_not_present_unknown_counts_as_zero(self):
         dom = Elements(self.page())
