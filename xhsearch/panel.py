@@ -2973,7 +2973,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
           f"（缓存 {config.cache_seconds:.0f} 秒刷一次，"
           + (f"{config.idle_minutes:g} 分钟没人看就停，有人来先取一趟新的，"
              if config.idle_minutes else "一直刷，")
-          + f"评论正文{'展示' if config.show_digest else '不展示'}）", flush=True)
+          + f"评论区快照{'展示' if config.show_digest else '不展示'}，"
+            "负面评论快照在待办详情里展示）", flush=True)
     if logs.enabled:
         print("Railway 日志：已接入", flush=True)
     else:

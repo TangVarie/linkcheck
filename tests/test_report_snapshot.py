@@ -166,9 +166,11 @@ class TestExistingSnapshot(unittest.TestCase):
         self.assertTrue(all(r.adhoc for r in rows))
 
     def test_private_comment_contents_are_not_retained_or_exposed(self):
+        """日报这一路不留昵称、不出评论原文。待办详情是另一回事：那里原样显示
+        「负面评论快照」（见 test_summary 的同名规则，2026-11-12）。"""
         snap = project([record(1, negative=True, digest=digest(2))], show_digest=False)
         self.assertIn(Settings().fields.negative_digest, summary.panel_fields(Settings()))
-        self.assertEqual(snap.todos[0].negative_digest, "")
+        self.assertIn("私人昵称", snap.todos[0].negative_digest)
         self.assertNotIn("私人昵称", repr(snap.report_rows))
         self.assertNotIn("示例预警内容", repr(report(snap)))
 
