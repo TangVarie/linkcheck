@@ -288,11 +288,19 @@ class TestTodos(unittest.TestCase):
 
     def test_digest_is_withheld_by_default(self):
         """评论正文、昵称、IP 属地是别人的个人信息，
-        默认不因为「顺手」就上一个公网页面。"""
+        「评论区快照」（整页评论）默认不因为「顺手」就上一个公网页面。"""
         snap = snapshot([record("r1", tags=["风控中"], digest="张三：这个真好用",
                                 negative_digest="李四：踩雷")])
         self.assertEqual(snap.todos[0].digest, "")
-        self.assertEqual(snap.todos[0].negative_digest, "")
+
+    def test_negative_snapshot_is_carried_whatever_the_switch(self):
+        """「负面评论快照」只有命中负面词的那几条。运营要在待办详情里直接看到是哪几条、
+        命中了什么词；负责人定的不看 PANEL_SHOW_DIGEST（2026-11-12）。"""
+        rows = [record("r1", tags=["风控中"], digest="张三：这个真好用",
+                       negative_digest="1. [命中「踩雷」 · 广东] 李四: 踩雷")]
+        for shown in (False, True):
+            todo = snapshot(rows, show_digest=shown).todos[0]
+            self.assertEqual(todo.negative_digest, "1. [命中「踩雷」 · 广东] 李四: 踩雷")
 
     def test_digest_shown_when_explicitly_enabled(self):
         snap = snapshot([record("r1", tags=["风控中"], digest="张三：这个真好用")],
@@ -310,6 +318,7 @@ class TestPanelFields(unittest.TestCase):
         settings = Settings()
         without = summary.panel_fields(settings)
         self.assertNotIn(settings.fields.comment_digest, without)
+        self.assertIn(settings.fields.negative_digest, without, "负面评论快照总是读")
         with_digest = summary.panel_fields(settings, show_digest=True)
         self.assertIn(settings.fields.comment_digest, with_digest)
         self.assertIn(settings.fields.negative_digest, with_digest)

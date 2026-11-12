@@ -73,9 +73,12 @@ class TodoRow:
     # 分开「同样的错」和「还没刷回来」的信号：勾着，看到的就还是旧结果；
     # 勾没了、「最近检查」变新了，看到的才是这一次的结论。
     queued: bool = False
-    # 只有 PANEL_SHOW_DIGEST=1 时才填。默认空——评论正文、昵称、IP 属地
-    # 是别人的个人信息，不该因为「顺手」就上一个公网页面。
+    # 「评论区快照」（第一页的全部评论）：只有 PANEL_SHOW_DIGEST=1 时才填。默认空——
+    # 评论正文、昵称、IP 属地是别人的个人信息，不该因为「顺手」就上一个公网页面。
     digest: str = ""
+    # 「负面评论快照」（只有命中负面词的那几条）：**总是填**，不看那个开关——运营要在
+    # 详情里直接看到是哪几条、命中了什么词，才知道怎么处理（负责人 2026-11-12 定的，
+    # 知道里面带昵称和 IP 属地）。只在登录后的待办详情里显示。
     negative_digest: str = ""
     # 只在 Overview.resolved 里的行有：运营什么时候点的「已解决」（毫秒）。
     resolved_at_ms: Optional[int] = None
@@ -276,7 +279,7 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         f.last_updated, f.consecutive_failures, f.pinned_status,
         f.platform, f.refresh_status, f.failure_reason,
         f.comment_status, f.negative_status, f.alive_confirmed,
-        # 仅在后端数预警评论，原始正文仍受 show_digest 控制，不送浏览器。
+        # 后端数预警评论要用；待办详情里也原样显示（不看 show_digest，见 Todo.negative_digest）。
         f.negative_digest,
         f.collation_status,
         # 抖音短链记过的「作品ID」：没有它，面板认不出这一行是哪个作品，
@@ -288,7 +291,7 @@ def panel_fields(settings: Settings, *, show_digest: bool = False,
         f.eval_baseline_count, f.eval_baseline_time,
     ]
     if show_digest:
-        wanted += [f.comment_digest, f.negative_digest]
+        wanted += [f.comment_digest]
     # 额外要读的列（「哪一条」那一列，见 `pick_label_column`；截图读数的
     # 「相关截图」「数据整理」，见 panel._collect_one）。
     # 读表不计费，多读一列只是多几个字节。
@@ -622,8 +625,7 @@ def _make_todo(row: rows_mod.Row, cells: dict, settings: Settings, *,
         queued=row.queued,
         digest=(clean(feishu.read_text(cells.get(f.comment_digest)))
                 if show_digest else ""),
-        negative_digest=(clean(feishu.read_text(cells.get(f.negative_digest)))
-                         if show_digest else ""),
+        negative_digest=clean(feishu.read_text(cells.get(f.negative_digest))),
     )
 
 

@@ -625,7 +625,7 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .todos tbody tr[data-rec]{cursor:pointer}
 .todos tbody tr.in-drawer td{background:var(--tint-primary)}
 /* ---------- 行详情抽屉 ----------
- * 这一行的全部信息：原因、处理状态、直达链接、完整诊断与评论摘要，最下面才是标题正文
+ * 这一行的全部信息：原因、处理状态、直达链接、完整诊断、负面评论快照，最下面才是标题正文
  * ——它是整段笔记文案，放最上面会把要看的东西全挤下去（2026-11-12）。
  * 不遮罩、不锁页面：开着它也能点别的行（内容跟着换）。
  * 上、中、下各一个「关闭」，都钉在抽屉上不跟着内容滚：上面一条、左边沿中间一个把手、
@@ -661,6 +661,10 @@ textarea{width:100%;resize:vertical;min-height:72px}
 .drawer h4{margin:16px 0 8px;font-size:13px;font-weight:600;color:var(--text-dark)}
 .drawer-body,.drawer-title{font-size:13px;line-height:1.7;white-space:pre-wrap;
   overflow-wrap:anywhere;color:var(--text)}
+/* 负面评论快照：一条评论一行，条与条之间一道细线。 */
+.drawer-snapshot{font-size:13px;line-height:1.7;overflow-wrap:anywhere;color:var(--text)}
+.drawer-snapshot div{padding:8px 0;border-top:1px solid var(--border)}
+.drawer-snapshot div:first-child{padding-top:0;border-top:0}
 /* 抽屉占满整屏宽时左边沿外面没有地方了：把手收进来，内容让出位置。 */
 @media (max-width:480px){
   .drawer-handle{left:0;border-left:0;border-right:1px solid var(--border)}
@@ -1366,6 +1370,12 @@ _SCRIPT = r"""
     setText("drawerComments", cellText(tr, "td.comments") || "—");
     setText("drawerWhen", cellText(tr, "td.when") || "—");
     setHtml("drawerBody", body && body.textContent.trim() ? body.innerHTML : "这一行没有诊断信息。");
+    // 负面评论快照：表里那一格一行一条（`1. [命中「词」 · 3赞 · 广东] 昵称: 正文`），照原样
+    // 一条一行摆出来；没有就整节不显示。
+    var snapshot = cellText(tr, ".negative-snapshot");
+    setHtml("drawerSnapshot", snapshot.split("\n").filter(function(line){ return line.trim(); })
+      .map(function(line){ return "<div>" + esc(line) + "</div>"; }).join(""));
+    var snapBox = document.getElementById("drawerSnapshotBox"); if (snapBox) snapBox.hidden = !snapshot;
     var seg = tr.querySelector(".seg"), row = tr.querySelector("a.act"), post = tr.querySelector(".post a");
     setHtml("drawerActs", (seg ? seg.outerHTML : "") +
       (row ? '<a target="_blank" rel="noopener noreferrer" href="' + attr(row.getAttribute("href")) + '">去飞书这一行</a>' : "") +
@@ -1417,7 +1427,7 @@ _SCRIPT = r"""
     var state = t.work_state || "pending", url = safeUrl(t.post_url), link = safeUrl(t.record_url);
     var pick = main ? '<td class="nowrap"><input type="checkbox" aria-label="选择 ' + attr(t.label || t.record_id) +
       ' 排队刷新" class="todoPick' + (t.archived || t.adhoc ? ' solo' : '') + '"></td>' : '';
-    var diagnostic = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
+    var diagnostic = t.diagnosis || "", digest = t.digest || "";
     var on = state === "processing" ? "processing" : "pending";
     function segment(cls, label, title){
       return '<button type="button" class="' + cls + '" aria-pressed="' + (cls === on ? "true" : "false") +
@@ -1442,7 +1452,8 @@ _SCRIPT = r"""
       '<td class="diagnosis"><div class="diagnostic"><span class="diagnostic-summary">' +
       esc(diagnostic.slice(0, 48) || '诊断与评论摘要') + '</span>' +
       '<button type="button" class="link detail" title="在右侧打开这一行的完整信息">详情</button>' +
-      '<div class="diagnostic-body" hidden>' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div></div></td>' +
+      '<div class="diagnostic-body" hidden>' + esc(diagnostic + (digest ? '\n' + digest : '')) + '</div>' +
+      '<div class="negative-snapshot" hidden>' + esc(t.negative_digest || '') + '</div></div></td>' +
       '<td class="nowrap right comments num">' + esc(t.comment_count == null ? '—' : t.comment_count) + '</td><td class="nowrap when">' +
       chinaTime(t.checked_at_ms, true) + (t.queued ? ' <span class="chip">排队中</span>' : '') + '</td>' +
       '<td class="nowrap acts">' + controls + (link ? '<a class="act" target="_blank" rel="noopener noreferrer" href="' + attr(link) + '">去飞书这一行</a>' : '') + '</td></tr>';
@@ -1536,9 +1547,14 @@ _SCRIPT = r"""
     if (cells[offset + 1]) cells[offset + 1].innerHTML = (t.reasons || []).map(reasonChip).join('') +
       (t.adhoc ? '<span class="chip">未巡查</span>' : (t.archived ? '<span class="chip">已归档</span>' : ''));
     if (cells[offset + 3]) cells[offset + 3].textContent = t.comment_count == null ? "—" : t.comment_count;
-    var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.negative_digest || t.digest || "";
+    var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.digest || "";
     if (d) { var nextDetail = detail + (digest ? "\n" + digest : ""); if (d.textContent !== nextDetail) d.textContent = nextDetail;
-      tr.querySelector(".diagnostic-summary").textContent = detail.slice(0, 48) || "诊断与评论摘要"; }
+      tr.querySelector(".diagnostic-summary").textContent = detail.slice(0, 48) || "诊断与评论摘要";
+      // 负面评论快照：那一格原来没有（页面打开时这一行还没有快照）就补一个。
+      var snap = tr.querySelector(".negative-snapshot");
+      if (!snap) { snap = document.createElement("div"); snap.className = "negative-snapshot"; snap.hidden = true;
+        d.parentNode.appendChild(snap); }
+      if (snap.textContent !== (t.negative_digest || "")) snap.textContent = t.negative_digest || ""; }
     // 抽屉正开着这一行：上面 updateRowState 重画时各格还是旧的，等全部写完再照新内容画一遍，
     // 不然抽屉里的诊断比行上慢一拍，运营会照着旧诊断去点「已处理」。
     if (tr === drawerRow) fillDrawer(tr);
@@ -2503,6 +2519,8 @@ _DRAWER = (
     "<div class=drawer-acts id=drawerActs></div>"
     "<span class=work-error id=drawerError role=status></span>"
     "<h4>诊断信息</h4><div class=drawer-body id=drawerBody></div>"
+    "<div id=drawerSnapshotBox hidden><h4>负面评论快照</h4>"
+    "<div class=drawer-snapshot id=drawerSnapshot></div></div>"
     "<h4>标题与正文</h4><div class=drawer-title id=drawerTitle></div>"
     "</div>"
     "<div class=drawer-foot><button type=button class=drawer-close>关闭</button></div>"
@@ -2655,10 +2673,12 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
     单独勾一行是人对这一行拿了主意；全选一下把老帖和「说了别管」的行一起
     重刷，是替人改了主意、还要花钱。
     """
+    # 「评论区快照」（整页评论）跟着 show_digest 走，接在诊断后面；「负面评论快照」
+    # 不看开关，单独放一格（.negative-snapshot），详情抽屉里有它自己的一节。
     extra = ""
-    if show_digest and (todo.negative_digest or todo.digest):
+    if show_digest and todo.digest:
         extra = (f"<div class=muted style='margin-top:4px'>"
-                 f"{_e(todo.negative_digest or todo.digest)[:300]}</div>")
+                 f"{_e(todo.digest)[:300]}</div>")
     pick = ""
     if main:
         pick_label = f"选择 {_clip(todo.label, 30)} 排队刷新"
@@ -2689,8 +2709,10 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
                  f"{_e(_clip(todo.diagnosis or '诊断与评论摘要', 48))}</span>"
                  "<button type=button class='link detail' "
                  "title='在右侧打开这一行的完整信息'>详情</button>"
-                 f"<div class=diagnostic-body hidden>{_e(todo.diagnosis)}{extra}</div></div>"
-                 if todo.diagnosis or extra else "<span class=muted>—</span>")
+                 f"<div class=diagnostic-body hidden>{_e(todo.diagnosis)}{extra}</div>"
+                 f"<div class=negative-snapshot hidden>{_e(todo.negative_digest)}</div></div>"
+                 if todo.diagnosis or extra or todo.negative_digest
+                 else "<span class=muted>—</span>")
     return (
         f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
         f"data-tbl='{_e(todo.table_id)}'{key} data-find='{_e(_find_text(todo))}' "

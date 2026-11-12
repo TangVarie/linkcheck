@@ -226,6 +226,32 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertIn(".drawer-head{flex:none", style)
         self.assertIn(".drawer-foot{flex:none", style)
 
+    def test_drawer_shows_the_negative_comment_snapshot(self):
+        """诊断里只写「有负面，详见负面评论快照」，运营还得去飞书找那一格。现在详情里
+        直接有这一节，不看 PANEL_SHOW_DIGEST；评论区快照（整页评论）仍然跟着开关
+        （2026-11-12）。"""
+        snapshot = "1. [命中「踩雷」 · 3赞 · 广东] 李四<b>: 真的踩雷\n2. [命中「退款」] 王五: 想退款"
+        todo = self.todo()
+        todo.negative_digest, todo.digest = snapshot, "张三: 整页评论"
+        row = panel_view._todo_row(todo, 8, False, main=True, resolvable=True)
+        self.assertIn("<div class=negative-snapshot hidden>", row)
+        self.assertIn("李四&lt;b&gt;: 真的踩雷", row, "别人写的字要转义")
+        self.assertNotIn("整页评论", row, "评论区快照没开开关不显示")
+        self.assertIn("整页评论", panel_view._todo_row(todo, 8, True, main=True, resolvable=True))
+        todo.diagnosis = ""
+        self.assertIn("negative-snapshot", panel_view._todo_row(todo, 8, False, main=True, resolvable=True),
+                      "没有诊断、只有快照的行也要能点开详情")
+        drawer = panel_view._DRAWER
+        order = [drawer.index(mark) for mark in ("id=drawerBody", "<h4>负面评论快照</h4>",
+                                                 "id=drawerSnapshot>", "<h4>标题与正文</h4>")]
+        self.assertEqual(order, sorted(order), "接在诊断信息后面，标题正文仍在最下面")
+        self.assertIn("<div id=drawerSnapshotBox hidden>", drawer, "没有快照时整节不显示")
+        script = panel_view._SCRIPT
+        self.assertIn('var snapshot = cellText(tr, ".negative-snapshot");', script)
+        self.assertIn('return "<div>" + esc(line) + "</div>";', script)
+        self.assertIn("snapBox.hidden = !snapshot;", script)
+        self.assertIn("'<div class=\"negative-snapshot\" hidden>' + esc(t.negative_digest || '') + '</div>", script)
+
     def test_report_loading_does_not_present_unknown_counts_as_zero(self):
         dom = Elements(self.page())
         self.assertIn("disabled", dom.by_id("copyReport"))
