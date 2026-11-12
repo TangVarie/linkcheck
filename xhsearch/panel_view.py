@@ -1550,11 +1550,8 @@ _SCRIPT = r"""
     var d = tr.querySelector(".diagnostic-body"), detail = t.diagnosis || "", digest = t.digest || "";
     if (d) { var nextDetail = detail + (digest ? "\n" + digest : ""); if (d.textContent !== nextDetail) d.textContent = nextDetail;
       tr.querySelector(".diagnostic-summary").textContent = detail.slice(0, 48) || "诊断与评论摘要";
-      // 负面评论快照：那一格原来没有（页面打开时这一行还没有快照）就补一个。
       var snap = tr.querySelector(".negative-snapshot");
-      if (!snap) { snap = document.createElement("div"); snap.className = "negative-snapshot"; snap.hidden = true;
-        d.parentNode.appendChild(snap); }
-      if (snap.textContent !== (t.negative_digest || "")) snap.textContent = t.negative_digest || ""; }
+      if (snap && snap.textContent !== (t.negative_digest || "")) snap.textContent = t.negative_digest || ""; }
     // 抽屉正开着这一行：上面 updateRowState 重画时各格还是旧的，等全部写完再照新内容画一遍，
     // 不然抽屉里的诊断比行上慢一拍，运营会照着旧诊断去点「已处理」。
     if (tr === drawerRow) fillDrawer(tr);
@@ -2705,14 +2702,15 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
                + "</span>" if resolvable else "")
     # 格子里只放一句摘要；完整诊断（和评论摘要）留在 .diagnostic-body 里不显示，
     # 点「详情」或点这一行时由脚本搬进右侧抽屉。
+    # 这一格的骨架**总是**画出来，此刻什么都没有也画（和脚本里 rowHtml 新建的行一样）：
+    # 后台同步是往 .diagnostic-body / .negative-snapshot 里填字的，页面打开时没有骨架，
+    # 之后才有的诊断和负面评论快照就填不进去，要整页刷新才看得到。
     diagnosis = ("<div class=diagnostic><span class=diagnostic-summary>"
                  f"{_e(_clip(todo.diagnosis or '诊断与评论摘要', 48))}</span>"
                  "<button type=button class='link detail' "
                  "title='在右侧打开这一行的完整信息'>详情</button>"
                  f"<div class=diagnostic-body hidden>{_e(todo.diagnosis)}{extra}</div>"
-                 f"<div class=negative-snapshot hidden>{_e(todo.negative_digest)}</div></div>"
-                 if todo.diagnosis or extra or todo.negative_digest
-                 else "<span class=muted>—</span>")
+                 f"<div class=negative-snapshot hidden>{_e(todo.negative_digest)}</div></div>")
     return (
         f"<tr data-rec='{_e(todo.record_id)}' data-app='{_e(todo.app_token)}' "
         f"data-tbl='{_e(todo.table_id)}'{key} data-find='{_e(_find_text(todo))}' "

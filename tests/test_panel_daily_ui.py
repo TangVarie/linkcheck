@@ -92,7 +92,8 @@ class TestPanelDailyUI(unittest.TestCase):
         self.assertEqual(markup.count("正在处理"), 2, "按钮文字一次 + 它的 title 一次，没有第二个徽标")
         self.assertNotIn("work-state'", markup)
         labels = [a["class"] for tag, a in Elements(markup).tags if tag == "button"]
-        self.assertEqual(labels, ["pending", "processing", "resolve"])
+        # 行里另一个按钮是诊断那一格的「详情」（现在每一行都有），不是状态。
+        self.assertEqual(labels, ["link detail", "pending", "processing", "resolve"])
         pressed = [a["class"] for tag, a in Elements(markup).tags
                    if tag == "button" and a.get("aria-pressed") == "true"]
         self.assertEqual(pressed, ["processing"])
@@ -241,6 +242,12 @@ class TestPanelDailyUI(unittest.TestCase):
         todo.diagnosis = ""
         self.assertIn("negative-snapshot", panel_view._todo_row(todo, 8, False, main=True, resolvable=True),
                       "没有诊断、只有快照的行也要能点开详情")
+        todo.negative_digest = todo.digest = ""
+        bare = panel_view._todo_row(todo, 8, False, main=True, resolvable=True)
+        self.assertIn("<div class=diagnostic-body hidden></div>"
+                      "<div class=negative-snapshot hidden></div>", bare,
+                      "此刻什么都没有也要有骨架：后台同步之后才来的诊断和快照是往里填的")
+        self.assertIn("button type=button class='link detail'", bare)
         drawer = panel_view._DRAWER
         order = [drawer.index(mark) for mark in ("id=drawerBody", "<h4>负面评论快照</h4>",
                                                  "id=drawerSnapshot>", "<h4>标题与正文</h4>")]
