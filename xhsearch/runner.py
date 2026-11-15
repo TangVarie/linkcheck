@@ -144,6 +144,9 @@ class Outcome:
     # 真正拿到评论页的一次观测，由调用方补 table_id 后写入持久留痕表。
     # 失败/跳过/只有 detail 数字的空壳没有扫描事件。
     scan_event: Optional[dict[str, Any]] = None
+    # 跟写的列 → 它跟着的那一列。写回时被跟的列被挡下（表里没有 / 类型写不进），
+    # 跟着它的列也不写：「评论数观测时间」不能给一个没写进去的评论数盖上新时间。
+    follows: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -324,6 +327,14 @@ class RunBudget:
             self.calls += calls
             self.yuan += yuan
             return True
+
+    def release_record(self) -> None:
+        """把一行占的行数名额还回去：这一行被上游限流、什么都没拿到也没花钱，
+        留给了下一轮。不还的话，排在最前面的几行持续被限流时会每一轮都占满
+        行数上限，后面健康的行永远轮不到。请求数和金额照 settle() 的实数记，不退。"""
+        with self._lock:
+            if self.records > 0:
+                self.records -= 1
 
     def settle(self, reserved_yuan: float, actual_yuan: float,
                reserved_calls: int, actual_calls: int) -> None:
@@ -1548,7 +1559,9 @@ def refresh(
 
         return Outcome(row.record_id, status, fields, "；".join(log_notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at,
-                       blue_word_plan=blue_word_plan, scan_event=scan_event)
+                       blue_word_plan=blue_word_plan, scan_event=scan_event,
+                       follows=({f.count_observed_at: f.comment_count}
+                                if f.count_observed_at in fields else {}))
 
     def work(row: Row) -> Outcome:
         platform = row.parsed.platform or ""
@@ -1695,6 +1708,8 @@ def refresh(
             if not (cost_yuan or credits or fetched.billed):
                 with lock:
                     rate_limited["rows"] += 1
+                if reserved:
+                    budget.release_record()
                 return Outcome(row.record_id, STATUS_DEFERRED, {},
                                "上游限流（本轮该平台持续限流，只问了一次），留给下一轮"
                                if single_attempt else
@@ -2542,6 +2557,10 @@ def write_back(
         if tags_planned and plan.field_name not in fields and plan.coupled:
             # 标签那一列被挡下了：跟着它的列也别单独写（见 TagPlan.coupled）。
             fields = {k: v for k, v in fields.items() if k not in plan.coupled}
+        follows = getattr(o, "follows", None)
+        if follows:
+            fields = {k: v for k, v in fields.items()
+                      if k not in follows or follows[k] in fields}
         if fields:
             updates.append({"record_id": o.record_id, "fields": fields})
     return table.batch_update(updates, errors=errors) if updates else 0

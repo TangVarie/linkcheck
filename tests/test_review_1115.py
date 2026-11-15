@@ -137,6 +137,28 @@ class TestSecondRateLimitDefersTheRow(FailoverTest):
             self.assertEqual(report.rate_limited_rows, 4)
             self.assertIn("4 行未处理（上游限流）", report.aborted_reason)
 
+    def test_limited_rows_do_not_use_up_the_row_cap(self):
+        """行数上限是 3，排最前面的 3 行持续被限流：它们占的名额要还回去，
+        否则后面那一行健康的每一轮都轮不到。"""
+        self.settings.max_concurrency = 1
+        stuck = [xhs_row(f"stuck{i}") for i in range(3)]
+        stuck_ids = [note_id(r.record_id) for r in stuck]
+
+        def answer(i):
+            url = self.get_calls[i]
+            if any(n in url for n in stuck_ids):
+                return limited()
+            return tikhub_ok_comments() if "comments" in url else tikhub_ok_detail()
+
+        for _ in range(2):
+            budget = runner.RunBudget(runner.Budget(max_records_per_run=3))
+            report = self.run_with(on_get=answer,
+                                   on_post=lambda i: self.fail("限流不换通道"),
+                                   rows=stuck + [xhs_row("ok0")], budget=budget)
+            self.assertEqual([o.status for o in report.outcomes],
+                             [runner.STATUS_DEFERRED] * 3 + [runner.STATUS_OK])
+            self.assertEqual(budget.records, 1)
+
     def test_a_real_answer_brings_the_backoff_back(self):
         """只问一次的那一段里有一行拿到了真回答：后面的行恢复退避重试。"""
         pause = runner.RATE_LIMIT_ROWS_BEFORE_PAUSE
@@ -357,6 +379,24 @@ class TestCountObservedAt(FailoverTest):
         self.assertNotIn(f.count_observed_at, fields)
         self.assertIn(f.comment_digest, fields)      # 评论页是看到了的
         self.assertIn(f.comment_records, fields)
+
+    def test_it_is_not_written_when_the_count_cannot_be(self):
+        """评论数那一列写不进去（表里是公式列，或者根本没有这一列）：
+        观测时间也不写——不给一个没写进去的数盖新时间。"""
+        f = self.settings.fields
+        answers = [tikhub_ok_comments(), tikhub_ok_detail()]
+        report = self.run_with(on_get=lambda i: answers[i],
+                               on_post=lambda i: self.fail("不该降级"))
+        self.assertIn(f.count_observed_at, report.outcomes[0].fields)
+        table, bad = FakeTable(), set()
+        runner.write_back(table, report, field_types={f.comment_count: 20, f.count_observed_at: 5},
+                          mistyped_fields=bad)
+        self.assertEqual(bad, {f.comment_count})
+        self.assertNotIn(f.count_observed_at, table.updates[0]["fields"])
+        table = FakeTable()
+        known = set(report.outcomes[0].fields) - {f.comment_count}
+        runner.write_back(table, report, known_fields=known)
+        self.assertNotIn(f.count_observed_at, table.updates[0]["fields"])
 
     def test_a_table_without_the_new_columns_is_written_as_before(self):
         f = self.settings.fields
