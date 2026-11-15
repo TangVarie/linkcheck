@@ -35,6 +35,16 @@ from .rows import (  # noqa: F401
     STATUS_SKIPPED, STATUS_COOLDOWN, STATUS_DEFERRED, STATUS_RIDE_SKIPPED,
 )
 
+# 同一个平台连着这么多行都是「退避一次再试仍被限流」，这一轮剩下的行就改成
+# 「只问一次」：被限流就直接留给下一轮，不再睡退避、不再重试。限流的行不再盖
+# 时间戳之后，每一轮都会重捞它们；上游真在持续限流时，不这样就是每一行先睡一次
+# 退避、再白打一次。
+# **不整个停掉这个平台**：限流的行时间戳没动，下一轮还排在最前面；要是限流只
+# 粘在某几行上（判限流也看报错文字，不只看 HTTP 429），一停就是每一轮都被这
+# 几行堵死，后面健康的行永远轮不到。所以剩下的行照样各问一次。
+# 中间只要有一行拿到了上游的真回答，就重新数、恢复正常的退避重试。
+RATE_LIMIT_ROWS_BEFORE_PAUSE = 3
+
 # 这些状态没有真正打过上游接口，不该参与熔断的失效比例计算。
 _NOT_ATTEMPTED = frozenset({STATUS_COOLDOWN, STATUS_SKIPPED, STATUS_DEFERRED,
                             STATUS_RIDE_SKIPPED})
@@ -134,6 +144,9 @@ class Outcome:
     # 真正拿到评论页的一次观测，由调用方补 table_id 后写入持久留痕表。
     # 失败/跳过/只有 detail 数字的空壳没有扫描事件。
     scan_event: Optional[dict[str, Any]] = None
+    # 跟写的列 → 它跟着的那一列。写回时被跟的列被挡下（表里没有 / 类型写不进），
+    # 跟着它的列也不写：「评论数观测时间」不能给一个没写进去的评论数盖上新时间。
+    follows: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -163,6 +176,10 @@ class RunReport:
     dead_platforms: dict[str, str] = field(default_factory=dict)
     # 预算触顶的原因（SUP-001）。非空 = 还有行没轮到，但它们完全没被写过。
     budget_stopped: str = ""
+    # 上游限流（退避一次再试仍是 429、手里没有数据、没花钱）而顺延的行数。这些行一个字
+    # 都没写：「最近检查时间」「排队刷新」原样，下一轮重捞（见 refresh 里
+    # 「二连限流」那一段）。
+    rate_limited_rows: int = 0
     # 抖音短链展开（免费的那一步）：成功换到 aweme_id 的条数 / 展不开的条数。
     # 写进日志是为了让「抖音这轮怎么还在走 SocialDataX」有处可查：
     # 失败数一高，多半是短链落地页形态变了，该去看 shortlink.py 的正则。
@@ -227,6 +244,9 @@ class RunReport:
                      "这批行已记 1 次失败，等待期过后复查一次，再取不到即判失效")
         if self.budget_stopped:
             line += f"\n💰 预算触顶：{self.budget_stopped}"
+        if self.rate_limited_rows:
+            line += (f"\n🚦 上游限流：{self.rate_limited_rows} 行被限流（退避重试后仍是），没有写回"
+                     "（「最近检查时间」和「排队刷新」的勾都没动），下一轮重捞")
         if self.short_links_expanded or self.short_links_failed:
             line += (f"\n🔗 抖音短链展开：成功 {self.short_links_expanded}，"
                      f"失败 {self.short_links_failed}（失败的行按原链接走备胎）")
@@ -307,6 +327,14 @@ class RunBudget:
             self.calls += calls
             self.yuan += yuan
             return True
+
+    def release_record(self) -> None:
+        """把一行占的行数名额还回去：这一行被上游限流、什么都没拿到也没花钱，
+        留给了下一轮。不还的话，排在最前面的几行持续被限流时会每一轮都占满
+        行数上限，后面健康的行永远轮不到。请求数和金额照 settle() 的实数记，不退。"""
+        with self._lock:
+            if self.records > 0:
+                self.records -= 1
 
     def settle(self, reserved_yuan: float, actual_yuan: float,
                reserved_calls: int, actual_calls: int) -> None:
@@ -405,6 +433,9 @@ class _Fetched:
     expanded_url: str = ""
     # 结果是同一篇内容的另一行这一轮刚取到的：这一行一分钱没花。
     shared: bool = False
+    # 取这份结果花过钱（抄给同篇行的那一份 yuan 是 0，靠这一格知道原主花过）。
+    # 「二连限流不写回」只对一分钱没花的结果成立，见 refresh 里那一段。
+    billed: bool = False
 
     def for_sibling(self) -> "_Fetched":
         """给同篇另一行的那一份：数据照抄，**钱和请求数一律是 0**——
@@ -412,7 +443,8 @@ class _Fetched:
         判定逐行做，谁也不该改到别人的那一份。"""
         return _Fetched(snapshot=copy.deepcopy(self.snapshot), error=self.error,
                         expanded_id=self.expanded_id, expanded_url=self.expanded_url,
-                        shared=True)
+                        shared=True,
+                        billed=bool(self.billed or self.yuan or self.credits))
 
 
 class _ShareEntry:
@@ -810,8 +842,12 @@ def _fetch_one(
     share: Optional[FetchShare] = None,
     watch: Optional[ContractWatch] = None,
     owned_key: Optional[tuple] = None,
+    retry_rate_limit: bool = True,
 ) -> _Fetched:
     """跑完一行需要的全部调用。
+
+    retry_rate_limit=False：被限流不退避、不重试，这一行直接带着限流回来
+    （这个平台这一轮已经连着几行二连限流，见 RATE_LIMIT_ROWS_BEFORE_PAUSE）。
 
     终局错误 code == "deadline" 且无快照 = 这一行根本没开始，留给下一轮。
 
@@ -849,7 +885,8 @@ def _fetch_one(
     def produce() -> _Fetched:
         fetched = _fetch_calls(calls, keys, settings, deadline=deadline, timeout=timeout,
                                disabled=disabled, tally=tally, lock=lock, watch=watch,
-                               expand_failure=expand_failure)
+                               expand_failure=expand_failure,
+                               retry_rate_limit=retry_rate_limit)
         # 展开出的作品 ID 在交给同篇行**之前**就填上：等着的行（for_sibling 照抄）
         # 一拿到就醒，晚一步填，它抄到的就是空的——日报里同一篇会被记成两篇。
         fetched.expanded_id, fetched.expanded_url = expanded_id, expanded_url
@@ -892,6 +929,7 @@ def _fetch_calls(
     lock: Optional[threading.Lock],
     watch: Optional[ContractWatch],
     expand_failure: str,
+    retry_rate_limit: bool = True,
 ) -> _Fetched:
     """真正发请求的那一段：评论页 → （可选）detail，带限流退避和失败分类。"""
     out = _Fetched()
@@ -952,7 +990,8 @@ def _fetch_calls(
 
         result = attempt(call)
 
-        if isinstance(result, protocol.Err) and result.kind is protocol.Failure.RATE_LIMIT:
+        if (retry_rate_limit and isinstance(result, protocol.Err)
+                and result.kind is protocol.Failure.RATE_LIMIT):
             # 退避一次再试。等待时间不能越过软截止——设了软截止的运行时里，
             # 一次 30 秒的 retry_after 睡过头会把整轮拖超时。
             # retry_after 已在 protocol.clamp_retry_after 里过滤过负数/NaN/超大值：
@@ -989,7 +1028,8 @@ def _fetch_calls(
                 # 只停这个平台：另一个平台可能配着完全健康的通道。
                 raise _Abort(str(result), call.platform, out.credits, out.yuan)
             if result.kind is protocol.Failure.RATE_LIMIT:
-                # 二连限流：把这一行留给下一轮，别拖垮整批。
+                # 二连限流（或者这一轮已经改成只问一次）：把这一行留给下一轮，
+                # 别拖垮整批。
                 return done(result)
             if result.kind is protocol.Failure.GONE and not _looks_alive(out.snapshot):
                 # 「内容没了」是行级结论，不管它是从评论接口还是 detail 冒出来的。
@@ -1206,6 +1246,12 @@ def refresh(
     # 不再穿透 pool.map——那样会把已完成但还没取出的结果一起丢掉。
     # 按平台分粒度是刻意的：xhs 的通道全倒，不该让 douyin 的健康行陪葬。
     dead_platforms: dict[str, str] = {}
+    # 上游限流（退避一次再试仍是 429）的账：被顺延了几行、每个平台连着几行、
+    # 哪个平台这一轮先改成「只问一次、不退避」（见 RATE_LIMIT_ROWS_BEFORE_PAUSE）。
+    # 读写都过 lock。
+    rate_limited = {"rows": 0}
+    rate_limit_streak: dict[str, int] = {}
+    rate_limit_single: set[str] = set()
     if budget is None:
         budget = RunBudget(settings.budget)
     # 抖音短链 → aweme_id 的缓存，一轮一份（跨表共享没有意义：同一条短链
@@ -1349,6 +1395,10 @@ def refresh(
                 if row.previous_comment_count is not None:
                     fields[f.previous_comment_count] = row.previous_comment_count
                 fields[f.comment_count] = snapshot.comment_count
+                # 这个数是哪一刻量到的。和上面那一格同写同不写——取不到内容、
+                # 评论数没量到的轮次（它们照样推进「最近检查时间」）不碰它，
+                # 所以它不会给一个旧数盖上新时间。时刻和「最近检查时间」同值。
+                fields[f.count_observed_at] = int(checked_at.timestamp() * 1000)
             # 「起量时间」**只写第一次**：它回答「什么时候起来的」，是个历史
             # 事实；后面每一波都覆盖的话，这一列就退化成「最近一次涨得猛的
             # 时间」，而那个问题「评论增量」已经回答了。格子空着才写。
@@ -1387,6 +1437,11 @@ def refresh(
             if analyze.saw_comment_page(snapshot):
                 fields[f.comment_digest] = analyze.format_digest(
                     snapshot, settings.digest, hit=verdict.seed_hit)
+                # 同一页评论的机器可读版，和快照同写同不写（表里没建这一列时
+                # write_back 会把它挡下，别的列照常写）。
+                fields[f.comment_records] = analyze.format_records(
+                    snapshot, observed_at_ms=int(checked_at.timestamp() * 1000),
+                    seed_keywords=row.seed_keywords)
 
         # —— 数据整理过时提醒：评论数比整理那一刻涨了一大截 → 需重新整理 ——
         # 只在这一轮真的量到了评论数时判（失败路径不碰这三格），而且表里
@@ -1504,7 +1559,9 @@ def refresh(
 
         return Outcome(row.record_id, status, fields, "；".join(log_notes)[:200],
                        credits, cost_yuan, tag_plan=tag_plan, checked_at=checked_at,
-                       blue_word_plan=blue_word_plan, scan_event=scan_event)
+                       blue_word_plan=blue_word_plan, scan_event=scan_event,
+                       follows=({f.count_observed_at: f.comment_count}
+                                if f.count_observed_at in fields else {}))
 
     def work(row: Row) -> Outcome:
         platform = row.parsed.platform or ""
@@ -1530,6 +1587,11 @@ def refresh(
             return Outcome(row.record_id, STATUS_COOLDOWN, {},
                            f"{settings.safety.cooldown_seconds} 秒内刚刷过，跳过（不计费）", 0)
 
+        with lock:
+            # 这个平台刚连着几行都是二连限流：后面的行只问一次，被限流就直接
+            # 留给下一轮，不睡退避、不重试（见 RATE_LIMIT_ROWS_BEFORE_PAUSE）。
+            single_attempt = platform in rate_limit_single
+
         # —— 同篇共享：同一篇内容这一轮只有认领的那一行去取（派发前定好的）——
         # 重复登记的行等它、拿一份结果去做自己的判定，不预留预算、不花钱；
         # 认领的那一行没去取（冷却、预算、截止……），重复行就自己接手照常付钱。
@@ -1548,8 +1610,10 @@ def refresh(
                 # —— 预算：在发请求**之前**预留（SUP-001）——
                 # 预留必须是**悲观**的：预留时主通道是健康的，可跑到一半它倒了、
                 # 这一行就走了贵十几倍的备胎。等 settle() 事后校正时钱已经花出去，
-                # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「可能走到的最贵
-                # 那家」预留，跑完再 settle 退还差额——上限不被突破，吞吐也不长期受压。
+                # MAX_YUAN_PER_RUN 在这一行上已经被越过了。所以按「这一行可能被收到
+                # 的最多的钱」预留——主通道收了钱却没给出能用的结果、再降到备胎，是
+                # 两家都收（rows._call_price）——跑完再 settle 退还差额：上限不被
+                # 突破，吞吐也不长期受压。
                 reserved_yuan = estimate_yuan([row], settings, now, keys=keys,
                                               disabled=disabled, worst_case=True)
                 # 调用数同理：一个计划中的调用最多会打 len(order) 家。传输层的重试
@@ -1565,6 +1629,7 @@ def refresh(
                     row, keys, settings, now=now, deadline=deadline, timeout=timeout,
                     disabled=disabled, tally=tally, lock=lock, resolver=resolver,
                     share=share, watch=watch, owned_key=key if owned else None,
+                    retry_rate_limit=not single_attempt,
                 )
         except _Abort as exc:
             # 中止的行也可能已经花过钱：按实际花销校正账面再走。
@@ -1617,6 +1682,45 @@ def refresh(
         if snapshot is None and error is not None and error.code == "deadline":
             return Outcome(row.record_id, STATUS_DEFERRED, {},
                            "已到软截止，留给下一轮", credits, cost_yuan)
+
+        # —— 二连限流、手里一点数据都没有、一分钱没花：不写回，留给下一轮 ——
+        # 退避一次再试还是 429（_fetch_calls 里那句「把这一行留给下一轮」）。以前
+        # 这个结果往下掉进「刷新失败」：盖「最近检查时间」、清「排队刷新」的勾——
+        # 这一行就按正常节奏等到下一档（8 小时到 3 天），运营勾的排队也像是
+        # 「处理完了」。限流对这篇内容什么都没说，和软截止、预算触顶是一回事：
+        # 一个字都不写，时间戳和排队勾原样，下一轮自然重捞；不算一次失败的巡查。
+        # 评论已经到手、只是后面的 detail 被限流的行不走这里（snapshot 不是 None），
+        # 照常按已有数据下结论。
+        #
+        # ⚠️ 只对**没花钱**的行这样做。主通道收了钱却给了认不出的东西、降到备胎
+        # 又被限流，这一行已经付过一次钱；不盖时间戳的话，每 5 分钟一轮都会把
+        # 同一批行再买一遍，表里什么都不留、花销没有上限（和「不盖戳的行每一轮
+        # 都重取」是同一个坑）。花过钱的行照旧往下走「刷新失败」：盖时间戳，
+        # 等它的下一档，花销以行数为界。
+        if (snapshot is None and error is not None
+                and error.kind is protocol.Failure.RATE_LIMIT):
+            with lock:
+                if not fetched.shared:
+                    # 同篇行抄来的是同一次限流，不重复计。
+                    rate_limit_streak[platform] = rate_limit_streak.get(platform, 0) + 1
+                    if rate_limit_streak[platform] >= RATE_LIMIT_ROWS_BEFORE_PAUSE:
+                        rate_limit_single.add(platform)
+            if not (cost_yuan or credits or fetched.billed):
+                with lock:
+                    rate_limited["rows"] += 1
+                if reserved:
+                    budget.release_record()
+                return Outcome(row.record_id, STATUS_DEFERRED, {},
+                               "上游限流（本轮该平台持续限流，只问了一次），留给下一轮"
+                               if single_attempt else
+                               "上游限流（退避重试后仍被限流），留给下一轮", 0)
+        if snapshot is not None or (error is not None
+                                    and error.kind is protocol.Failure.GONE):
+            # 上游给了一个真回答（数据，或者「内容没了」）：不是持续限流，重新数，
+            # 后面的行恢复正常的退避重试。
+            with lock:
+                rate_limit_streak.pop(platform, None)
+                rate_limit_single.discard(platform)
 
         # —— 链接形态不被当前配置的通道支持（比如只配 TikHub 的抖音短链）——
         # 这是链接/配置问题，不是上游观测：按「跳过」处理（和坏链接同类），
@@ -1795,8 +1899,15 @@ def refresh(
     else:
         deferred = sum(1 for o in report.outcomes if o.status == STATUS_DEFERRED)
         if deferred:
-            cause = budget.stopped_reason or "到达软截止"
+            limited = min(rate_limited["rows"], deferred)
+            if limited >= deferred:
+                cause = "上游限流"
+            else:
+                cause = budget.stopped_reason or "到达软截止"
+                if limited:
+                    cause += f"；其中 {limited} 行是上游限流"
             report.aborted_reason = f"{deferred} 行未处理（{cause}），留给下一轮"
+    report.rate_limited_rows = rate_limited["rows"]
 
     report.used_providers = dict(tally)
     report.short_links_expanded = resolver.expanded
@@ -1864,6 +1975,7 @@ def emit_run_events(report: RunReport, sink: Optional[Callable[[dict[str, Any]],
         "breaker_attempted": report.breaker_attempted,
         "breaker_gone": report.breaker_gone,
         "budget_stopped": report.budget_stopped,
+        "rate_limited_rows": report.rate_limited_rows,
         "dead_platforms": dict(report.dead_platforms),
         "aborted_reason": report.aborted_reason,
         "fatal": report.fatal,
@@ -2445,6 +2557,10 @@ def write_back(
         if tags_planned and plan.field_name not in fields and plan.coupled:
             # 标签那一列被挡下了：跟着它的列也别单独写（见 TagPlan.coupled）。
             fields = {k: v for k, v in fields.items() if k not in plan.coupled}
+        follows = getattr(o, "follows", None)
+        if follows:
+            fields = {k: v for k, v in fields.items()
+                      if k not in follows or follows[k] in fields}
         if fields:
             updates.append({"record_id": o.record_id, "fields": fields})
     return table.batch_update(updates, errors=errors) if updates else 0

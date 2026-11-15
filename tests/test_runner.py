@@ -2176,7 +2176,8 @@ class TestRunBudget(RunnerTest):
 
         乐观预留下 settle() 是**事后**校正：等它反应过来，钱已经花出去，
         MAX_YUAN_PER_RUN 在这一行上已经被越过。所以预留必须按
-        「可能走到的最贵那家」算。
+        「这一行可能被收到的最多的钱」算：主通道收了钱却没给出能用的结果、
+        再降到备胎，是两家都收（2026-11-15，见 tests/test_review_1115.py）。
         """
         from xhsearch.rows import estimate_yuan
 
@@ -2187,7 +2188,7 @@ class TestRunBudget(RunnerTest):
         optimistic = estimate_yuan([row], self.settings, NOW, keys=keys)
         pessimistic = estimate_yuan([row], self.settings, NOW, keys=keys, worst_case=True)
         self.assertAlmostEqual(optimistic, 0.0144, places=4)   # TikHub 两次
-        self.assertAlmostEqual(pessimistic, 0.20, places=4)    # SocialDataX 两次
+        self.assertAlmostEqual(pessimistic, 0.2144, places=4)  # 两次 ×（TikHub + SocialDataX）
 
         # 上限落在两者之间时，悲观预留必须把这一行拦下
         budget = runner.RunBudget(runner.Budget(max_yuan_per_run=0.10))

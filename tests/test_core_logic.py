@@ -2020,11 +2020,14 @@ class TestEstimateByActualChannel(unittest.TestCase):
         self.assertAlmostEqual(yuan, 2 * 0.001 * 7.2)   # 评论 + detail 各 $0.001
 
     def test_douyin_short_link_reserves_at_socialdatax_in_worst_case(self):
-        """预算闸门预留时展开还没发生：展不开就退回 SDX，悲观口径必须把它算上。"""
+        """预算闸门预留时展开还没发生：展不开就退回 SDX，悲观口径必须把它算上。
+        展开成功的那条路更贵一点：TikHub 收了钱却没给出能用的结果、再降到 SDX，
+        两家都收（2026-11-15）。"""
         row, now = self._short_link_row()
         yuan = rows.estimate_yuan([row], Settings(), now,
                                   keys={"tikhub": "t", "socialdatax": "s"}, worst_case=True)
-        self.assertAlmostEqual(yuan, 0.20)   # 评论 + detail 各 ¥0.10
+        # 评论 + detail 各（TikHub ¥0.0072 + SDX ¥0.10）
+        self.assertAlmostEqual(yuan, 2 * (0.001 * 7.2 + 0.10))
 
     def test_short_link_is_priced_at_socialdatax_when_tikhub_is_dead(self):
         """TikHub 本轮已判死：展开不会发生（换成 ID 也没通道接），按 SDX 算。"""

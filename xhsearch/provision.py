@@ -370,7 +370,12 @@ FULL_LAYOUT: tuple = (
     "negative_status",
     "negative_digest",
     "comment_digest",
+    # 评论区快照的机器可读版（2026-11-15 加，机器写）：挨着快照。
+    "comment_records",
     "comment_count",
+    # 评论数是哪一刻量到的（2026-11-15 加，机器写）：夹在评论数和最近检查时间中间，
+    # 两个时刻并排，一眼看得出「查过」和「量到」不是同一回事。
+    "count_observed_at",
     "last_updated",
     # 公式本体在 next_check_formula()（要按配置里的列名拼），这里只占位。
     BusinessColumn(NEXT_CHECK_COLUMN, FORMULA, formula="<next_check_formula>"),

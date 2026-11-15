@@ -627,8 +627,9 @@ def estimate_yuan(
 ) -> float:
     """预估这一批要花多少钱，按每个平台**实际会走的那家**的单价算。
 
-    worst_case=True 时改按**这次调用可能走到的最贵那家**算。两种口径各有各的
-    用途，别混：
+    worst_case=True 时改按**这次调用可能被收到的最多的钱**算——不是最贵的那一家：
+    主通道收了钱却没给出能用的结果、再降到备胎，是两家都收（见 _call_price）。
+    两种口径各有各的用途，别混：
 
     * 报给人看的「预计花费」要用乐观口径（默认）——报最贵的会让每次估算
       都虚高，没人会信。
@@ -679,9 +680,31 @@ def _over(count: Optional[int], floor: int) -> bool:
 
 def _call_price(call: ToolCall, settings: Settings, keys: Optional[dict[str, str]],
                 dead: set[str], worst_case: bool) -> float:
-    """一次调用多少钱：乐观口径按实际会走的那家，悲观口径按可能走到的最贵那家。
-    一家都接不了 = 这一行实际会以「不支持的链接形态/没通道」失败，不产生费用。"""
-    prices: list[float] = []
+    """一次调用多少钱：乐观口径按实际会走的那家，悲观口径按**这一次调用可能被
+    收到的最多的钱**。一家都接不了 = 这一行实际会以「不支持的链接形态/没通道」
+    失败，不产生费用。
+
+    悲观口径不是「最贵的那一家」：一次调用可能被**几家都收一次**。主通道回了
+    HTTP 200、东西却认不出来（上游改版）或者说内容没了以外的失败——对失败也
+    收费的通道（Provider.bills_failed_lookups，现在是 TikHub）照样扣钱，然后
+    runner._call 降到下一家，下一家成功了再收一次。只按最贵那家预留的话，
+    `MAX_YUAN_PER_RUN=0.10` 一行能花掉 0.172（2026-11 外部复核离线复现）。
+
+    按通道顺序往后推（和 runner._call 走的是同一个顺序）：
+
+        到第 i 家为止最多花多少 = max(这一家成功：它的单价,
+                                    这一家收了钱却失败：它的单价 + 后面几家最多花多少)
+
+    失败不收费的通道（SocialDataX）失败那一支是 0 —— 它失败了再换下一家，
+    这一家没花钱。所以「TikHub → SocialDataX」是两家之和，
+    「SocialDataX → TikHub」还是两家里贵的那个。
+
+    ⚠️ 没算进去的两种（都要先撞上别的故障才会发生，预留不为它们加码）：
+    读超时那几次「发出去了没回答」按已扣费记的账（runner._call 里 unanswered
+    那一笔），和限流退避之后重打的那一次。真撞上时，这一行会比预留多记至多
+    一次主通道的单价，settle 照实入账，后面的行按真实余量放行。
+    """
+    prices: list[tuple[float, bool]] = []
     for name in settings.channels.for_platform(call.platform):
         if keys is not None and not keys.get(name):
             continue
@@ -693,12 +716,18 @@ def _call_price(call: ToolCall, settings: Settings, keys: Optional[dict[str, str
             continue
         if any(provider.can_handle(call.platform, call.purpose, form)
                for form in _argument_forms(call)):
-            prices.append(provider.yuan_per_call(call.platform, call.purpose))
+            prices.append((provider.yuan_per_call(call.platform, call.purpose),
+                           bool(provider.bills_failed_lookups)))
             if not worst_case:
                 break
     if not prices:
         return 0.0
-    return max(prices) if worst_case else prices[0]
+    if not worst_case:
+        return prices[0][0]
+    worst = 0.0
+    for price, bills_failures in reversed(prices):
+        worst = max(price, (price if bills_failures else 0.0) + worst)
+    return worst
 
 
 @dataclass

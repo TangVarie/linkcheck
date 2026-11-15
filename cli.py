@@ -545,6 +545,10 @@ def _doctor_table(settings: Settings, table: feishu.Bitable) -> int:
     else:
         print(f"OK（表里共 {len(meta)} 列）")
         problems.extend(_schema_problems(settings, meta))
+        # 只给下游用的两列缺了不算问题（老表照常跑），说一句就够。
+        note = schema.downstream_note(schema.downstream_missing(settings, meta))
+        if note:
+            print(f"   {note}")
 
     print("③ 试读一行 …", end=" ", flush=True)
     try:
@@ -992,9 +996,14 @@ def _write_back_table(table: feishu.Bitable, report,
         else report.checked_span(settings.display,
                                  skip=[record_id for record_id, _ in write_errors])
     print(f"已写回 {written} 行" + (f"，本轮「最近检查时间」= {span}" if span else ""))
-    if dropped_fields:
+    # 只给下游用的两列（评论数观测时间 / 评论区明细）老表没有是常态，不当警告报。
+    quiet = sorted(dropped_fields & set(schema.downstream_columns(settings)))
+    loud = sorted(dropped_fields - set(quiet))
+    if loud:
         print(f"⚠ 这些列在表里还没建，本轮已跳过（建好后下一轮自动补上）："
-              f"{'、'.join(sorted(dropped_fields))}")
+              f"{'、'.join(loud)}")
+    if quiet:
+        print(schema.downstream_note(quiet))
     if mistyped_fields:
         print(_mistyped_warning(mistyped_fields, fields_meta, settings, label))
     if write_errors:
