@@ -64,6 +64,10 @@ def expected_schema(settings: Settings) -> list[tuple]:
         (f.platform, (3, 1), "单选或文本", ["小红书", "抖音"], None),
         (f.comment_count, (2,), "数字", None, None),
         (f.previous_comment_count, (2,), "数字", None, None),
+        (f.count_observed_at, (5,), "日期", None,
+         f"机器写：「{f.comment_count}」那个数是哪一刻量到的。只在这一轮真的量到评论数时写；"
+         f"「{f.last_updated}」巡查失败的轮次也会推进，不能代替它。普通日期字段。"
+         "给下游数据仓库用，老表缺了不算问题（见 downstream_columns）"),
         (f.surge_time, (5,), "日期", None,
          "普通日期字段。机器只在**第一次**判定起量时写一次，之后不再改；"
          "手工清空这一格就等于让它重新计一次"),
@@ -81,6 +85,11 @@ def expected_schema(settings: Settings) -> list[tuple]:
         (f.comment_status, (3,), "单选", settings.comment_status.machine_written(),
          "机器直接覆盖写入当前状态（待评论等旧值会被覆盖）"),
         (f.comment_digest, (1,), "文本", None, None),
+        (f.comment_records, (1,), "文本", None,
+         f"机器写：「{f.comment_digest}」的机器可读版（一行 JSON：每条评论的平台评论 ID、"
+         "发布时刻、作者 / 置顶 / 命中关键词标记、赞数、父评论 ID、截短的正文，和这一页是"
+         "哪一刻看到的），给下游数据仓库用，不带昵称。普通文本字段，别手改。"
+         "老表缺了不算问题（见 downstream_columns）"),
         (f.negative_status, (3,), "单选", settings.negative_status.machine_written(),
          "由「负面词」命中驱动，机器直接覆盖；没填负面词的行不碰这一列"),
         (f.negative_digest, (1,), "文本", None, None),
@@ -120,6 +129,35 @@ def expected_schema(settings: Settings) -> list[tuple]:
     ]
 
 
+def downstream_columns(settings: Settings) -> tuple[str, ...]:
+    """只给下游（数据仓库）读的机器列：`评论数观测时间`、`评论区明细`。
+
+    它们和别的机器列有一处不一样：**老表缺了不算问题**。巡查、判定、运营看的
+    每一格都不靠它们，缺了只是下游少两样更准的东西——为这个把每张老表的体检
+    都染红、催运营挨个去点，不值得。所以：
+
+    * `schema_problems`（体检、面板项目卡的红绿）缺了不报；建了但类型不对照报
+      ——那种列每一轮都会被写回的类型闸摘掉、把退出码染红，得让人知道；
+    * `diff`（「补齐缺的列」要建哪些）照样列出来：想要就点一次，一起建上；
+    * 新建的表自带（它们在 `expected_schema` 里）。
+    """
+    f = settings.fields
+    return (f.count_observed_at, f.comment_records)
+
+
+def downstream_missing(settings: Settings, meta) -> list[str]:
+    """下游用的那两列里，这张表还没建的。"""
+    return [name for name in downstream_columns(settings) if name not in (meta or {})]
+
+
+def downstream_note(missing) -> str:
+    """缺下游列时说的那一句（doctor 和运行日志共用）。空清单返回空串。"""
+    if not missing:
+        return ""
+    return (f"ℹ 给下游数据仓库用的列还没建：{'、'.join(missing)}。不影响巡查，这几格不写而已；"
+            "想要的话在面板「项目」里点这张表的「补齐缺的列」，一次就建上")
+
+
 # 这些 ui_type 和普通数字/文本共用类型码（2/1），但写入行为完全不同：
 # 评分字段封顶 5 星，写 like_count=3000 会失败或被截断。光看类型码抓不到。
 EXOTIC_UI_TYPES = {"Progress": "进度", "Currency": "货币",
@@ -141,9 +179,12 @@ def schema_problems(settings: Settings, meta: dict) -> list[str]:
     # 写回可能失败——两种情况的文案必须如实区分。
     filtered_columns = {f.traffic_status, f.comment_status, f.negative_status,
                         f.pinned_status, f.blue_word_shot, f.collation_status}
+    downstream = downstream_columns(settings)
     for name, allowed, type_label, required_options, note in expected_schema(settings):
         info = meta.get(name)
         if info is None:
+            if name in downstream:
+                continue      # 只给下游用的列：老表缺了不算问题（见 downstream_columns）
             # 缺链接/巡查开关机器一行都读不出来；缺最近检查时间分层刷新
             # 失去依据，每轮 sweep 都会全表重刷烧钱——这三列单独点名。
             (missing_required if name in (f.link, f.monitoring, f.last_updated)
@@ -253,8 +294,11 @@ def _readout_diff(meta) -> tuple[list, list, list]:
 # 现在和截图读数四列一样：每张表都该有，缺了体检会说、面板一键能补。
 # 只看在不在，**不看类型和选项**：选项是运营填的时候自己长出来的，类型
 # 哪天他们觉得日期更顺手改了，也不是机器该拦的事。
+# 「维护情况」的提示照运营实际的写法（2026-11-15 改）：投了流就填「月/日🍟」。
+# 以前这里写的是「准备投流 / 已投流」，而表里实际填的、下游数据仓库认得出是
+# 哪天投的，都是带日期的那种——照旧提示填的人会填成认不出日期的写法。
 MAINTENANCE_COLUMNS = (
-    ("维护情况", "准备投流 / 已投流"),
+    ("维护情况", "投了流就填「月/日🍟」，如 9/16🍟"),
     ("维护时间", "投流的时间"),
     ("维护效果", "投流后 12 小时的曝光量增长情况"),
 )

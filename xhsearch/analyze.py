@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -80,6 +81,9 @@ class CommentView:
     replies_more: bool = False
     # 发这条评论的账号 ID（只有抖音给：抖音评论没有作者标记，贴主靠它认，见 by_post_author）。
     author_ids: tuple[str, ...] = ()
+    # 楼中楼回复：它回的那条一级评论的平台评论 ID（上游没给 ID 时是空的）。
+    # 只给「评论区明细」用（format_records）；人看的快照里用的是 reply_to 那几个字。
+    parent_id: str = ""
 
     def one_line(self, fmt: DigestFormat, extra_mark: str = "") -> str:
         text = re.sub(r"\s+", " ", self.content or "").strip()
@@ -359,7 +363,8 @@ def by_post_author(comment: CommentView, snapshot: "Snapshot") -> bool:
 def _as_reply(item: dict[str, Any], parent: CommentView, *, from_page: bool) -> CommentView:
     # 回复不判置顶：置顶说的是一级评论那一屏（snapshot.pinned 也只看 comments）。
     return replace(_comment_view(item), is_pinned=False, is_reply=True,
-                   reply_to=reply_excerpt(parent.content), from_reply_page=from_page)
+                   reply_to=reply_excerpt(parent.content), from_reply_page=from_page,
+                   parent_id=parent.comment_id)
 
 
 def _replies_of(item: dict[str, Any], parent: CommentView) -> list[CommentView]:
@@ -544,6 +549,111 @@ def format_digest(snapshot: Snapshot, fmt: DigestFormat,
         lines.append(line)
         used += len(line) + 1
     return "\n".join(lines)
+
+
+# ---------- 「评论区明细」：评论区快照的机器可读版 ----------
+#
+# 「评论区快照」是排给人看的：每条截到 40 字、带昵称和 IP、没有评论 ID 和发布
+# 时刻，下游要从一段文字里把它们猜回来。而这些东西每一轮都从上游拿到了，只是
+# 没落表。这一格把同一页评论按固定的键写成一行 JSON，给数据仓库直接读。
+#
+# 大小：飞书一格文本最多 10 万字（panel_settings.CELL_MAX_CHARS）；这一格自己
+# 封顶 RECORDS_MAX_CHARS，远在那个数以内——它每晚还要跟着整行被下游同步、留痕，
+# 没必要占满。小红书一页 10 条、抖音一页 20 条，正文各截到 RECORD_TEXT_CHARS，
+# 平常两三千字；真超了就从末尾（先是楼中楼回复）往前丢，丢了几条写在 more 里。
+RECORDS_VERSION = 1
+RECORD_TEXT_CHARS = 200
+RECORDS_MAX_CHARS = 8000
+
+
+def _hits_seed(text: str, needles: list[str]) -> bool:
+    haystack = _normalize(text)
+    return any(needle in haystack for needle in needles)
+
+
+def format_records(snapshot: Snapshot, *, observed_at_ms: int,
+                   seed_keywords: Optional[list[str]] = None) -> str:
+    """把这一轮看到的第一页评论写成一行 JSON（「评论区明细」那一格）。
+
+    调用方保证这一轮真的看到了评论页（saw_comment_page），和「评论区快照」同写
+    同不写。一页一条评论都没有也照写（c 是空列表）：那是「看到了，就是没有」。
+
+    外层::
+
+        v     格式版本（现在是 1）
+        t     这一页是哪一刻看到的（毫秒 epoch，和这一轮「最近检查时间」同一个值）
+        n     那一刻的评论总数（上游没报是 null）
+        hid   接口说有、别人却一条都看不到的评论数（平常是 0，见 comments_hidden）
+        kw    这一行填没填「评论关键词」（1/0）。0 的时候每条的 k 都是 0，
+              意思是「没法判」，不是「都不是种子评论」
+        ar    这一轮的作者标记可不可信（1/0）：小红书看通道报不报可信的作者标记，
+              抖音看这一轮知不知道贴主的账号 ID。0 的时候 a 只能当「没标出来」
+        pr    这一轮的置顶标记可不可信（1/0）：抖音没有置顶字段、备胎通道的置顶
+              值不可信，都是 0
+        lim   正文截到多少字（RECORD_TEXT_CHARS）
+        more  因为整格太长而没写进来的条数（平常是 0）
+        c     评论列表：先是一级评论（页面上的顺序），再是它们下面露出来的回复
+
+    每条评论（键固定，一个都不省）::
+
+        id    平台评论 ID（上游没给是空串）
+        ts    评论发布时刻（毫秒 epoch；上游没给是 null——不拿发现时刻代填）
+        a     是不是贴主自己发的（1/0）
+        p     是不是置顶（1/0；回复恒为 0）
+        l     赞数
+        k     正文里有没有出现这一行的任一个「评论关键词」（1/0）——命中的多半
+              是我们自己铺的评论，下游数「读者评论」时要先把它们拿掉
+        r     回复：它回的那条一级评论的 id；一级评论是空串
+        x     正文：空白压成一个空格，其余原样（小红书的表情 `[笑哭R]`、蓝词
+              `#词[搜索高亮]#` 标记都还在），超过 lim 就截到 lim 个字
+        tr    正文有没有被截（1/0）
+
+    **不带昵称、不带 IP 属地**：下游用不着，个人信息能不多存就不多存。
+    """
+    needles = [n for n in (_normalize(k) for k in (seed_keywords or [])) if n]
+    author_reliable = (snapshot.author_reported if snapshot.platform == "xhs"
+                       else bool(snapshot.post_author_ids))
+
+    def record(comment: CommentView) -> dict[str, Any]:
+        text = re.sub(r"\s+", " ", comment.content or "").strip()
+        cut = len(text) > RECORD_TEXT_CHARS
+        likes = comment.like_count
+        return {
+            "id": comment.comment_id,
+            "ts": comment.created_at_ms,
+            "a": int(by_post_author(comment, snapshot)),
+            "p": int(bool(comment.is_pinned) and not comment.is_reply),
+            "l": likes if isinstance(likes, int) and not isinstance(likes, bool)
+                 and likes >= 0 else 0,
+            "k": int(_hits_seed(comment.content, needles)) if needles else 0,
+            "r": comment.parent_id if comment.is_reply else "",
+            "x": text[:RECORD_TEXT_CHARS] if cut else text,
+            "tr": int(cut),
+        }
+
+    records = [record(c) for c in [*snapshot.comments, *snapshot.replies]]
+    out: dict[str, Any] = {
+        "v": RECORDS_VERSION,
+        "t": int(observed_at_ms),
+        "n": snapshot.comment_count,
+        "hid": int(snapshot.hidden_comment_count or 0),
+        "kw": int(bool(needles)),
+        "ar": int(bool(author_reliable)),
+        "pr": int(bool(snapshot.supports_pinned)),
+        "lim": RECORD_TEXT_CHARS,
+        "more": 0,
+        "c": records,
+    }
+
+    def dump() -> str:
+        return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+    text = dump()
+    while len(text) > RECORDS_MAX_CHARS and records:
+        records.pop()
+        out["more"] += 1
+        text = dump()
+    return text
 
 
 # 小红书评论正文里的「蓝词」标记：被平台变成搜索超链接的词，原文长这样
