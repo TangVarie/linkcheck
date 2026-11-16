@@ -1607,14 +1607,21 @@ def _search_trial_tables(selected: list[str] | None) -> list[tuple[str, feishu.B
                  "先在登记表里把这张表的「搜索检查」勾上")
     if not switched:
         sys.exit("没有一张表开了「搜索检查」。在登记表里给要试的表勾上「搜索检查」"
-                 "（老登记表没有这一列：手工加一列同名的复选框），再在那几张表里填「搜索关键词」")
+                 "（老登记表没有这一列：手工加一列同名的复选框），"
+                 "再把要查的词写进那几张表的「搜索关键词」（每行一样，或者只写一行）")
     return switched
 
 
 def _search_trial_rows(tables, settings: Settings) -> list:
-    """逐表读出（行, 「搜索关键词」那一格）。只读，不写。"""
+    """逐表读出（行, 「搜索关键词」那一格），**一张表一份**。只读，不写。
+
+    词是表的：一张表的词是它所有行里写过的词合起来，所以每一行都要读出来
+    ——格子空着的行也是这张表的帖子，要拿去和这张表的词对。
+    """
+    from xhsearch import visibility
+
     f = settings.fields
-    pairs: list = []
+    groups: list = []
     for label, table in tables:
         meta = table.fields_meta()
         if not meta:
@@ -1622,10 +1629,10 @@ def _search_trial_rows(tables, settings: Settings) -> list:
         info = meta.get(f.search_keywords)
         if info is None:
             print(f"⚠ 表「{label}」还没有「{f.search_keywords}」这一列，这张表不查。"
-                  "在面板「项目」里点它的「补齐缺的列」，或在飞书里手工加一列同名的文本列")
+                  "在面板「项目」里点它的「补齐缺的列」，或在飞书里手工加一列同名的多选列（文本也认）")
             continue
         if info.get("type") not in (1, 4):
-            print(f"⚠ 表「{label}」的「{f.search_keywords}」不是文本或多选列，这张表不查")
+            print(f"⚠ 表「{label}」的「{f.search_keywords}」不是多选或文本列，这张表不查")
             continue
         wanted = [c for c in f.must_read() if c in meta] + [f.search_keywords]
         try:
@@ -1633,14 +1640,18 @@ def _search_trial_rows(tables, settings: Settings) -> list:
         except Exception as exc:                                # noqa: BLE001
             sys.exit(f"读表「{label}」失败：{exc}。一分钱没花")
         filled = 0
+        pairs: list = []
         for record in records:
             cell = (record.get("fields") or {}).get(f.search_keywords)
-            if cell in (None, "", []):
-                continue
-            filled += 1
-            pairs.append((runner.row_from_record(record, settings), cell))
-        print(f"表「{label}」：读到 {len(records)} 行，填了「{f.search_keywords}」的 {filled} 行")
-    return pairs
+            if cell not in (None, "", []):
+                filled += 1
+            # 多选还是文本只看列类型，不看格子的形状（文本格子里 @人 的分段长得像选项）。
+            pairs.append((runner.row_from_record(record, settings),
+                          visibility.keyword_cell(cell, info.get("type"))))
+        print(f"表「{label}」：读到 {len(records)} 行，填了「{f.search_keywords}」的 {filled} 行"
+              + ("" if filled else "——一个词都没写，这张表不查"))
+        groups.append(pairs)
+    return groups
 
 
 def cmd_search_trial(args: list[str], selected: list[str] | None = None) -> int:
@@ -1693,13 +1704,17 @@ def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, k
     except visibility.StateError as exc:
         sys.exit(str(exc))
 
-    pairs = _search_trial_rows(_search_trial_tables(selected), settings)
+    groups = _search_trial_rows(_search_trial_tables(selected), settings)
     resolver = None if dry_run else shortlink.Resolver()
     info = visibility.intake(
-        pairs, resolve=(lambda url: resolver.resolve(url).content_id) if resolver else None)
+        groups, resolve=(lambda url: resolver.resolve(url).content_id) if resolver else None)
     if not info.keywords:
-        sys.exit(f"没有可查的词：开了「搜索检查」的表里，没有一行填了「{settings.fields.search_keywords}」"
-                 f"又查得了的（小红书、没失效、拿得到笔记 ID、填了「{settings.fields.publish_time}」）。"
+        if info.sentence_cells:
+            print(f"有 {info.sentence_cells} 格「{settings.fields.search_keywords}」像一句话"
+                  "（有句号、问号、冒号，或有一段太长），整格不查")
+        sys.exit(f"没有可查的词：开了「搜索检查」的表里，要么「{settings.fields.search_keywords}」"
+                 "一个词都没写，要么写了词的表里没有一篇对得了的帖子"
+                 f"（小红书、没失效、拿得到笔记 ID、填了「{settings.fields.publish_time}」）。"
                  "一分钱没花")
     refusal = state.register(info.keywords)
     if refusal:

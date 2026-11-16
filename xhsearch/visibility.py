@@ -1,9 +1,16 @@
 """搜索可见 · 试跑。**只有手工起的 `python3 cli.py search-trial` 会走到这里。**
 
-要回答的只有一个问题（2026-11-16 定的）：我们的帖子发出去三天，在它该被搜到的
-那个词下面，前几页里**到底看不看得见**。如果几乎都看不见，按综合排序查排名这件事
+要回答的只有一个问题（2026-11-16 定的）：我们的帖子发出去三天，在这张表要查的
+那些词下面，前几页里**到底看不看得见**。如果几乎都看不见，按综合排序查排名这件事
 就没有意义，得换办法；看得见，才值得做成每天自动查。所以先花小钱试一次，
-不建任何自动的东西：
+不建任何自动的东西。
+
+**词是表的，不是帖子的**（2026-11-16 负责人改的）：一张表要查哪些词，全写在
+「搜索关键词」那一列里（多选，或者一格里用逗号、顿号隔开写几个；空格不拆，
+写成一句话的格子整格不查——规则在 `parse_cell`）。多选还是文本只看**列类型**。这张表所有行里出现过的词
+合起来就是这张表的词——每行都填一样的，或者只填一行，效果一样。每个词拉前几页，
+再拿这张表**所有**发布帖去对，看对不对得上；不再是「一篇帖子配一个词」。
+两张表写了同一个词，只查一次，结果分别和两张表的帖子对。
 
 * **巡查不受影响**：sweep / queue / row / estimate 一行都没改，不会多发一次请求。
   搜索那个端点登记在 providers 里，但 rows.plan_calls 从不排它。
@@ -34,9 +41,11 @@
 
 ## 没查到的帖子算「没查全」，后来才发的帖子不算
 
-一个词在某一轮一页都没拿到（第 1 页失败、上限先到），它下面的帖子照样进这一轮的
-表，记成「没查全」，帖龄按这一轮跑的那一刻算（进度文件里的 `rounds`）。反过来，
-那个词查的那一刻还没发出来的帖子不进这一轮——它不在当时查的那批里。
+一篇帖子在它那张表的哪个词下面都没出现，而这些词里有没查全的（缺页、第 1 页失败、
+上限先到一页都没拿到，或者这个词是查完之后才加进表的），它就是「没查全」——说不准，
+不是「没搜到」，也不是「付费位」（只在付费位出现也一样）；一页都没拿到的词
+按这一轮跑的那一刻算帖龄（进度文件里的 `rounds`）。反过来，词查的那一刻还没发出来
+的帖子不和那个词对；它那张表的词查的时候它都还没发，就不进这一轮。
 
 全部是**可以离线测的**：发请求的那一下是注入的（`send`），进度文件的位置是参数。
 """
@@ -46,6 +55,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -66,7 +76,7 @@ MAX_CALLS = 280
 MAX_YUAN = 20.0
 # 词的个数是定死的：上限是按 15 个词算出来的，30 个词要 350 次，装不下。
 MAX_KEYWORDS = 15
-# 一格里像是整句话的不查：搜一句话什么都说明不了，钱照花。
+# 像是整句话的词不查：搜一句话什么都说明不了，钱照花。
 MAX_KEYWORD_CHARS = 30
 
 # 两次请求之间至少隔这么久。对方的限速是每秒 10 次，我们不赶时间。
@@ -111,11 +121,11 @@ INCOMPLETE = "没查全"
 RESULT_LABELS = (*FOUND_BANDS, PAID, NOT_FOUND, INCOMPLETE)
 
 # 没进试跑的行，按原因计数。
-SKIP_TOO_LONG = "词太长（像整句话）"
 SKIP_NOT_XHS = "不是小红书"
 SKIP_DEAD = "已失效或疑似受限"
 SKIP_NO_ID = "拿不到笔记 ID"
 SKIP_NO_TIME = "发布时间空着"
+SKIP_NO_WORDS = "所在的表一个词都没写"
 
 # 一页里有条目、却一条笔记 ID 都认不出来：记在失败清单里的种类名。
 UNREADABLE = "unreadable_page"
@@ -127,15 +137,97 @@ SESSION_KEYS = ("search_id", "search_session_id")
 # ---------- 读表：哪些帖子、哪些词 ----------
 
 
-def first_keyword(cell: Any) -> tuple[str, int]:
-    """「搜索关键词」那一格 →（要查的那个词, 多写了几个）。
+# 文本格子里只按这些符号拆：中英文逗号、顿号、中英文分号、竖线、斜杠、# 号、换行。
+# **空格不拆**——「cGMP 因子」是一个词；一句话也不会被拆成一串单字去花钱。
+_SEPARATORS = re.compile(r"[，,、;；|｜/／#＃\r\n]+")
+# 文本格子里出现这些，就当它是一句话（备注），不是词表：整格不查。
+_SENTENCE = re.compile(r"[。！？!?：:…]")
+# 行首的编号（「1. 」「2）」「3、」）不是词的一部分。
+# 句点后面紧跟数字的是小数（「3.5mm耳机」「2.4G无线鼠标」），那是词本身，不能当编号削掉。
+_NUMBERING = re.compile(r"(?m)^\s*(?:\d{1,2}\s*(?:[.．](?!\d)|[)）])|\d、)\s*")
 
-    拆法和「评论关键词」一样（feishu.read_keywords：逗号 / 顿号 / 分号 / 换行），
-    词前面的 # 去掉。一格只查第一个词：多一个词就多一份钱，试跑的上限装不下。
+# 飞书的列类型：1 文本，4 多选。
+COLUMN_TEXT = 1
+COLUMN_MULTI = 4
+
+
+@dataclass
+class CellWords:
+    """一格「搜索关键词」读出来的东西。"""
+
+    words: list[str] = field(default_factory=list)
+    too_long: int = 0          # 多选里超过 MAX_KEYWORD_CHARS 的选项，不查
+    sentence: bool = False     # 文本格子像一句话（有句号、问号、冒号，或有一段太长）：整格不查
+
+
+def _segments_text(cell: Any) -> str:
+    """文本格子 → 人打的字。@人、链接这些分段不是词，不要。"""
+    if isinstance(cell, str):
+        return cell
+    if isinstance(cell, list):
+        parts = []
+        for item in cell:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type", "text") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "".join(parts)
+    return ""
+
+
+def keyword_cell(cell: Any, column_type: Optional[int]) -> Any:
+    """按**列的类型**把飞书读回来的格子整理成 `parse_cell` 认的样子。
+
+    文本列读回来也是一个数组（富文本分段），里面 @人 的那一段带着 `name`——光看形状会把它
+    当成多选的选项，把同事的名字拿去搜。所以多选还是文本，只看列类型：
+    多选 → 选项名的列表；别的（文本）→ 一个字符串。
     """
-    words = [w.lstrip("#＃").strip() for w in feishu.read_keywords(cell)]
-    words = [w for w in words if w]
-    return (words[0], len(words) - 1) if words else ("", 0)
+    if column_type == COLUMN_MULTI:
+        return feishu.read_multi_select(cell)
+    return _segments_text(cell)
+
+
+def parse_cell(cell: Any) -> CellWords:
+    """「搜索关键词」的一格 → 这一格里写的词（去掉前后空白和词前面的 #，一格之内去重）。
+
+    * **多选**（一个全是字符串的列表）：一个选项就是一个词，里面有逗号也不拆。
+      超过 MAX_KEYWORD_CHARS 的选项不查。
+    * **文本**（字符串，或富文本分段）：只按逗号（中英文）、顿号、分号（中英文）、竖线、
+      斜杠、# 号、换行拆；**空格不拆**。行首的「1.」「2）」「3、」这种编号去掉。
+      格子里有句号、问号、感叹号、冒号、省略号，或者拆出来有一段超过 MAX_KEYWORD_CHARS：
+      这是一句话，不是词表，**整格不查**。
+    * 两种都一样：词里连着的空白算一个空格；一个字母、数字、汉字都没有的（只剩符号）不要。
+    """
+    out = CellWords()
+    multi = isinstance(cell, list) and bool(cell) and all(isinstance(i, str) for i in cell)
+    if multi:
+        pieces = list(cell)
+    else:
+        text = _NUMBERING.sub("", _segments_text(cell))
+        pieces = _SEPARATORS.split(text)
+        if _SENTENCE.search(text):
+            out.sentence = True
+    seen: set[str] = set()
+    for word in pieces:
+        word = " ".join(str(word or "").split()).lstrip("#＃").strip()
+        if not word or not any(ch.isalnum() for ch in word):
+            continue
+        if len(word) > MAX_KEYWORD_CHARS:
+            if multi:
+                out.too_long += 1
+                continue
+            out.sentence = True
+        if keyword_hash(word) not in seen:
+            seen.add(keyword_hash(word))
+            out.words.append(word)
+    if out.sentence:
+        out.words = []
+    return out
+
+
+def split_keywords(cell: Any) -> list[str]:
+    """`parse_cell` 的词那一半。"""
+    return parse_cell(cell).words
 
 
 def keyword_hash(word: str) -> str:
@@ -146,7 +238,9 @@ def keyword_hash(word: str) -> str:
 @dataclass(frozen=True)
 class Post:
     note_id: str
-    keyword: str                       # 原词，只在内存里，不落盘、不进报告
+    # 这一篇所在的那张表要查的**全部**词（原词，只在内存里，不落盘、不进报告）。
+    # 同一张表的帖子带的是同一组。
+    keywords: tuple[str, ...] = ()
     publish_ms: Optional[int] = None   # 表里填的「发布时间」；空着就是 None，不猜
     comments: Optional[int] = None     # 表里现成的评论数
 
@@ -157,74 +251,105 @@ class Intake:
 
     posts: list[Post] = field(default_factory=list)
     # 按第一次出现的顺序：词的原文（同一个词大小写不同只留第一种写法）。
+    # 只收「有帖子可对」的表的词——一篇能查的帖子都没有的表，它的词不占名额。
     keywords: list[str] = field(default_factory=list)
-    rows_with_keyword: int = 0
-    extra_words: int = 0
+    tables: int = 0                   # 读了几张表
+    tables_with_keywords: int = 0     # 其中写了词的
+    rows: int = 0                     # 一共几行
+    rows_with_keyword: int = 0        # 其中「搜索关键词」那一格不空的
+    too_long: int = 0                 # 太长（像整句话）没收的多选选项
+    sentence_cells: int = 0           # 像一句话（备注）、整格没收的文本格子
     # 短链还没展开的行（只在不展开的模式下有，也就是 --dry-run）。
     short_links: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
 
-    def _skip(self, reason: str) -> None:
-        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+    def _skip(self, reason: str, count: int = 1) -> None:
+        if count:
+            self.skipped[reason] = self.skipped.get(reason, 0) + count
 
 
-def intake(rows: Iterable[tuple[Row, Any]], *,
+def intake(tables: Iterable[Iterable[tuple[Row, Any]]], *,
            resolve: Optional[Callable[[str], Optional[str]]] = None) -> Intake:
-    """（行, 那一行「搜索关键词」的原始格子）→ 要查的帖子和词。
+    """一张表一份（行, 那一行「搜索关键词」的原始格子）→ 要查的词和要对的帖子。
 
-    「搜索关键词」空着的行**完全不算**——不计数、不报原因，和没有这一行一样。
+    **词是表的**：一张表的词 = 它所有行里写过的词合起来（去重，按第一次出现排）。
+    每行都填一样的、只填一行，结果一样。格子空着的行照样是这张表的帖子。
+    **帖子是这张表里所有查得了的行**：小红书、没失效、填了发布时间、拿得到笔记 ID。
+    每一篇都带着整张表的词，报告里拿它去对每一个词。
+
+    一个词都没写的表整张不看（连免费的短链展开都不做）。
     `resolve` 是免费的短链展开（链接 → 笔记 ID 或 None）；不给就不展开，
-    短链行只记个数（--dry-run 用：那时词数是上界）。
+    短链行只记个数（--dry-run 用：那时帖子数是下界）。
     """
     out = Intake()
     seen_words: dict[str, str] = {}
-    seen_posts: set[tuple[str, str]] = set()
-    for row, cell in rows:
-        word, extra = first_keyword(cell)
-        if not word:
+    for table in tables:
+        rows = list(table)
+        out.tables += 1
+        out.rows += len(rows)
+        words: list[str] = []
+        own: set[str] = set()
+        for _row, cell in rows:
+            parsed = parse_cell(cell)
+            out.too_long += parsed.too_long
+            out.sentence_cells += parsed.sentence
+            if parsed.words:
+                out.rows_with_keyword += 1
+            for word in parsed.words:
+                digest = keyword_hash(word)
+                if digest in own:
+                    continue
+                own.add(digest)
+                # 两张表写了同一个词：是同一个词，用先见到的那种写法。
+                words.append(seen_words.get(digest, word))
+        if not words:
+            if rows:
+                out._skip(SKIP_NO_WORDS, len(rows))
             continue
-        out.rows_with_keyword += 1
-        out.extra_words += extra
-        if len(word) > MAX_KEYWORD_CHARS:
-            out._skip(SKIP_TOO_LONG)
-            continue
-        link = row.parsed
-        if link.platform != "xhs":
-            out._skip(SKIP_NOT_XHS)
-            continue
-        if row.refresh_status in (STATUS_GONE, STATUS_SUSPECT):
-            # 已失效、疑似受限的帖子搜不到是应该的，查了也说明不了排名。
-            out._skip(SKIP_DEAD)
-            continue
-        if row.publish_time_ms is None:
-            # 试跑只问「发了三天的帖子看不看得见」：发布时间空着就算不出它发了几天，
-            # 查了也进不了任何一档。不查、不花钱，也不占 15 个词的名额。
-            out._skip(SKIP_NO_TIME)
-            continue
-        note_id = link.content_id
-        pending = False
-        if not note_id and link.url:
-            if resolve is None:
-                pending = True
-            else:
+        out.tables_with_keywords += 1
+        group = tuple(words)
+        posts: list[Post] = []
+        seen_posts: set[str] = set()
+        pending = 0
+        for row, _cell in rows:
+            link = row.parsed
+            if link.platform != "xhs":
+                out._skip(SKIP_NOT_XHS)
+                continue
+            if row.refresh_status in (STATUS_GONE, STATUS_SUSPECT):
+                # 已失效、疑似受限的帖子搜不到是应该的，对了也说明不了什么。
+                out._skip(SKIP_DEAD)
+                continue
+            if row.publish_time_ms is None:
+                # 试跑只问「发了三天的帖子看不看得见」：发布时间空着就算不出它发了几天，
+                # 对上了也进不了任何一档。不拿笔记 ID 去猜，也不去展开它的短链。
+                out._skip(SKIP_NO_TIME)
+                continue
+            note_id = link.content_id
+            if not note_id and link.url:
+                if resolve is None:
+                    pending += 1
+                    continue
                 note_id = resolve(link.url)
-        if not note_id and not pending:
-            out._skip(SKIP_NO_ID)
-            continue
-        digest = keyword_hash(word)
-        if digest not in seen_words:
-            seen_words[digest] = word
-            out.keywords.append(word)
-        if pending:
-            out.short_links += 1
-            continue
-        key = (digest, str(note_id).lower())
-        if key in seen_posts:
-            continue                      # 同一篇、同一个词在表里出现两行：算一篇
-        seen_posts.add(key)
-        out.posts.append(Post(note_id=key[1], keyword=seen_words[digest],
+            if not note_id:
+                out._skip(SKIP_NO_ID)
+                continue
+            note_id = str(note_id).lower()
+            if note_id in seen_posts:
+                continue                      # 同一篇在一张表里出现两行：算一篇
+            seen_posts.add(note_id)
+            posts.append(Post(note_id=note_id, keywords=group,
                               publish_ms=row.publish_time_ms,
                               comments=row.previous_comment_count))
+        out.short_links += pending
+        if not posts and not pending:
+            continue                          # 没有一篇能对的帖子：这张表的词不查
+        out.posts.extend(posts)
+        for word in words:
+            digest = keyword_hash(word)
+            if digest not in seen_words:
+                seen_words[digest] = word
+                out.keywords.append(word)
     return out
 
 
@@ -237,6 +362,10 @@ class StateError(RuntimeError):
 
 class State:
     """本地那份进度文件。**只有 ID、名次、计数和哈希**，没有词的原文。
+
+    里面**不分帖子、也不分表**：页是按「轮 + 词 + 页」记的。哪篇帖子对哪些词，
+    每次出报告时按当时读到的表现算。所以「一篇帖子配一个词」那时候存下的进度文件
+    照样能读、能接着跑，账也是同一本（见 docs/搜索可见试跑.md 第五节）。
 
         {"version", "trial",
          "calls": 一共发了几个请求, "yuan": 按多了算一共花了多少,
@@ -337,7 +466,7 @@ class State:
             return (f"词太多了：这次试跑最多 {MAX_KEYWORDS} 个不同的词，"
                     f"已经查过的加上表里新出现的一共 {total} 个。"
                     f"上限（{MAX_CALLS} 次 / ¥{MAX_YUAN:.0f}）是按 {MAX_KEYWORDS} 个词算的，"
-                    "多一个都装不下——把表里多出来的「搜索关键词」清掉再跑")
+                    "多一个都装不下——把「搜索关键词」里多出来的词删掉再跑")
         for digest in fresh:
             self.data["keywords"][digest] = len(self.data["keywords"]) + 1
         return ""
@@ -722,9 +851,11 @@ class Listing:
         rank = self.rank(note_id)
         if rank is not None:
             return rank_band(rank), rank
-        if note_id in self.paid:
-            return PAID, None
-        return (NOT_FOUND if self.complete else INCOMPLETE), None
+        if not self.complete:
+            # 页没翻全：不管它在已翻的页里是不是出现在付费位上，没翻的页里可能自然排上了，
+            # 「只在付费位」和「没搜到」一样，要翻全了才能说。
+            return INCOMPLETE, None
+        return (PAID if note_id in self.paid else NOT_FOUND), None
 
 
 def listing(round_: Round, digest: str, state: State) -> Listing:
@@ -769,10 +900,29 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
     """进度文件 + 这次读到的帖子 → 报告（一个能直接 json.dump 的字典）。**纯函数。**
 
     里面只有计数：没有词、没有笔记 ID、没有链接。词用 K01 这样的编号。
+
+    怎么对：每一篇帖子带着它那张表的全部词（`Post.keywords`）。一轮里，它和这一轮
+    定下来的、属于它那张表的**每一个**词都对一遍；
+
+    * 至少在一个词下面出现（自然结果）= 搜到，档位取名次最好的那一个；
+    * 一个词下面都没有，而且这些词该翻的页都翻了 = 没搜到；
+    * 一个词下面都没有，但有词没查全（包括一页都没拿到、这一轮没查过）= 没查全，说不准；
+    * 只在付费位出现：它那张表的词都查全了才记「付费位」，否则也是没查全。
     """
-    by_word: dict[str, list[Post]] = {}
+    # 同一篇帖子在两张表里都有：算一篇，词取两张表的合起来。
+    merged: dict[str, Post] = {}
+    words_of: dict[str, list[str]] = {}
     for post in posts:
-        by_word.setdefault(keyword_hash(post.keyword), []).append(post)
+        merged.setdefault(post.note_id, post)
+        mine = words_of.setdefault(post.note_id, [])
+        for word in post.keywords:
+            digest = keyword_hash(word)
+            if digest not in mine:
+                mine.append(digest)
+    by_word: dict[str, list[Post]] = {}
+    for note_id, digests in words_of.items():
+        for digest in digests:
+            by_word.setdefault(digest, []).append(merged[note_id])
     numbered = sorted(((n, d) for d, n in state.data["keywords"].items()
                        if isinstance(n, int)))
     rounds: dict[str, Any] = {}
@@ -805,7 +955,11 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         sizes: list[int] = []
         types: dict[str, int] = {}
         keys: set[str] = set()
-        ads = other = late = 0
+        ads = other = 0
+        # 这一轮里每一篇帖子对出来的结果：{笔记 ID: [(词的哈希, 标签, 名次)]}。
+        pairs: dict[str, list[tuple[str, str, Optional[int]]]] = {}
+        seen_ats: dict[str, float] = {}
+        touched: set[str] = set()         # 这一轮里至少有一个词轮到它的帖子（含后来才发的）
         for number, digest in chosen:
             found = listings[digest]
             for page in range(1, found.pages + 1):
@@ -819,27 +973,66 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
                     types[kind] = types.get(kind, 0) + int(count)
             row = {"词": f"K{number:02d}", "拿到几页": found.pages,
                    "看了前几位": len(found.organic), "查全了": found.complete,
-                   "翻到底了": found.ended, "按帖龄": {}}
+                   "翻到底了": found.ended, "帖子": _blank(), "按帖龄": {}}
             # 这个词在这一轮是哪一刻查的：有第 1 页就是拿到它的那一刻；一页都没拿到
             # （第 1 页失败了，或者上限先到、还没轮到它）就用这一轮跑的那一刻。
             seen_at = found.at if found.pages and found.at else round_at
+            seen_ats[digest] = seen_at
             for post in by_word.get(digest, []):
+                touched.add(post.note_id)
                 if post.publish_ms is not None and post.publish_ms > seen_at * 1000:
-                    # 那一刻这一篇还没发：它不在这一轮查的那批帖子里。算进来的话
+                    # 那一刻这一篇还没发：它不在这个词当时对的那批帖子里。算进来的话
                     # 帖龄是负的，会被说成「3 天内、没搜到」。
-                    late += 1
                     continue
-                # 一页都没拿到的词，它下面的帖子是「没查全」，不是不存在。
+                # 一页都没拿到的词，这张表的帖子在它下面是「没查全」，不是不存在。
                 label, rank = (found.result(post.note_id) if found.pages
                                else (INCOMPLETE, None))
                 results[round_.name][(digest, post.note_id)] = (label, rank)
+                pairs.setdefault(post.note_id, []).append((digest, label, rank))
                 band = age_band(post.publish_ms, seen_at, tz)
-                group = _comment_group(post.comments, comment_floor)
-                for bucket in (by_age[band], row["按帖龄"].setdefault(band, _blank()),
-                               by_comments.setdefault(group, _blank())):
+                for bucket in (row["帖子"], row["按帖龄"].setdefault(band, _blank())):
                     bucket["篇数"] += 1
                     bucket[label] += 1
             per_word.append(row)
+        # 表里现在有、这一轮却没查的词（多半是查完之后才加进表的）：它下面有没有这篇帖子
+        # 不知道，所以别的词下面没搜到的帖子是「没查全」，不能说「没搜到」。
+        # 例外是本来就只查一部分词的轮（depth 只查 2 个）定满了的时候：别的词不归这一轮管。
+        by_design = round_.keywords < MAX_KEYWORDS and len(digests) >= round_.keywords
+        in_round = set(digests)
+        unsearched: set[str] = set()
+        # 一篇帖子一个结论：它那张表在这一轮查的每个词都对过了，合起来看。
+        # 先后是：自然结果里搜到 > 没查全 > 只在付费位 > 没搜到。只在付费位、可还有词没查全的，
+        # 说不准它在没查的地方是不是自然排上了，所以是「没查全」。
+        for note_id, found_pairs in pairs.items():
+            post = merged[note_id]
+            labels = {label for _d, label, _r in found_pairs}
+            missing = ([] if by_design else
+                       [d for d in words_of[note_id] if d not in in_round])
+            unsearched.update(missing)
+            # 帖龄跟着「这个结论是哪一刻看到的」走。一轮隔了几天才续跑完的时候，同一篇帖子在
+            # 不同的词下面是在不同帖龄查的：第 2 天在甲词下没搜到、第 5 天在乙词下搜到了，
+            # 不能记成「3 天内搜到」。
+            first_seen = min(seen_ats[d] for d, _l, _r in found_pairs)
+            bands = {age_band(post.publish_ms, seen_ats[d], tz) for d, _l, _r in found_pairs}
+            hits = sorted((seen_ats[d], rank) for d, _l, rank in found_pairs if rank is not None)
+            if hits:
+                # 搜到了：按最早搜到它的那一次算帖龄和名次。
+                seen_at, rank = hits[0]
+                label = rank_band(rank)
+                band = age_band(post.publish_ms, seen_at, tz)
+            else:
+                band = age_band(post.publish_ms, first_seen, tz)
+                if INCOMPLETE in labels or missing or len(bands) > 1:
+                    # 各个词不是在同一个帖龄段查的：最早那一段里还有词没查，说不了「没搜到」。
+                    label = INCOMPLETE
+                else:
+                    label = PAID if PAID in labels else NOT_FOUND
+            group = _comment_group(post.comments, comment_floor)
+            for bucket in (by_age[band], by_comments.setdefault(group, _blank())):
+                bucket["篇数"] += 1
+                bucket[label] += 1
+        late = len(touched) - len(pairs)
+        outside = len(merged) - len(touched)
         need, have = plan(round_, digests, state)
         rounds[round_.name] = {
             "说明": round_.label,
@@ -852,6 +1045,8 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
             "像广告位的条数": ads,
             "认不出笔记的条数": other,
             "查之后才发的帖子（不算）": late,
+            "这一轮没查它那张表的词的帖子（不算）": outside,
+            "表里有、这一轮没查的词": len(unsearched),
             "条目类型": dict(sorted(types.items())),
             "条目键名": sorted(keys),
             "按帖龄": by_age,
@@ -865,7 +1060,7 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         again = results.get(name)
         if not again or not base:
             continue
-        tally = {"对得上的篇数": 0, "档位一样": 0, "档位变了": 0,
+        tally = {"对得上的（帖子×词）": 0, "档位一样": 0, "档位变了": 0,
                  "名次差超过20": 0, "一次搜到一次没搜到": 0}
         for key, (label, rank) in again.items():
             if key not in base:
@@ -873,7 +1068,7 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
             first_label, first_rank = base[key]
             if INCOMPLETE in (label, first_label):
                 continue
-            tally["对得上的篇数"] += 1
+            tally["对得上的（帖子×词）"] += 1
             tally["档位一样" if label == first_label else "档位变了"] += 1
             if rank is not None and first_rank is not None and abs(rank - first_rank) > 20:
                 tally["名次差超过20"] += 1
@@ -911,11 +1106,12 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         "花费": {"已发请求": state.calls, "已记金额": round(state.yuan, 2),
                "次数上限": MAX_CALLS, "金额上限": MAX_YUAN, "计划次数": PLANNED_CALLS},
         "词": len(numbered),
-        "帖子": len({(keyword_hash(p.keyword), p.note_id) for p in posts}),
+        "帖子": len(merged),
         "回答": {
-            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
+            "问题": "发布 3 天内的帖子，在这张表要查的词下面，综合排序前 3 页里看不看得见",
             "3天内的帖子": day3["篇数"],
             "搜到的": sum(day3[label] for label in FOUND_BANDS),
+            "只在付费位的": day3[PAID],
             "没搜到的": day3[NOT_FOUND],
             "没查全的": day3[INCOMPLETE],
         },
@@ -926,8 +1122,12 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         "余额对账": list(state.data["balance"]),
     }
     if intake_info is not None:
-        report["读表"] = {"填了词的行": intake_info.rows_with_keyword,
-                        "多写的词（没查）": intake_info.extra_words,
+        report["读表"] = {"表": intake_info.tables,
+                        "写了词的表": intake_info.tables_with_keywords,
+                        "行": intake_info.rows,
+                        "填了词的行": intake_info.rows_with_keyword,
+                        "太长没收的词": intake_info.too_long,
+                        "像整句话没收的格子": intake_info.sentence_cells,
                         "没进试跑的行": dict(sorted(intake_info.skipped.items()))}
     return report
 
@@ -951,8 +1151,13 @@ def render_report(report: dict[str, Any]) -> str:
     read = report.get("读表")
     if read:
         skipped = "、".join(f"{k} {v} 行" for k, v in read["没进试跑的行"].items()) or "没有"
-        lines.append(f"表里填了词的行 {read['填了词的行']} 行；没进试跑的：{skipped}；"
-                     f"一格里多写的词 {read['多写的词（没查）']} 个（没查）。")
+        lines.append(f"读了 {read['表']} 张表、{read['行']} 行，其中 {read['写了词的表']} 张表写了词"
+                     f"（填了「搜索关键词」的 {read['填了词的行']} 行）；没进试跑的行：{skipped}"
+                     + (f"；太长（像整句话）没收的词 {read['太长没收的词']} 个"
+                        if read["太长没收的词"] else "")
+                     + (f"；像一句话、整格没收的 {read['像整句话没收的格子']} 格"
+                        if read.get("像整句话没收的格子") else "") + "。")
+    lines.append("词是表的：一张表里写过的词都算这张表的，这张表每一篇帖子和每一个词都对一遍。")
     lines += ["", "## 先回答那个问题", ""]
     unread = report.get("读不懂的页") or {}
     if unread.get("页数"):
@@ -965,12 +1170,14 @@ def render_report(report: dict[str, Any]) -> str:
             ""]
     if not answer["3天内的帖子"]:
         lines.append("第一轮里还没有「发布 3 天内」的帖子有结果——要么第一轮还没跑，"
-                     "要么填了词的帖子都超过 3 天了（看下面按帖龄的表）。")
+                     "要么这几张表的帖子都超过 3 天了（看下面按帖龄的表）。")
     else:
         lines.append(
-            f"发布 3 天内的帖子 {answer['3天内的帖子']} 篇，综合排序前 3 页里搜到 "
-            f"{answer['搜到的']} 篇，没搜到 {answer['没搜到的']} 篇"
-            + (f"，没查全 {answer['没查全的']} 篇" if answer["没查全的"] else "") + "。")
+            f"发布 3 天内的帖子 {answer['3天内的帖子']} 篇，综合排序前 3 页里"
+            f"至少在一个词下面搜到 {answer['搜到的']} 篇，"
+            f"哪个词下面都没搜到 {answer['没搜到的']} 篇"
+            + (f"，只出现在付费位 {answer['只在付费位的']} 篇" if answer.get("只在付费位的") else "")
+            + (f"，没查全（说不准）{answer['没查全的']} 篇" if answer["没查全的"] else "") + "。")
     lines.append("「没搜到」只是说前几页里没有，不等于没被收录；名次是供应商那一刻看到的，"
                  "不是某个读者看到的。")
     for name, block in report["各轮"].items():
@@ -989,30 +1196,38 @@ def render_report(report: dict[str, Any]) -> str:
         if block.get("查之后才发的帖子（不算）"):
             lines.append(f"有 {block['查之后才发的帖子（不算）']} 篇帖子是这一轮查完之后才发的，"
                          "不算在这一轮里（那时候它还不存在，搜不到说明不了什么）。")
-        lines += ["", "按帖龄（查的那一刻、按表里的「发布时间」算）："]
+        if block.get("这一轮没查它那张表的词的帖子（不算）"):
+            lines.append(f"有 {block['这一轮没查它那张表的词的帖子（不算）']} 篇帖子，它那张表的词"
+                         "这一轮一个都没轮到，不算在这一轮里。")
+        if block.get("表里有、这一轮没查的词"):
+            lines.append(f"表里现在有 {block['表里有、这一轮没查的词']} 个词这一轮没查过（多半是查完之后"
+                         "才加的），下面「按词」里没有它们：别的词下面没搜到的帖子记成「没查全」。"
+                         "再跑一次这一轮会补上。")
+        lines += ["", "按帖龄（一篇帖子算一次：它那张表这一轮查的词里，至少一个词下面搜到就算搜到；"
+                      "帖龄是查的那一刻、按表里的「发布时间」算）："]
         lines += [f"- {band}：{_counts(block['按帖龄'][band])}" for band in AGE_BANDS]
         if block["按评论数"]:
             lines += ["", "按评论数："]
             lines += [f"- {group}：{_counts(bucket)}"
                       for group, bucket in block["按评论数"].items()]
-        lines += ["", "按词："]
+        lines += ["", "按词（写了这个词的表的帖子，在这个词下面出现了几篇、排在哪一档）："]
         for row in block["按词"]:
+            total = row.get("帖子") or _blank()
+            ages = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
+                            for band in AGE_BANDS if band in row["按帖龄"])
+            tail = (f"｜帖子 {_counts(total)}｜{ages}" if total["篇数"] else "｜没有帖子")
             if not row["拿到几页"]:
-                waiting = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
-                                   for band in AGE_BANDS if band in row["按帖龄"])
-                lines.append(f"- {row['词']}：还没查" + (f"｜{waiting}" if waiting else ""))
+                lines.append(f"- {row['词']}：还没查{tail if total['篇数'] else ''}")
                 continue
             state_text = "翻到底了" if row["翻到底了"] else ("查全了" if row["查全了"] else "没查全")
-            ages = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
-                            for band in AGE_BANDS if band in row["按帖龄"]) or "没有帖子"
             lines.append(f"- {row['词']}：拿到 {row['拿到几页']} 页，看了前 {row['看了前几位']} 位"
-                         f"（{state_text}）｜{ages}")
+                         f"（{state_text}）{tail}")
         if block["条目类型"] or block["条目键名"]:
             lines += ["", "结果条目的类型：" + ("、".join(
                 f"{k} {v}" for k, v in block["条目类型"].items()) or "（没有）"),
                       "结果条目里出现过的键名：" + ("、".join(block["条目键名"]) or "（没有）")]
     if report["名次稳不稳"]:
-        lines += ["", "## 名次稳不稳（和第一轮比）", ""]
+        lines += ["", "## 名次稳不稳（和第一轮比；一篇帖子在一个词下面算一次）", ""]
         for name, tally in report["名次稳不稳"].items():
             lines.append(f"- {name}：" + "，".join(f"{k} {v}" for k, v in tally.items()))
     if report["失败的页"]:
@@ -1068,13 +1283,16 @@ def dry_run_lines(round_: Round, info: Intake, state: State, price: float,
     need, have = plan(round_, digests, state)
     upper = ""
     if info.short_links:
-        upper = (f"（其中 {info.short_links} 行是短链，真跑时先免费展开；"
-                 "展不开的那几行不查，所以词数、页数是上界）")
+        upper = (f"（另有 {info.short_links} 行是短链，真跑时先免费展开，展开了也算帖子；"
+                 "一张表的帖子全是展不开的短链时，它的词不查，所以词数、页数是上界）")
     room_calls = MAX_CALLS - state.calls
     room_yuan = MAX_YUAN - state.yuan
     lines = [
         f"【只演练，不发付费请求】{round_.label}",
-        f"  词：{len(info.keywords)} 个（最多 {MAX_KEYWORDS} 个）；帖子：{len(info.posts)} 篇{upper}",
+        f"  表：{info.tables} 张，写了词的 {info.tables_with_keywords} 张；"
+        f"词：{len(info.keywords)} 个（最多 {MAX_KEYWORDS} 个）；"
+        f"要对的帖子：{len(info.posts)} 篇{upper}",
+        "  每个词拉前几页，这张表的每一篇帖子和这张表的每一个词都对一遍",
         f"  这一轮查 {len(digests)} 个词，每个词最多 {round_.pages} 页："
         f"已经拿到 {have} 页，还要发最多 {need} 次，约 ¥{need * price:.2f}"
         f"（¥{price:.3f} 一次）",
@@ -1083,13 +1301,16 @@ def dry_run_lines(round_: Round, info: Intake, state: State, price: float,
     ]
     affordable = min(room_calls, int((room_yuan + 1e-9) // price) if price > 0 else room_calls)
     if left:
-        lines.insert(3, f"  这一轮最多 {round_.keywords} 个词，已经定了 {len(selection)} 个"
+        lines.insert(4, f"  这一轮最多 {round_.keywords} 个词，已经定了 {len(selection)} 个"
                         f"（以前跑这一轮时定的不换）；表里另外 {len(left)} 个词这一轮不查")
     if need > affordable:
         lines.append(f"  ⚠ 剩下的额度只够 {max(0, affordable)} 次，这一轮跑不完，跑到上限会自己停")
     if info.skipped:
         lines.append("  没进试跑的行：" + "、".join(
             f"{reason} {count} 行" for reason, count in sorted(info.skipped.items())))
-    if info.extra_words:
-        lines.append(f"  有 {info.extra_words} 个词写在同一格的后面，不查（一格只查第一个）")
+    if info.too_long:
+        lines.append(f"  有 {info.too_long} 个词超过 {MAX_KEYWORD_CHARS} 个字（像整句话），不查")
+    if info.sentence_cells:
+        lines.append(f"  有 {info.sentence_cells} 格「搜索关键词」像一句话（有句号、问号、冒号，或有一段超过 "
+                     f"{MAX_KEYWORD_CHARS} 个字），整格不查。词之间用逗号、顿号、分号或换行隔开")
     return lines

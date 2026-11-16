@@ -292,7 +292,8 @@ class TestSearchSwitch(unittest.TestCase):
         missing = [c for c in schema.diff(self.on, meta).missing_columns
                    if c.name == self.column]
         self.assertEqual(len(missing), 1)
-        self.assertEqual(missing[0].body(), {"field_name": "搜索关键词", "type": 1})
+        # 建成空的多选（选项填的时候自己长出来），不用先定选项。
+        self.assertEqual(missing[0].body(), {"field_name": "搜索关键词", "type": 4})
 
     def test_switch_on_column_present_is_clean(self):
         for type_code in (1, 4):
@@ -400,55 +401,166 @@ def xhs_row(n: int, **kwargs) -> rows_mod.Row:
 
 
 class TestIntake(unittest.TestCase):
-    def test_first_keyword_rules(self):
-        self.assertEqual(visibility.first_keyword("#快充小片"), ("快充小片", 0))
-        self.assertEqual(visibility.first_keyword("快充、小片；充电宝"), ("快充", 2))
-        self.assertEqual(visibility.first_keyword([{"name": "a b"}, {"name": "c"}]), ("a b", 1))
-        self.assertEqual(visibility.first_keyword(None), ("", 0))
-        self.assertEqual(visibility.first_keyword(" # "), ("", 0))
+    """词是表的：一张表的词 = 它所有行里写过的词合起来；帖子 = 这张表所有查得了的行。"""
 
-    def test_blank_cells_are_not_counted_at_all(self):
-        info = visibility.intake([(xhs_row(1), ""), (xhs_row(2), None)])
-        self.assertEqual((info.rows_with_keyword, info.posts, info.skipped), (0, [], {}))
+    def test_multi_select_options_are_taken_whole(self):
+        self.assertEqual(visibility.split_keywords(["词甲", "a b", "#词丙"]), ["词甲", "a b", "词丙"])
+        # 飞书读回来的多选格子按列类型整理成选项名的列表；选项里的逗号不拆。
+        cell = visibility.keyword_cell(["a, b", "c"], visibility.COLUMN_MULTI)
+        self.assertEqual(visibility.split_keywords(cell), ["a, b", "c"])
+
+    def test_text_cell_with_a_mention_is_never_read_as_a_multi_select(self):
+        """文本格子也是一个数组，@人 的分段带着 name：不能把人名当选项拿去搜。"""
+        cell = [{"type": "text", "text": "词甲，词乙 "},
+                {"type": "mention", "mentionType": "User", "name": "某同事",
+                 "text": "@某同事", "token": "ou_x"}]
+        self.assertEqual(visibility.split_keywords(cell), ["词甲", "词乙"])
+        tidy = visibility.keyword_cell(cell, visibility.COLUMN_TEXT)
+        self.assertEqual(visibility.split_keywords(tidy), ["词甲", "词乙"])
+        info = visibility.intake([[(xhs_row(1), tidy), (xhs_row(2), None)]])
+        self.assertEqual(info.keywords, ["词甲", "词乙"])
+        # 只有 @人、没有字的格子：一个词都没有。
+        self.assertEqual(visibility.split_keywords(cell[1:]), [])
+
+    def test_a_sentence_in_a_text_cell_is_not_split_into_paid_words(self):
+        split = visibility.split_keywords
+        sentence = "how to pick a sunscreen for sensitive skin in summer"
+        for cell in (sentence, "这张表先不查，等客户确认了再说。", "备注：词甲、词乙",
+                     "词甲、" + "很" * 31, "词甲 还是 词乙？"):
+            self.assertEqual(split(cell), [], cell)
+            self.assertTrue(visibility.parse_cell(cell).sentence, cell)
+        info = visibility.intake([[(xhs_row(1), sentence), (xhs_row(2), "词甲")]])
+        self.assertEqual((info.keywords, info.sentence_cells, info.rows_with_keyword),
+                         (["词甲"], 1, 1))
+        self.assertEqual(len(info.posts), 2)
+        # 一句话是唯一的格子：这张表一个词都没有，不查。
+        self.assertEqual(visibility.intake([[(xhs_row(1), sentence)]]).keywords, [])
+
+    def test_a_decimal_at_the_start_of_a_word_is_not_list_numbering(self):
+        """「3.5mm耳机」开头的 3. 不是编号；削掉就成了另一个词，钱花在别的词上。"""
+        self.assertEqual(visibility.split_keywords("3.5mm耳机"), ["3.5mm耳机"])
+        self.assertEqual(visibility.split_keywords("2.4G无线鼠标，1.5米数据线"),
+                         ["2.4G无线鼠标", "1.5米数据线"])
+        self.assertEqual(visibility.split_keywords("1. 词甲\n2.词乙\n3）词丙\n4、词丁"),
+                         ["词甲", "词乙", "词丙", "词丁"])
+
+    def test_paid_only_needs_every_page_just_like_not_found(self):
+        """页没翻全时，在已翻的页里只出现在付费位的帖子是「没查全」：没翻的页里可能自然排上了。"""
+        partial = visibility.Listing(organic=["n-other"], paid={"n-ours"}, pages=1, complete=False)
+        self.assertEqual(partial.result("n-ours"), (visibility.INCOMPLETE, None))
+        full = visibility.Listing(organic=["n-other"], paid={"n-ours"}, pages=3, complete=True)
+        self.assertEqual(full.result("n-ours"), (visibility.PAID, None))
+        self.assertEqual(full.result("n-none"), (visibility.NOT_FOUND, None))
+        self.assertEqual(partial.result("n-other")[1], 1)
+
+    def test_lone_punctuation_and_numbering_never_become_keywords(self):
+        split = visibility.split_keywords
+        self.assertEqual(split("词甲 / 词乙"), ["词甲", "词乙"])
+        self.assertEqual(split("词甲 - 词乙、-、/、·"), ["词甲 - 词乙"])
+        self.assertEqual(split("词甲|词乙｜词丙"), ["词甲", "词乙", "词丙"])
+        self.assertEqual(split("#词甲#词乙 ＃词丙"), ["词甲", "词乙", "词丙"])
+        self.assertEqual(split("1. 词甲\n2）词乙\n3、词丙"), ["词甲", "词乙", "词丙"])
+        self.assertEqual(split(["-", "词甲", " / "]), ["词甲"])
+        self.assertEqual(split("618、双11"), ["618", "双11"])
+
+    def test_a_spaced_word_is_one_keyword_however_the_rows_are_filled(self):
+        """空格不拆：只写一个带空格的词，和它跟别的词写在一起，得到的是同一个词。"""
+        info = visibility.intake([[(xhs_row(1), "cGMP  因子"), (xhs_row(2), "cGMP 因子、词甲"),
+                                   (xhs_row(3), ["cGMP 因子"])]])
+        self.assertEqual(info.keywords, ["cGMP 因子", "词甲"])
+
+    def test_text_splits_on_the_listed_separators_and_keeps_inner_spaces(self):
+        split = visibility.split_keywords
+        self.assertEqual(split("快充、小片；充电宝,磁吸，薄;轻\n小"),
+                         ["快充", "小片", "充电宝", "磁吸", "薄", "轻", "小"])
+        self.assertEqual(split("cGMP 因子、 #快充 "), ["cGMP 因子", "快充"])
+        self.assertEqual(split([{"type": "text", "text": "词甲，"}, {"type": "text", "text": "词乙"}]),
+                         ["词甲", "词乙"])
+        self.assertEqual(split("词甲,"), ["词甲"])
+
+    def test_whitespace_never_splits_a_text_cell(self):
+        split = visibility.split_keywords
+        self.assertEqual(split("快充  小片\u3000充电宝\t磁吸"), ["快充 小片 充电宝 磁吸"])
+        self.assertEqual(split("#快充小片"), ["快充小片"])
+        self.assertEqual(split("a b,"), ["a b"])
+
+    def test_empty_cells_and_repeats(self):
+        split = visibility.split_keywords
+        self.assertEqual([split(None), split(""), split(" # "), split([]), split("，、")],
+                         [[], [], [], [], []])
+        self.assertEqual(split("SPX、spx、Spx"), ["SPX"])
+
+    def test_keywords_are_the_union_over_the_tables_rows_in_first_seen_order(self):
+        same = visibility.intake([[(xhs_row(1), "词甲、词乙"), (xhs_row(2), "词甲、词乙"),
+                                   (xhs_row(3), "词甲、词乙")]])
+        one = visibility.intake([[(xhs_row(1), None), (xhs_row(2), "词甲、词乙"), (xhs_row(3), "")]])
+        mixed = visibility.intake([[(xhs_row(1), ["词甲"]), (xhs_row(2), "词乙；词甲"),
+                                    (xhs_row(3), None)]])
+        for info in (same, one, mixed):
+            self.assertEqual(info.keywords, ["词甲", "词乙"])
+            # 每一行都是这张表的帖子（格子空着的也是），每一篇都带着整张表的词。
+            self.assertEqual([p.note_id for p in info.posts], [nid(1), nid(2), nid(3)])
+            self.assertEqual({p.keywords for p in info.posts}, {("词甲", "词乙")})
+        self.assertEqual((same.rows_with_keyword, one.rows_with_keyword, one.rows), (3, 1, 3))
+
+    def test_each_table_has_its_own_set_and_a_shared_word_is_one_keyword(self):
+        info = visibility.intake([
+            [(xhs_row(1), "SPX、词甲"), (xhs_row(2), None)],
+            [(xhs_row(3), "词乙，spx")],
+        ])
+        self.assertEqual(info.keywords, ["SPX", "词甲", "词乙"])
+        self.assertEqual([p.keywords for p in info.posts],
+                         [("SPX", "词甲"), ("SPX", "词甲"), ("词乙", "SPX")])
+        self.assertEqual((info.tables, info.tables_with_keywords), (2, 2))
+
+    def test_table_without_any_keyword_is_not_looked_at(self):
+        resolved = []
+        short = rows_mod.Row(record_id="s", link_cell="https://xhslink.cn/o/abcDEF",
+                             publish_time_ms=1_700_000_000_000)
+        info = visibility.intake([[(xhs_row(1), ""), (short, None)], [(xhs_row(2), "词甲")]],
+                                 resolve=lambda url: resolved.append(url) or nid(9))
+        self.assertEqual((info.keywords, [p.note_id for p in info.posts]), (["词甲"], [nid(2)]))
+        self.assertEqual(info.skipped, {visibility.SKIP_NO_WORDS: 2})
+        self.assertEqual((info.tables, info.tables_with_keywords, resolved), (2, 1, []))
 
     def test_rows_that_cannot_be_checked_are_counted_by_reason(self):
         douyin = rows_mod.Row(record_id="d", link_cell="https://www.douyin.com/video/7412345678901234567")
-        info = visibility.intake([
+        info = visibility.intake([[
             (xhs_row(1), "词甲"),
             (douyin, "词甲"),
-            (xhs_row(2, refresh_status=rows_mod.STATUS_GONE), "词甲"),
-            (xhs_row(3, refresh_status=rows_mod.STATUS_SUSPECT), "词甲"),
-            (xhs_row(4), "很" * 31),
-        ])
-        self.assertEqual([p.note_id for p in info.posts], [nid(1)])
-        self.assertEqual(info.skipped, {visibility.SKIP_NOT_XHS: 1, visibility.SKIP_DEAD: 2,
-                                        visibility.SKIP_TOO_LONG: 1})
-        self.assertEqual(info.keywords, ["词甲"])
+            (xhs_row(2, refresh_status=rows_mod.STATUS_GONE), None),
+            (xhs_row(3, refresh_status=rows_mod.STATUS_SUSPECT), None),
+            (xhs_row(4), ["很" * 31]),
+        ]])
+        self.assertEqual([p.note_id for p in info.posts], [nid(1), nid(4)])
+        self.assertEqual(info.skipped, {visibility.SKIP_NOT_XHS: 1, visibility.SKIP_DEAD: 2})
+        # 像整句话的词不收，但写它的那一行照样是这张表的帖子。
+        self.assertEqual((info.keywords, info.too_long), (["词甲"], 1))
 
     def test_same_post_twice_is_one_post_and_case_does_not_split_a_keyword(self):
-        info = visibility.intake([(xhs_row(1), "SPX"), (xhs_row(1), "spx"), (xhs_row(2), "Spx")])
+        info = visibility.intake([[(xhs_row(1), "SPX"), (xhs_row(1), "spx"), (xhs_row(2), "Spx")]])
         self.assertEqual(info.keywords, ["SPX"])
         self.assertEqual(len(info.posts), 2)
 
     def test_short_links_are_expanded_for_free_or_left_pending(self):
         short = rows_mod.Row(record_id="s", link_cell="https://xhslink.cn/o/abcDEF",
                              publish_time_ms=1_700_000_000_000)
-        pending = visibility.intake([(short, "词甲")])
+        pending = visibility.intake([[(short, "词甲")]])
         self.assertEqual((pending.short_links, pending.posts, pending.keywords),
                          (1, [], ["词甲"]))
-        resolved = visibility.intake([(short, "词甲")], resolve=lambda url: nid(9))
+        resolved = visibility.intake([[(short, "词甲")]], resolve=lambda url: nid(9))
         self.assertEqual([p.note_id for p in resolved.posts], [nid(9)])
-        failed = visibility.intake([(short, "词甲")], resolve=lambda url: None)
+        # 一篇对得了的帖子都没有的表：它的词不占名额、不花钱。
+        failed = visibility.intake([[(short, "词甲")]], resolve=lambda url: None)
         self.assertEqual((failed.skipped, failed.keywords), ({visibility.SKIP_NO_ID: 1}, []))
 
-    def test_empty_publish_time_is_not_searched_and_takes_no_keyword_slot(self):
-        """设计第 9 条：发布时间空着的行查不了、不花钱。只被这种行带着的词也不该占名额。"""
+    def test_empty_publish_time_is_not_matched_and_its_short_link_is_not_expanded(self):
+        """设计第 9 条：发布时间空着的行对不了。只有这种行的表，它的词也不占名额。"""
         resolved = []
         short = rows_mod.Row(record_id="s", link_cell="https://xhslink.cn/o/abcDEF")
         info = visibility.intake(
-            [(xhs_row(1, publish_time_ms=None), "只有空时间的词"),
-             (short, "只有空时间的词"),
-             (xhs_row(2), "词甲"), (xhs_row(3, publish_time_ms=None), "词甲")],
+            [[(xhs_row(1, publish_time_ms=None), "只有空时间的词"), (short, "只有空时间的词")],
+             [(xhs_row(2), "词甲"), (xhs_row(3, publish_time_ms=None), "词甲")]],
             resolve=lambda url: resolved.append(url) or nid(9))
         self.assertEqual(info.keywords, ["词甲"])
         self.assertEqual([(p.note_id, p.publish_ms) for p in info.posts],
@@ -896,6 +1008,7 @@ class TestRunRound(unittest.TestCase):
 
 
 AT = 1_800_000_000.0        # 2027-01-15 16:00 北京时间
+QUESTION = "发布 3 天内的帖子，在这张表要查的词下面，综合排序前 3 页里看不看得见"
 
 
 def days_before(days: float) -> int:
@@ -918,7 +1031,7 @@ class TestReport(unittest.TestCase):
             "item_keys": ["model_type", "note"], "search_id": "s"}, AT)
 
     def post(self, n, age_days=None, comments=None):
-        return visibility.Post(nid(n), self.word,
+        return visibility.Post(nid(n), (self.word,),
                                None if age_days is None else days_before(age_days), comments)
 
     def report(self, posts):
@@ -948,8 +1061,8 @@ class TestReport(unittest.TestCase):
         day3 = report["各轮"]["first"]["按帖龄"]["3天内"]
         self.assertEqual((day3["没搜到"], day3["没查全"]), (1, 0))
         self.assertEqual(report["回答"], {
-            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
-            "3天内的帖子": 3, "搜到的": 2, "没搜到的": 1, "没查全的": 0})
+            "问题": QUESTION,
+            "3天内的帖子": 3, "搜到的": 2, "只在付费位的": 0, "没搜到的": 1, "没查全的": 0})
         row = report["各轮"]["first"]["按词"][0]
         self.assertEqual((row["词"], row["看了前几位"], row["查全了"]), ("K01", 60, True))
 
@@ -964,18 +1077,18 @@ class TestReport(unittest.TestCase):
                             Sender([ok(page_of(100)), ok(page_of(200)), ok(page_of(300)), bad]))
         self.assertEqual(result.failed, 1)
         posts = [self.post(105, 2, comments=30),
-                 visibility.Post(nid(999), other, days_before(2), 30)]
+                 visibility.Post(nid(999), (other,), days_before(2), 30)]
         report = self.report(posts)
         self.assertEqual(report["帖子"], 2)
         self.assertEqual(report["回答"], {
-            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
-            "3天内的帖子": 2, "搜到的": 1, "没搜到的": 0, "没查全的": 1})
+            "问题": QUESTION,
+            "3天内的帖子": 2, "搜到的": 1, "只在付费位的": 0, "没搜到的": 0, "没查全的": 1})
         block = report["各轮"]["first"]
         self.assertEqual(block["按评论数"]["评论数到 20 条"]["没查全"], 1)
         self.assertEqual(block["按词"][1]["按帖龄"]["3天内"]["没查全"], 1)
         text = visibility.render_report(report)
-        self.assertIn("搜到 1 篇，没搜到 0 篇，没查全 1 篇", text)
-        self.assertIn("K02：还没查｜3天内 1 篇：没查全 1", text)
+        self.assertIn("至少在一个词下面搜到 1 篇，哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", text)
+        self.assertIn("K02：还没查｜帖子 1 篇：没查全 1｜3天内 1 篇：没查全 1", text)
 
     def test_posts_under_a_keyword_the_cap_stopped_before_are_incomplete(self):
         other = "另一个词"
@@ -986,8 +1099,8 @@ class TestReport(unittest.TestCase):
         result, _logs = run("first", pairs, self.state, sender)
         self.assertEqual((len(sender.requests), bool(result.stopped)), (3, True))
         # 帖龄按这一轮跑的那一刻算（这个词没有自己的第 1 页时间）。
-        posts = [visibility.Post(nid(999), other, days_before(2)),
-                 visibility.Post(nid(998), other, days_before(5))]
+        posts = [visibility.Post(nid(999), (other,), days_before(2)),
+                 visibility.Post(nid(998), (other,), days_before(5))]
         by_age = self.report(posts)["各轮"]["first"]["按帖龄"]
         self.assertEqual((by_age["3天内"]["没查全"], by_age["4到7天"]["没查全"]), (1, 1))
 
@@ -1002,11 +1115,11 @@ class TestReport(unittest.TestCase):
         """同一个词后来又填了一篇新帖：它不在当时查的那批里，不能算成「3 天内、没搜到」。"""
         for page in (1, 2, 3):
             self.keep("first", page, range(page * 100, page * 100 + 20))
-        later = visibility.Post(nid(999), self.word, days_before(-2))   # 查完两天后才发
+        later = visibility.Post(nid(999), (self.word,), days_before(-2))   # 查完两天后才发
         report = self.report([self.post(105, 2), later])
         self.assertEqual(report["回答"], {
-            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
-            "3天内的帖子": 1, "搜到的": 1, "没搜到的": 0, "没查全的": 0})
+            "问题": QUESTION,
+            "3天内的帖子": 1, "搜到的": 1, "只在付费位的": 0, "没搜到的": 0, "没查全的": 0})
         block = report["各轮"]["first"]
         self.assertEqual(block["查之后才发的帖子（不算）"], 1)
         self.assertEqual(sum(b["篇数"] for b in block["按帖龄"].values()), 1)
@@ -1015,8 +1128,8 @@ class TestReport(unittest.TestCase):
         other = "另一个词"
         self.state.register([other])
         self.state.mark_round("first", AT, [self.digest, visibility.keyword_hash(other)])
-        report = self.report([visibility.Post(nid(998), other, days_before(-2)),
-                              visibility.Post(nid(997), other, days_before(1))])
+        report = self.report([visibility.Post(nid(998), (other,), days_before(-2)),
+                              visibility.Post(nid(997), (other,), days_before(1))])
         block = report["各轮"]["first"]
         self.assertEqual((block["查之后才发的帖子（不算）"],
                           block["按帖龄"]["3天内"]["没查全"]), (1, 1))
@@ -1028,7 +1141,7 @@ class TestReport(unittest.TestCase):
                 "notes": [{"note_id": nid(i), "ad": False}
                           for i in range(page * 100, page * 100 + 20)],
                 "items": 20, "search_id": "s"}, AT + 3 * 86400)
-        rounds = self.report([visibility.Post(nid(999), self.word, days_before(-2))])["各轮"]
+        rounds = self.report([visibility.Post(nid(999), (self.word,), days_before(-2))])["各轮"]
         self.assertEqual(rounds["first"]["按帖龄"]["3天内"]["篇数"], 0)
         self.assertEqual(rounds["repeat2"]["按帖龄"]["3天内"]["没搜到"], 1)
 
@@ -1092,7 +1205,7 @@ class TestReport(unittest.TestCase):
         self.keep("repeat1", 3, range(600, 620))              # 200：搜到 → 没搜到
         tally = self.report([self.post(100, 1), self.post(200, 1), self.post(300, 1),
                              self.post(999, 1)])["名次稳不稳"]["repeat1"]
-        self.assertEqual(tally, {"对得上的篇数": 4, "档位一样": 1, "档位变了": 3,
+        self.assertEqual(tally, {"对得上的（帖子×词）": 4, "档位一样": 1, "档位变了": 3,
                                  "名次差超过20": 1, "一次搜到一次没搜到": 1})
 
     def test_report_is_counts_only(self):
@@ -1109,7 +1222,8 @@ class TestReport(unittest.TestCase):
                 self.assertNotIn(forbidden, content)
         text = text_path.read_text(encoding="utf-8")
         self.assertIn("K01", text)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里搜到 1 篇，没搜到 1 篇", text)
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+                      "哪个词下面都没搜到 1 篇", text)
         self.assertIn("first：unknown（HTTP 400）：1 次", text)
         self.assertIn("余额少了 $0.03", text)
         self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["花费"]["次数上限"], 280)
@@ -1129,6 +1243,223 @@ class TestReport(unittest.TestCase):
         self.assertEqual(block["页"], {"计划": 20, "拿到": 10, "还差": 10, "失败过": 0})
 
 
+class TestTableMatching(unittest.TestCase):
+    """2026-11-16 负责人定的：每个词拉前几页，再拿这张表**所有**发布帖去对。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.state = fresh_state(self.dir.name)
+        self.a, self.b, self.c = "词甲", "词乙", "词丙"
+        self.state.register([self.a, self.b, self.c])
+
+    def keep(self, word, page, ids, round_name="first", at=AT):
+        self.state.keep_page(round_name, visibility.keyword_hash(word), page, {
+            "notes": [{"note_id": nid(i), "ad": False} for i in ids],
+            "items": len(ids), "search_id": "s"}, at)
+
+    def full(self, word, start, **kwargs):
+        for page in (1, 2, 3):
+            self.keep(word, page, range(start + page * 100, start + page * 100 + 20), **kwargs)
+
+    def post(self, n, words, age_days=2.0, comments=None):
+        return visibility.Post(nid(n), tuple(words), days_before(age_days), comments)
+
+    def first(self, posts):
+        report = visibility.build_report(self.state, posts, tz=BJ, now=AT)
+        return report, report["各轮"]["first"]
+
+    def test_a_match_seen_days_later_is_not_backdated_to_the_first_search(self):
+        """一轮隔了几天才续跑完：第 2 天在词甲下没搜到、第 5 天在词乙下搜到的帖子，
+        不能记成「3 天内搜到」；只在词甲那一刻查过的另一篇也说不了「3 天内没搜到」。"""
+        day = 86400
+        self.full(self.a, 1000, at=AT)                       # 词甲：发布后第 2 天查的
+        self.full(self.b, 2000, at=AT + 3 * day)             # 词乙：第 5 天才查
+        table = (self.a, self.b)
+        late_hit = visibility.Post(nid(2105), table, days_before(2.0), None)   # 只在词乙下出现
+        nowhere = visibility.Post(nid(9999), table, days_before(2.0), None)
+        early_hit = visibility.Post(nid(1105), table, days_before(2.0), None)  # 第 2 天就在词甲下
+        report = visibility.build_report(self.state, [late_hit, nowhere, early_hit], tz=BJ,
+                                         now=AT + 3 * day)
+        block = report["各轮"]["first"]
+        day3, day7 = block["按帖龄"]["3天内"], block["按帖龄"]["4到7天"]
+        self.assertEqual((day3["篇数"], day3["前20"], day3["没查全"], day3["没搜到"]), (2, 1, 1, 0))
+        self.assertEqual((day7["篇数"], day7["前20"]), (1, 1))
+        self.assertEqual((report["回答"]["3天内的帖子"], report["回答"]["搜到的"],
+                          report["回答"]["没搜到的"], report["回答"]["没查全的"]), (2, 1, 0, 1))
+
+    def test_every_post_is_checked_against_every_keyword_of_its_table(self):
+        self.full(self.a, 1000)                    # 词甲：1100.. 1200.. 1300..
+        self.full(self.b, 2000)                    # 词乙：2100.. 2200.. 2300..
+        table = (self.a, self.b)
+        posts = [self.post(1105, table), self.post(2205, table), self.post(9999, table),
+                 self.post(2301, table, age_days=5), self.post(8888, table, age_days=30)]
+        report, block = self.first(posts)
+        self.assertEqual(report["帖子"], 5)
+        self.assertEqual(report["回答"], {
+            "问题": QUESTION, "3天内的帖子": 3, "搜到的": 2, "只在付费位的": 0,
+            "没搜到的": 1, "没查全的": 0})
+        day3 = block["按帖龄"]["3天内"]
+        self.assertEqual((day3["篇数"], day3["前20"], day3["21到40"], day3["没搜到"]), (3, 1, 1, 1))
+        self.assertEqual(block["按帖龄"]["4到7天"]["41到60"], 1)
+        self.assertEqual(block["按帖龄"]["更早"]["没搜到"], 1)
+        # 每个词：这张表的 5 篇里，在它下面出现了几篇、排在哪一档。
+        rows = {row["词"]: row["帖子"] for row in block["按词"]}
+        self.assertEqual((rows["K01"]["篇数"], rows["K01"]["前20"], rows["K01"]["没搜到"]), (5, 1, 4))
+        self.assertEqual((rows["K02"]["篇数"], rows["K02"]["21到40"], rows["K02"]["41到60"],
+                          rows["K02"]["没搜到"]), (5, 1, 1, 3))
+        text = visibility.render_report(report)
+        self.assertIn("K01：拿到 3 页，看了前 60 位（查全了）｜帖子 5 篇：前20 1 · 没搜到 4", text)
+
+    def test_best_rank_wins_when_a_post_shows_under_two_keywords(self):
+        self.keep(self.a, 1, [*range(100, 150), 7])       # 第 51 位
+        self.keep(self.a, 2, [])
+        self.keep(self.b, 1, [1, 2, 7])                   # 第 3 位
+        self.keep(self.b, 2, [])
+        _report, block = self.first([self.post(7, (self.a, self.b))])
+        self.assertEqual(block["按帖龄"]["3天内"]["前20"], 1)
+        self.assertEqual(block["按帖龄"]["3天内"]["41到60"], 0)
+
+    def test_not_found_needs_every_keyword_complete_else_it_cannot_be_judged(self):
+        self.full(self.a, 1000)
+        self.keep(self.b, 1, range(2100, 2120))           # 词乙只拿到 1 页
+        table = (self.a, self.b, self.c)                  # 词丙一页都没拿到
+        self.state.mark_round("first", AT, [visibility.keyword_hash(w) for w in table])
+        posts = [self.post(1105, table), self.post(2105, table), self.post(9999, table)]
+        report, block = self.first(posts)
+        self.assertEqual(report["回答"], {
+            "问题": QUESTION, "3天内的帖子": 3, "搜到的": 2, "只在付费位的": 0,
+            "没搜到的": 0, "没查全的": 1})
+        rows = {row["词"]: row["帖子"] for row in block["按词"]}
+        self.assertEqual((rows["K01"]["前20"], rows["K01"]["没搜到"]), (1, 2))
+        self.assertEqual((rows["K02"]["前20"], rows["K02"]["没查全"]), (1, 2))
+        self.assertEqual(rows["K03"]["没查全"], 3)
+        # 补齐之后才说得出「没搜到」。
+        self.keep(self.b, 2, [])
+        self.keep(self.c, 1, [])
+        report, _block = self.first(posts)
+        self.assertEqual((report["回答"]["没搜到的"], report["回答"]["没查全的"]), (1, 0))
+
+    def test_keyword_added_to_the_table_after_the_round_makes_unfound_posts_incomplete(self):
+        self.full(self.a, 1000)
+        self.state.mark_round("first", AT, [visibility.keyword_hash(self.a)])
+        table = (self.a, self.b)                          # 词乙是查完之后才加进表的
+        posts = [self.post(1105, table), self.post(9999, table)]
+        report, block = self.first(posts)
+        self.assertEqual(report["回答"], {
+            "问题": QUESTION, "3天内的帖子": 2, "搜到的": 1, "只在付费位的": 0,
+            "没搜到的": 0, "没查全的": 1})
+        self.assertEqual(block["表里有、这一轮没查的词"], 1)
+        self.assertEqual([row["词"] for row in block["按词"]], ["K01"])
+        self.assertIn("表里现在有 1 个词这一轮没查过", visibility.render_report(report))
+        # 表里没多出词：照旧是「没搜到」。
+        report, block = self.first([self.post(9999, (self.a,))])
+        self.assertEqual((report["回答"]["没搜到的"], block["表里有、这一轮没查的词"]), (1, 0))
+
+    def test_depth_round_that_is_full_does_not_wait_for_the_other_keywords(self):
+        for word in (self.a, self.b):
+            for page in range(1, 11):
+                self.keep(word, page, range(page * 100, page * 100 + 20), round_name="depth")
+        self.state.mark_round("depth", AT, [visibility.keyword_hash(w) for w in (self.a, self.b)])
+        report = visibility.build_report(
+            self.state, [self.post(9999, (self.a, self.b, self.c))], tz=BJ, now=AT)
+        block = report["各轮"]["depth"]
+        self.assertEqual(block["按帖龄"]["3天内"]["没搜到"], 1)
+        self.assertEqual(block["表里有、这一轮没查的词"], 0)
+
+    def test_paid_slot_only_is_not_a_verdict_while_a_keyword_is_incomplete(self):
+        digest = visibility.keyword_hash(self.a)
+        self.state.keep_page("first", digest, 1, {
+            "notes": [{"note_id": nid(1), "ad": False}, {"note_id": nid(7), "ad": True}],
+            "items": 2, "search_id": "s"}, AT)
+        self.keep(self.a, 2, [])
+        table = (self.a, self.b)                          # 词乙选了，一页都没拿到
+        self.state.mark_round("first", AT, [visibility.keyword_hash(w) for w in table])
+        report, block = self.first([self.post(7, table)])
+        self.assertEqual((report["回答"]["只在付费位的"], report["回答"]["没查全的"]), (0, 1))
+        rows = {row["词"]: row["帖子"] for row in block["按词"]}
+        self.assertEqual((rows["K01"]["付费位"], rows["K02"]["没查全"]), (1, 1))
+        # 词乙查全了、也没有：这才是「只在付费位」。
+        self.keep(self.b, 1, [])
+        report, _block = self.first([self.post(7, table)])
+        self.assertEqual((report["回答"]["只在付费位的"], report["回答"]["没查全的"]), (1, 0))
+
+    def test_same_keyword_in_two_tables_is_searched_once_and_matched_per_table(self):
+        self.full(self.a, 1000)
+        self.full(self.b, 2000)
+        self.full(self.c, 3000)
+        one, two = (self.a, self.b), (self.a, self.c)     # 两张表都写了词甲
+        posts = [self.post(1105, one), self.post(3105, one),     # 3105 在词丙下面，但词丙不是它那张表的
+                 self.post(1106, two), self.post(3106, two), self.post(2106, two)]
+        report, block = self.first(posts)
+        self.assertEqual(report["词"], 3)
+        self.assertEqual(block["页"]["计划"], 9)           # 词甲只算一份
+        day3 = block["按帖龄"]["3天内"]
+        self.assertEqual((day3["篇数"], day3["前20"], day3["没搜到"]), (5, 3, 2))
+        rows = {row["词"]: row["帖子"] for row in block["按词"]}
+        self.assertEqual((rows["K01"]["篇数"], rows["K01"]["前20"]), (5, 2))   # 两张表的帖子都对
+        self.assertEqual((rows["K02"]["篇数"], rows["K02"]["前20"]), (2, 0))
+        self.assertEqual((rows["K03"]["篇数"], rows["K03"]["前20"]), (3, 1))
+
+    def test_same_post_in_two_tables_counts_once_with_both_sets(self):
+        self.full(self.a, 1000)
+        self.full(self.b, 2000)
+        report, block = self.first([self.post(2105, (self.a,)), self.post(2105, (self.b,))])
+        self.assertEqual(report["帖子"], 1)
+        self.assertEqual(block["按帖龄"]["3天内"]["前20"], 1)
+
+    def test_post_published_between_two_keyword_searches_is_only_matched_with_the_later(self):
+        self.full(self.a, 1000)
+        self.full(self.b, 2000, at=AT + 3 * 86400)        # 词乙是三天后补查的
+        table = (self.a, self.b)
+        newer = self.post(9999, table, age_days=-1)       # 两次之间发的
+        much_newer = self.post(9998, table, age_days=-5)  # 都查完了才发
+        _report, block = self.first([newer, much_newer])
+        rows = {row["词"]: row["帖子"] for row in block["按词"]}
+        self.assertEqual((rows["K01"]["篇数"], rows["K02"]["篇数"], rows["K02"]["没搜到"]), (0, 1, 1))
+        self.assertEqual(block["查之后才发的帖子（不算）"], 1)
+        self.assertEqual(sum(b["篇数"] for b in block["按帖龄"].values()), 1)
+
+    def test_round_that_searched_none_of_a_tables_keywords_leaves_its_posts_out(self):
+        for page in range(1, 11):
+            self.keep(self.a, page, range(page * 100, page * 100 + 20), round_name="depth")
+        self.state.mark_round("depth", AT, [visibility.keyword_hash(self.a)])
+        report = visibility.build_report(
+            self.state, [self.post(105, (self.a, self.b)), self.post(999, (self.c,))], tz=BJ, now=AT)
+        block = report["各轮"]["depth"]
+        self.assertEqual([row["词"] for row in block["按词"]], ["K01"])
+        self.assertEqual(sum(b["篇数"] for b in block["按帖龄"].values()), 1)
+        self.assertEqual(block["这一轮没查它那张表的词的帖子（不算）"], 1)
+        self.assertIn("这一轮一个都没轮到", visibility.render_report(report))
+
+    def test_state_file_from_the_per_post_design_still_loads_and_reports(self):
+        """改动之前（一篇帖子配一个词）存下的进度文件：形状没变，页是按词记的，照样能用。"""
+        digest = visibility.keyword_hash(self.a)
+        old = {"version": 1, "trial": visibility.TRIAL_NAME, "calls": 3, "yuan": 0.216,
+               "keywords": {digest: 1},
+               "pages": {f"first|{digest}|{page}": {
+                   "at": int(AT), "ids": [nid(i) for i in range(page * 100, page * 100 + 20)],
+                   "ads": [], "items": 20, "other": 0, "types": {}, "keys": [],
+                   "sid": {"search_id": "s"}} for page in (1, 2, 3)},
+               "rounds": {"first": {"at": int(AT), "kw": [digest]}},
+               "failures": [], "balance": []}
+        path = pathlib.Path(self.dir.name, "old", "state.json")
+        path.parent.mkdir()
+        path.write_text(json.dumps(old), encoding="utf-8")
+        state = visibility.State.load(path)
+        self.assertEqual((state.calls, state.yuan), (3, 0.216))
+        # 那时候只有「填了这个词的那一篇」被对过；现在整张表的帖子都拿去对同一批页。
+        posts = [self.post(105, (self.a,)), self.post(205, (self.a,)), self.post(999, (self.a,))]
+        report = visibility.build_report(state, posts, tz=BJ, now=AT)
+        day3 = report["各轮"]["first"]["按帖龄"]["3天内"]
+        self.assertEqual((day3["前20"], day3["21到40"], day3["没搜到"]), (1, 1, 1))
+        # 接着跑：拿到过的页不付第二次钱；新词照样受 15 个的上限。
+        result, _logs = run("first", [(self.a, digest)], state, Sender())
+        self.assertEqual((result.reused, result.requests), (3, 0))
+        self.assertIn("最多 15 个", state.register([f"新词{i}" for i in range(15)]))
+        self.assertEqual(state.data["keywords"], {digest: 1})
+
+
 class TestReportSelection(unittest.TestCase):
     """报告里一轮算哪几个词：跑的时候记下的那几个，不是「编号靠前的」。"""
 
@@ -1138,7 +1469,7 @@ class TestReportSelection(unittest.TestCase):
         self.state = fresh_state(self.dir.name)
         self.words = words(3)
         self.state.register([w for w, _d in self.words])
-        self.posts = [visibility.Post(nid(900 + i), word, days_before(2))
+        self.posts = [visibility.Post(nid(900 + i), (word,), days_before(2))
                       for i, (word, _d) in enumerate(self.words, start=1)]
         self.bad = transport.Response(400, "application/json",
                                       json.dumps({"detail": {"code": 400, "message": "x"}}))
@@ -1299,7 +1630,8 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(sender.requests), 6)
         self.assertIn("新拿到 6 页", out)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里搜到 1 篇，没搜到 1 篇", out)
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+                      "哪个词下面都没搜到 1 篇", out)
         for forbidden in ("某某品牌", "第二个词", nid(100), "tikhub.", KEY):
             self.assertNotIn(forbidden, out)
         names = sorted(p.name for p in pathlib.Path(self.dir.name).iterdir())
@@ -1331,8 +1663,9 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("没拿到 1 页", out)
         self.assertIn("还差 3 页", out)
-        self.assertIn("没查全 2 篇", out)
-        self.assertNotIn("没搜到 1 篇", out)
+        # 词是表的：第一个词没查到，但另一个词下面搜到的那一篇照样算搜到；
+        # 两个词下面都没有的那一篇，因为有一个词没查全，说不准。
+        self.assertIn("至少在一个词下面搜到 1 篇，哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", out)
         with mock.patch.object(visibility, "_send_once", sender):       # 再跑补得上
             code, out = self.invoke()
         self.assertEqual(code, 0)
@@ -1344,7 +1677,8 @@ class TestCommand(unittest.TestCase):
         self.table._records.append(trial_record(998, "某某品牌", age_days=-1))
         code, out = self.invoke("--report-only")
         self.assertEqual(code, 0)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里搜到 1 篇，没搜到 1 篇。", out)
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+                      "哪个词下面都没搜到 1 篇。", out)
         self.assertIn("有 1 篇帖子是这一轮查完之后才发的", out)
 
     def test_unreadable_first_page_exits_non_zero_after_one_call(self):
@@ -1355,7 +1689,7 @@ class TestCommand(unittest.TestCase):
         self.assertEqual((code, len(sender.requests)), (1, 1))
         self.assertIn("中途停了", out)
         self.assertIn("不能当成「没搜到」", out)
-        self.assertNotIn("没搜到 1 篇", out)
+        self.assertNotIn("都没搜到 1 篇", out)
 
     def test_ledger_is_read_only_after_the_lock_is_held(self):
         """另一个试跑在我们启动之后、拿到锁之前跑完了：我们得用它存完盘的账本，
@@ -1459,6 +1793,72 @@ class TestCommand(unittest.TestCase):
             code, _out = self.invoke()
         self.assertIn("最多 15 个", str(code))
         self.assertIn("一分钱没花", str(code))
+        self.assertFalse(pathlib.Path(self.dir.name, "state.json").exists())
+
+    def test_sixteen_words_in_one_cell_refuse_before_spending(self):
+        self.table._records = [trial_record(1, "、".join(f"词{n}" for n in range(1, 17))),
+                               trial_record(2, None)]
+        with mock.patch.object(visibility, "_send_once", Sender()):
+            code, _out = self.invoke()
+        self.assertIn("最多 15 个", str(code))
+        self.assertIn("一分钱没花", str(code))
+        self.assertFalse(pathlib.Path(self.dir.name, "state.json").exists())
+
+    def test_keywords_on_one_row_are_matched_against_every_row_of_the_table(self):
+        """只在一行里写词（多选），别的行空着：整张表的帖子都拿去对。"""
+        self.table._meta[Settings().fields.search_keywords] = {"type": 4, "options": None}
+        self.table._records = [trial_record(900, ["词甲", "词乙"], age_days=20),
+                               trial_record(105, None), trial_record(205, ""),
+                               trial_record(999, None)]
+        sender = Sender(default=by_page)
+        with mock.patch.object(visibility, "_send_once", sender):
+            code, out = self.invoke()
+        self.assertEqual((code, len(sender.requests)), (0, 6))     # 2 个词 × 3 页
+        self.assertIn("读到 4 行，填了「搜索关键词」的 1 行", out)
+        self.assertIn("发布 3 天内的帖子 3 篇，综合排序前 3 页里至少在一个词下面搜到 2 篇，"
+                      "哪个词下面都没搜到 1 篇", out)
+        report = json.loads(pathlib.Path(self.dir.name, "report.json").read_text(encoding="utf-8"))
+        self.assertEqual((report["词"], report["帖子"]), (2, 4))
+        self.assertEqual(report["读表"]["填了词的行"], 1)
+        state = pathlib.Path(self.dir.name, "state.json").read_text(encoding="utf-8")
+        for path_text in (out, state, json.dumps(report, ensure_ascii=False)):
+            self.assertNotIn("词甲", path_text)
+        self.assertNotIn(nid(105), json.dumps(report))
+
+    def test_mention_in_a_text_cell_is_not_searched(self):
+        mention = {"type": "mention", "mentionType": "User", "name": "某同事",
+                   "text": "@某同事", "token": "ou_x"}
+        self.table._records = [
+            trial_record(105, [{"type": "text", "text": "词甲，词乙 "}, mention]),
+            trial_record(205, [mention]), trial_record(999, None)]
+        sender = Sender(default=by_page)
+        with mock.patch.object(visibility, "_send_once", sender):
+            code, _out = self.invoke("--show-keywords")
+        self.assertEqual((code, len(sender.requests)), (0, 6))     # 2 个词 × 3 页
+        self.assertNotIn("%E6%9F%90%E5%90%8C%E4%BA%8B", "".join(r.url for r in sender.requests))
+        self.assertNotIn("某同事", _out)
+
+    def test_a_sentence_in_the_cell_spends_nothing_and_says_so(self):
+        self.table._records = [
+            trial_record(105, "how to pick a sunscreen for sensitive skin in summer"),
+            trial_record(999, "词甲 / -")]
+        code, out = self.invoke("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("词：1 个", out)
+        self.assertIn("有 1 格「搜索关键词」像一句话", out)
+        self.table._records = self.table._records[:1]
+        sender = Sender()
+        with mock.patch.object(visibility, "_send_once", sender):
+            code, out = self.invoke()
+        self.assertEqual(len(sender.requests), 0)
+        self.assertIn("一分钱没花", str(code) + out)
+
+    def test_table_with_the_column_but_no_word_spends_nothing(self):
+        self.table._records = [trial_record(1, None), trial_record(2, "")]
+        with mock.patch.object(visibility, "_send_once", Sender()):
+            code, out = self.invoke()
+        self.assertIn("没有可查的词", str(code))
+        self.assertIn("一个词都没写，这张表不查", out)
         self.assertFalse(pathlib.Path(self.dir.name, "state.json").exists())
 
     def test_missing_key_refuses_before_reading_anything(self):
