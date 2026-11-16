@@ -88,9 +88,10 @@ COL_BLUE_WORD_EXCLUDES = "蓝词排除词"
 # —— 逐表「搜索检查」开关（2026-11-16 加）——
 # 复选框，空着 = 关。开了的表才有「搜索关键词」那一列的事：体检才会说它缺、
 # 「补齐缺的列」才会建它、搜索可见的试跑（cli.py search-trial）才读它。
-# 关着的表一切照旧——老表不会因为多了一个新功能就集体变红。
-# **它不让巡查多花一分钱**：搜索只有手工起的试跑会发，没有任何定时任务看这个开关。
-# 老的注册表里没有这一列：在飞书里手工加一列同名的复选框就行，没加 = 全关。
+# 关着的表一切照旧——老表不会因为多了一个新功能就集体变红。没有任何定时任务看这个开关。
+# 开关在面板上点（「加表 / 改配置」→ 这张表的「参数」→「搜索检查」，见 set_search_check）：
+# 老的注册表里没有这一列，保存时会自己建上。在飞书里手工勾也照样认。
+# **它不让巡查多花一分钱**：搜索只有人在面板上（或命令行里）亲手起的试跑会发。
 COL_SEARCH_CHECK = "搜索检查"
 
 # 建注册表时用的列定义（类型码见 schema.FIELD_TYPE_NAMES）。
@@ -554,6 +555,30 @@ def set_blue_word_excludes(table: feishu.Bitable, record_id: str,
                             "在飞书里把它改回文本列再保存")
     table.batch_update([{"record_id": record_id,
                          "fields": {COL_BLUE_WORD_EXCLUDES: "、".join(words) or None}}])
+    return made
+
+
+def set_search_check(table: feishu.Bitable, record_id: str, on: bool) -> list[str]:
+    """写回这张表的「搜索检查」开关。返回这次新建的列名。
+
+    老的登记表没有这一列就先建上（复选框，纯追加，不碰已有的列），不让人去飞书里
+    手工加列——和逐表参数那几列一个做法。本来就没有这一列、又是要关：什么都不用做。
+    这一列被人改成了别的类型就不写：往文本列里写一个勾，读回来不是勾。
+    """
+    meta = table.fields_meta()
+    if meta is None:
+        raise RegistryError("读不到注册表的字段列表，没写")
+    made: list[str] = []
+    info = meta.get(COL_SEARCH_CHECK)
+    if info is None:
+        if not on:
+            return []
+        table.create_field({"field_name": COL_SEARCH_CHECK, "type": 7})
+        made.append(COL_SEARCH_CHECK)
+    elif info.get("type") not in (None, 7):
+        raise RegistryError(f"注册表里「{COL_SEARCH_CHECK}」这一列不是复选框，没写——"
+                            "在飞书里把它改回复选框再保存")
+    table.batch_update([{"record_id": record_id, "fields": {COL_SEARCH_CHECK: bool(on)}}])
     return made
 
 

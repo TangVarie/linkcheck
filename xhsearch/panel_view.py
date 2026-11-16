@@ -2106,7 +2106,20 @@ _SCRIPT = r"""
       body +
       "<div><button type=button data-thr=preview>先算给我看</button> " +
       "<button type=button data-thr=save disabled>保存</button></div>" +
-      "<div class='out thrOut'></div>" + excludesForm(e) + "</div>";
+      "<div class='out thrOut'></div>" + excludesForm(e) + searchCheckForm(e) + "</div>";
+  }
+  // 搜索检查：这张表参不参加「搜索可见试跑」。和数字参数分开存——开了也不花钱
+  // （搜索只有人在下面「搜索可见试跑」那一栏点了确认才发），用不着先算。
+  function searchCheckForm(e){
+    return "<div class=schk style='margin-top:16px;padding-top:12px;border-top:1px solid var(--border)'>" +
+      "<div style='margin:0 0 4px'><b>搜索可见试跑</b></div>" +
+      "<label><input type=checkbox data-search-check" + (e.search_check ? " checked" : "") +
+      "> 搜索检查（搜索可见试跑）</label>" +
+      "<div class=muted style='font-size:12px;max-width:560px;margin:4px 0 6px'>" +
+      "勾上 = 这张表参加搜索可见试跑：试跑会读这张表「搜索关键词」那一列里写的词。" +
+      "勾上本身不花钱，巡查也不受影响；花钱的只有下面「搜索可见试跑」那一栏里你点了确认的按钮。" +
+      "</div><div><button type=button data-search-save>保存搜索检查</button></div>" +
+      "<div class='out schkOut'></div></div>";
   }
   // 蓝词排除词：竞品名等不往「蓝词字段」里记的词。和上面的数字参数分开存——它不影响
   // 花费，用不着先算；改了数字没算、只想改排除词的人也不该被「先算给我看」挡住。
@@ -2169,9 +2182,26 @@ _SCRIPT = r"""
       if (out2) out2.textContent = "值已变化，请重新点「先算给我看」再保存。";
     });
     list.addEventListener("click", function(ev){
-      var b = ev.target.closest ? ev.target.closest("button[data-act],button[data-thr],button[data-excl-save]") : null;
+      var b = ev.target.closest ? ev.target.closest("button[data-act],button[data-thr],button[data-excl-save],button[data-search-save]") : null;
       if (!b) return;
       var act = b.dataset.act;
+      if (b.hasAttribute("data-search-save")) {
+        var schkBox = b.closest(".thr"), tick = schkBox.querySelector("input[data-search-check]");
+        var schkOut = schkBox.querySelector(".schkOut");
+        b.disabled = true; schkOut.textContent = "保存中…";
+        post("search_check", {record_id: schkBox.dataset.rec, on: tick.checked})
+          .then(function(j){
+            var lines = ["<span class=ok>" + (j.on
+              ? "保存了：这张表参加搜索可见试跑。接下来到下面「搜索可见试跑」那一栏看。"
+              : "保存了：这张表不参加搜索可见试跑。") + "</span>"];
+            if (j.created_columns && j.created_columns.length)
+              lines.push("登记表里新建了这一列：" + j.created_columns.map(esc).join("、"));
+            schkOut.innerHTML = lines.join("\n"); b.disabled = false;
+            loadTrial();
+          })
+          .catch(function(err){ schkOut.textContent = errText(err); b.disabled = false; });
+        return;
+      }
       if (b.hasAttribute("data-excl-save")) {
         var exclBox = b.closest(".thr"), field = exclBox.querySelector("textarea[data-excl]");
         var exclOut = exclBox.querySelector(".exclOut");
@@ -2421,6 +2451,216 @@ _SCRIPT = r"""
       btnCreate.disabled = false;
     }).catch(function(err){ say(esc(errText(err)), ""); btnCreate.disabled = false; });
   });
+  // ---- 搜索可见试跑 ----
+  // 这一栏的数据全由前端异步拉（/api/trial）：它要读登记表、几张业务表和账本，
+  // 读不到不该让整个面板变空白。会花钱的只有 start，而且必须先在页面上看过
+  // 「最多几次、多少钱」再点确认——服务端重算，比确认的多就不跑。
+  var trialBox = document.getElementById("trial");
+  var trialState = null, trialTimer = null;
+  function money(n){ return "¥" + Number(n || 0).toFixed(2); }
+  function trialPost(action, body){
+    return fetch("/api/trial/" + action, {
+      method: "POST",
+      headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
+      body: JSON.stringify(body || {})
+    }).then(function(r){ return r.json().then(function(j){
+      if (!r.ok) { throw new Error((j && j.error) || ("HTTP " + r.status)); }
+      return j; }); });
+  }
+  function trialPart(id){ return document.getElementById(id); }
+  function trialSay(html, cls){
+    var o = trialPart("trialOut");
+    if (o) o.innerHTML = html ? "<div class='" + (cls || "") + "'>" + html + "</div>" : "";
+  }
+  function trialRound(name){
+    var found = null;
+    ((trialState && trialState.rounds) || []).forEach(function(r){ if (r.name === name) found = r; });
+    return found;
+  }
+  function trialTableLine(t, column){
+    var col;
+    if (t.column === "ok") col = "<span class='chip g'>有「" + esc(column) + "」列</span>";
+    else if (t.column === "missing") col = "<span class='chip r'>缺「" + esc(column) + "」列</span> " +
+      "<button type=button class=sm data-trial=build data-app='" + attr(t.app_token) + "' data-tbl='" + attr(t.table_id) + "'>补齐缺的列</button>";
+    else if (t.column === "wrong_type") col = "<span class='chip r'>「" + esc(column) + "」不是多选或文本列</span> <span class=muted>在飞书里把这一列改成多选</span>";
+    else col = "<span class='chip r'>读不到这张表</span> <span class=muted>" + esc(t.error) + "</span>";
+    var tail = "";
+    if (t.column === "ok") {
+      tail = " 读到 <b>" + t.words + "</b> 个词，能查的帖子 <b>" + t.posts + "</b> 篇" +
+        (t.short_links ? "（另有 " + t.short_links + " 行是短链，真跑时免费展开）" : "") +
+        "<span class=muted>（共 " + t.rows + " 行，其中 " + t.filled + " 行填了词）</span>";
+      var skipped = Object.keys(t.skipped || {}).map(function(k){ return esc(k) + " " + t.skipped[k] + " 行"; });
+      if (skipped.length) tail += "<div class=muted style='margin-left:8px'>不拿去查的行：" + skipped.join("、") + "</div>";
+      if (!t.words) tail += "<div class=muted style='margin-left:8px'>还没读到词：让运营在这张飞书表的「" + esc(column) + "」列里填上要查的词（一个标签一个词，只填一行也行），填好点「重新读一遍」。</div>";
+      if (t.words && !t.posts && !t.short_links) tail += "<div class=muted style='margin-left:8px'>这张表没有一篇能查的帖子，它的词不查、不占名额。</div>";
+    }
+    return "<div class=srow><b>" + esc(t.label) + "</b> " + col + tail + "</div>";
+  }
+  function renderTrialStatus(){
+    var j = trialState, box = trialPart("trialStatus");
+    if (!box || !j) return;
+    if (j.enabled === false) { box.innerHTML = "<div class=muted>" + esc(j.hint) + "</div>"; return; }
+    var L = j.limits || {}, html = [];
+    html.push("<div><b>第 1 步 · 看现在的情况</b> <span class=muted>不花钱</span> " +
+      "<button type=button class=sm data-trial=reload>重新读一遍</button></div>");
+    if (!j.key_ok) html.push("<div class=note>面板还没配 TikHub 的 Key（TIKHUB_API_KEY），看状态、空跑都行，真跑不了（下面「跑」的按钮是灰的）。这一步你自己配不了：把这句话发给技术，让他在 Railway 的面板服务上配一次（手册「第 0 步」）。</div>");
+    if (j.tables && j.tables.length) {
+      html.push("<div style='margin-top:8px'>开了「搜索检查」的表（" + j.tables.length + " 张）：</div>" +
+        j.tables.map(function(t){ return trialTableLine(t, j.column); }).join(""));
+    }
+    var k = j.keywords;
+    if (k) {
+      html.push("<div class=srow>不同的词一共 <b>" + k.total + "</b> 个，上限 <b>" + L.keywords + "</b> 个" +
+        (k.over ? " <span class='chip r'>超了，跑不了</span>" : " <span class='chip g'>没超</span>") +
+        (k.gone ? " <span class=muted>（其中 " + k.gone + " 个是以前查过、现在表里已经没有的，照样占名额）</span>" : "") + "</div>");
+      if (k.sentence_cells || k.too_long) html.push("<div class=srow><span class='chip a'>没收的格子</span> " +
+        (k.sentence_cells ? "像一句话、整格没收的 " + k.sentence_cells + " 格（有句号、问号、冒号，或有一段超过 " + L.keyword_chars + " 个字）" : "") +
+        (k.sentence_cells && k.too_long ? "；" : "") +
+        (k.too_long ? "超过 " + L.keyword_chars + " 个字没收的选项 " + k.too_long + " 个" : "") + "</div>");
+      if (k.list && k.list.length) html.push("<details style='margin-top:8px'><summary>K01… 各是哪个词（只在这一页显示，不进报告）</summary>" +
+        "<div class=out>" + k.list.map(function(w){ return esc(w.k) + " = " + esc(w.word); }).join("\n") + "</div></details>");
+    }
+    if (j.ledger) html.push("<div class=srow>账本：已经发了 <b>" + j.ledger.calls + "</b> 次请求，记了 <b>" + money(j.ledger.yuan) +
+      "</b>；整个试跑上限 " + L.calls + " 次 / " + money(L.yuan) + "，还剩 " + j.ledger.calls_left + " 次 / " + money(j.ledger.yuan_left) + "</div>");
+    if (j.lease && !j.lease.mine) html.push("<div class=note>" + esc(j.lease.text) + "。这段时间这里点「跑」会被拒，不花钱。</div>");
+    if (j.problem) html.push("<div class=problem>" + esc(j.problem) + "</div>");
+    box.innerHTML = html.join("");
+  }
+  function renderTrialActs(){
+    var j = trialState, box = trialPart("trialActs");
+    if (!box || !j || j.enabled === false) { if (box) box.innerHTML = ""; return; }
+    var busy = !!(j.job && j.job.running), html = [];
+    var first = trialRound("first");
+    html.push("<div style='margin-top:16px'><b>第 2 步 · 空跑</b> <span class=muted>不花钱：只算第一轮会查什么、最多花多少</span></div>" +
+      "<div class=srow><button type=button data-trial=dry" + (busy ? " disabled" : "") + ">空跑（不花钱）</button></div>");
+    html.push("<div style='margin-top:16px'><b>第 3 步 · 真跑</b> <span class=muted>会花钱：点了之后先给你看最多花多少，你再点一次确认才开始</span></div>");
+    var buttons = (j.rounds || []).filter(function(r){ return r.visible; }).map(function(r){
+      var done = r.ran && !r.max_calls;
+      var text = r.name === "first" ? (r.ran ? (done ? "第一轮已跑完" : "接着跑第一轮（补没拿到的页）") : "跑第一轮")
+        : (r.ran ? (done ? r.button + "：已跑完" : "接着跑：" + r.button) : "跑：" + r.button);
+      return "<div class=srow><button type=button data-trial=ask data-round='" + attr(r.name) + "'" +
+        ((busy || done || !r.runnable || !j.key_ok || (j.lease && !j.lease.mine)) ? " disabled" : "") + ">" + esc(text) + "</button> " +
+        "<span class=muted>" + esc(r.label) + "；" + (done ? "没有要补的页" : "现在最多 " + r.max_calls + " 次、" + money(r.max_yuan)) +
+        (r.have ? "，已经拿到 " + r.have + " 页（不再付钱）" : "") +
+        (r.ran_at ? "；上次跑是 " + chinaTime(r.ran_at * 1000, true) : "") + "</span></div>";
+    });
+    html.push(buttons.join(""));
+    if (!j.key_ok) html.push("<div class=problem>「跑」的按钮现在是灰的、点不动：面板还没配 TikHub 的 Key（TIKHUB_API_KEY）。这不是你能在页面上解决的——找技术在 Railway 的面板服务上配一次（手册「第 0 步」），他说配好了之后刷新这一页，按钮就能点了。</div>");
+    var laterShown = (j.rounds || []).some(function(r){ return r.name !== "first" && r.visible; });
+    if (first && !laterShown) html.push("<div class=muted style='margin-top:6px'>后面几轮（最新排序、隔一小时 / 隔一天再查、翻到第 10 页）是拿来和第一轮比的：要第一轮至少拿到过一页之后才会出现在这里。" +
+      (first.ran ? "第一轮点过了，但一页都还没拿到——先按上面进度里说的原因处理，再点一次第一轮。" : "") + "</div>");
+    html.push("<div id=trialConfirm class=out></div>");
+    box.innerHTML = html.join("");
+  }
+  function renderTrialJob(job){
+    var box = trialPart("trialJob");
+    if (!box) return;
+    if (!job) { box.innerHTML = ""; return; }
+    var head = job.running
+      ? "<b>正在" + (job.kind === "run" ? "跑" + esc(job.label ? "「" + job.label + "」" : "") : "重出报告") + "…</b> <span class=muted>每 3 秒自动更新；可以关掉页面，跑的是服务器，回来刷新就能看到结果</span>"
+      : (job.refused ? "<span class='chip r'>没跑</span> " + esc(job.refused)
+        : job.error ? "<span class='chip r'>出错了</span> " + esc(job.error)
+        : "<span class='chip g'>" + (job.kind === "run" ? "这一轮跑完了" : "报告出好了") + "</span>" +
+          (job.run ? " 发了 " + job.run.requests + " 次请求，" + money(job.run.yuan) +
+            (job.run.todo ? "；<b>还差 " + job.run.todo + " 页</b>，再点一次同一个按钮只补这几页" : "") : ""));
+    box.innerHTML = "<div>" + head + "</div>" +
+      (job.lines && job.lines.length ? "<div class=muted style='margin-top:6px'>" + job.lines.map(esc).join("\n") + "</div>" : "");
+  }
+  function renderTrialReport(){
+    var j = trialState, box = trialPart("trialReport");
+    if (!box || !j || j.enabled === false) { if (box) box.innerHTML = ""; return; }
+    var busy = !!(j.job && j.job.running), r = j.result;
+    var html = "<div style='margin-top:16px'><b>第 4 步 · 看报告</b> <span class=muted>只有计数：没有词、没有链接、没有笔记 ID，可以直接转给别人</span></div>" +
+      "<div class=srow><button type=button class=sm data-trial=report" + (busy ? " disabled" : "") + ">只重出报告（不花钱）</button> " +
+      (r && r.text ? "<button type=button class=sm data-trial=copy>复制报告</button> " : "") +
+      "<span class=muted>" + (r && r.at ? "下面这一份是 " + chinaTime(r.at * 1000, true) + " 出的" : "还没有报告：跑过一轮，或点「只重出报告」之后会出现在这里") + "</span></div>";
+    if (r && r.note) html += "<div class=muted>" + esc(r.note) + "</div>";
+    if (r && r.text) html += "<div class=out id=trialReportText style='border:1px solid var(--border);padding:12px;background:var(--bg)'>" + esc(r.text) + "</div>";
+    box.innerHTML = html;
+  }
+  function renderTrial(){
+    renderTrialStatus(); renderTrialActs();
+    renderTrialJob(trialState ? trialState.job : null); renderTrialReport();
+  }
+  function pollTrial(){
+    if (trialTimer) return;
+    trialTimer = setInterval(function(){
+      getJson("/api/trial?job=1", true).then(function(j){
+        renderTrialJob(j.job);
+        if (!j.job || !j.job.running) { clearInterval(trialTimer); trialTimer = null; loadTrial(); }
+      }).catch(function(){ /* 面板在重启：下一次再拉 */ });
+    }, 3000);
+  }
+  function loadTrial(done){
+    if (!trialBox) return;
+    getJson("/api/trial").then(function(j){
+      trialState = j; renderTrial();
+      if (typeof done === "function") done();
+      if (j.job && j.job.running) pollTrial();
+    }).catch(function(err){
+      var box = trialPart("trialStatus");
+      if (box) box.innerHTML = "<div class=problem>" + esc(errText(err)) + "</div>";
+    });
+  }
+  if (trialBox) {
+    loadTrial();
+    trialBox.addEventListener("click", function(ev){
+      var b = ev.target.closest ? ev.target.closest("button[data-trial]") : null;
+      if (!b) return;
+      var what = b.dataset.trial;
+      if (what === "reload") { trialSay("重新读表中…（不花钱）", "muted"); loadTrial(function(){ trialSay("", ""); }); return; }
+      if (what === "build") {
+        b.disabled = true; trialSay("在建缺的列…", "muted");
+        post("build", {app_token: b.dataset.app, table_id: b.dataset.tbl}).then(function(j){
+          trialSay(esc(j.summary), j.ok ? "ok" : ""); loadTrial();
+        }).catch(function(err){ trialSay(esc(errText(err)), ""); b.disabled = false; });
+        return;
+      }
+      if (what === "dry") {
+        b.disabled = true; trialSay("空跑中…（不花钱）", "muted");
+        trialPost("dry-run", {round: "first"}).then(function(j){
+          trialSay(esc((j.lines || []).join("\n")), j.ok ? "" : "problem"); b.disabled = false;
+        }).catch(function(err){ trialSay(esc(errText(err)), ""); b.disabled = false; });
+        return;
+      }
+      if (what === "ask") {
+        var r = trialRound(b.dataset.round), L = trialState.limits, led = trialState.ledger || {calls: 0, yuan: 0};
+        var confirmBox = trialPart("trialConfirm");
+        if (!r || !confirmBox) return;
+        confirmBox.innerHTML = "<div class=note>「" + esc(r.button) + "」这一轮最多发 <b>" + r.max_calls + "</b> 次请求，最多花 <b>" + money(r.max_yuan) +
+          "</b>（一次 ¥" + L.price + "）。" +
+          "账本上已经 " + led.calls + " 次 / " + money(led.yuan) + "；整个试跑的上限是 " + L.calls + " 次 / " + money(L.yuan) + "，到了会自己停。" +
+          "已经拿到的页不会再付钱。开始之后不能撤回。</div>" +
+          "<button type=button data-trial=go data-round='" + attr(r.name) + "' data-calls='" + Number(r.max_calls) + "'>确认，开始跑（最多 " +
+          r.max_calls + " 次 / " + money(r.max_yuan) + "）</button> <button type=button class=sm data-trial=cancel>先不跑</button>";
+        return;
+      }
+      if (what === "cancel") { var c = trialPart("trialConfirm"); if (c) c.innerHTML = ""; return; }
+      if (what === "go") {
+        // 连点两下：第一下就把按钮禁掉；就算两个请求都发出去了，服务端也只让一个跑。
+        b.disabled = true; trialSay("在占位、开跑…", "muted");
+        trialPost("start", {round: b.dataset.round, confirm: true, confirm_calls: Number(b.dataset.calls)}).then(function(j){
+          trialSay("", ""); var c = trialPart("trialConfirm"); if (c) c.innerHTML = "";
+          trialState.job = j.job; renderTrialActs(); renderTrialJob(j.job); renderTrialReport(); pollTrial();
+        }).catch(function(err){ trialSay(esc(errText(err)), "problem"); b.disabled = false; });
+        return;
+      }
+      if (what === "report") {
+        b.disabled = true; trialSay("", "");
+        trialPost("report", {}).then(function(j){
+          trialState.job = j.job; renderTrialActs(); renderTrialJob(j.job); renderTrialReport(); pollTrial();
+        }).catch(function(err){ trialSay(esc(errText(err)), "problem"); b.disabled = false; });
+        return;
+      }
+      if (what === "copy") {
+        var text = trialState && trialState.result ? trialState.result.text : "";
+        if (!navigator.clipboard) { trialSay("这个浏览器不让自动复制：用鼠标选中下面的报告再复制，或者截图。", ""); return; }
+        navigator.clipboard.writeText(text).then(function(){ b.textContent = "已复制";
+          setTimeout(function(){ b.textContent = "复制报告"; }, 1800);
+        }).catch(function(){ trialSay("没复制成：用鼠标选中下面的报告再复制，或者截图。", ""); });
+      }
+    });
+  }
 })();
 """
 
@@ -3066,6 +3306,29 @@ def _projects_section(config) -> str:
 </div>"""
 
 
+def _trial_section() -> str:
+    """搜索可见试跑。**内容由前端异步拉**（/api/trial，见 trial.py）——它要读登记表、
+    开了「搜索检查」的那几张表和账本，读不到不该让整个面板变空白。
+
+    顺序是给第一次用的人排的：先看现在的情况（不花钱）→ 空跑（不花钱）→ 真跑
+    （会花钱，先看最多花多少再点确认）→ 看报告。上限这些数由服务端给，这里不写死。
+    """
+    return """<h2 id=s-trial>搜索可见试跑</h2>
+<div class=muted style='margin-bottom:8px'>只回答一个问题：我们的帖子发出去三天，在表里写的那些词下面，
+搜索结果的前几页里<b>看不看得见</b>。它<b>不会自己跑</b>：只有你在这里点了才查。
+会花钱的只有「跑…」那几个按钮，点了先告诉你最多花多少，你再点一次确认才开始；
+其余按钮都不花钱。<b>从上往下按第 1 步到第 4 步做</b>；开始之前，先在上面「加表 / 改配置」里点要试的表的
+「参数」勾上「搜索检查」，再让运营把要查的词填进那张飞书表的「搜索关键词」列（一个标签一个词，
+几张表加起来最多 15 个）。</div>
+<div class='addbox share' id=trial>
+  <div id=trialStatus><div class=sk style='margin:14px 0;width:70%'></div><div class=sk style='margin:14px 0;width:55%'></div></div>
+  <div id=trialActs></div>
+  <div id=trialOut class=out></div>
+  <div id=trialJob class=out></div>
+  <div id=trialReport></div>
+</div>"""
+
+
 def _outage_note(outages) -> str:
     """「有通道发不出请求了」那条告警带。**放在最上面**，在别的提示之前。
 
@@ -3432,8 +3695,9 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 <aside class=side>
   <div class=brand>{_MARK}<b>BYWOOD</b><span>监控</span></div>
   {nav}
-  <div class=foot>面板只读飞书表，<b>不发任何付费请求</b>。<br>
-    要刷新某一行，勾「排队刷新」，cron 五分钟内接手。{_build_line(config)}</div>
+  <div class=foot>面板只读飞书表，<b>不发巡查的付费请求</b>。<br>
+    要刷新某一行，勾「排队刷新」，cron 五分钟内接手。<br>
+    会花钱的只有「搜索可见试跑」里你点了确认的按钮。{_build_line(config)}</div>
 </aside>
 <div class=main>
   <div class=top>
@@ -3468,6 +3732,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
     {_projects_section(config)}
 
+    {_trial_section()}
+
     {_balance_section(balances or [], balance_error, runway, config, outages or [])}
 
     {_runs_section(runs or [], log_error, offset_hours)}
@@ -3489,7 +3755,8 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
         ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
         ("s-proj", "layout-grid", "各项目", str(projects)),
     ]
-    system = [("s-manage", "folder", "加表 / 改配置", "")]
+    system = [("s-manage", "folder", "加表 / 改配置", ""),
+              ("s-trial", "search", "搜索可见试跑", "")]
     if balances:
         system.append(("s-balance", "wallet", "余额", ""))
     system.append(("s-runs", "history", "运行历史", str(runs) if runs else ""))

@@ -1,4 +1,5 @@
-"""搜索可见 · 试跑。**只有手工起的 `python3 cli.py search-trial` 会走到这里。**
+"""搜索可见 · 试跑。**只有人亲手起才会走到这里**：面板「搜索可见试跑」那一栏里点了确认
+（`trial.py`），或者手工敲 `python3 cli.py search-trial`。没有任何定时的东西调它。
 
 要回答的只有一个问题（2026-11-16 定的）：我们的帖子发出去三天，在这张表要查的
 那些词下面，前几页里**到底看不看得见**。如果几乎都看不见，按综合排序查排名这件事
@@ -14,10 +15,10 @@
 
 * **巡查不受影响**：sweep / queue / row / estimate 一行都没改，不会多发一次请求。
   搜索那个端点登记在 providers 里，但 rows.plan_calls 从不排它。
-* **不往飞书写一个字**：只读「搜索关键词」和几列现成的（链接、发布时间、巡查状态）。
-* **不留任何客户的东西**：本地那份进度文件只有笔记 ID、名次和几个计数，关键词只存
-  哈希；报告只有计数，词用 K01、K02 代替。标题、昵称、正文在 providers 归一化
-  那一步就丢了，这里根本拿不到。
+* **不往项目表写一个字**：只读「搜索关键词」和几列现成的（链接、发布时间、巡查状态）。
+* **不留任何客户的东西**：进度文件（本地那份，或者面板存在登记表 base 里的那份，见
+  `trial.py`）只有笔记 ID、名次和几个计数，关键词只存哈希；报告只有计数，词用 K01、K02
+  代替。标题、昵称、正文在 providers 归一化那一步就丢了，这里根本拿不到。
 
 ## 钱：闸门在代码里，发之前查
 
@@ -47,7 +48,8 @@
 按这一轮跑的那一刻算帖龄（进度文件里的 `rounds`）。反过来，词查的那一刻还没发出来
 的帖子不和那个词对；它那张表的词查的时候它都还没发，就不进这一轮。
 
-全部是**可以离线测的**：发请求的那一下是注入的（`send`），进度文件的位置是参数。
+全部是**可以离线测的**：发请求的那一下是注入的（`send`），进度文件的位置是参数
+（`State` 存本地文件；`trial.StoredState` 存登记表 base，规则是同一套）。
 """
 
 from __future__ import annotations
@@ -399,16 +401,22 @@ class State:
                 f"进度文件读不懂（{type(exc).__name__}）：{state.path}。"
                 "里面记着这次试跑已经花了多少，不能当它不存在。"
                 "确认不要了再手工删掉它") from exc
+        state.adopt(data, str(state.path), "换一个 --state-dir")
+        return state
+
+    def adopt(self, data: Any, where: str, remedy: str = "") -> None:
+        """把读回来的那份账本收下——先看它是不是这次试跑的、形状对不对。
+        本地文件和存在登记表 base 里的那份（见 trial.py）用同一道检查。"""
         if not isinstance(data, dict) or data.get("trial") != TRIAL_NAME \
                 or data.get("version") != STATE_VERSION:
-            raise StateError(f"进度文件不是这次试跑的（{state.path}），换一个 --state-dir")
+            raise StateError(f"进度文件不是这次试跑的（{where}）"
+                             + (f"，{remedy}" if remedy else ""))
         data.setdefault("rounds", {})     # 早先存的进度文件没有这一项
-        for key, default in state.data.items():
+        for key, default in self.data.items():
             if not isinstance(data.get(key), type(default)) \
                     and not (key == "yuan" and isinstance(data.get(key), int)):
-                raise StateError(f"进度文件里「{key}」的形状不对（{state.path}）")
-        state.data = data
-        return state
+                raise StateError(f"进度文件里「{key}」的形状不对（{where}）")
+        self.data = data
 
     def save(self) -> None:
         """原子写：先写旁边的临时文件再换名，断电也不会留下半份账本。"""
@@ -648,8 +656,19 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
               send: Optional[Send] = None, sleep: Optional[Callable[[float], None]] = None,
               clock: Optional[Callable[[], float]] = None,
               log: Callable[[str], None] = print,
-              timeout: float = 30.0, pace: Optional[float] = None) -> RunResult:
+              timeout: float = 30.0, pace: Optional[float] = None,
+              guard: Optional[Callable[[], str]] = None,
+              budget: Optional[int] = None) -> RunResult:
     """跑一轮。`keywords` 是按编号排好的 [(词的原文, 哈希)]。
+
+    `budget` 是这一次最多发几个请求（开跑前告诉人的那个「最多 N 次」）。失败重试、
+    限流重试的那一次也是一个进账的请求，也算在里面：发满了就停，差的页下次再补。
+    不给就只受总上限管。
+
+    `guard` 是每发一个付费请求之前多问的一句「还能不能发」（空串 = 能；否则是停下来的
+    原因）。账本存在登记表 base 里的时候用它看租约还在不在自己手里（见 trial.py）。
+    账本存不上（`state.save()` 抛 `StateError`）就停：发之前存不上，这一次不发；
+    发之后存不上，后面的都不发。
 
     日志里**不出现词的原文**（只说 K 几）、不出现地址、不出现对方回的错误正文
     ——这条命令可能跑在日志公开的地方。
@@ -662,7 +681,6 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
     clock = clock or time.time
     pace = PACE_SECONDS if pace is None else pace
     out = RunResult(round_.name)
-    last_sent = [0.0]
     selection, chosen, left = select(round_, [digest for _word, digest in keywords], state)
     keywords = [(word, digest) for word, digest in keywords if digest in chosen]
     # 这一轮是哪一刻跑的、定下来查哪几个词：报告按记下的这份词来算，没查到的词
@@ -671,6 +689,24 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
     if left:
         log(f"  这一轮最多 {round_.keywords} 个词，已经定了 {len(selection)} 个；"
             f"表里另外 {len(left)} 个词这一轮不查")
+    try:
+        _run_round(round_, keywords, chosen, state, api_key, provider, price, out,
+                   send, sleep, clock, log, timeout, pace, guard, budget)
+    except StateError as exc:
+        # 发完请求之后账本存不上：这一次的钱在发之前就记上、存好了，只是这一页没留住。
+        # 不接着发——接着发的每一页都留不住，全是白花。
+        out.stopped = f"账本存不上，停了：{exc}"
+    out.todo = plan(round_, chosen, state)[0]
+    return out
+
+
+def _run_round(round_: Round, keywords: list[tuple[str, str]], chosen: list[str],
+               state: State, api_key: str, provider: Any, price: float, out: RunResult,
+               send: Send, sleep: Callable[[float], None], clock: Callable[[], float],
+               log: Callable[[str], None], timeout: float, pace: float,
+               guard: Optional[Callable[[], str]], budget: Optional[int] = None) -> None:
+    """`run_round` 的正文：一个词一个词、一页一页地拿。停下来的原因写在 `out.stopped`。"""
+    last_sent = [0.0]
 
     def fetch(word: str, digest: str, page: int, session: dict) -> Optional[protocol.Result]:
         """拿一页。None = 整轮该停了（原因在 out.stopped）。"""
@@ -679,12 +715,22 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
         tries = 0
         while True:
             reason = state.blocked(price)
+            if not reason and budget is not None and out.requests >= budget:
+                reason = (f"这一轮说好最多发 {budget} 次，已经发满了"
+                          "（有请求失败后重试过，重试的那一次也算次数）")
+            reason = reason or (guard() if guard else "")
             if reason:
                 out.stopped = reason
                 return None
             # 先记账、存盘，再发：发出去之后进程被杀，这一次也在账上。
             state.charge(price)
-            state.save()
+            try:
+                state.save()
+            except StateError as exc:
+                # 这一笔没存上，就不发：存不上还发，重启之后这次花的钱就不在账上了。
+                state.refund(price)
+                out.stopped = f"账本存不上，这一次没发：{exc}"
+                return None
             wait = pace - (clock() - last_sent[0])
             if wait > 0:
                 sleep(wait)
@@ -744,9 +790,11 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
                     break
                 result = fetch(word, digest, page, session if page > 1 else {})
                 if result is None:
-                    state.save()
-                    out.todo = plan(round_, chosen, state)[0]
-                    return out
+                    try:
+                        state.save()
+                    except StateError:
+                        pass              # 停下来的原因已经写在 out.stopped 里了
+                    return
                 if isinstance(result, protocol.Err):
                     out.failed += 1
                     state.note_failure(round_.name, digest, page, result.kind.value,
@@ -770,8 +818,7 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
                         out.stopped = (f"K{number:02d} 第 1 页返回了 {count} 条，却一条笔记 ID "
                                        "都认不出来（返回的形状和代码猜的不一样）。这不是「没搜到」，"
                                        "要先改代码才能接着查")
-                        out.todo = plan(round_, chosen, state)[0]
-                        return out
+                        return
                     log(f"  K{number:02d} 第 {page} 页返回了 {count} 条，却一条笔记 ID 都认不出来，"
                         "这一页不算数（不是到底了）；这个词记成没查全")
                     break
@@ -793,8 +840,6 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
                 session = dict(record.get("sid") or {})
             if not record.get("ids"):
                 break                     # 这一页一条条目都没有：到底了
-    out.todo = plan(round_, chosen, state)[0]
-    return out
 
 
 # ---------- 报告：只有计数 ----------

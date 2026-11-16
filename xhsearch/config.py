@@ -866,7 +866,7 @@ class Settings:
 
     # 这张表开没开「搜索检查」（2026-11-16 加）。按表配：登记表里的「搜索检查」
     # 那个复选框，见 registry.apply_overrides。默认关——关着的表，「搜索关键词」
-    # 那一列缺了体检不报、「补齐缺的列」不建，试跑（cli.py search-trial）也不读它。
+    # 那一列缺了体检不报、「补齐缺的列」不建，试跑（面板那一栏 / cli.py search-trial）也不读它。
     # **巡查不看这个开关**：开了也不会多发一次请求，搜索只有手工起的试跑会做。
     search_check: bool = False
 

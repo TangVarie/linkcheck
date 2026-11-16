@@ -6,9 +6,16 @@
 代码层面的保证：这个模块不 import 供应商那一层，也不调用任何会发付费请求的
 函数——有一条测试按 AST 逐个节点检查，不是靠字符串搜。
 
-唯一的计费外呼是**运营打开单个项目日报时的 DeepSeek 草稿**（POST
-`/api/report-ai`，见 `report_ai.py`）：按需、有短缓存、有超时，不参与任何轮询，
-也不碰业务表。不配 `DEEPSEEK_API_KEY` 就整块降级成人工填写。
+计费的外呼只有两处，都是**人在页面上亲手点了才发**，都不在这个模块里发：
+
+* **运营打开单个项目日报时的 DeepSeek 草稿**（POST `/api/report-ai`，见
+  `report_ai.py`）：按需、有短缓存、有超时，不参与任何轮询，也不碰业务表。
+  不配 `DEEPSEEK_API_KEY` 就整块降级成人工填写。
+* **「搜索可见试跑」那一栏的「跑第一轮」和后面几轮**（POST `/api/trial/start`，见
+  `trial.py`，2026-11-16 加）：页面上先给出「最多几次、多少钱」，人点了确认才跑；
+  整个试跑有写死的上限（280 次 / ¥20），账本和租约存在登记表 base 里，重新部署不丢、
+  两处同时点只有一处能跑。这一栏的其余按钮（看状态、空跑、只重出报告）不花钱。
+  它不是巡查，也不替巡查发任何请求；没有任何定时的东西会点它。
 
 ## 为什么敢用标准库的 http.server
 
@@ -52,7 +59,7 @@ from urllib.parse import parse_qs, urlparse
 from . import balance as balance_mod
 from . import (channels as channels_mod, feishu, negatives, panel_settings, panel_view,
                provision, railway, readout, registry, report_ai as report_ai_mod,
-               schema, summary, tablespec)
+               schema, summary, tablespec, trial as trial_mod)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -1249,6 +1256,26 @@ class Projects:
         made = registry.set_blue_word_excludes(self._registry(), record_id, words)
         return {"words": words, "created_columns": made}
 
+    def set_search_check(self, record_id: str, on: bool) -> dict:
+        """改这张表的「搜索检查」开关（搜索可见试跑读不读它）。
+
+        只写登记表那一格；老的登记表没有这一列就先建上。**开了也不花钱**——
+        搜索只有人在「搜索可见试跑」那一栏亲手点了才发，巡查不看这个开关。
+        """
+        self.log(f"⚙ 改搜索检查 {record_id}：{'开' if on else '关'}")
+        made = registry.set_search_check(self._registry(), record_id, on)
+        return {"on": bool(on), "created_columns": made}
+
+    def trial_tables(self) -> list:
+        """搜索可见试跑读哪几张表：登记表里开了「搜索检查」、正在巡查的那些。
+        → [(项目名, 飞书表)]。和命令行同一个口径（cli._search_trial_tables）。"""
+        return [(e.label, self._bitable(e.app_token, e.table_id))
+                for e in self.list() if e.usable and e.search_check]
+
+    def trial_store(self) -> "trial_mod.TrialStore":
+        """试跑的账本、租约存在哪：登记表 base 里的「面板设置」表（见 trial.py）。"""
+        return trial_mod.TrialStore(self._store(), log=self.log)
+
     def set_enabled(self, record_id: str, enabled: bool) -> None:
         self.log(f"📋 {'启用' if enabled else '停用'} 注册表行 {record_id}")
         registry.set_enabled(self._registry(), record_id, enabled)
@@ -2104,6 +2131,8 @@ class _Deps:
     resolutions: Optional["Resolutions"] = None
     reports: Optional["DailyReports"] = None
     report_drafts: Optional["report_ai_mod.ReportDrafts"] = None
+    # 「搜索可见试跑」那一栏（见 trial.py）。None = 没接登记表，那一栏只说一句怎么接。
+    trial: Optional["trial_mod.Trial"] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -2191,6 +2220,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json(401, {"error": "未登录"})
             return self._share_payload()
+        if path == "/api/trial":
+            if not self._authed():
+                return self._send_json(401, {"error": "未登录"})
+            return self._trial_payload()
         return self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def _share_payload(self):
@@ -2205,6 +2238,65 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": exc.msg, "hint": exc.hint})
         except Exception as exc:                                # noqa: BLE001
             return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _trial_payload(self):
+        """「搜索可见试跑」那一栏的状态。只读，不花钱。
+
+        `?job=1`（页面在任务跑着的时候每几秒拉一次）只回内存里那个任务的进度，
+        不读飞书；不带就把表、词、账本、能点哪几个按钮都读一遍。
+        词的原文（K01 是哪个词）只在这一份回包里，登录了才拿得到。
+        """
+        trial = self.deps.trial
+        if trial is None:
+            projects = self.deps.projects
+            return self._send_json(200, {
+                "enabled": False,
+                "hint": "试跑的账本要存在登记表那个 base 里，现在存不了："
+                        + (projects.why_disabled() if projects else "面板没配 FEISHU_APP_ID")})
+        if parse_qs(urlparse(self.path).query).get("job"):
+            return self._send_json(200, {"enabled": True, "job": trial.job()})
+        try:
+            return self._send_json(200, {"enabled": True, **trial.status()})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _trial_action(self, action: str):
+        """「搜索可见试跑」的按钮。鉴权和 CSRF 在 do_POST 里已经过了。
+
+        * `dry-run`：空跑，不花钱、不改账本。
+        * `report`：只重出报告，不花钱、不改账本。
+        * `start`：**会花钱。** 要带着页面上显示的那个「最多几次」（`confirm_calls`）；
+          服务端重算，比确认的多就不跑。拿不到租约（别处在跑）也不跑。活在后台线程里做，
+          这个请求只回「开始了」。
+        """
+        trial = self.deps.trial
+        if trial is None:
+            return self._send_json(400, {"error": "试跑没接上：要先配 FEISHU_REGISTRY"})
+        body = self._read_body()
+        if body is None:
+            return None
+        try:
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("要一个 JSON 对象")
+        except (ValueError, json.JSONDecodeError) as exc:
+            return self._send_json(400, {"error": f"请求体不是 JSON：{exc}"})
+        name = str(payload.get("round") or "first")
+        try:
+            if action == "dry-run":
+                return self._send_json(200, trial.dry_run(name))
+            if action == "report":
+                return self._send_json(200, {"job": trial.report_only()})
+            if action == "start":
+                if payload.get("confirm") is not True:
+                    raise trial_mod.Refused("要先在页面上点「确认」")
+                return self._send_json(200, {"job": trial.start(
+                    name, payload.get("confirm_calls"))})
+        except trial_mod.Refused as exc:
+            return self._send_json(409, {"error": str(exc)})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        return self._send_json(404, {"error": f"没有这个动作：{action}"})
 
     def _chats_payload(self):
         """应用所在的群和 chat_id。只读；是给填 FEISHU_TABLE_EDITOR_CHATS 找值用的。"""
@@ -2245,6 +2337,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._project_action(path.rsplit("/", 1)[-1])
         if path == "/api/report-ai":
             return self._report_ai_action()
+        if path.startswith("/api/trial/"):
+            return self._trial_action(path.rsplit("/", 1)[-1])
         if path == "/api/queue":
             return self._queue_action()
         if path == "/api/resolve":
@@ -2777,6 +2871,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             if raw is not None and not isinstance(raw, str):
                 raise ValueError("text 要是字符串")
             return {"ok": True, **projects.set_blue_word_excludes(text("record_id"), raw or "")}
+        if action == "search_check":
+            on = payload.get("on")
+            if not isinstance(on, bool):
+                raise ValueError("on 要是 true / false")
+            return {"ok": True, **projects.set_search_check(text("record_id"), on)}
         if action == "enable":
             projects.set_enabled(text("record_id"), bool(payload.get("enabled")))
             self.deps.cache.refresh()
@@ -2820,6 +2919,7 @@ def _entry_json(entry, settings: Optional[Settings] = None) -> dict:
             "thresholds": dict(entry.thresholds or {}),
             "threshold_columns": list(registry.THRESHOLD_COLUMNS),
             "blue_word_excludes": list(entry.blue_word_excludes or []),
+            "search_check": bool(getattr(entry, "search_check", False)),
             "params": registry.param_specs(settings or Settings())}
 
 
@@ -2917,6 +3017,7 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
                  resolutions: Optional[Resolutions] = None,
                  reports: Optional["DailyReports"] = None,
                  report_drafts: Optional["report_ai_mod.ReportDrafts"] = None,
+                 trial: Optional["trial_mod.Trial"] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
@@ -2924,10 +3025,28 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
         config=config, cache=cache, settings=settings, logs=logs,
         balances=balances, projects=projects, queueing=queueing,
         resolutions=resolutions, reports=reports, report_drafts=report_drafts,
+        trial=trial,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
     return PanelServer((host, config.port), deps)
+
+
+def build_trial(config: PanelConfig, projects: Projects,
+                settings: Settings) -> Optional["trial_mod.Trial"]:
+    """「搜索可见试跑」那一栏。没接登记表就没有它——账本没地方存，就不许花钱。"""
+    if not projects.enabled:
+        return None
+    key = config.api_keys.get(balance_mod.TIKHUB, "")
+
+    def balance() -> Optional[float]:
+        # TikHub 余额（美元），零费用的端点（见 balance.py）。只用来对一下失败的页收没收钱。
+        found = balance_mod.read_tikhub(key, base=config.tikhub_base,
+                                        usd_to_cny=config.usd_to_cny)
+        return found.amount if found.ok else None
+
+    return trial_mod.Trial(projects.trial_tables, projects.trial_store(), settings, key,
+                           balance=balance if key and config.tikhub_base else None)
 
 
 def reconciling(produce: Callable[[], summary.Overview], resolutions: Resolutions,
@@ -2968,7 +3087,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
     server = build_server(config, cache, logs=logs, balances=balances,
                           projects=projects, queueing=queueing,
                           settings=resolved, resolutions=resolutions, reports=reports,
-                          report_drafts=report_drafts)
+                          report_drafts=report_drafts,
+                          trial=build_trial(config, projects, resolved))
     cache.start()
     # 日志和余额也先在后台取一趟：第一个打开面板的人不用等 Railway 和两家余额接口。
     if logs.enabled:
@@ -2999,6 +3119,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
         print(f"在面板上加表删表：未就绪（{projects.why_disabled()}）", flush=True)
     print("⚠ 这个进程不发巡检付费请求：要刷新就在飞书表里勾「排队刷新」，"
           "由 cron 那个服务处理", flush=True)
+    print("搜索可见试跑：" + ("已就绪（只有人在页面上点了确认才发请求，上限 280 次 / ¥20）"
+          if projects.enabled else "未就绪（要先配 FEISHU_REGISTRY）"), flush=True)
     print("DeepSeek 日报草稿：" + ("已接入 deepseek-flash（仅打开单项目日报时调用）"
           if report_drafts is not None else "未配置 DEEPSEEK_API_KEY"), flush=True)
     try:
