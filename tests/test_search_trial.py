@@ -436,6 +436,23 @@ class TestIntake(unittest.TestCase):
         # 一句话是唯一的格子：这张表一个词都没有，不查。
         self.assertEqual(visibility.intake([[(xhs_row(1), sentence)]]).keywords, [])
 
+    def test_a_decimal_at_the_start_of_a_word_is_not_list_numbering(self):
+        """「3.5mm耳机」开头的 3. 不是编号；削掉就成了另一个词，钱花在别的词上。"""
+        self.assertEqual(visibility.split_keywords("3.5mm耳机"), ["3.5mm耳机"])
+        self.assertEqual(visibility.split_keywords("2.4G无线鼠标，1.5米数据线"),
+                         ["2.4G无线鼠标", "1.5米数据线"])
+        self.assertEqual(visibility.split_keywords("1. 词甲\n2.词乙\n3）词丙\n4、词丁"),
+                         ["词甲", "词乙", "词丙", "词丁"])
+
+    def test_paid_only_needs_every_page_just_like_not_found(self):
+        """页没翻全时，在已翻的页里只出现在付费位的帖子是「没查全」：没翻的页里可能自然排上了。"""
+        partial = visibility.Listing(organic=["n-other"], paid={"n-ours"}, pages=1, complete=False)
+        self.assertEqual(partial.result("n-ours"), (visibility.INCOMPLETE, None))
+        full = visibility.Listing(organic=["n-other"], paid={"n-ours"}, pages=3, complete=True)
+        self.assertEqual(full.result("n-ours"), (visibility.PAID, None))
+        self.assertEqual(full.result("n-none"), (visibility.NOT_FOUND, None))
+        self.assertEqual(partial.result("n-other")[1], 1)
+
     def test_lone_punctuation_and_numbering_never_become_keywords(self):
         split = visibility.split_keywords
         self.assertEqual(split("词甲 / 词乙"), ["词甲", "词乙"])

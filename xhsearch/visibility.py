@@ -143,7 +143,8 @@ _SEPARATORS = re.compile(r"[，,、;；|｜/／#＃\r\n]+")
 # 文本格子里出现这些，就当它是一句话（备注），不是词表：整格不查。
 _SENTENCE = re.compile(r"[。！？!?：:…]")
 # 行首的编号（「1. 」「2）」「3、」）不是词的一部分。
-_NUMBERING = re.compile(r"(?m)^\s*(?:\d{1,2}\s*[.．)）]|\d、)\s*")
+# 句点后面紧跟数字的是小数（「3.5mm耳机」「2.4G无线鼠标」），那是词本身，不能当编号削掉。
+_NUMBERING = re.compile(r"(?m)^\s*(?:\d{1,2}\s*(?:[.．](?!\d)|[)）])|\d、)\s*")
 
 # 飞书的列类型：1 文本，4 多选。
 COLUMN_TEXT = 1
@@ -850,9 +851,11 @@ class Listing:
         rank = self.rank(note_id)
         if rank is not None:
             return rank_band(rank), rank
-        if note_id in self.paid:
-            return PAID, None
-        return (NOT_FOUND if self.complete else INCOMPLETE), None
+        if not self.complete:
+            # 页没翻全：不管它在已翻的页里是不是出现在付费位上，没翻的页里可能自然排上了，
+            # 「只在付费位」和「没搜到」一样，要翻全了才能说。
+            return INCOMPLETE, None
+        return (PAID if note_id in self.paid else NOT_FOUND), None
 
 
 def listing(round_: Round, digest: str, state: State) -> Listing:
