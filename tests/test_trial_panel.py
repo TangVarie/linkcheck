@@ -1400,6 +1400,37 @@ class TestReportOnlyNeedsEveryTable(unittest.TestCase):
         self.assertEqual(table.value(trial.KEY_RESULT), before)
 
 
+class TestReportOnlyGivesWay(unittest.TestCase):
+    def setUp(self):
+        self.table = SettingsTable()
+        self.tables = [("甲表", two_word_table())]
+        make_trial(self.table, self.tables, Sender(default=by_page)).start("first", 6)
+        self.before = self.table.value(trial.KEY_RESULT)
+
+    def test_report_only_waits_for_a_run_that_holds_the_lease(self):
+        lease = trial_store(self.table).acquire("别处", "latest")
+        self.addCleanup(lease.release)
+        job = make_trial(self.table, self.tables, Sender()).report_only()
+        self.assertIn("另一个试跑正在跑", job["refused"])
+        self.assertEqual(self.table.value(trial.KEY_RESULT), self.before)
+
+    def test_report_only_drops_a_snapshot_that_went_stale_while_reading(self):
+        made = make_trial(self.table, self.tables, Sender())
+        real = made._survey
+
+        def survey_then_someone_saves(**kwargs):
+            survey = real(**kwargs)
+            other = trial_store(self.table).load_state()
+            other.data["balance"].append({"round": "x"})
+            other.save()
+            return survey
+
+        made._survey = survey_then_someone_saves
+        job = made.report_only()
+        self.assertIn("账本被别处更新过了", job["refused"])
+        self.assertEqual(self.table.value(trial.KEY_RESULT), self.before)
+
+
 class TestCliSharesTheStore(unittest.TestCase):
     """`search-trial --state registry` 和面板是同一本账、同一把锁；默认还是本机目录。"""
 

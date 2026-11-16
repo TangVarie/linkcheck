@@ -392,6 +392,22 @@ class TrialStore:
 
     # ---------- 最近一份报告 ----------
 
+    def stale_for_report(self, state: StoredState) -> str:
+        """「只重出报告」要不要让路（空串 = 可以出）。它不拿租约，所以出之前看两样：
+        有没有别的试跑正拿着租约在跑；手里这份账本是不是还是表里最新的那一份。
+        哪一样不对都不出——出了会把正在跑 / 刚跑完那一方的报告盖成旧数。"""
+        try:
+            holder = self.lease_holder()
+            current = _manifest_mark(self.settings_store.read_one(KEY_MANIFEST))
+        except Exception as exc:                                # noqa: BLE001
+            return f"读不到试跑的状态（{type(exc).__name__}），报告没重出，原来那份还在"
+        if holder is not None:
+            return ("另一个试跑正在跑（" + describe_holder(holder, self._clock())
+                    + "），等它跑完再重出报告；原来那份还在")
+        if current != (state._generation, state._save_id):
+            return "读表这会儿账本被别处更新过了，报告没重出；再点一次「只重出报告」"
+        return ""
+
     def load_result(self) -> Optional[dict[str, Any]]:
         try:
             value = json.loads(self.settings_store.read_one(KEY_RESULT) or "null")
@@ -1037,6 +1053,10 @@ class Trial:
                 # 少读了一张表，出的报告就少算那张表的帖：不出，原来那份报告留着
                 job.refused = ("这几张开了「搜索检查」的表读不到：" + "；".join(
                     f"「{r.label}」{r.error}" for r in broken) + "。报告没重出，原来那份还在")
+                return
+            stale = self.store.stale_for_report(survey.state)
+            if stale:
+                job.refused = stale
                 return
             self._publish(job, survey.state, survey.info)
             job.say("报告出好了（没发付费请求，账本没动）")

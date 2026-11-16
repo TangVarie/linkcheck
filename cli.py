@@ -1839,6 +1839,12 @@ def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, k
         comment_floor=settings.thresholds.tier_evaluating, intake_info=info)
     print()
     print(visibility.render_report(report))
+    if store is not None and result is None:
+        stale = store.stale_for_report(state)
+        if stale:
+            # 没拿租约的「只重出报告」：别把正在跑 / 刚跑完那一方存的报告盖成旧数
+            print(f"报告没存进登记表 base：{stale}")
+            return 1
     if store is not None:
         # 账本在登记表 base 里：报告也存一份到那儿，面板那一栏打开就是这一份。本机不留文件。
         try:
