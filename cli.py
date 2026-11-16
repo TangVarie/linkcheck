@@ -1725,8 +1725,9 @@ def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, k
     result = None
     if paid:
         state.save()                       # 词的编号先落盘
-        need, _have = visibility.plan(
-            round_, [d for _w, d in ordered[:round_.keywords]], state)
+        _all, now_digests, _left = visibility.select(
+            round_, [d for _w, d in ordered], state)
+        need, _have = visibility.plan(round_, now_digests, state)
         print(f"▶ {round_.label}：还要发最多 {need} 次（约 ¥{need * price:.2f}）；"
               f"账本上已经 {state.calls} 次 / ¥{state.yuan:.2f}，"
               f"上限 {visibility.MAX_CALLS} 次 / ¥{visibility.MAX_YUAN:.0f}")

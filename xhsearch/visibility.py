@@ -244,7 +244,8 @@ class State:
          "pages": {"轮|词的哈希|页": {"at": 秒, "ids": [按顺序的笔记 ID],
                    "ads": [像广告位的那几条在 ids 里的下标], "items", "other",
                    "types": {类型名: 条数}, "keys": [键名], "sid": {翻页会话}}},
-         "rounds": {"轮": {"at": 最近一次跑这一轮是哪一刻（秒）}},
+         "rounds": {"轮": {"at": 最近一次跑这一轮是哪一刻（秒）,
+                          "kw": [这一轮定下来要查的词的哈希]}},
          "failures": [{"round", "kw", "page", "kind", "http", "at"}],
          "balance": [{"round", "drop_usd", "requests", "at"}]}
     """
@@ -361,8 +362,31 @@ class State:
 
     # —— 每一轮是哪一刻跑的 ——
 
-    def mark_round(self, round_name: str, at: float) -> None:
-        self.data["rounds"][round_name] = {"at": int(at)}
+    def mark_round(self, round_name: str, at: float, digests: list[str]) -> None:
+        """记下这一轮是哪一刻跑的、定下来查哪几个词（只有哈希）。"""
+        self.data["rounds"][round_name] = {"at": int(at), "kw": list(digests)}
+
+    def selection(self, round_name: str) -> tuple[list[str], bool]:
+        """这一轮算哪几个词 →（词的哈希, 是不是当时记下来的）。
+
+        记过就用记的那份（`rounds[轮]["kw"]`）——包括第 1 页失败、一页都没拿到的词。
+        早先的进度文件没记：退回「这一轮里留下过痕迹的词」（有页，或者有失败记录），
+        按编号排。只认编过号的词。
+        """
+        entry = self.data["rounds"].get(round_name)
+        stored = entry.get("kw") if isinstance(entry, dict) else None
+        if isinstance(stored, list) and all(isinstance(d, str) for d in stored):
+            seen: list[str] = []
+            for digest in stored:
+                if digest not in seen and self.number(digest) is not None:
+                    seen.append(digest)
+            return seen, True
+        touched = {k.split("|")[1] for k in self.data["pages"]
+                   if k.startswith(f"{round_name}|") and k.count("|") == 2}
+        touched |= {str(f.get("kw")) for f in self.data["failures"]
+                    if isinstance(f, dict) and f.get("round") == round_name}
+        known = sorted((self.number(d), d) for d in touched if self.number(d) is not None)
+        return [d for _n, d in known], False
 
     def round_at(self, round_name: str) -> float:
         """这一轮的观察时刻：最近一次跑它是哪一刻。没查到的词（第 1 页失败、上限先到）
@@ -451,9 +475,33 @@ class RunResult:
         return not self.stopped and not self.failed
 
 
+def select(round_: Round, available: list[str],
+           state: State) -> tuple[list[str], list[str], list[str]]:
+    """这一轮查哪几个词 →（这一轮定下来的全部词, 这一次能查的, 这一次表里有却排不进的）。
+
+    `available` 是这一次读表读到的词（哈希，按编号排好）。规则只有一条，报告、演练、
+    真跑、接着跑都用它：**一轮的词一旦定下就不换，只往空位里补**。
+
+    - 以前跑这一轮时定下的词（见 `State.selection`）全都留着，不管这一次的表里有没有它；
+    - 还有空位（这一轮最多 `round_.keywords` 个词），就按编号从这一次的词里补；
+    - 补不进去的词这一轮不查——不然换一张表再跑一次，「最多 20 次」的那一轮就能
+      查出第三、第四个词来，花的比这一轮说好的多。
+
+    拿到过的页按「轮 + 词 + 页」记着，和这一次点了哪张表没关系，所以不会付第二次钱。
+    纯函数，不改进度文件。
+    """
+    selection = list(state.selection(round_.name)[0])
+    for digest in available:
+        if digest not in selection and len(selection) < round_.keywords:
+            selection.append(digest)
+    now = [d for d in available if d in selection]
+    left = [d for d in available if d not in selection]
+    return selection, now, left
+
+
 def plan(round_: Round, digests: list[str], state: State) -> tuple[int, int]:
     """这一轮（最多还要发几页, 已经拿到几页）。按「每个词都翻满」算，是上界。
-    `digests` 是这一轮要查的那几个词（调用方已经按 `round_.keywords` 截过）。"""
+    `digests` 是要算的那几个词（调用方用 `select` 定好的，这里不再截）。"""
     have = need = 0
     for digest in digests:
         ended = False
@@ -486,10 +534,14 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
     pace = PACE_SECONDS if pace is None else pace
     out = RunResult(round_.name)
     last_sent = [0.0]
-    keywords = keywords[:round_.keywords]
-    chosen = [digest for _word, digest in keywords]
-    # 这一轮是哪一刻跑的：没查到的词在报告里按这一刻算帖龄（不发请求、不花钱）。
-    state.mark_round(round_.name, clock())
+    selection, chosen, left = select(round_, [digest for _word, digest in keywords], state)
+    keywords = [(word, digest) for word, digest in keywords if digest in chosen]
+    # 这一轮是哪一刻跑的、定下来查哪几个词：报告按记下的这份词来算，没查到的词
+    # （第 1 页失败、上限先到）也在里面，帖龄按这一刻算（不发请求、不花钱）。
+    state.mark_round(round_.name, clock(), selection)
+    if left:
+        log(f"  这一轮最多 {round_.keywords} 个词，已经定了 {len(selection)} 个；"
+            f"表里另外 {len(left)} 个词这一轮不查")
 
     def fetch(word: str, digest: str, page: int, session: dict) -> Optional[protocol.Result]:
         """拿一页。None = 整轮该停了（原因在 out.stopped）。"""
@@ -727,21 +779,25 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
     results: dict[str, dict[tuple[str, str], tuple[str, Optional[int]]]] = {}
 
     for round_ in ROUNDS.values():
-        listings = {d: listing(round_, d, state) for _n, d in numbered}
-        if not any(found.pages for found in listings.values()) \
-                and round_.name not in state.data["rounds"]:
+        selected, recorded = state.selection(round_.name)
+        if not selected and round_.name not in state.data["rounds"]:
             continue                      # 这一轮没跑过
         round_at = state.round_at(round_.name) or (now if now is not None else time.time())
-        # 这一轮算哪几个词：查过的都算；没查过的从前往后补到这一轮该查的个数
-        # （「前两个词翻到第 10 页」那一轮，别把另外十三个词列成「还没查」）。
-        chosen = [(n, d) for n, d in numbered if listings[d].pages]
-        for pair in numbered:
-            if len(chosen) >= round_.keywords:
-                break
-            if pair not in chosen:
-                chosen.append(pair)
+        # 这一轮算哪几个词：跑的时候记下的那一份（`select` 定的），不多不少——
+        # 第 1 页失败、一页都没拿到的词也在里面；没被选中的词不在。
+        # 早先的进度文件没记：留下过痕迹的词（有页或有失败记录）都算，再从前往后补到
+        # 这一轮该查的个数（上限先到、还没轮到的词没有痕迹，别让它下面的帖子消失）。
+        # 这是推的，报告里会说。
+        chosen = [(state.number(d) or 0, d) for d in selected]
+        if not recorded:
+            for pair in numbered:
+                if len(chosen) >= round_.keywords:
+                    break
+                if pair not in chosen:
+                    chosen.append(pair)
         chosen.sort()
         digests = [d for _n, d in chosen]
+        listings = {d: listing(round_, d, state) for d in digests}
         by_age = {band: _blank() for band in AGE_BANDS}
         by_comments: dict[str, dict[str, int]] = {}
         per_word = []
@@ -787,6 +843,7 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         need, have = plan(round_, digests, state)
         rounds[round_.name] = {
             "说明": round_.label,
+            "词是当时记下的": recorded,
             "页": {"计划": round_.pages * len(digests), "拿到": have, "还差": need,
                    "失败过": sum(1 for f in state.data["failures"]
                               if f.get("round") == round_.name)},
@@ -921,6 +978,9 @@ def render_report(report: dict[str, Any]) -> str:
         lines += ["", f"## {block['说明']}（{name}）", "",
                   f"页：计划 {pages['计划']}，拿到 {pages['拿到']}，还差 {pages['还差']}，"
                   f"失败过 {pages['失败过']} 次。"]
+        if not block.get("词是当时记下的", True):
+            lines.append("这一轮是早先的进度文件，没记当时查的是哪几个词：下面的词是按留下的页和"
+                         "失败记录推的，可能多列了没查过的词（列成「还没查」）。再跑一次这一轮就会记下。")
         size = block["每页笔记数"]
         if size:
             lines.append(f"每页笔记数：最少 {size['最少']}，中位 {size['中位']:g}，最多 {size['最多']}。"
@@ -1004,7 +1064,7 @@ def check_state_dir(directory: Path, repo_root: Path) -> str:
 def dry_run_lines(round_: Round, info: Intake, state: State, price: float,
                   digests: list[str]) -> list[str]:
     """--dry-run 打印的那几行：会做什么、要花多少。不发任何付费请求。"""
-    digests = digests[:round_.keywords]
+    selection, digests, left = select(round_, digests, state)
     need, have = plan(round_, digests, state)
     upper = ""
     if info.short_links:
@@ -1015,13 +1075,16 @@ def dry_run_lines(round_: Round, info: Intake, state: State, price: float,
     lines = [
         f"【只演练，不发付费请求】{round_.label}",
         f"  词：{len(info.keywords)} 个（最多 {MAX_KEYWORDS} 个）；帖子：{len(info.posts)} 篇{upper}",
-        f"  这一轮查前 {len(digests)} 个词，每个词最多 {round_.pages} 页："
+        f"  这一轮查 {len(digests)} 个词，每个词最多 {round_.pages} 页："
         f"已经拿到 {have} 页，还要发最多 {need} 次，约 ¥{need * price:.2f}"
         f"（¥{price:.3f} 一次）",
         f"  账本：已经发了 {state.calls} 次、记了 ¥{state.yuan:.2f}；"
         f"上限 {MAX_CALLS} 次 / ¥{MAX_YUAN:.0f}，还剩 {room_calls} 次 / ¥{room_yuan:.2f}",
     ]
     affordable = min(room_calls, int((room_yuan + 1e-9) // price) if price > 0 else room_calls)
+    if left:
+        lines.insert(3, f"  这一轮最多 {round_.keywords} 个词，已经定了 {len(selection)} 个"
+                        f"（以前跑这一轮时定的不换）；表里另外 {len(left)} 个词这一轮不查")
     if need > affordable:
         lines.append(f"  ⚠ 剩下的额度只够 {max(0, affordable)} 次，这一轮跑不完，跑到上限会自己停")
     if info.skipped:

@@ -791,11 +791,68 @@ class TestRunRound(unittest.TestCase):
         run("first", self.words[:1], self.state, Sender(default=by_page))
         path = pathlib.Path(self.dir.name, "state.json")
         data = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(data.pop("rounds"), {"first": {"at": 1_800_000_000}})
+        self.assertEqual(data.pop("rounds"), {
+            "first": {"at": 1_800_000_000, "kw": [self.words[0][1]]}})
         path.write_text(json.dumps(data), encoding="utf-8")
         state = fresh_state(self.dir.name)
         self.assertEqual(state.calls, 3)
         self.assertEqual(state.round_at("first"), 1_800_000_000.0)     # 退回页上的时间
+
+    # —— 一轮的词：定下就不换，只往空位里补 ——
+
+    def test_round_remembers_the_keywords_it_selected_as_digests(self):
+        run("depth", self.words[2:3], self.state, Sender(default=by_page))
+        saved = json.loads(pathlib.Path(self.dir.name, "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["rounds"]["depth"]["kw"], [self.words[2][1]])
+        self.assertNotIn("词3", json.dumps(saved, ensure_ascii=False))
+
+    def test_second_run_with_another_subset_fills_free_slots_and_repays_nothing(self):
+        """depth 最多两个词：先只查了 K03，再拿全表跑——K03 留着、K01 补进空位、K02 不查。"""
+        first, _logs = run("depth", self.words[2:3], self.state, Sender(default=by_page))
+        self.assertEqual(first.requests, 10)
+        sender = Sender(default=by_page)
+        again, logs = run("depth", self.words, fresh_state(self.dir.name), sender)
+        self.assertEqual((again.fetched, again.reused, again.requests), (10, 10, 10))
+        state = fresh_state(self.dir.name)
+        self.assertEqual(state.calls, 20)                     # 这一轮说好的最多 20 次
+        self.assertEqual(state.selection("depth"),
+                         ([self.words[2][1], self.words[0][1]], True))
+        self.assertTrue(any("另外 13 个词这一轮不查" in line for line in logs))
+        self.assertEqual(state.page("depth", self.words[1][1], 1), None)
+        # 第三次只点了排不进去的词：一个请求都不发，定下的词也不变。
+        third, _logs = run("depth", self.words[1:2], state, Sender())
+        self.assertEqual((third.requests, third.fetched, third.todo), (0, 0, 0))
+        self.assertEqual(state.selection("depth")[0], [self.words[2][1], self.words[0][1]])
+        self.assertEqual(state.calls, 20)
+
+    def test_second_run_of_the_first_round_adds_the_other_tables_keywords(self):
+        run("first", self.words[:1], self.state, Sender(default=by_page))
+        sender = Sender(default=by_page)
+        again, _logs = run("first", self.words[1:3], self.state, sender)
+        self.assertEqual((again.requests, again.reused, self.state.calls), (6, 0, 9))
+        self.assertEqual(self.state.selection("first")[0], [d for _w, d in self.words[:3]])
+        whole, _logs = run("first", self.words[:3], self.state, Sender())    # 再发就炸
+        self.assertEqual((whole.reused, whole.requests), (9, 0))
+
+    def test_old_state_file_without_a_selection_resumes_without_paying_again(self):
+        run("depth", self.words[2:3], self.state, Sender(default=by_page))
+        path = pathlib.Path(self.dir.name, "state.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["rounds"]["depth"]["kw"]                    # 早先的进度文件长这样
+        path.write_text(json.dumps(data), encoding="utf-8")
+        state = fresh_state(self.dir.name)
+        self.assertEqual(state.selection("depth"), ([self.words[2][1]], False))
+        again, _logs = run("depth", self.words, state, Sender(default=by_page))
+        self.assertEqual((again.fetched, again.reused, again.requests), (10, 10, 10))
+        self.assertEqual(state.selection("depth"),
+                         ([self.words[2][1], self.words[0][1]], True))
+
+    def test_cap_is_still_checked_first_when_a_round_is_topped_up(self):
+        run("depth", self.words[2:3], self.state, Sender(default=by_page))
+        self.state.data["calls"] = visibility.MAX_CALLS
+        result, _logs = run("depth", self.words, self.state, Sender())       # 再发就炸
+        self.assertTrue(result.stopped)
+        self.assertEqual((result.requests, self.state.calls), (0, visibility.MAX_CALLS))
 
     def test_empty_page_ends_the_keyword(self):
         sender = Sender([ok(page_of(100)), ok([])])
@@ -957,7 +1014,7 @@ class TestReport(unittest.TestCase):
         # 没查到的词也一样：这一轮跑完之后才发的不算。
         other = "另一个词"
         self.state.register([other])
-        self.state.mark_round("first", AT)
+        self.state.mark_round("first", AT, [self.digest, visibility.keyword_hash(other)])
         report = self.report([visibility.Post(nid(998), other, days_before(-2)),
                               visibility.Post(nid(997), other, days_before(1))])
         block = report["各轮"]["first"]
@@ -1070,6 +1127,95 @@ class TestReport(unittest.TestCase):
         self.assertEqual(block["按词"][0]["看了前几位"], 200)
         self.assertEqual(block["按帖龄"]["3天内"]["60以后"], 1)
         self.assertEqual(block["页"], {"计划": 20, "拿到": 10, "还差": 10, "失败过": 0})
+
+
+class TestReportSelection(unittest.TestCase):
+    """报告里一轮算哪几个词：跑的时候记下的那几个，不是「编号靠前的」。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.state = fresh_state(self.dir.name)
+        self.words = words(3)
+        self.state.register([w for w, _d in self.words])
+        self.posts = [visibility.Post(nid(900 + i), word, days_before(2))
+                      for i, (word, _d) in enumerate(self.words, start=1)]
+        self.bad = transport.Response(400, "application/json",
+                                      json.dumps({"detail": {"code": 400, "message": "x"}}))
+
+    def depth(self, state=None):
+        report = visibility.build_report(state or self.state, self.posts, tz=BJ, now=AT)
+        return report["各轮"]["depth"], visibility.render_report(report)
+
+    def forget_selection(self) -> visibility.State:
+        """把进度文件改回早先的样子：`rounds` 里没有记这一轮选了哪几个词。"""
+        self.state.save()
+        path = pathlib.Path(self.dir.name, "state.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for entry in data["rounds"].values():
+            entry.pop("kw", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return fresh_state(self.dir.name)
+
+    def test_subset_run_reports_only_the_keyword_it_selected(self):
+        """K01–K03 都编了号，depth 只选了 K03 并翻满 10 页：报告只列 K03，一页不差。"""
+        result, _logs = run("depth", self.words[2:], self.state, Sender(default=by_page))
+        self.assertTrue(result.clean)
+        block, text = self.depth()
+        self.assertEqual([row["词"] for row in block["按词"]], ["K03"])
+        self.assertEqual(block["页"], {"计划": 10, "拿到": 10, "还差": 0, "失败过": 0})
+        self.assertTrue(block["词是当时记下的"])
+        self.assertEqual(sum(b["篇数"] for b in block["按帖龄"].values()), 1)
+        section = text.split("（depth）")[1]
+        self.assertNotIn("K01", section)
+        self.assertNotIn("还没查", section)
+
+    def test_selected_keyword_whose_first_page_failed_stays_in_the_report(self):
+        """只选了 K03、它的第 1 页失败：报告列的还是 K03，它的帖子记成「没查全」。"""
+        result, _logs = run("depth", self.words[2:], self.state, Sender([self.bad, self.bad]))
+        self.assertEqual(result.failed, 1)
+        block, _text = self.depth()
+        self.assertEqual([row["词"] for row in block["按词"]], ["K03"])
+        self.assertEqual(block["页"], {"计划": 10, "拿到": 0, "还差": 10, "失败过": 1})
+        self.assertEqual(block["按帖龄"]["3天内"]["没查全"], 1)
+        self.assertEqual(block["按帖龄"]["3天内"]["篇数"], 1)
+
+    def test_old_state_file_keeps_the_keyword_whose_first_page_failed(self):
+        run("depth", self.words[2:], self.state, Sender([self.bad, self.bad]))
+        block, text = self.depth(self.forget_selection())
+        self.assertFalse(block["词是当时记下的"])
+        # 失败记录认得出 K03；另一个是从前往后补的（旧文件分不清，报告里明说是推的）。
+        self.assertEqual([row["词"] for row in block["按词"]], ["K01", "K03"])
+        self.assertEqual(block["按词"][1]["按帖龄"]["3天内"]["没查全"], 1)
+        self.assertIn("没记当时查的是哪几个词", text)
+
+    def test_old_state_file_with_pages_still_reports_them(self):
+        run("depth", self.words[2:], self.state, Sender(default=by_page))
+        old = self.forget_selection()
+        block, _text = self.depth(old)
+        rows = {row["词"]: row for row in block["按词"]}
+        self.assertEqual((rows["K03"]["拿到几页"], rows["K03"]["查全了"]), (10, True))
+        self.assertEqual(block["页"]["拿到"], 10)
+        # 连 rounds 这一项都没有的更老的文件也一样读得出来。
+        path = pathlib.Path(self.dir.name, "state.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["rounds"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        block, _text = self.depth(fresh_state(self.dir.name))
+        self.assertIn("K03", [row["词"] for row in block["按词"]])
+
+    def test_report_after_a_second_subset_lists_the_whole_selection(self):
+        run("depth", self.words[2:], self.state, Sender(default=by_page))
+        run("depth", self.words, self.state, Sender(default=by_page))
+        block, _text = self.depth()
+        self.assertEqual([row["词"] for row in block["按词"]], ["K01", "K03"])
+        self.assertEqual(block["页"], {"计划": 20, "拿到": 20, "还差": 0, "失败过": 0})
+
+    def test_building_a_report_does_not_touch_the_state(self):
+        run("depth", self.words[2:], self.state, Sender(default=by_page))
+        before = json.dumps(self.state.data, sort_keys=True)
+        self.depth()
+        self.assertEqual(json.dumps(self.state.data, sort_keys=True), before)
 
 
 # ---------- 命令行 ----------
@@ -1270,6 +1416,42 @@ class TestCommand(unittest.TestCase):
             code, out = self.invoke("--report-only")
         self.assertEqual(code, 0)
         self.assertIn("搜索可见试跑报告", out)
+
+    def test_table_subset_round_reports_its_own_keyword_and_resumes_for_free(self):
+        """先全表跑第一轮（K01、K02），再只点一张只有 K02 的表跑 depth。"""
+        with mock.patch.object(visibility, "_send_once", Sender(default=by_page)):
+            self.invoke()
+        full = self.table
+        self.table = TrialTable([trial_record(300, "第二个词", age_days=5)])
+        sender = Sender(default=by_page)
+        with mock.patch.object(visibility, "_send_once", sender):
+            code, out = self.invoke("--round", "depth")
+        self.assertEqual((code, len(sender.requests)), (0, 10))
+        self.assertIn("还要发最多 10 次", out)
+        report = json.loads(pathlib.Path(self.dir.name, "report.json").read_text(encoding="utf-8"))
+        block = report["各轮"]["depth"]
+        self.assertEqual([row["词"] for row in block["按词"]], ["K02"])
+        self.assertEqual(block["页"], {"计划": 10, "拿到": 10, "还差": 0, "失败过": 0})
+        # 演练、只出报告：不发请求、进度文件一个字节都不动。
+        self.table = full
+        state_path = pathlib.Path(self.dir.name, "state.json")
+        before = state_path.read_bytes()
+        with mock.patch.object(visibility, "_send_once", Sender()):
+            code, out = self.invoke("--round", "depth", "--dry-run")
+            self.assertEqual(code, 0)
+            self.assertIn("这一轮查 2 个词", out)
+            self.assertIn("已经拿到 10 页，还要发最多 10 次", out)    # K01 补进空位
+            code, out = self.invoke("--round", "depth", "--report-only")
+            self.assertEqual(code, 0)
+        self.assertEqual(state_path.read_bytes(), before)
+        again = json.loads(pathlib.Path(self.dir.name, "report.json").read_text(encoding="utf-8"))
+        self.assertEqual([row["词"] for row in again["各轮"]["depth"]["按词"]], ["K02"])
+        # 拿全表再跑 depth：K02 的 10 页沿用，只付 K01 的 10 页。
+        sender = Sender(default=by_page)
+        with mock.patch.object(visibility, "_send_once", sender):
+            code, out = self.invoke("--round", "depth")
+        self.assertEqual((code, len(sender.requests)), (0, 10))
+        self.assertIn("新拿到 10 页，沿用 10 页", out)
 
     def test_sixteen_keywords_refuse_before_spending(self):
         self.table._records = [trial_record(n, f"词{n}") for n in range(1, 17)]
