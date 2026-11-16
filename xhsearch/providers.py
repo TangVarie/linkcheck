@@ -173,7 +173,8 @@ TIKHUB_PATHS = {
     ("douyin", "replies"): "/api/v1/douyin/app/v3/fetch_video_comment_replies",
     ("douyin", "detail"): "/api/v1/douyin/app/v3/fetch_one_video",
     # 按关键词搜笔记（2026-11-16 加，只给「搜索可见」试跑用，见 visibility.py）。
-    # **巡查不走这一条**：rows.plan_calls 从不排它，只有 `cli.py search-trial` 会发。
+    # **巡查不走这一条**：rows.plan_calls 从不排它，只有人亲手起的试跑会发
+    # （面板「搜索可见试跑」那一栏，或 `cli.py search-trial`）。
     # 对方计价表里小红书搜笔记有七个端点，只有这一个在公开 OpenAPI 里；另外六个
     # 只挂在计价表上——和上面那三个 404 的打折端点是同一种情况，别换。
     ("xhs", "search"): "/api/v1/xiaohongshu/app_v2/search_notes",

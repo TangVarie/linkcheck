@@ -527,8 +527,11 @@ xhsearch/
   panel_view.py  面板的单文件 HTML（内联样式和脚本，零外部资源）
   report_ai.py   日报 AI 草稿：DeepSeek Flash，证据最小化、竞品必须可核验
   panel_settings.py  面板上点出来的设置（存在注册表那个 base 里的一张键值表）
-  visibility.py  搜索可见试跑（只有手工起的 `cli.py search-trial` 会走到；
-                 硬上限 280 次 / ¥20，不往飞书写，见 docs/搜索可见试跑.md）
+  visibility.py  搜索可见试跑的规则：读词、发请求、记账、出报告（只有人亲手起才会走到：
+                 面板「搜索可见试跑」那一栏，或 `cli.py search-trial`；
+                 硬上限 280 次 / ¥20，不往项目表写，见 docs/搜索可见试跑.md）
+  trial.py       试跑在面板上点着跑的那一半：账本和租约存在注册表那个 base 里
+                 （重新部署不丢、跨容器只放行一个），面板那一栏的按钮
 cli.py           命令行入口
 tools/
   estimate_cost.py     按配置算月度成本（两家分开报）

@@ -231,5 +231,83 @@ class TestUpdateJson(unittest.TestCase):
         self.assertNotIn("rec1", lines[0])
 
 
+class TestRawText(unittest.TestCase):
+    """试跑的账本用的那三个口子：原样读一批、只读一行、原样写一行（见 trial.py）。"""
+
+    def _store(self, bitable):
+        workspace = mock.Mock()
+        workspace.list_tables.return_value = [{"table_id": "tblSET",
+                                               "name": panel_settings.TABLE_NAME}]
+        return panel_settings.SettingsStore(workspace, lambda _a, _t: bitable, "bascnREG",
+                                            log=lambda *a: None, clock=lambda: 0.0)
+
+    def test_read_texts_returns_raw_values_by_prefix_and_names_duplicates(self):
+        bitable = FakeBitable([row("rec1", "a.one", "不是 JSON"), row("rec2", "a.two", "x"),
+                               row("rec3", "b.one", "y"), row("rec4", "a.two", "z")])
+        texts, dupes = self._store(bitable).read_texts("a.")
+        self.assertEqual(texts, {"a.one": "不是 JSON", "a.two": "z"})
+        self.assertEqual(dupes, {"a.two"})
+
+    def test_read_texts_always_reads_the_table_again(self):
+        bitable = FakeBitable([row("rec1", "a.one", "1")])
+        store = self._store(bitable)
+        store.read_texts("a.")
+        bitable.rows[0]["fields"][panel_settings.COL_VALUE] = "2"     # 另一个进程改了
+        self.assertEqual(store.read_texts("a.")[0], {"a.one": "2"})
+
+    def test_read_one_picks_the_exact_key_even_if_the_filter_is_ignored(self):
+        bitable = FakeBitable([row("rec1", "a.one", "1"), row("rec2", "a.one.more", "2")])
+        store = self._store(bitable)
+        self.assertEqual(store.read_one("a.one"), "1")
+        self.assertIsNone(store.read_one("a.missing"))
+
+    def test_read_one_falls_back_to_a_full_read_when_the_filter_is_refused(self):
+        bitable = FakeBitable([row("rec1", "a.one", "1")])
+        plain = bitable.search
+
+        def picky(field_names, **kwargs):
+            if kwargs.get("filter_spec"):
+                raise feishu.FeishuError(-1, "筛选条件不认")
+            return plain(field_names)
+        bitable.search = picky
+        self.assertEqual(self._store(bitable).read_one("a.one"), "1")
+
+    def test_read_prefix_keeps_only_keys_that_start_with_it(self):
+        """筛选是「包含」，飞书不认时退回整表读：两条路都只留真以它开头的键，读的是此刻的值。"""
+        bitable = FakeBitable([row("rec1", "a.x.one", "1"), row("rec2", "b.a.x.two", "2"),
+                               row("rec3", "a.x.three", "3")])
+        store = self._store(bitable)
+        self.assertEqual(store.read_prefix("a.x."), {"a.x.one": "1", "a.x.three": "3"})
+        bitable.rows[0]["fields"][panel_settings.COL_VALUE] = "9"     # 另一个进程改了
+        plain = bitable.search
+
+        def picky(field_names, **kwargs):
+            if kwargs.get("filter_spec"):
+                raise feishu.FeishuError(-1, "筛选条件不认")
+            return plain(field_names)
+        bitable.search = picky
+        self.assertEqual(store.read_prefix("a.x."), {"a.x.one": "9", "a.x.three": "3"})
+
+    def test_write_text_refuses_a_value_over_the_cell_limit(self):
+        bitable = FakeBitable()
+        with self.assertRaisesRegex(ValueError, "超过飞书单个单元格"):
+            self._store(bitable).write_text("a.one", "x" * (panel_settings.CELL_MAX_CHARS + 1))
+        self.assertEqual((bitable.created, bitable.updated), ([], []))
+
+    def test_write_text_without_a_fresh_read_reuses_the_row_it_made(self):
+        bitable = FakeBitable()
+        reads = []
+        plain = bitable.search
+        bitable.search = lambda field_names, **kw: (reads.append(1), plain(field_names))[1]
+        store = self._store(bitable)
+        store.write_text("a.one", "1", fresh=False)
+        store.write_text("a.one", "2", fresh=False)
+        store.write_text("a.two", "3", fresh=False)
+        self.assertEqual(len(reads), 1)                       # 只在一开始读了一遍
+        self.assertEqual(len(bitable.created), 2)             # 两个键两行，没有重复的行
+        self.assertEqual(bitable.updated[0]["record_id"], "rec1")
+        self.assertEqual(store.read_texts("a.")[0], {"a.one": "2", "a.two": "3"})
+
+
 if __name__ == "__main__":
     unittest.main()

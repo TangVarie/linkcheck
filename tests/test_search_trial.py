@@ -1943,12 +1943,65 @@ class TestNothingScheduled(unittest.TestCase):
             self.assertNotIn("search-trial", path.read_text(encoding="utf-8"), path.name)
 
     def test_only_the_trial_imports_the_search_module(self):
+        """搜索那一层只有两个入口摸得到：命令行，和面板「搜索可见试跑」那一栏背后的
+        trial.py。面板自己（panel.py）不直接引它，巡查那几层更不引。"""
+        import ast
+
         repo = pathlib.Path(cli.__file__).resolve().parent
-        users = [p.name for p in (repo / "xhsearch").glob("*.py")
-                 if p.name != "visibility.py" and any(
-                     line.lstrip().startswith(("import ", "from ")) and "visibility" in line
-                     for line in p.read_text(encoding="utf-8").splitlines())]
-        self.assertEqual(users, [])
+
+        def imported(path) -> set:
+            # 按语法树取，不按行搜：`from . import (a,\n b)` 换了行也算。
+            names = set()
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    names.update(a.name.split(".")[-1] for a in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    names.update(a.name for a in node.names)
+                    if node.module:
+                        names.add(node.module.split(".")[-1])
+            return names
+
+        def importers(module: str) -> list:
+            return sorted(p.name for p in (repo / "xhsearch").glob("*.py")
+                          if p.name != f"{module}.py" and module in imported(p))
+        self.assertEqual(importers("visibility"), ["trial.py"])
+        self.assertEqual(importers("trial"), ["panel.py"])
+
+    def test_the_cli_reaches_the_trial_only_from_the_trial_command(self):
+        """cli.py 里引 trial / visibility 的地方都在 search-trial 那几个函数里——
+        sweep / queue / row / estimate / serve 的函数体里没有。"""
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(cli))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.ImportFrom) and child.module == "xhsearch" \
+                        and {a.name for a in child.names} & {"trial", "visibility"}:
+                    self.assertIn("search_trial", node.name)
+        top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+        for node in top:
+            self.assertFalse({a.name for a in node.names} & {"trial", "visibility"})
+
+    def test_the_panel_starts_a_paid_run_only_from_the_button_route(self):
+        """面板里会花钱的那一下（Trial.start）只有 POST /api/trial/start 的处理函数会调：
+        取数的后台线程、每期结算、轮询都不调。"""
+        import ast
+        import inspect
+
+        callers = set()
+        for node in ast.walk(ast.parse(inspect.getsource(panel))):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) \
+                        and child.func.attr in ("start", "report_only", "dry_run") \
+                        and isinstance(child.func.value, ast.Name) \
+                        and child.func.value.id == "trial":
+                    callers.add(node.name)
+        self.assertEqual(callers, {"_trial_action"})
 
 
 if __name__ == "__main__":
