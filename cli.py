@@ -9,6 +9,8 @@
     python3 cli.py serve               # 起监控面板（常驻、只读，一分钱不花）
     python3 cli.py init-registry       # 建那张存表清单的飞书表（这辈子跑一次）
     python3 cli.py chats               # 列出应用所在的群和 chat_id（给新建表开群编辑权限用）
+    python3 cli.py search-trial --dry-run   # 搜索可见试跑：先看会查什么、花多少（不花钱）
+    python3 cli.py search-trial             # 真跑一轮（手工起，有硬上限，见 docs/搜索可见试跑.md）
 
 多表：设 FEISHU_TABLES 一次巡查多张表（见 .env.example），上面每个命令都会
 逐表执行；`--table 标签` 可以只跑其中某几张（逗号分隔）。
@@ -576,6 +578,21 @@ def _doctor_table(settings: Settings, table: feishu.Bitable) -> int:
     return len(problems)
 
 
+def _schema_settings(settings: Settings, table: feishu.Bitable) -> Settings:
+    """体检这张表用的 Settings：全局那份 + 登记表里这张表的开关。
+
+    体检要知道这张表开没开「搜索检查」（开了才查「搜索关键词」那一列在不在，
+    见 schema.search_columns）。和 `settings_for_table` 是同一份覆盖，只是不打
+    「用的是这张表自己的参数」那几行日志——体检的输出只说表有没有问题。
+    没用登记表、或表不在登记表里：原样返回全局那份。
+    """
+    row = _REGISTRY_ROWS.get(table.table_id)
+    if row is None:
+        return settings
+    from xhsearch import registry as registry_mod
+    return registry_mod.apply_overrides(settings, row)
+
+
 def cmd_doctor(selected: list[str] | None = None) -> int:
     """上线前体检。不花一分钱，但能挡掉九成的「配好了跑不通」。"""
     settings = build_settings()
@@ -584,7 +601,7 @@ def cmd_doctor(selected: list[str] | None = None) -> int:
     for index, (label, table) in enumerate(tables):
         if len(tables) > 1:
             print(("\n" if index else "") + f"━━━━ 表：{label} ━━━━")
-        total += _doctor_table(settings, table)
+        total += _doctor_table(_schema_settings(settings, table), table)
 
     print("\n④ 数据通道 …")
     keys = _api_keys()
@@ -1518,6 +1535,240 @@ def cmd_serve(selected: list[str] | None = None) -> int:
     return panel.serve(config, produce, settings)
 
 
+# ---------- 搜索可见试跑（手工起，不在任何定时任务里）----------
+
+SEARCH_TRIAL_USAGE = """用法：python3 cli.py search-trial [选项]
+
+  --dry-run         只演练：读表、算要查几页、要花多少，不发任何付费请求
+  --round 名字      跑哪一轮，一次一轮（默认 first）：
+                      first    综合排序，每个词 3 页（最多 45 次）
+                      latest   最新排序，每个词 2 页（最多 30 次）
+                      repeat1  隔一小时再查一遍（最多 45 次）
+                      repeat2  隔一天再查一遍（最多 45 次）
+                      depth    前两个词翻到第 10 页（最多 20 次）
+  --report-only     不查，只按已经拿到的页重新出一份报告
+  --state-dir 目录  进度文件和报告放哪（默认 ~/.linkcheck/search-trial，不能在仓库里）
+  --show-keywords   在屏幕上列出 K01… 各是哪个词（只打在屏幕上，不进报告）
+  --table A,B       只查这几张表（没用登记表时必须点名）
+
+整个试跑最多 280 次请求 / ¥20，发之前查，到了就停。说明见 docs/搜索可见试跑.md。"""
+
+
+def _search_trial_options(args: list[str]) -> dict:
+    """解析 `search-trial` 后面的参数。看不懂的参数当场退出——悄悄忽略一个
+    拼错的 `--dry-run`，就是把演练跑成了真花钱。"""
+    from xhsearch import visibility
+    options = {"dry_run": False, "report_only": False, "show_keywords": False,
+               "round": visibility.DEFAULT_ROUND, "state_dir": ""}
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--dry-run":
+            options["dry_run"] = True
+        elif flag == "--report-only":
+            options["report_only"] = True
+        elif flag == "--show-keywords":
+            options["show_keywords"] = True
+        elif flag in ("--round", "--state-dir"):
+            if not rest:
+                sys.exit(f"{flag} 后面要跟一个值\n\n{SEARCH_TRIAL_USAGE}")
+            options[flag[2:].replace("-", "_")] = rest.pop(0).strip()
+        elif flag in ("-h", "--help"):
+            print(SEARCH_TRIAL_USAGE)
+            raise SystemExit(0)
+        else:
+            sys.exit(f"看不懂的参数：{flag}\n\n{SEARCH_TRIAL_USAGE}")
+    if options["round"] not in visibility.ROUNDS:
+        sys.exit(f"没有叫 {options['round']!r} 的轮次，可选："
+                 f"{'、'.join(visibility.ROUNDS)}")
+    if options["dry_run"] and options["report_only"]:
+        sys.exit("--dry-run 和 --report-only 只能用一个")
+    return options
+
+
+def _search_trial_tables(selected: list[str] | None) -> list[tuple[str, feishu.Bitable]]:
+    """试跑读哪几张表：登记表里开了「搜索检查」的那些。
+
+    没用登记表（只有 FEISHU_TABLES）就没有逐表开关可看，必须用 `--table` 点名
+    ——点名就是开关。绝不退化成「所有表都读」。
+    """
+    tables = _tables(selected)
+    if not _REGISTRY_ROWS:
+        if not selected:
+            sys.exit("没用登记表（或这一次读不到它），没有「搜索检查」开关可看："
+                     "用 --table 点名要查哪几张表")
+        return tables
+    switched = [(label, table) for label, table in tables
+                if getattr(_REGISTRY_ROWS.get(table.table_id), "search_check", False)]
+    if selected and len(switched) != len(tables):
+        on = {label for label, _table in switched}
+        sys.exit("--table 点名的这几张表没开「搜索检查」："
+                 f"{'、'.join(label for label, _t in tables if label not in on)}。"
+                 "先在登记表里把这张表的「搜索检查」勾上")
+    if not switched:
+        sys.exit("没有一张表开了「搜索检查」。在登记表里给要试的表勾上「搜索检查」"
+                 "（老登记表没有这一列：手工加一列同名的复选框），再在那几张表里填「搜索关键词」")
+    return switched
+
+
+def _search_trial_rows(tables, settings: Settings) -> list:
+    """逐表读出（行, 「搜索关键词」那一格）。只读，不写。"""
+    f = settings.fields
+    pairs: list = []
+    for label, table in tables:
+        meta = table.fields_meta()
+        if not meta:
+            sys.exit(f"读不到表「{label}」的字段列表（应用没被加进这张表？）。一分钱没花")
+        info = meta.get(f.search_keywords)
+        if info is None:
+            print(f"⚠ 表「{label}」还没有「{f.search_keywords}」这一列，这张表不查。"
+                  "在面板「项目」里点它的「补齐缺的列」，或在飞书里手工加一列同名的文本列")
+            continue
+        if info.get("type") not in (1, 4):
+            print(f"⚠ 表「{label}」的「{f.search_keywords}」不是文本或多选列，这张表不查")
+            continue
+        wanted = [c for c in f.must_read() if c in meta] + [f.search_keywords]
+        try:
+            records = table.search(wanted)
+        except Exception as exc:                                # noqa: BLE001
+            sys.exit(f"读表「{label}」失败：{exc}。一分钱没花")
+        filled = 0
+        for record in records:
+            cell = (record.get("fields") or {}).get(f.search_keywords)
+            if cell in (None, "", []):
+                continue
+            filled += 1
+            pairs.append((runner.row_from_record(record, settings), cell))
+        print(f"表「{label}」：读到 {len(records)} 行，填了「{f.search_keywords}」的 {filled} 行")
+    return pairs
+
+
+def cmd_search_trial(args: list[str], selected: list[str] | None = None) -> int:
+    """搜索可见试跑。**只有人手工敲这条命令才会跑**，没有任何定时任务调它。
+
+    顺序是故意的：所有「配得对不对」的检查（参数、进度文件、Key、表、词数）都在
+    发第一个付费请求之前做完，哪一步不对就退出，一分钱不花。
+    """
+    import pathlib
+    from xhsearch import visibility
+
+    options = _search_trial_options(args)
+    round_ = visibility.ROUNDS[options["round"]]
+    dry_run, report_only = options["dry_run"], options["report_only"]
+    state_dir = pathlib.Path(options["state_dir"] or visibility.default_state_dir()).expanduser()
+    problem = visibility.check_state_dir(state_dir, pathlib.Path(__file__).resolve().parent)
+    if problem:
+        sys.exit(problem)
+
+    settings = build_settings()
+    key = _api_keys().get(providers.TIKHUB, "")
+    if not key and not dry_run and not report_only:
+        sys.exit("没配 TIKHUB_API_KEY：搜索只走 TikHub（和巡查用的是同一个 Key）。一分钱没花")
+    # 真跑的时候**先拿锁、再读账本**，一直拿到最后一次存盘。反过来（先读账本，读表、
+    # 展开短链之后才拿锁）的话，这中间另一个试跑跑完了，我们手里的就是一份旧账：
+    # 它拿到的页会被再付一遍钱，存盘时还会把它记的账盖掉，上限就按少记的账在查。
+    lease = None
+    if not dry_run and not report_only:
+        try:
+            lease = runlock.acquire("cli.py search-trial", path=str(state_dir / "trial.lock"))
+        except runlock.Busy as exc:
+            sys.exit(f"另一个试跑正在跑（{exc}）。两个一起跑会各记各的账，这次不跑")
+    try:
+        return _search_trial_locked(options, round_, state_dir, settings, key, selected,
+                                    paid=lease is not None)
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, key: str,
+                         selected: list[str] | None, *, paid: bool) -> int:
+    """试跑的正文。`paid` 为真时调用方**已经拿着** trial.lock（见 cmd_search_trial）；
+    账本只在这里读，所以读到的一定是别的试跑存完盘之后的那一份。"""
+    from xhsearch import balance as balance_mod, shortlink, visibility
+
+    dry_run = options["dry_run"]
+    try:
+        state = visibility.State.load(state_dir / "state.json")
+    except visibility.StateError as exc:
+        sys.exit(str(exc))
+
+    pairs = _search_trial_rows(_search_trial_tables(selected), settings)
+    resolver = None if dry_run else shortlink.Resolver()
+    info = visibility.intake(
+        pairs, resolve=(lambda url: resolver.resolve(url).content_id) if resolver else None)
+    if not info.keywords:
+        sys.exit(f"没有可查的词：开了「搜索检查」的表里，没有一行填了「{settings.fields.search_keywords}」"
+                 f"又查得了的（小红书、没失效、拿得到笔记 ID、填了「{settings.fields.publish_time}」）。"
+                 "一分钱没花")
+    refusal = state.register(info.keywords)
+    if refusal:
+        sys.exit(refusal + "。一分钱没花")
+    keywords = sorted(((state.number(visibility.keyword_hash(word)) or 0,
+                        word, visibility.keyword_hash(word)) for word in info.keywords))
+    if options["show_keywords"]:
+        print("词的编号（只打在屏幕上，不进报告）：")
+        for number, word, _digest in keywords:
+            print(f"  K{number:02d} = {word}")
+    ordered = [(word, digest) for _number, word, digest in keywords]
+    price = providers.get_provider(providers.TIKHUB).yuan_per_call("xhs", providers.SEARCH)
+
+    if dry_run:
+        for line in visibility.dry_run_lines(round_, info, state, price,
+                                             [digest for _word, digest in ordered]):
+            print(line)
+        if not key:
+            print("  ⚠ 还没配 TIKHUB_API_KEY，真跑之前要配上")
+        print("  去掉 --dry-run 才会真的查。")
+        return 0
+
+    result = None
+    if paid:
+        state.save()                       # 词的编号先落盘
+        need, _have = visibility.plan(
+            round_, [d for _w, d in ordered[:round_.keywords]], state)
+        print(f"▶ {round_.label}：还要发最多 {need} 次（约 ¥{need * price:.2f}）；"
+              f"账本上已经 {state.calls} 次 / ¥{state.yuan:.2f}，"
+              f"上限 {visibility.MAX_CALLS} 次 / ¥{visibility.MAX_YUAN:.0f}")
+        before = _tikhub_balance_usd(balance_mod, key) if need else None
+        result = visibility.run_round(round_, ordered, state, key)
+        if result.requests and before is not None:
+            after = _tikhub_balance_usd(balance_mod, key)
+            if after is not None:
+                state.data["balance"].append({
+                    "round": round_.name, "requests": result.requests,
+                    "drop_usd": round(before - after, 4), "at": int(time.time())})
+        state.save()
+        print(f"■ 这一轮：新拿到 {result.fetched} 页，沿用 {result.reused} 页，"
+              f"没拿到 {result.failed} 页；发了 {result.requests} 次请求，"
+              f"按多了算 ¥{result.yuan:.2f}")
+        if result.stopped:
+            print(f"⏹ 中途停了：{result.stopped}。还差 {result.todo} 页；拿到的页都留着，"
+                  "再跑同一条命令只补没拿到的")
+        elif result.todo:
+            print(f"  还差 {result.todo} 页没拿到。再跑同一条命令只补这几页")
+
+    report = visibility.build_report(
+        state, info.posts, tz=settings.display.tz(),
+        comment_floor=settings.thresholds.tier_evaluating, intake_info=info)
+    text_path, json_path = visibility.write_report(state_dir, report)
+    print()
+    print(visibility.render_report(report))
+    print(f"报告：{text_path}\n      {json_path}（都只有计数，没有词、链接、笔记 ID）")
+    return 0 if result is None or result.clean else 1
+
+
+def _tikhub_balance_usd(balance_mod, key: str):
+    """TikHub 余额（美元）。零费用的端点（见 xhsearch/balance.py）；读不到返回 None，
+    不打印原因——那句话里可能带着对方回的东西。"""
+    try:
+        found = balance_mod.read_tikhub(key, base=providers.TIKHUB_BASE,
+                                        usd_to_cny=providers.usd_to_cny())
+    except Exception:                                           # noqa: BLE001
+        return None
+    return found.amount if found.ok else None
+
+
 def pop_table_flag(args: list[str]) -> list[str] | None:
     """从参数里取出 `--table A,B`（就地删掉这两项）。没传返回 None。
 
@@ -1572,6 +1823,8 @@ def main(argv: list[str]) -> int:
         return cmd_init_registry()
     if command == "chats":
         return cmd_chats()
+    if command == "search-trial":
+        return cmd_search_trial(args[1:], selected)
     if command in ("sweep", "queue", "estimate"):
         return _run(command, None, selected)
     if command == "row":

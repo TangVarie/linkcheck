@@ -1,0 +1,960 @@
+"""搜索可见 · 试跑。**只有手工起的 `python3 cli.py search-trial` 会走到这里。**
+
+要回答的只有一个问题（2026-11-16 定的）：我们的帖子发出去三天，在它该被搜到的
+那个词下面，前几页里**到底看不看得见**。如果几乎都看不见，按综合排序查排名这件事
+就没有意义，得换办法；看得见，才值得做成每天自动查。所以先花小钱试一次，
+不建任何自动的东西：
+
+* **巡查不受影响**：sweep / queue / row / estimate 一行都没改，不会多发一次请求。
+  搜索那个端点登记在 providers 里，但 rows.plan_calls 从不排它。
+* **不往飞书写一个字**：只读「搜索关键词」和几列现成的（链接、发布时间、巡查状态）。
+* **不留任何客户的东西**：本地那份进度文件只有笔记 ID、名次和几个计数，关键词只存
+  哈希；报告只有计数，词用 K01、K02 代替。标题、昵称、正文在 providers 归一化
+  那一步就丢了，这里根本拿不到。
+
+## 钱：闸门在代码里，发之前查
+
+整个试跑（不是一次运行）最多 `MAX_CALLS` 次请求、`MAX_YUAN` 元。花了多少记在进度
+文件里，分几次跑、隔天再跑，都是同一本账。每发一个 HTTP 请求之前先看这本账——
+再发一次会过线就停，已经拿到的页照样算数。账是往多了记的：先记账、存盘，再发；
+只有传输层**明说没发出去**（建连失败，`Response.not_sent`）的那一次会退回来。限流、
+超时、HTTP 400、读回答时断开或出错的页一律按花了钱算（收不收钱没验过）。
+
+## 读不懂的页不当成「到底了」
+
+对方返回了条目、却一条笔记 ID 都认不出来（返回的形状和我们猜的不一样），这一页
+**不留**：留下来报告就会说「没搜到」，其实是没读懂。第 1 页就这样，整轮立刻停
+（只花这一次的钱），退出码非零；只有一条条目都没有的页才算翻到底了。
+
+## 断了能接着跑，拿到的页不付第二次钱
+
+每拿到一页就存盘。再跑同一条命令，拿到过的页直接用，只补没拿到的。
+翻页要用的那两个会话值跟着第一页一起存着。
+
+全部是**可以离线测的**：发请求的那一下是注入的（`send`），进度文件的位置是参数。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import statistics
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+from . import feishu, protocol, providers, transport
+from .rows import SORT_DEFAULT, SORT_LATEST, STATUS_GONE, STATUS_SUSPECT, Row
+
+TRIAL_NAME = "search-visibility-2026-11"
+STATE_VERSION = 1
+
+# —— 硬上限（2026-11-16 定的：试跑最多 ¥20）——
+# 计划是 185 次（约 ¥13），多出来的是给失败的页重试用的。两个闸门都查，先到哪个算哪个：
+# 按现在的单价（¥0.072 一次）金额那个先到，277 次。
+MAX_CALLS = 280
+MAX_YUAN = 20.0
+# 词的个数是定死的：上限是按 15 个词算出来的，30 个词要 350 次，装不下。
+MAX_KEYWORDS = 15
+# 一格里像是整句话的不查：搜一句话什么都说明不了，钱照花。
+MAX_KEYWORD_CHARS = 30
+
+# 两次请求之间至少隔这么久。对方的限速是每秒 10 次，我们不赶时间。
+PACE_SECONDS = 0.5
+# 限流时对方没说等多久，就等这么久（和 runner 里一个数）。
+RATE_LIMIT_WAIT_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class Round:
+    """试跑的一轮：用哪种排序、每个词翻几页、查前几个词。"""
+
+    name: str
+    sort: str
+    pages: int
+    keywords: int
+    label: str
+
+    @property
+    def planned_calls(self) -> int:
+        return self.pages * self.keywords
+
+
+# 五轮加起来 45 + 30 + 45 + 45 + 20 = 185 次。**一次只跑一轮**，默认第一轮——
+# 那一轮就能回答「前几页里看不看得见」；后面几轮是为了知道名次稳不稳、能翻多深，
+# 要不要跑看第一轮的结果。
+ROUNDS: dict[str, Round] = {r.name: r for r in (
+    Round("first", SORT_DEFAULT, 3, MAX_KEYWORDS, "第一轮：综合排序，每个词 3 页"),
+    Round("latest", SORT_LATEST, 2, MAX_KEYWORDS, "最新排序，每个词 2 页（看收没收录）"),
+    Round("repeat1", SORT_DEFAULT, 3, MAX_KEYWORDS, "隔一小时再查一遍（看名次稳不稳）"),
+    Round("repeat2", SORT_DEFAULT, 3, MAX_KEYWORDS, "隔一天再查一遍（看名次稳不稳）"),
+    Round("depth", SORT_DEFAULT, 10, 2, "前两个词翻到第 10 页（看能翻多深）"),
+)}
+DEFAULT_ROUND = "first"
+PLANNED_CALLS = sum(r.planned_calls for r in ROUNDS.values())
+
+AGE_BANDS = ("3天内", "4到7天", "更早", "发布时间空")
+FOUND_BANDS = ("前20", "21到40", "41到60", "60以后")
+PAID = "付费位"
+NOT_FOUND = "没搜到"
+INCOMPLETE = "没查全"
+RESULT_LABELS = (*FOUND_BANDS, PAID, NOT_FOUND, INCOMPLETE)
+
+# 没进试跑的行，按原因计数。
+SKIP_TOO_LONG = "词太长（像整句话）"
+SKIP_NOT_XHS = "不是小红书"
+SKIP_DEAD = "已失效或疑似受限"
+SKIP_NO_ID = "拿不到笔记 ID"
+SKIP_NO_TIME = "发布时间空着"
+
+# 一页里有条目、却一条笔记 ID 都认不出来：记在失败清单里的种类名。
+UNREADABLE = "unreadable_page"
+
+
+# ---------- 读表：哪些帖子、哪些词 ----------
+
+
+def first_keyword(cell: Any) -> tuple[str, int]:
+    """「搜索关键词」那一格 →（要查的那个词, 多写了几个）。
+
+    拆法和「评论关键词」一样（feishu.read_keywords：逗号 / 顿号 / 分号 / 换行），
+    词前面的 # 去掉。一格只查第一个词：多一个词就多一份钱，试跑的上限装不下。
+    """
+    words = [w.lstrip("#＃").strip() for w in feishu.read_keywords(cell)]
+    words = [w for w in words if w]
+    return (words[0], len(words) - 1) if words else ("", 0)
+
+
+def keyword_hash(word: str) -> str:
+    """词 → 进度文件里用的代号。大小写不分（搜索本来也不分）。"""
+    return hashlib.sha256(word.strip().casefold().encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class Post:
+    note_id: str
+    keyword: str                       # 原词，只在内存里，不落盘、不进报告
+    publish_ms: Optional[int] = None   # 表里填的「发布时间」；空着就是 None，不猜
+    comments: Optional[int] = None     # 表里现成的评论数
+
+
+@dataclass
+class Intake:
+    """这次读表读到了什么。"""
+
+    posts: list[Post] = field(default_factory=list)
+    # 按第一次出现的顺序：词的原文（同一个词大小写不同只留第一种写法）。
+    keywords: list[str] = field(default_factory=list)
+    rows_with_keyword: int = 0
+    extra_words: int = 0
+    # 短链还没展开的行（只在不展开的模式下有，也就是 --dry-run）。
+    short_links: int = 0
+    skipped: dict[str, int] = field(default_factory=dict)
+
+    def _skip(self, reason: str) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+
+def intake(rows: Iterable[tuple[Row, Any]], *,
+           resolve: Optional[Callable[[str], Optional[str]]] = None) -> Intake:
+    """（行, 那一行「搜索关键词」的原始格子）→ 要查的帖子和词。
+
+    「搜索关键词」空着的行**完全不算**——不计数、不报原因，和没有这一行一样。
+    `resolve` 是免费的短链展开（链接 → 笔记 ID 或 None）；不给就不展开，
+    短链行只记个数（--dry-run 用：那时词数是上界）。
+    """
+    out = Intake()
+    seen_words: dict[str, str] = {}
+    seen_posts: set[tuple[str, str]] = set()
+    for row, cell in rows:
+        word, extra = first_keyword(cell)
+        if not word:
+            continue
+        out.rows_with_keyword += 1
+        out.extra_words += extra
+        if len(word) > MAX_KEYWORD_CHARS:
+            out._skip(SKIP_TOO_LONG)
+            continue
+        link = row.parsed
+        if link.platform != "xhs":
+            out._skip(SKIP_NOT_XHS)
+            continue
+        if row.refresh_status in (STATUS_GONE, STATUS_SUSPECT):
+            # 已失效、疑似受限的帖子搜不到是应该的，查了也说明不了排名。
+            out._skip(SKIP_DEAD)
+            continue
+        if row.publish_time_ms is None:
+            # 试跑只问「发了三天的帖子看不看得见」：发布时间空着就算不出它发了几天，
+            # 查了也进不了任何一档。不查、不花钱，也不占 15 个词的名额。
+            out._skip(SKIP_NO_TIME)
+            continue
+        note_id = link.content_id
+        pending = False
+        if not note_id and link.url:
+            if resolve is None:
+                pending = True
+            else:
+                note_id = resolve(link.url)
+        if not note_id and not pending:
+            out._skip(SKIP_NO_ID)
+            continue
+        digest = keyword_hash(word)
+        if digest not in seen_words:
+            seen_words[digest] = word
+            out.keywords.append(word)
+        if pending:
+            out.short_links += 1
+            continue
+        key = (digest, str(note_id).lower())
+        if key in seen_posts:
+            continue                      # 同一篇、同一个词在表里出现两行：算一篇
+        seen_posts.add(key)
+        out.posts.append(Post(note_id=key[1], keyword=seen_words[digest],
+                              publish_ms=row.publish_time_ms,
+                              comments=row.previous_comment_count))
+    return out
+
+
+# ---------- 进度文件：账本 + 拿到过的页 ----------
+
+
+class StateError(RuntimeError):
+    """进度文件用不了。`str(exc)` 是可以直接给人看的中文。"""
+
+
+class State:
+    """本地那份进度文件。**只有 ID、名次、计数和哈希**，没有词的原文。
+
+        {"version", "trial",
+         "calls": 一共发了几个请求, "yuan": 按多了算一共花了多少,
+         "keywords": {词的哈希: 编号（K01 的 1）},
+         "pages": {"轮|词的哈希|页": {"at": 秒, "ids": [按顺序的笔记 ID],
+                   "ads": [像广告位的那几条在 ids 里的下标], "items", "other",
+                   "types": {类型名: 条数}, "keys": [键名], "sid": {翻页会话}}},
+         "failures": [{"round", "kw", "page", "kind", "http", "at"}],
+         "balance": [{"round", "drop_usd", "requests", "at"}]}
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.data: dict[str, Any] = {
+            "version": STATE_VERSION, "trial": TRIAL_NAME, "calls": 0, "yuan": 0.0,
+            "keywords": {}, "pages": {}, "failures": [], "balance": [],
+        }
+
+    @classmethod
+    def load(cls, path: Path) -> "State":
+        state = cls(path)
+        if not state.path.exists():
+            return state
+        try:
+            data = json.loads(state.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # 读不懂就停，绝不当成「一分钱没花过」重新开始——那等于把上限清零。
+            raise StateError(
+                f"进度文件读不懂（{type(exc).__name__}）：{state.path}。"
+                "里面记着这次试跑已经花了多少，不能当它不存在。"
+                "确认不要了再手工删掉它") from exc
+        if not isinstance(data, dict) or data.get("trial") != TRIAL_NAME \
+                or data.get("version") != STATE_VERSION:
+            raise StateError(f"进度文件不是这次试跑的（{state.path}），换一个 --state-dir")
+        for key, default in state.data.items():
+            if not isinstance(data.get(key), type(default)) \
+                    and not (key == "yuan" and isinstance(data.get(key), int)):
+                raise StateError(f"进度文件里「{key}」的形状不对（{state.path}）")
+        state.data = data
+        return state
+
+    def save(self) -> None:
+        """原子写：先写旁边的临时文件再换名，断电也不会留下半份账本。"""
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(self.data, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, self.path)
+
+    # —— 账本 ——
+
+    @property
+    def calls(self) -> int:
+        return int(self.data["calls"])
+
+    @property
+    def yuan(self) -> float:
+        return float(self.data["yuan"])
+
+    def blocked(self, price: float) -> str:
+        """再发一个请求会不会过线。空串 = 可以发；否则是停下来的原因。"""
+        if self.calls + 1 > MAX_CALLS:
+            return f"次数上限到了：已经发了 {self.calls} 次，上限 {MAX_CALLS} 次"
+        if self.yuan + price > MAX_YUAN + 1e-9:
+            return (f"金额上限到了：已经记了 ¥{self.yuan:.2f}，再发一次（¥{price:.3f}）"
+                    f"会超过 ¥{MAX_YUAN:.0f}")
+        return ""
+
+    def charge(self, price: float) -> None:
+        self.data["calls"] = self.calls + 1
+        self.data["yuan"] = round(self.yuan + price, 6)
+
+    def refund(self, price: float) -> None:
+        self.data["calls"] = max(0, self.calls - 1)
+        self.data["yuan"] = round(max(0.0, self.yuan - price), 6)
+
+    # —— 词的编号 ——
+
+    def number(self, digest: str) -> Optional[int]:
+        value = self.data["keywords"].get(digest)
+        return value if isinstance(value, int) else None
+
+    def register(self, words: list[str]) -> str:
+        """给这次读到的词编号（已经有号的不变）。返回空串 = 好了；否则是拒跑的原因。
+
+        **先数再记**：加上新词会超过 15 个就一个都不记——记了一半再拒，下次这几个
+        没查过的词还占着名额。
+        """
+        fresh = [keyword_hash(w) for w in words]
+        fresh = [d for i, d in enumerate(fresh)
+                 if d not in self.data["keywords"] and d not in fresh[:i]]
+        total = len(self.data["keywords"]) + len(fresh)
+        if total > MAX_KEYWORDS:
+            return (f"词太多了：这次试跑最多 {MAX_KEYWORDS} 个不同的词，"
+                    f"已经查过的加上表里新出现的一共 {total} 个。"
+                    f"上限（{MAX_CALLS} 次 / ¥{MAX_YUAN:.0f}）是按 {MAX_KEYWORDS} 个词算的，"
+                    "多一个都装不下——把表里多出来的「搜索关键词」清掉再跑")
+        for digest in fresh:
+            self.data["keywords"][digest] = len(self.data["keywords"]) + 1
+        return ""
+
+    # —— 页 ——
+
+    @staticmethod
+    def page_key(round_name: str, digest: str, page: int) -> str:
+        return f"{round_name}|{digest}|{page}"
+
+    def page(self, round_name: str, digest: str, page: int) -> Optional[dict]:
+        """拿到过的那一页；没有就是 None。读不懂的页（见 `unreadable`）也当没有：
+        现在不会再存这种页，这里是防着进度文件里已经有一份。"""
+        value = self.data["pages"].get(self.page_key(round_name, digest, page))
+        if not isinstance(value, dict) or unreadable(value):
+            return None
+        return value
+
+    def keep_page(self, round_name: str, digest: str, page: int,
+                  data: dict[str, Any], at: float) -> dict:
+        notes = [n for n in data.get("notes") or [] if isinstance(n, dict)]
+        record = {
+            "at": int(at),
+            "ids": [str(n.get("note_id") or "") for n in notes],
+            "ads": [i for i, n in enumerate(notes) if n.get("ad")],
+            "items": int(data.get("items") or 0),
+            "other": int(data.get("other_items") or 0),
+            "types": dict(data.get("model_types") or {}),
+            "keys": list(data.get("item_keys") or []),
+            "sid": {k: str(data[k]) for k in ("search_id", "search_session_id")
+                    if data.get(k)},
+        }
+        self.data["pages"][self.page_key(round_name, digest, page)] = record
+        return record
+
+    def note_failure(self, round_name: str, digest: str, page: int,
+                     kind: str, http: Optional[int], at: float,
+                     shape: Optional[dict[str, Any]] = None) -> None:
+        entry = {"round": round_name, "kw": digest, "page": page,
+                 "kind": kind, "http": http, "at": int(at)}
+        if shape:
+            # 读不懂的页：留下条目的类型和键名（只有名字，没有内容），好知道该怎么改。
+            entry["items"] = int(shape.get("items") or 0)
+            entry["types"] = dict(shape.get("model_types") or {})
+            entry["keys"] = list(shape.get("item_keys") or [])
+        self.data["failures"].append(entry)
+
+
+def unreadable(page: dict[str, Any]) -> bool:
+    """这一页有条目、却一条笔记 ID 都没认出来——是没读懂，不是到底了。
+    两种形状都认：归一化后的（`notes`）和进度文件里的（`ids`）。"""
+    ids = page.get("ids") if "ids" in page else page.get("notes")
+    return not ids and int(page.get("items") or 0) > 0
+
+
+# ---------- 发请求 ----------
+
+
+Send = Callable[[providers.Request, float], transport.Response]
+
+
+def _send_once(request: providers.Request, timeout: float) -> transport.Response:
+    """发**一个** HTTP 请求。不用传输层自带的三次重试：每一个请求发之前都得先过账本。"""
+    return transport.request_with_retry(request.method, request.url, request.headers,
+                                        request.body, timeout=timeout, attempts=1)
+
+
+@dataclass
+class RunResult:
+    round: str
+    fetched: int = 0          # 这次新拿到的页
+    reused: int = 0           # 进度文件里已经有、没再花钱的页
+    failed: int = 0           # 这次没拿到的页
+    requests: int = 0         # 这次发出去的 HTTP 请求（进账的）
+    yuan: float = 0.0
+    todo: int = 0             # 这一轮还没拿到的页（停下来时）
+    stopped: str = ""         # 非空 = 中途停了，原因
+
+    @property
+    def clean(self) -> bool:
+        return not self.stopped and not self.failed
+
+
+def plan(round_: Round, digests: list[str], state: State) -> tuple[int, int]:
+    """这一轮（最多还要发几页, 已经拿到几页）。按「每个词都翻满」算，是上界。
+    `digests` 是这一轮要查的那几个词（调用方已经按 `round_.keywords` 截过）。"""
+    have = need = 0
+    for digest in digests:
+        ended = False
+        for page in range(1, round_.pages + 1):
+            record = state.page(round_.name, digest, page)
+            if record is not None:
+                have += 1
+                ended = not record.get("ids")
+            elif not ended:
+                need += 1
+    return need, have
+
+
+def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_key: str, *,
+              send: Optional[Send] = None, sleep: Optional[Callable[[float], None]] = None,
+              clock: Optional[Callable[[], float]] = None,
+              log: Callable[[str], None] = print,
+              timeout: float = 30.0, pace: Optional[float] = None) -> RunResult:
+    """跑一轮。`keywords` 是按编号排好的 [(词的原文, 哈希)]。
+
+    日志里**不出现词的原文**（只说 K 几）、不出现地址、不出现对方回的错误正文
+    ——这条命令可能跑在日志公开的地方。
+    """
+    provider = providers.get_provider(providers.TIKHUB)
+    price = provider.yuan_per_call("xhs", providers.SEARCH)
+    # 在调用时才取默认值，不绑在参数上——绑死了测试就换不掉，一个限流用例能睡 5 秒。
+    send = send or _send_once
+    sleep = sleep or time.sleep
+    clock = clock or time.time
+    pace = PACE_SECONDS if pace is None else pace
+    out = RunResult(round_.name)
+    last_sent = [0.0]
+    keywords = keywords[:round_.keywords]
+    chosen = [digest for _word, digest in keywords]
+
+    def fetch(word: str, digest: str, page: int, session: dict) -> Optional[protocol.Result]:
+        """拿一页。None = 整轮该停了（原因在 out.stopped）。"""
+        request = provider.build(api_key, "xhs", providers.SEARCH, {
+            "keyword": word, "page": page, "sort": round_.sort, **session})
+        tries = 0
+        while True:
+            reason = state.blocked(price)
+            if reason:
+                out.stopped = reason
+                return None
+            # 先记账、存盘，再发：发出去之后进程被杀，这一次也在账上。
+            state.charge(price)
+            state.save()
+            wait = pace - (clock() - last_sent[0])
+            if wait > 0:
+                sleep(wait)
+            response = send(request, timeout)
+            last_sent[0] = clock()
+            tries += 1
+            # 只有传输层**明说没发出去**（建连那一步失败）才退账。别的 status 0
+            # ——超时、被断开、读回答时的 TLS / 系统错误——都可能已经到了对方那边。
+            unreached = response.status == 0 and bool(getattr(response, "not_sent", False))
+            if unreached:
+                # 建连失败：对方根本没收到，这一次不算。
+                state.refund(price)
+                state.save()
+            else:
+                out.requests += 1
+                out.yuan += price
+            result = provider.parse("xhs", providers.SEARCH, response.status,
+                                    response.content_type, response.body,
+                                    response.request_id, api_key)
+            if isinstance(result, protocol.Ok):
+                return result
+            if result.kind in protocol.FATAL:
+                out.stopped = ("TikHub 的 Key 不对或被拦了" if result.kind is protocol.Failure.AUTH
+                               else "TikHub 余额不够了")
+                state.note_failure(round_.name, digest, page, result.kind.value,
+                                   result.http_status, clock())
+                return None
+            if unreached and tries >= 2:
+                out.stopped = "连不上 TikHub（网络不通），这两次没算钱"
+                return None
+            if result.kind is protocol.Failure.RATE_LIMIT:
+                if tries >= 2:
+                    state.note_failure(round_.name, digest, page, result.kind.value,
+                                       result.http_status, clock())
+                    out.stopped = "被限流了两次，过一会儿再跑同一条命令接着来"
+                    return None
+                sleep(protocol.clamp_retry_after(
+                    result.retry_after_seconds if result.retry_after_seconds is not None
+                    else response.retry_after) or RATE_LIMIT_WAIT_SECONDS)
+                continue
+            if (result.kind is protocol.Failure.TRANSPORT and tries < 2
+                    and result.code not in providers.CONTRACT_CODES):
+                continue                  # 5xx、超时：再试一次（照样先过账本）
+            return result
+
+    for word, digest in keywords:
+        number = state.number(digest) or 0
+        session: dict[str, str] = {}
+        for page in range(1, round_.pages + 1):
+            record = state.page(round_.name, digest, page)
+            if record is None:
+                if page > 1 and not session:
+                    # 第 2 页起要回传第 1 页给的会话值；没给就不翻（翻了多半是白花钱）。
+                    log(f"  K{number:02d} 第 1 页没给翻页用的会话值，后面的页不翻")
+                    break
+                result = fetch(word, digest, page, session if page > 1 else {})
+                if result is None:
+                    state.save()
+                    out.todo = plan(round_, chosen, state)[0]
+                    return out
+                if isinstance(result, protocol.Err):
+                    out.failed += 1
+                    state.note_failure(round_.name, digest, page, result.kind.value,
+                                       result.http_status, clock())
+                    state.save()
+                    log(f"  K{number:02d} 第 {page} 页没拿到（{result.kind.value}"
+                        f"{f'，HTTP {result.http_status}' if result.http_status else ''}），"
+                        "这个词后面的页先不翻；再跑一次会补")
+                    break
+                if unreadable(result.data):
+                    # 有条目、没有一条认得出笔记 ID：不留这一页（留了就成了「到底了」，
+                    # 报告会把没读懂说成没搜到，而且以后再也不会重新拿）。
+                    out.failed += 1
+                    state.note_failure(round_.name, digest, page, UNREADABLE, None,
+                                       clock(), shape=result.data)
+                    state.save()
+                    count = int(result.data.get("items") or 0)
+                    if page == 1:
+                        # 第 1 页就读不懂 = 返回的形状和我们猜的不一样，每个词都会这样。
+                        # 现在就停：只花这一次的钱，不把 15 个词的第 1 页都搭进去。
+                        out.stopped = (f"K{number:02d} 第 1 页返回了 {count} 条，却一条笔记 ID "
+                                       "都认不出来（返回的形状和代码猜的不一样）。这不是「没搜到」，"
+                                       "要先改代码才能接着查")
+                        out.todo = plan(round_, chosen, state)[0]
+                        return out
+                    log(f"  K{number:02d} 第 {page} 页返回了 {count} 条，却一条笔记 ID 都认不出来，"
+                        "这一页不算数（不是到底了）；这个词记成没查全")
+                    break
+                record = state.keep_page(round_.name, digest, page, result.data, clock())
+                state.save()
+                out.fetched += 1
+            else:
+                out.reused += 1
+            if page == 1:
+                session = dict(record.get("sid") or {})
+            if not record.get("ids"):
+                break                     # 这一页一条条目都没有：到底了
+    out.todo = plan(round_, chosen, state)[0]
+    return out
+
+
+# ---------- 报告：只有计数 ----------
+
+
+def age_band(publish_ms: Optional[int], at_seconds: float, tz: timezone) -> str:
+    """查的那一刻，这一篇发了几天——按日历日（表里日期列显示的那个时区）。
+    只认表里填的「发布时间」，空着就是「发布时间空」，不拿笔记 ID 去猜。"""
+    if publish_ms is None:
+        return AGE_BANDS[3]
+    try:
+        published = datetime.fromtimestamp(publish_ms / 1000, tz=tz).date()
+        seen = datetime.fromtimestamp(at_seconds, tz=tz).date()
+    except (OverflowError, OSError, ValueError):
+        return AGE_BANDS[3]
+    days = (seen - published).days
+    if days <= 3:
+        return AGE_BANDS[0]
+    return AGE_BANDS[1] if days <= 7 else AGE_BANDS[2]
+
+
+def rank_band(rank: int) -> str:
+    if rank <= 20:
+        return FOUND_BANDS[0]
+    if rank <= 40:
+        return FOUND_BANDS[1]
+    return FOUND_BANDS[2] if rank <= 60 else FOUND_BANDS[3]
+
+
+@dataclass
+class Listing:
+    """一轮里一个词的结果单：自然结果按名次排好的笔记 ID。"""
+
+    organic: list[str] = field(default_factory=list)
+    paid: set[str] = field(default_factory=set)
+    pages: int = 0             # 拿到了几页
+    complete: bool = False     # 该翻的都翻了（翻满了，或者翻到底了）
+    ended: bool = False        # 翻到了一条条目都没有的页
+    at: float = 0.0            # 第一页是哪一刻拿的
+    sizes: list[int] = field(default_factory=list)
+
+    def rank(self, note_id: str) -> Optional[int]:
+        try:
+            return self.organic.index(note_id) + 1
+        except ValueError:
+            return None
+
+    def result(self, note_id: str) -> tuple[str, Optional[int]]:
+        """这一篇在这个词下面的结论 →（标签, 名次或 None）。
+
+        名次只在自然结果里数；我们自己的帖子出现在付费位上不算搜到，单独记。
+        「没搜到」只在该翻的页都翻了的时候说——缺了页就是「没查全」。
+        """
+        rank = self.rank(note_id)
+        if rank is not None:
+            return rank_band(rank), rank
+        if note_id in self.paid:
+            return PAID, None
+        return (NOT_FOUND if self.complete else INCOMPLETE), None
+
+
+def listing(round_: Round, digest: str, state: State) -> Listing:
+    out = Listing()
+    seen: set[str] = set()
+    for page in range(1, round_.pages + 1):
+        record = state.page(round_.name, digest, page)
+        if record is None:
+            return out
+        out.pages += 1
+        if page == 1:
+            out.at = float(record.get("at") or 0)
+        ids = [str(i) for i in record.get("ids") or []]
+        ads = set(record.get("ads") or [])
+        out.sizes.append(len(ids))
+        if not ids:
+            out.ended = out.complete = True
+            return out
+        for index, note_id in enumerate(ids):
+            if index in ads:
+                out.paid.add(note_id)
+            elif note_id not in seen:
+                seen.add(note_id)
+                out.organic.append(note_id)
+    out.complete = True
+    return out
+
+
+def _blank() -> dict[str, int]:
+    return {"篇数": 0, **{label: 0 for label in RESULT_LABELS}}
+
+
+def _comment_group(comments: Optional[int], floor: int) -> str:
+    if comments is None:
+        return "评论数没量到"
+    return f"评论数到 {floor} 条" if comments >= floor else f"评论数不到 {floor} 条"
+
+
+def build_report(state: State, posts: list[Post], *, tz: timezone,
+                 comment_floor: int = 20, now: Optional[float] = None,
+                 intake_info: Optional[Intake] = None) -> dict[str, Any]:
+    """进度文件 + 这次读到的帖子 → 报告（一个能直接 json.dump 的字典）。**纯函数。**
+
+    里面只有计数：没有词、没有笔记 ID、没有链接。词用 K01 这样的编号。
+    """
+    by_word: dict[str, list[Post]] = {}
+    for post in posts:
+        by_word.setdefault(keyword_hash(post.keyword), []).append(post)
+    numbered = sorted(((n, d) for d, n in state.data["keywords"].items()
+                       if isinstance(n, int)))
+    rounds: dict[str, Any] = {}
+    results: dict[str, dict[tuple[str, str], tuple[str, Optional[int]]]] = {}
+
+    for round_ in ROUNDS.values():
+        listings = {d: listing(round_, d, state) for _n, d in numbered}
+        if not any(found.pages for found in listings.values()):
+            continue
+        # 这一轮算哪几个词：查过的都算；没查过的从前往后补到这一轮该查的个数
+        # （「前两个词翻到第 10 页」那一轮，别把另外十三个词列成「还没查」）。
+        chosen = [(n, d) for n, d in numbered if listings[d].pages]
+        for pair in numbered:
+            if len(chosen) >= round_.keywords:
+                break
+            if pair not in chosen:
+                chosen.append(pair)
+        chosen.sort()
+        digests = [d for _n, d in chosen]
+        by_age = {band: _blank() for band in AGE_BANDS}
+        by_comments: dict[str, dict[str, int]] = {}
+        per_word = []
+        results[round_.name] = {}
+        sizes: list[int] = []
+        types: dict[str, int] = {}
+        keys: set[str] = set()
+        ads = other = 0
+        for number, digest in chosen:
+            found = listings[digest]
+            for page in range(1, found.pages + 1):
+                record = state.page(round_.name, digest, page) or {}
+                if record.get("ids"):
+                    sizes.append(len(record["ids"]))
+                ads += len(record.get("ads") or [])
+                other += int(record.get("other") or 0)
+                keys.update(record.get("keys") or [])
+                for kind, count in (record.get("types") or {}).items():
+                    types[kind] = types.get(kind, 0) + int(count)
+            row = {"词": f"K{number:02d}", "拿到几页": found.pages,
+                   "看了前几位": len(found.organic), "查全了": found.complete,
+                   "翻到底了": found.ended, "按帖龄": {}}
+            for post in by_word.get(digest, []):
+                if not found.pages:
+                    continue
+                label, rank = found.result(post.note_id)
+                results[round_.name][(digest, post.note_id)] = (label, rank)
+                band = age_band(post.publish_ms, found.at, tz)
+                group = _comment_group(post.comments, comment_floor)
+                for bucket in (by_age[band], row["按帖龄"].setdefault(band, _blank()),
+                               by_comments.setdefault(group, _blank())):
+                    bucket["篇数"] += 1
+                    bucket[label] += 1
+            per_word.append(row)
+        need, have = plan(round_, digests, state)
+        rounds[round_.name] = {
+            "说明": round_.label,
+            "页": {"计划": round_.pages * len(digests), "拿到": have, "还差": need,
+                   "失败过": sum(1 for f in state.data["failures"]
+                              if f.get("round") == round_.name)},
+            "每页笔记数": ({"最少": min(sizes), "中位": statistics.median(sizes),
+                         "最多": max(sizes)} if sizes else {}),
+            "像广告位的条数": ads,
+            "认不出笔记的条数": other,
+            "条目类型": dict(sorted(types.items())),
+            "条目键名": sorted(keys),
+            "按帖龄": by_age,
+            "按评论数": dict(sorted(by_comments.items())),
+            "按词": per_word,
+        }
+
+    stability: dict[str, Any] = {}
+    base = results.get("first") or {}
+    for name in ("repeat1", "repeat2"):
+        again = results.get(name)
+        if not again or not base:
+            continue
+        tally = {"对得上的篇数": 0, "档位一样": 0, "档位变了": 0,
+                 "名次差超过20": 0, "一次搜到一次没搜到": 0}
+        for key, (label, rank) in again.items():
+            if key not in base:
+                continue
+            first_label, first_rank = base[key]
+            if INCOMPLETE in (label, first_label):
+                continue
+            tally["对得上的篇数"] += 1
+            tally["档位一样" if label == first_label else "档位变了"] += 1
+            if rank is not None and first_rank is not None and abs(rank - first_rank) > 20:
+                tally["名次差超过20"] += 1
+            if (rank is None) != (first_rank is None):
+                tally["一次搜到一次没搜到"] += 1
+        stability[name] = tally
+
+    failures: dict[str, int] = {}
+    # 读不懂的页：只数**现在还没拿到**的（改好代码重新拿到之后，这个警告就该没了）。
+    unread = {"页数": 0, "条目类型": {}, "条目键名": set()}
+    unread_seen: set[tuple] = set()
+    for item in state.data["failures"]:
+        kind = item.get("kind")
+        tag = f"{item.get('round')}：{'读不懂的页' if kind == UNREADABLE else kind}" + (
+            f"（HTTP {item.get('http')}）" if item.get("http") else "")
+        failures[tag] = failures.get(tag, 0) + 1
+        where = (item.get("round"), item.get("kw"), item.get("page"))
+        if kind != UNREADABLE or where in unread_seen \
+                or not all(isinstance(v, (str, int)) for v in where) \
+                or state.page(str(where[0]), str(where[1]), int(where[2] or 0)) is not None:
+            continue
+        unread_seen.add(where)
+        unread["页数"] += 1
+        unread["条目键名"].update(str(k) for k in item.get("keys") or [])
+        for name, count in (item.get("types") or {}).items():
+            unread["条目类型"][name] = unread["条目类型"].get(name, 0) + int(count)
+    unread["条目键名"] = sorted(unread["条目键名"])
+    unread["条目类型"] = dict(sorted(unread["条目类型"].items()))
+
+    day3 = (rounds.get("first") or {}).get("按帖龄", {}).get(AGE_BANDS[0]) or _blank()
+    report = {
+        "试跑": TRIAL_NAME,
+        "生成时间": datetime.fromtimestamp(now if now is not None else time.time(),
+                                        tz=tz).strftime("%Y-%m-%d %H:%M"),
+        "花费": {"已发请求": state.calls, "已记金额": round(state.yuan, 2),
+               "次数上限": MAX_CALLS, "金额上限": MAX_YUAN, "计划次数": PLANNED_CALLS},
+        "词": len(numbered),
+        "帖子": len({(keyword_hash(p.keyword), p.note_id) for p in posts}),
+        "回答": {
+            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
+            "3天内的帖子": day3["篇数"],
+            "搜到的": sum(day3[label] for label in FOUND_BANDS),
+            "没搜到的": day3[NOT_FOUND],
+            "没查全的": day3[INCOMPLETE],
+        },
+        "各轮": rounds,
+        "名次稳不稳": stability,
+        "失败的页": failures,
+        "读不懂的页": unread,
+        "余额对账": list(state.data["balance"]),
+    }
+    if intake_info is not None:
+        report["读表"] = {"填了词的行": intake_info.rows_with_keyword,
+                        "多写的词（没查）": intake_info.extra_words,
+                        "没进试跑的行": dict(sorted(intake_info.skipped.items()))}
+    return report
+
+
+def _counts(bucket: dict[str, int]) -> str:
+    shown = [f"{label} {bucket[label]}" for label in RESULT_LABELS if bucket.get(label)]
+    return f"{bucket['篇数']} 篇" + (f"：{' · '.join(shown)}" if shown else "")
+
+
+def render_report(report: dict[str, Any]) -> str:
+    """报告 → 给人看的文字。"""
+    spend = report["花费"]
+    answer = report["回答"]
+    lines = [
+        f"# 搜索可见试跑报告（{report['生成时间']}）",
+        "",
+        f"花费：发了 {spend['已发请求']} 次请求，按多了算 ¥{spend['已记金额']:.2f}"
+        f"（上限 {spend['次数上限']} 次 / ¥{spend['金额上限']:.0f}，计划 {spend['计划次数']} 次）。",
+        f"词 {report['词']} 个，帖子 {report['帖子']} 篇。",
+    ]
+    read = report.get("读表")
+    if read:
+        skipped = "、".join(f"{k} {v} 行" for k, v in read["没进试跑的行"].items()) or "没有"
+        lines.append(f"表里填了词的行 {read['填了词的行']} 行；没进试跑的：{skipped}；"
+                     f"一格里多写的词 {read['多写的词（没查）']} 个（没查）。")
+    lines += ["", "## 先回答那个问题", ""]
+    unread = report.get("读不懂的页") or {}
+    if unread.get("页数"):
+        lines += [
+            f"⚠ 有 {unread['页数']} 页对方返回了条目，却一条笔记 ID 都认不出来——返回的形状和"
+            "代码猜的不一样。**下面的数不能当成「没搜到」**：是没读懂，要先改代码再重新查。",
+            "那几页的条目类型：" + ("、".join(
+                f"{k} {v}" for k, v in unread["条目类型"].items()) or "（没有）")
+            + "；条目里的键名：" + ("、".join(unread["条目键名"]) or "（没有）") + "。",
+            ""]
+    if not answer["3天内的帖子"]:
+        lines.append("第一轮里还没有「发布 3 天内」的帖子有结果——要么第一轮还没跑，"
+                     "要么填了词的帖子都超过 3 天了（看下面按帖龄的表）。")
+    else:
+        lines.append(
+            f"发布 3 天内的帖子 {answer['3天内的帖子']} 篇，综合排序前 3 页里搜到 "
+            f"{answer['搜到的']} 篇，没搜到 {answer['没搜到的']} 篇"
+            + (f"，没查全 {answer['没查全的']} 篇" if answer["没查全的"] else "") + "。")
+    lines.append("「没搜到」只是说前几页里没有，不等于没被收录；名次是供应商那一刻看到的，"
+                 "不是某个读者看到的。")
+    for name, block in report["各轮"].items():
+        pages = block["页"]
+        lines += ["", f"## {block['说明']}（{name}）", "",
+                  f"页：计划 {pages['计划']}，拿到 {pages['拿到']}，还差 {pages['还差']}，"
+                  f"失败过 {pages['失败过']} 次。"]
+        size = block["每页笔记数"]
+        if size:
+            lines.append(f"每页笔记数：最少 {size['最少']}，中位 {size['中位']:g}，最多 {size['最多']}。"
+                         f"像广告位的 {block['像广告位的条数']} 条，认不出笔记的 "
+                         f"{block['认不出笔记的条数']} 条。")
+        lines += ["", "按帖龄（查的那一刻、按表里的「发布时间」算）："]
+        lines += [f"- {band}：{_counts(block['按帖龄'][band])}" for band in AGE_BANDS]
+        if block["按评论数"]:
+            lines += ["", "按评论数："]
+            lines += [f"- {group}：{_counts(bucket)}"
+                      for group, bucket in block["按评论数"].items()]
+        lines += ["", "按词："]
+        for row in block["按词"]:
+            if not row["拿到几页"]:
+                lines.append(f"- {row['词']}：还没查")
+                continue
+            state_text = "翻到底了" if row["翻到底了"] else ("查全了" if row["查全了"] else "没查全")
+            ages = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
+                            for band in AGE_BANDS if band in row["按帖龄"]) or "没有帖子"
+            lines.append(f"- {row['词']}：拿到 {row['拿到几页']} 页，看了前 {row['看了前几位']} 位"
+                         f"（{state_text}）｜{ages}")
+        if block["条目类型"] or block["条目键名"]:
+            lines += ["", "结果条目的类型：" + ("、".join(
+                f"{k} {v}" for k, v in block["条目类型"].items()) or "（没有）"),
+                      "结果条目里出现过的键名：" + ("、".join(block["条目键名"]) or "（没有）")]
+    if report["名次稳不稳"]:
+        lines += ["", "## 名次稳不稳（和第一轮比）", ""]
+        for name, tally in report["名次稳不稳"].items():
+            lines.append(f"- {name}：" + "，".join(f"{k} {v}" for k, v in tally.items()))
+    if report["失败的页"]:
+        lines += ["", "## 失败的页", ""]
+        lines += [f"- {tag}：{count} 次" for tag, count in report["失败的页"].items()]
+    if report["余额对账"]:
+        lines += ["", "## 余额对账（看失败的页收没收钱）", "",
+                  "同一时间巡查也在花同一个余额，所以这个差只能当参考。"]
+        for item in report["余额对账"]:
+            lines.append(f"- {item.get('round')}：发了 {item.get('requests')} 次请求，"
+                         f"余额少了 ${item.get('drop_usd')}")
+    return "\n".join(lines) + "\n"
+
+
+def write_report(directory: Path, report: dict[str, Any]) -> tuple[Path, Path]:
+    """报告写两份：给人看的 .md 和给机器读的 .json。都只有计数。"""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    text_path = directory / "report.md"
+    json_path = directory / "report.json"
+    text_path.write_text(render_report(report), encoding="utf-8")
+    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    return text_path, json_path
+
+
+# ---------- 进度文件放哪 ----------
+
+
+def default_state_dir() -> Path:
+    """默认放在自己的家目录下。不放系统临时目录：试跑要隔天再跑一轮，
+    临时目录重启就清，清了账本也就没了。"""
+    return Path.home() / ".linkcheck" / "search-trial"
+
+
+def check_state_dir(directory: Path, repo_root: Path) -> str:
+    """进度文件不许放进仓库里（里面有别人笔记的 ID，不能被顺手提交）。
+    空串 = 可以；否则是原因。"""
+    try:
+        resolved = Path(directory).expanduser().resolve()
+        root = Path(repo_root).resolve()
+    except OSError as exc:
+        return f"--state-dir 看不懂：{exc}"
+    if resolved == root or root in resolved.parents:
+        return (f"--state-dir 不能放在仓库目录里（{resolved}）——进度文件里有笔记 ID，"
+                "放这儿迟早被一起提交。换一个仓库外面的目录")
+    return ""
+
+
+def dry_run_lines(round_: Round, info: Intake, state: State, price: float,
+                  digests: list[str]) -> list[str]:
+    """--dry-run 打印的那几行：会做什么、要花多少。不发任何付费请求。"""
+    digests = digests[:round_.keywords]
+    need, have = plan(round_, digests, state)
+    upper = ""
+    if info.short_links:
+        upper = (f"（其中 {info.short_links} 行是短链，真跑时先免费展开；"
+                 "展不开的那几行不查，所以词数、页数是上界）")
+    room_calls = MAX_CALLS - state.calls
+    room_yuan = MAX_YUAN - state.yuan
+    lines = [
+        f"【只演练，不发付费请求】{round_.label}",
+        f"  词：{len(info.keywords)} 个（最多 {MAX_KEYWORDS} 个）；帖子：{len(info.posts)} 篇{upper}",
+        f"  这一轮查前 {len(digests)} 个词，每个词最多 {round_.pages} 页："
+        f"已经拿到 {have} 页，还要发最多 {need} 次，约 ¥{need * price:.2f}"
+        f"（¥{price:.3f} 一次）",
+        f"  账本：已经发了 {state.calls} 次、记了 ¥{state.yuan:.2f}；"
+        f"上限 {MAX_CALLS} 次 / ¥{MAX_YUAN:.0f}，还剩 {room_calls} 次 / ¥{room_yuan:.2f}",
+    ]
+    affordable = min(room_calls, int((room_yuan + 1e-9) // price) if price > 0 else room_calls)
+    if need > affordable:
+        lines.append(f"  ⚠ 剩下的额度只够 {max(0, affordable)} 次，这一轮跑不完，跑到上限会自己停")
+    if info.skipped:
+        lines.append("  没进试跑的行：" + "、".join(
+            f"{reason} {count} 行" for reason, count in sorted(info.skipped.items())))
+    if info.extra_words:
+        lines.append(f"  有 {info.extra_words} 个词写在同一格的后面，不查（一格只查第一个）")
+    return lines

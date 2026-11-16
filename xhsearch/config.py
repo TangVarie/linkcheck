@@ -135,6 +135,13 @@ class FieldNames:
     # 之后这一行直接按 ID 走 TikHub，不用每轮现场展开；换了链接自动作废。
     resolved_id: str = "作品ID"
 
+    # —— 搜索可见（2026-11-16 加，只有试跑在读，见 visibility.py）——
+    # 运营填：这一篇想在哪个词下面被搜到。一格一个词；空着 = 不查、不花钱。
+    # **不在 must_read 里，也不在 schema.expected_schema 里**：它跟着登记表里这张表的
+    # 「搜索检查」开关走（Settings.search_check），没开的表不读、缺了不报、
+    # 「补齐缺的列」也不建（见 schema.search_columns）。巡查一个字都不碰它。
+    search_keywords: str = "搜索关键词"
+
     def must_read(self) -> list[str]:
         """search 时必须拉回来的列。少读一个就会写错。"""
         return [
@@ -855,6 +862,12 @@ class Settings:
     # 回复靠账号 ID 对 detail 里发视频的账号排除（analyze.by_post_author）。开了的表，扫到的负面评论
     # 攒着，点了「已处理」才收（见 negatives.py）——每轮展开的不一定是同几条。
     reply_pages_per_post: int = 0
+
+    # 这张表开没开「搜索检查」（2026-11-16 加）。按表配：登记表里的「搜索检查」
+    # 那个复选框，见 registry.apply_overrides。默认关——关着的表，「搜索关键词」
+    # 那一列缺了体检不报、「补齐缺的列」不建，试跑（cli.py search-trial）也不读它。
+    # **巡查不看这个开关**：开了也不会多发一次请求，搜索只有手工起的试跑会做。
+    search_check: bool = False
 
     # 小红书笔记发布多少天内额外调一次 detail。**默认 0 = 不调。**
     #

@@ -85,6 +85,14 @@ THRESHOLD_COLUMNS = (COL_TIER_EVALUATING, COL_TIER_HOT, COL_TIER_SUPER_HOT,
 # 老的注册表里没有这一列：在飞书里手工加一列同名的文本列就行，没加 = 不排除。
 COL_BLUE_WORD_EXCLUDES = "蓝词排除词"
 
+# —— 逐表「搜索检查」开关（2026-11-16 加）——
+# 复选框，空着 = 关。开了的表才有「搜索关键词」那一列的事：体检才会说它缺、
+# 「补齐缺的列」才会建它、搜索可见的试跑（cli.py search-trial）才读它。
+# 关着的表一切照旧——老表不会因为多了一个新功能就集体变红。
+# **它不让巡查多花一分钱**：搜索只有手工起的试跑会发，没有任何定时任务看这个开关。
+# 老的注册表里没有这一列：在飞书里手工加一列同名的复选框就行，没加 = 全关。
+COL_SEARCH_CHECK = "搜索检查"
+
 # 建注册表时用的列定义（类型码见 schema.FIELD_TYPE_NAMES）。
 REGISTRY_FIELDS = [
     {"field_name": COL_LABEL, "type": 1},
@@ -98,6 +106,7 @@ REGISTRY_FIELDS = [
     *[{"field_name": name, "type": 2, "property": {"formatter": "0"}}
       for name in THRESHOLD_COLUMNS],
     {"field_name": COL_BLUE_WORD_EXCLUDES, "type": 1},
+    {"field_name": COL_SEARCH_CHECK, "type": 7},
 ]
 
 # 认出「这确实是一张注册表」要的最小列集。用来挡住 FEISHU_REGISTRY 被误填成
@@ -130,6 +139,8 @@ class Entry:
     thresholds: dict = field(default_factory=dict)
     # 「蓝词排除词」那一格拆出来的词（没校验长度，见 read_blue_word_excludes）。
     blue_word_excludes: list = field(default_factory=list)
+    # 「搜索检查」那个勾。没这一列、没勾都是 False。
+    search_check: bool = False
 
     @property
     def usable(self) -> bool:
@@ -175,7 +186,7 @@ def read(table: feishu.Bitable) -> list[Entry]:
 
     wanted = [c for c in (COL_LABEL, COL_TARGET, COL_ENABLED, COL_NOTE,
                           COL_STATUS, COL_FIRST_RUN, *THRESHOLD_COLUMNS,
-                          COL_BLUE_WORD_EXCLUDES)
+                          COL_BLUE_WORD_EXCLUDES, COL_SEARCH_CHECK)
               if c in meta]
     entries: list[Entry] = []
     for record in table.search(wanted):
@@ -194,6 +205,9 @@ def read(table: feishu.Bitable) -> list[Entry]:
                         for name in THRESHOLD_COLUMNS
                         if feishu.read_int(cells.get(name)) is not None},
             blue_word_excludes=feishu.read_keywords(cells.get(COL_BLUE_WORD_EXCLUDES)),
+            # 空着算关（和「启用」相反）：这是个要人主动打开的功能。
+            search_check=feishu.read_bool(cells.get(COL_SEARCH_CHECK))
+            if COL_SEARCH_CHECK in cells else False,
         )
         if not entry.target:
             entry.problem = f"「{COL_TARGET}」是空的"
@@ -449,10 +463,13 @@ def apply_overrides(base, entry: Entry, *, log=None):
             log(f"⚠ 注册表里「{entry.label}」的阈值有问题：{problem}")
         for problem in exclude_problems:
             log(f"⚠ 注册表里「{entry.label}」的{problem}")
-    if not override.any and not excludes:
+    search_check = bool(getattr(entry, "search_check", False))
+    if not override.any and not excludes and not search_check:
         return base
 
     settings = copy.deepcopy(base)
+    if search_check:
+        settings.search_check = True
     if excludes:
         settings.blue_word_excludes = tuple(excludes)
         if log:

@@ -172,10 +172,20 @@ TIKHUB_PATHS = {
     # 抖音楼中楼：$0.001、allow_discount=1，和抖音评论接口同价。参数是 item_id（不是 aweme_id）。
     ("douyin", "replies"): "/api/v1/douyin/app/v3/fetch_video_comment_replies",
     ("douyin", "detail"): "/api/v1/douyin/app/v3/fetch_one_video",
+    # 按关键词搜笔记（2026-11-16 加，只给「搜索可见」试跑用，见 visibility.py）。
+    # **巡查不走这一条**：rows.plan_calls 从不排它，只有 `cli.py search-trial` 会发。
+    # 对方计价表里小红书搜笔记有七个端点，只有这一个在公开 OpenAPI 里；另外六个
+    # 只挂在计价表上——和上面那三个 404 的打折端点是同一种情况，别换。
+    ("xhs", "search"): "/api/v1/xiaohongshu/app_v2/search_notes",
 }
 
 # 抽象的用途名（rows.PURPOSE_REPLIES 是同一个字符串；providers 不反过来 import rows）。
 REPLIES = "replies"
+SEARCH = "search"
+
+# 搜索排序：抽象名（和评论排序同一对名字）→ TikHub 的 sort_type。
+# general = 综合（App 里默认那一种），time_descending = 最新。
+TIKHUB_SEARCH_SORTS = {"default": "general", "latest": "time_descending"}
 
 # 单价（元/次）。TikHub 的数字来自它自己公开免鉴权的计价接口
 # https://api.tikhub.dev/api/v1/tikhub/user/get_all_endpoints_info
@@ -199,6 +209,12 @@ REPLIES = "replies"
 PRICING_CHECKED_ON = "2026-08-24"
 _USD_TO_CNY = 7.2
 TIKHUB_USD = {"xhs": 0.010, "douyin": 0.001}
+# 搜笔记那个端点的单价（美元/次，一次 = 一页结果）。和评论接口同价，但它是计价表里
+# 单独的一行，所以单独记、单独带核对日期：allow_discount=0，每日免费额度不能用。
+# 一次失败的搜索收不收钱**没验过**（另一个仓库见过 HTTP 400 的搜索页，没对过账），
+# 试跑按「发出去就算花了」记（visibility.Ledger）。
+TIKHUB_SEARCH_USD = 0.010
+SEARCH_PRICING_CHECKED_ON = "2026-11-16"
 SOCIALDATAX_YUAN = 0.10   # 10 积分 × ¥0.01，全平台统一价
 
 
@@ -261,8 +277,9 @@ def _handles_everything(platform: str, purpose: str, arguments: dict[str, Any]) 
 
 def _sdx_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
     """SocialDataX 不接楼中楼：它那边一次真实调用都还没发过（docs/供应商对比.md），
-    楼中楼的字段更没人见过。降到它那一轮就不展开，由 runner 说一声。"""
-    return purpose != REPLIES
+    楼中楼的字段更没人见过。降到它那一轮就不展开，由 runner 说一声。
+    搜索也不接：它有搜索端点，但我们一次都没调过，这家也还没过验收。"""
+    return purpose not in (REPLIES, SEARCH)
 
 
 def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -> bool:
@@ -281,6 +298,8 @@ def _tikhub_can_handle(platform: str, purpose: str, arguments: dict[str, Any]) -
     """
     if (platform, purpose) not in TIKHUB_PATHS:
         return False
+    if purpose == SEARCH:
+        return bool(str(arguments.get("keyword") or "").strip())
     if platform == "douyin" and not arguments.get("aweme_id"):
         return False
     return True
@@ -400,7 +419,18 @@ def _tikhub_build(api_key: str, platform: str, purpose: str, arguments: dict[str
     args = dict(arguments)
     params: dict[str, Any] = {}
 
-    if platform == "xhs":
+    if platform == "xhs" and purpose == SEARCH:
+        # 一次 = 一页结果。第 2 页起要把第 1 页给的 search_id / search_session_id
+        # 原样传回去（对方 OpenAPI 的翻页说明）；别的参数（笔记类型、时间范围）
+        # 一律不传，用对方的默认值——试跑要看的就是「什么都不筛」时排在哪。
+        sort = args.get("sort", "default")
+        params["keyword"] = str(args.get("keyword") or "").strip()
+        params["page"] = max(1, int(args.get("page") or 1))
+        params["sort_type"] = TIKHUB_SEARCH_SORTS.get(sort, sort)
+        for name in ("search_id", "search_session_id"):
+            if args.get(name):
+                params[name] = args[name]
+    elif platform == "xhs":
         if args.get("note_id"):
             params["note_id"] = args["note_id"]
         elif args.get("url"):
@@ -657,6 +687,111 @@ def _douyin_comment_items(comments: list[Any], *, with_replies: bool = True) -> 
     return items
 
 
+_XHS_NOTE_ID_CHARS = frozenset("0123456789abcdef")
+
+# 搜索结果里「这一条是广告位」的几种写法。**没实测过**——TikHub 透传的是平台原文，
+# 广告怎么标对方文档没写。这里只认键名或类型名里明摆着带 ad 的；认出来的不计入
+# 自然排名。试跑报告会把一页里出现过的键名和类型名列出来，对着改这张表。
+_SEARCH_AD_KEYS = ("ads_info", "ad_info", "is_ads", "is_ad", "ads", "ad")
+
+
+def _is_xhs_note_id(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 24
+            and all(ch in _XHS_NOTE_ID_CHARS for ch in value.lower()))
+
+
+def _search_item(item: Any) -> tuple[Optional[str], bool, str]:
+    """搜索结果里的一条 →（笔记 ID 或 None, 像不像广告位, 类型名）。
+
+    app_v2 把笔记本体包在 `items[].note` 里（web 端是 `note_card`），两种都认，
+    都不是就当它自己是笔记本体。ID 认 `note_id` 或 `id`，必须是 24 位十六进制
+    ——话题卡、搜索建议卡这些也有 id，但不是这个形状。
+    """
+    if not isinstance(item, dict):
+        return None, False, "非对象"
+    card = item
+    for key in ("note", "note_card"):
+        if isinstance(item.get(key), dict):
+            card = item[key]
+            break
+    kind = str(item.get("model_type") or card.get("model_type") or "")[:40]
+    note_id = next((str(card[k]).lower() for k in ("note_id", "id")
+                    if _is_xhs_note_id(card.get(k))), None)
+    words = set(kind.lower().replace("_", " ").replace("-", " ").split())
+    is_ad = bool(words & {"ad", "ads", "advert", "advertisement"})
+    for holder in (item, card):
+        if any(holder.get(k) for k in _SEARCH_AD_KEYS):
+            is_ad = True
+    return note_id, is_ad, kind
+
+
+def _search_session(inner: dict[str, Any], core: dict[str, Any]) -> dict[str, str]:
+    """翻页要回传的那两个值。在哪一层对方没写，里外两层都找。"""
+    out: dict[str, str] = {}
+    for name in ("search_id", "search_session_id"):
+        for holder in (core, inner):
+            value = holder.get(name)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) \
+                    and value not in ("", 0):
+                out[name] = str(value)
+                break
+    return out
+
+
+def _tikhub_search(inner: dict[str, Any], http_status: int, request_id: str,
+                   api_key: str) -> Result:
+    """搜索那一页 → 归一化形状。**只留 ID、顺序和几个计数**，标题、作者、正文
+    一个字都不往外带：
+
+        {"notes": [{"note_id", "ad": bool}]（按页面顺序，只有认得出笔记 ID 的）,
+         "items": 这一页一共几条, "other_items": 认不出笔记 ID 的有几条,
+         "model_types": {类型名: 条数}, "item_keys": [条目里出现过的键名],
+         "search_id", "search_session_id"（没给就没有这两个键）}
+
+    成功信封实测过的只有外层（另一个仓库在用同一个端点）：
+    `{code: 200, data: {code: 0, success: true, data: {items: [...]}}}`。
+    列表的键名对方没有公开的字段清单，几种常见叫法都认。
+    """
+    core = inner.get("data") if isinstance(inner.get("data"), dict) else inner
+    raw_items = next((core[k] for k in ("items", "notes", "note_list")
+                      if isinstance(core.get(k), list)), None)
+    if raw_items is None:
+        refused = (inner.get("success") is False
+                   or (inner.get("success") is not True
+                       and inner.get("code") not in (None, 0, 200, "0", "200")))
+        if refused:
+            # HTTP 200、里层说没成功：上游拒了这一次搜索（关键词、会话过期……）。
+            # 行级的事，不是这家的契约坏了。
+            return Err(Failure.UNKNOWN, "search_refused",
+                       "搜索接口里层报错："
+                       + _redact(json.dumps(inner, ensure_ascii=False), api_key)[:200],
+                       http_status=http_status, request_id=request_id)
+        return Err(Failure.TRANSPORT, "unexpected_shape",
+                   _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
+                   http_status=http_status, request_id=request_id)
+    notes: list[dict[str, Any]] = []
+    model_types: dict[str, int] = {}
+    keys: set[str] = set()
+    other = 0
+    for item in raw_items:
+        note_id, is_ad, kind = _search_item(item)
+        model_types[kind or "（没写）"] = model_types.get(kind or "（没写）", 0) + 1
+        if isinstance(item, dict):
+            keys.update(str(k)[:40] for k in item)
+        if note_id is None:
+            other += 1
+            continue
+        notes.append({"note_id": note_id, "ad": is_ad})
+    return Ok({
+        "notes": notes,
+        "items": len(raw_items),
+        "other_items": other,
+        "model_types": model_types,
+        "item_keys": sorted(keys)[:60],
+        **_search_session(inner, core),
+    }, request_id=request_id)
+
+
 def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
                       http_status: int, request_id: str, api_key: str) -> Result:
     inner = payload.get("data")
@@ -667,6 +802,9 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
         return Err(Failure.TRANSPORT, "no_data",
                    _redact(json.dumps(payload, ensure_ascii=False), api_key)[:300],
                    http_status=http_status, request_id=request_id)
+
+    if platform == "xhs" and purpose == SEARCH:
+        return _tikhub_search(inner, http_status, request_id, api_key)
 
     if platform == "xhs" and purpose == "comments":
         core = inner.get("data") if isinstance(inner.get("data"), dict) else {}
@@ -846,6 +984,8 @@ def _tikhub_parse(platform: str, purpose: str, http_status: int, content_type: s
 
 
 def _tikhub_yuan(platform: str, purpose: str) -> float:
+    if purpose == SEARCH:
+        return TIKHUB_SEARCH_USD * _USD_TO_CNY
     return TIKHUB_USD.get(platform, 0.010) * _USD_TO_CNY
 
 
