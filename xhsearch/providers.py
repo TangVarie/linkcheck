@@ -755,17 +755,19 @@ def _tikhub_search(inner: dict[str, Any], http_status: int, request_id: str,
     core = inner.get("data") if isinstance(inner.get("data"), dict) else inner
     raw_items = next((core[k] for k in ("items", "notes", "note_list")
                       if isinstance(core.get(k), list)), None)
+    # 里层说没成功就是没成功，**不管带没带列表**：拒掉的搜索常常顺手带一个空的
+    # `items: []`，当成「这一页一条都没有」就会被永久记成翻到底了、报成没搜到。
+    refused = (inner.get("success") is False
+               or (inner.get("success") is not True
+                   and inner.get("code") not in (None, 0, 200, "0", "200")))
+    if refused:
+        # HTTP 200、里层说没成功：上游拒了这一次搜索（关键词、会话过期……）。
+        # 行级的事，不是这家的契约坏了。
+        return Err(Failure.UNKNOWN, "search_refused",
+                   "搜索接口里层报错："
+                   + _redact(json.dumps(inner, ensure_ascii=False), api_key)[:200],
+                   http_status=http_status, request_id=request_id)
     if raw_items is None:
-        refused = (inner.get("success") is False
-                   or (inner.get("success") is not True
-                       and inner.get("code") not in (None, 0, 200, "0", "200")))
-        if refused:
-            # HTTP 200、里层说没成功：上游拒了这一次搜索（关键词、会话过期……）。
-            # 行级的事，不是这家的契约坏了。
-            return Err(Failure.UNKNOWN, "search_refused",
-                       "搜索接口里层报错："
-                       + _redact(json.dumps(inner, ensure_ascii=False), api_key)[:200],
-                       http_status=http_status, request_id=request_id)
         return Err(Failure.TRANSPORT, "unexpected_shape",
                    _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
                    http_status=http_status, request_id=request_id)

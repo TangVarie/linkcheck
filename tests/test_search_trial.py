@@ -176,6 +176,17 @@ class TestSearchParse(unittest.TestCase):
         self.assertIsInstance(result, protocol.Err)
         self.assertEqual((result.kind, result.code), (protocol.Failure.UNKNOWN, "search_refused"))
 
+    def test_inner_refusal_with_an_empty_list_is_not_an_empty_page(self):
+        """里层说没成功，就算带着一个空的 items，也是失败，不是「一条都没有」。"""
+        for kwargs in ({"success": False}, {"success": None, "inner_code": 5001},
+                       {"success": False, "inner_code": 5001}):
+            result = self.parse(body([], **kwargs))
+            self.assertIsInstance(result, protocol.Err, kwargs)
+            self.assertEqual((result.kind, result.code),
+                             (protocol.Failure.UNKNOWN, "search_refused"))
+        self.assertIsInstance(self.parse(body(page_of(100), success=False)), protocol.Err)
+        self.assertIsInstance(self.parse(body([])), protocol.Ok)       # 真的空页照旧
+
     def test_unrecognised_success_shape_is_a_contract_failure(self):
         text = json.dumps({"code": 200, "data": {"code": 0, "success": True,
                                                  "data": {"whatever": 1}}})
@@ -740,11 +751,51 @@ class TestRunRound(unittest.TestCase):
         self.assertIn("Key", result.stopped)
         self.assertNotIn(KEY, " ".join(logs) + result.stopped)
 
-    def test_no_session_on_page_one_means_no_page_two(self):
+    def test_no_session_on_page_one_is_a_failure_and_is_fetched_again(self):
         sender = Sender([ok(page_of(100), session=False)], default=by_page)
         result, logs = run("first", self.words[:1], self.state, sender)
-        self.assertEqual((result.fetched, result.requests), (1, 1))
+        self.assertEqual((result.fetched, result.failed, result.requests, result.todo),
+                         (0, 1, 1, 3))
+        self.assertFalse(result.clean)
         self.assertTrue(any("会话值" in line for line in logs))
+        self.assertEqual(self.state.data["pages"], {})                 # 这一页不留
+        self.assertEqual(self.state.data["failures"][0]["kind"], visibility.NO_SESSION)
+        # 再跑：第 1 页重新拿（再付一次），这回给了会话值，三页都拿到。
+        again, _logs = run("first", self.words[:1], fresh_state(self.dir.name), sender)
+        self.assertEqual((again.fetched, again.reused, again.todo), (3, 0, 0))
+        self.assertTrue(again.clean)
+        self.assertEqual(len(sender.requests), 4)
+
+    def test_session_less_first_page_already_in_the_state_file_is_not_trusted(self):
+        digest = self.words[0][1]
+        self.state.keep_page("first", digest, 1, {
+            "notes": [{"note_id": nid(i), "ad": False} for i in range(100, 120)],
+            "items": 20}, 1_800_000_000.0)
+        self.assertIsNone(self.state.page("first", digest, 1))
+        self.assertEqual(visibility.plan(visibility.ROUNDS["first"], [digest], self.state),
+                         (3, 0))
+        sender = Sender(default=by_page)
+        result, _logs = run("first", self.words[:1], self.state, sender)
+        self.assertEqual((result.fetched, result.reused), (3, 0))
+
+    def test_refused_search_with_an_empty_list_is_not_kept_as_the_end(self):
+        sender = Sender([ok([], success=False)], default=by_page)
+        result, _logs = run("first", self.words[:1], self.state, sender)
+        self.assertEqual((result.fetched, result.failed, result.todo), (0, 1, 3))
+        self.assertFalse(result.clean)
+        self.assertEqual(self.state.data["pages"], {})
+        again, _logs = run("first", self.words[:1], self.state, sender)
+        self.assertEqual(again.fetched, 3)
+
+    def test_old_state_file_without_round_times_still_loads(self):
+        run("first", self.words[:1], self.state, Sender(default=by_page))
+        path = pathlib.Path(self.dir.name, "state.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data.pop("rounds"), {"first": {"at": 1_800_000_000}})
+        path.write_text(json.dumps(data), encoding="utf-8")
+        state = fresh_state(self.dir.name)
+        self.assertEqual(state.calls, 3)
+        self.assertEqual(state.round_at("first"), 1_800_000_000.0)     # 退回页上的时间
 
     def test_empty_page_ends_the_keyword(self):
         sender = Sender([ok(page_of(100)), ok([])])
@@ -844,6 +895,85 @@ class TestReport(unittest.TestCase):
             "3天内的帖子": 3, "搜到的": 2, "没搜到的": 1, "没查全的": 0})
         row = report["各轮"]["first"]["按词"][0]
         self.assertEqual((row["词"], row["看了前几位"], row["查全了"]), ("K01", 60, True))
+
+    def test_posts_under_a_keyword_that_was_never_fetched_are_incomplete(self):
+        """第二个词第 1 页 HTTP 400：它下面的帖子是「没查全」，不能从表里消失。"""
+        other = "另一个词"
+        self.state.register([other])
+        bad = transport.Response(400, "application/json",
+                                 json.dumps({"detail": {"code": 400, "message": "x"}}))
+        pairs = [(self.word, self.digest), (other, visibility.keyword_hash(other))]
+        result, _logs = run("first", pairs, self.state,
+                            Sender([ok(page_of(100)), ok(page_of(200)), ok(page_of(300)), bad]))
+        self.assertEqual(result.failed, 1)
+        posts = [self.post(105, 2, comments=30),
+                 visibility.Post(nid(999), other, days_before(2), 30)]
+        report = self.report(posts)
+        self.assertEqual(report["帖子"], 2)
+        self.assertEqual(report["回答"], {
+            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
+            "3天内的帖子": 2, "搜到的": 1, "没搜到的": 0, "没查全的": 1})
+        block = report["各轮"]["first"]
+        self.assertEqual(block["按评论数"]["评论数到 20 条"]["没查全"], 1)
+        self.assertEqual(block["按词"][1]["按帖龄"]["3天内"]["没查全"], 1)
+        text = visibility.render_report(report)
+        self.assertIn("搜到 1 篇，没搜到 0 篇，没查全 1 篇", text)
+        self.assertIn("K02：还没查｜3天内 1 篇：没查全 1", text)
+
+    def test_posts_under_a_keyword_the_cap_stopped_before_are_incomplete(self):
+        other = "另一个词"
+        self.state.register([other])
+        self.state.data["calls"] = visibility.MAX_CALLS - 3
+        pairs = [(self.word, self.digest), (other, visibility.keyword_hash(other))]
+        sender = Sender(default=by_page)
+        result, _logs = run("first", pairs, self.state, sender)
+        self.assertEqual((len(sender.requests), bool(result.stopped)), (3, True))
+        # 帖龄按这一轮跑的那一刻算（这个词没有自己的第 1 页时间）。
+        posts = [visibility.Post(nid(999), other, days_before(2)),
+                 visibility.Post(nid(998), other, days_before(5))]
+        by_age = self.report(posts)["各轮"]["first"]["按帖龄"]
+        self.assertEqual((by_age["3天内"]["没查全"], by_age["4到7天"]["没查全"]), (1, 1))
+
+    def test_round_where_every_first_page_failed_still_counts_its_posts(self):
+        bad = transport.Response(400, "application/json",
+                                 json.dumps({"detail": {"code": 400, "message": "x"}}))
+        run("first", [(self.word, self.digest)], self.state, Sender([bad]))
+        report = self.report([self.post(105, 2)])
+        self.assertEqual((report["回答"]["3天内的帖子"], report["回答"]["没查全的"]), (1, 1))
+
+    def test_post_published_after_the_round_was_searched_is_left_out(self):
+        """同一个词后来又填了一篇新帖：它不在当时查的那批里，不能算成「3 天内、没搜到」。"""
+        for page in (1, 2, 3):
+            self.keep("first", page, range(page * 100, page * 100 + 20))
+        later = visibility.Post(nid(999), self.word, days_before(-2))   # 查完两天后才发
+        report = self.report([self.post(105, 2), later])
+        self.assertEqual(report["回答"], {
+            "问题": "发布 3 天内的帖子，综合排序前 3 页里看不看得见",
+            "3天内的帖子": 1, "搜到的": 1, "没搜到的": 0, "没查全的": 0})
+        block = report["各轮"]["first"]
+        self.assertEqual(block["查之后才发的帖子（不算）"], 1)
+        self.assertEqual(sum(b["篇数"] for b in block["按帖龄"].values()), 1)
+        self.assertIn("有 1 篇帖子是这一轮查完之后才发的", visibility.render_report(report))
+        # 没查到的词也一样：这一轮跑完之后才发的不算。
+        other = "另一个词"
+        self.state.register([other])
+        self.state.mark_round("first", AT)
+        report = self.report([visibility.Post(nid(998), other, days_before(-2)),
+                              visibility.Post(nid(997), other, days_before(1))])
+        block = report["各轮"]["first"]
+        self.assertEqual((block["查之后才发的帖子（不算）"],
+                          block["按帖龄"]["3天内"]["没查全"]), (1, 1))
+
+    def test_later_round_still_counts_the_newer_post(self):
+        for page in (1, 2, 3):
+            self.keep("first", page, range(page * 100, page * 100 + 20))
+            self.state.keep_page("repeat2", self.digest, page, {
+                "notes": [{"note_id": nid(i), "ad": False}
+                          for i in range(page * 100, page * 100 + 20)],
+                "items": 20, "search_id": "s"}, AT + 3 * 86400)
+        rounds = self.report([visibility.Post(nid(999), self.word, days_before(-2))])["各轮"]
+        self.assertEqual(rounds["first"]["按帖龄"]["3天内"]["篇数"], 0)
+        self.assertEqual(rounds["repeat2"]["按帖龄"]["3天内"]["没搜到"], 1)
 
     def test_unreadable_page_never_reads_as_not_found(self):
         """认不出 ID 的页：报告不许说「没搜到」「查全了」，要明说没读懂。"""
@@ -1047,6 +1177,29 @@ class TestCommand(unittest.TestCase):
             code, out = self.invoke()
         self.assertEqual(code, 1)
         self.assertIn("没拿到 1 页", out)
+
+    def test_first_page_without_a_session_exits_non_zero(self):
+        sender = Sender([ok(page_of(100), session=False)], default=by_page)
+        with mock.patch.object(visibility, "_send_once", sender):
+            code, out = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertIn("没拿到 1 页", out)
+        self.assertIn("还差 3 页", out)
+        self.assertIn("没查全 2 篇", out)
+        self.assertNotIn("没搜到 1 篇", out)
+        with mock.patch.object(visibility, "_send_once", sender):       # 再跑补得上
+            code, out = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertIn("新拿到 3 页，沿用 3 页", out)
+
+    def test_report_only_leaves_out_a_post_added_after_the_search(self):
+        with mock.patch.object(visibility, "_send_once", Sender(default=by_page)):
+            self.invoke()
+        self.table._records.append(trial_record(998, "某某品牌", age_days=-1))
+        code, out = self.invoke("--report-only")
+        self.assertEqual(code, 0)
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里搜到 1 篇，没搜到 1 篇。", out)
+        self.assertIn("有 1 篇帖子是这一轮查完之后才发的", out)
 
     def test_unreadable_first_page_exits_non_zero_after_one_call(self):
         odd = [{"model_type": "note", "note": {"noteId": nid(n)}} for n in range(100, 120)]

@@ -29,7 +29,14 @@
 ## 断了能接着跑，拿到的页不付第二次钱
 
 每拿到一页就存盘。再跑同一条命令，拿到过的页直接用，只补没拿到的。
-翻页要用的那两个会话值跟着第一页一起存着。
+翻页要用的那两个会话值跟着第一页一起存着。第一页有笔记却没给会话值的，后面的页
+翻不了：这一页**不留**、算没拿到（退出码非零），下次重新拿。
+
+## 没查到的帖子算「没查全」，后来才发的帖子不算
+
+一个词在某一轮一页都没拿到（第 1 页失败、上限先到），它下面的帖子照样进这一轮的
+表，记成「没查全」，帖龄按这一轮跑的那一刻算（进度文件里的 `rounds`）。反过来，
+那个词查的那一刻还没发出来的帖子不进这一轮——它不在当时查的那批里。
 
 全部是**可以离线测的**：发请求的那一下是注入的（`send`），进度文件的位置是参数。
 """
@@ -112,6 +119,9 @@ SKIP_NO_TIME = "发布时间空着"
 
 # 一页里有条目、却一条笔记 ID 都认不出来：记在失败清单里的种类名。
 UNREADABLE = "unreadable_page"
+# 第 1 页有笔记、却没给翻页要回传的会话值：后面的页翻不了，这一页也不留。
+NO_SESSION = "no_session"
+SESSION_KEYS = ("search_id", "search_session_id")
 
 
 # ---------- 读表：哪些帖子、哪些词 ----------
@@ -234,6 +244,7 @@ class State:
          "pages": {"轮|词的哈希|页": {"at": 秒, "ids": [按顺序的笔记 ID],
                    "ads": [像广告位的那几条在 ids 里的下标], "items", "other",
                    "types": {类型名: 条数}, "keys": [键名], "sid": {翻页会话}}},
+         "rounds": {"轮": {"at": 最近一次跑这一轮是哪一刻（秒）}},
          "failures": [{"round", "kw", "page", "kind", "http", "at"}],
          "balance": [{"round", "drop_usd", "requests", "at"}]}
     """
@@ -242,7 +253,7 @@ class State:
         self.path = Path(path)
         self.data: dict[str, Any] = {
             "version": STATE_VERSION, "trial": TRIAL_NAME, "calls": 0, "yuan": 0.0,
-            "keywords": {}, "pages": {}, "failures": [], "balance": [],
+            "keywords": {}, "pages": {}, "rounds": {}, "failures": [], "balance": [],
         }
 
     @classmethod
@@ -261,6 +272,7 @@ class State:
         if not isinstance(data, dict) or data.get("trial") != TRIAL_NAME \
                 or data.get("version") != STATE_VERSION:
             raise StateError(f"进度文件不是这次试跑的（{state.path}），换一个 --state-dir")
+        data.setdefault("rounds", {})     # 早先存的进度文件没有这一项
         for key, default in state.data.items():
             if not isinstance(data.get(key), type(default)) \
                     and not (key == "yuan" and isinstance(data.get(key), int)):
@@ -336,12 +348,36 @@ class State:
         return f"{round_name}|{digest}|{page}"
 
     def page(self, round_name: str, digest: str, page: int) -> Optional[dict]:
-        """拿到过的那一页；没有就是 None。读不懂的页（见 `unreadable`）也当没有：
-        现在不会再存这种页，这里是防着进度文件里已经有一份。"""
+        """拿到过的那一页；没有就是 None。读不懂的页（见 `unreadable`）、翻不下去的
+        第 1 页（见 `sessionless`）也当没有：现在不会再存这种页，这里是防着进度文件里
+        已经有一份——当没有，下次跑才会重新拿。"""
         value = self.data["pages"].get(self.page_key(round_name, digest, page))
         if not isinstance(value, dict) or unreadable(value):
             return None
+        round_ = ROUNDS.get(round_name)
+        if page == 1 and round_ is not None and round_.pages > 1 and sessionless(value):
+            return None
         return value
+
+    # —— 每一轮是哪一刻跑的 ——
+
+    def mark_round(self, round_name: str, at: float) -> None:
+        self.data["rounds"][round_name] = {"at": int(at)}
+
+    def round_at(self, round_name: str) -> float:
+        """这一轮的观察时刻：最近一次跑它是哪一刻。没查到的词（第 1 页失败、上限先到）
+        没有自己的第 1 页时间，帖龄就按这个算。早先的进度文件没记，退回这一轮里
+        最晚的那一页 / 那一次失败的时间；都没有就是 0。"""
+        entry = self.data["rounds"].get(round_name)
+        if isinstance(entry, dict) and isinstance(entry.get("at"), (int, float)) \
+                and entry["at"] > 0:
+            return float(entry["at"])
+        prefix = f"{round_name}|"
+        stamps = [v.get("at") for k, v in self.data["pages"].items()
+                  if k.startswith(prefix) and isinstance(v, dict)]
+        stamps += [f.get("at") for f in self.data["failures"]
+                   if isinstance(f, dict) and f.get("round") == round_name]
+        return float(max((s for s in stamps if isinstance(s, (int, float))), default=0))
 
     def keep_page(self, round_name: str, digest: str, page: int,
                   data: dict[str, Any], at: float) -> dict:
@@ -354,8 +390,7 @@ class State:
             "other": int(data.get("other_items") or 0),
             "types": dict(data.get("model_types") or {}),
             "keys": list(data.get("item_keys") or []),
-            "sid": {k: str(data[k]) for k in ("search_id", "search_session_id")
-                    if data.get(k)},
+            "sid": {k: str(data[k]) for k in SESSION_KEYS if data.get(k)},
         }
         self.data["pages"][self.page_key(round_name, digest, page)] = record
         return record
@@ -378,6 +413,14 @@ def unreadable(page: dict[str, Any]) -> bool:
     两种形状都认：归一化后的（`notes`）和进度文件里的（`ids`）。"""
     ids = page.get("ids") if "ids" in page else page.get("notes")
     return not ids and int(page.get("items") or 0) > 0
+
+
+def sessionless(page: dict[str, Any]) -> bool:
+    """这一页有笔记、却没给翻页要回传的两个会话值里的任何一个——后面的页翻不了。
+    只对第 1 页有意义。两种形状都认：归一化后的和进度文件里的（`sid`）。"""
+    if "ids" in page:
+        return bool(page.get("ids")) and not page.get("sid")
+    return bool(page.get("notes")) and not any(page.get(k) for k in SESSION_KEYS)
 
 
 # ---------- 发请求 ----------
@@ -445,6 +488,8 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
     last_sent = [0.0]
     keywords = keywords[:round_.keywords]
     chosen = [digest for _word, digest in keywords]
+    # 这一轮是哪一刻跑的：没查到的词在报告里按这一刻算帖龄（不发请求、不花钱）。
+    state.mark_round(round_.name, clock())
 
     def fetch(word: str, digest: str, page: int, session: dict) -> Optional[protocol.Result]:
         """拿一页。None = 整轮该停了（原因在 out.stopped）。"""
@@ -512,7 +557,9 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
             if record is None:
                 if page > 1 and not session:
                     # 第 2 页起要回传第 1 页给的会话值；没给就不翻（翻了多半是白花钱）。
-                    log(f"  K{number:02d} 第 1 页没给翻页用的会话值，后面的页不翻")
+                    # 正常走不到这儿（这种第 1 页不留，见下面）；走到了也算没拿到。
+                    out.failed += 1
+                    log(f"  K{number:02d} 第 1 页没给翻页用的会话值，后面的页不翻；这个词没查全")
                     break
                 result = fetch(word, digest, page, session if page > 1 else {})
                 if result is None:
@@ -546,6 +593,15 @@ def run_round(round_: Round, keywords: list[tuple[str, str]], state: State, api_
                         return out
                     log(f"  K{number:02d} 第 {page} 页返回了 {count} 条，却一条笔记 ID 都认不出来，"
                         "这一页不算数（不是到底了）；这个词记成没查全")
+                    break
+                if page == 1 and round_.pages > 1 and sessionless(result.data):
+                    # 有笔记、却没给翻页用的会话值：后面的页翻不了，这个词查不全。
+                    # 这一页也不留——留了以后每次都沿用它，永远补不上后面的页。
+                    out.failed += 1
+                    state.note_failure(round_.name, digest, page, NO_SESSION, None, clock())
+                    state.save()
+                    log(f"  K{number:02d} 第 1 页没给翻页用的会话值，后面的页翻不了；"
+                        "这一页不留，这个词记成没查全，再跑一次会重新拿")
                     break
                 record = state.keep_page(round_.name, digest, page, result.data, clock())
                 state.save()
@@ -672,8 +728,10 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
 
     for round_ in ROUNDS.values():
         listings = {d: listing(round_, d, state) for _n, d in numbered}
-        if not any(found.pages for found in listings.values()):
-            continue
+        if not any(found.pages for found in listings.values()) \
+                and round_.name not in state.data["rounds"]:
+            continue                      # 这一轮没跑过
+        round_at = state.round_at(round_.name) or (now if now is not None else time.time())
         # 这一轮算哪几个词：查过的都算；没查过的从前往后补到这一轮该查的个数
         # （「前两个词翻到第 10 页」那一轮，别把另外十三个词列成「还没查」）。
         chosen = [(n, d) for n, d in numbered if listings[d].pages]
@@ -691,7 +749,7 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         sizes: list[int] = []
         types: dict[str, int] = {}
         keys: set[str] = set()
-        ads = other = 0
+        ads = other = late = 0
         for number, digest in chosen:
             found = listings[digest]
             for page in range(1, found.pages + 1):
@@ -706,12 +764,20 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
             row = {"词": f"K{number:02d}", "拿到几页": found.pages,
                    "看了前几位": len(found.organic), "查全了": found.complete,
                    "翻到底了": found.ended, "按帖龄": {}}
+            # 这个词在这一轮是哪一刻查的：有第 1 页就是拿到它的那一刻；一页都没拿到
+            # （第 1 页失败了，或者上限先到、还没轮到它）就用这一轮跑的那一刻。
+            seen_at = found.at if found.pages and found.at else round_at
             for post in by_word.get(digest, []):
-                if not found.pages:
+                if post.publish_ms is not None and post.publish_ms > seen_at * 1000:
+                    # 那一刻这一篇还没发：它不在这一轮查的那批帖子里。算进来的话
+                    # 帖龄是负的，会被说成「3 天内、没搜到」。
+                    late += 1
                     continue
-                label, rank = found.result(post.note_id)
+                # 一页都没拿到的词，它下面的帖子是「没查全」，不是不存在。
+                label, rank = (found.result(post.note_id) if found.pages
+                               else (INCOMPLETE, None))
                 results[round_.name][(digest, post.note_id)] = (label, rank)
-                band = age_band(post.publish_ms, found.at, tz)
+                band = age_band(post.publish_ms, seen_at, tz)
                 group = _comment_group(post.comments, comment_floor)
                 for bucket in (by_age[band], row["按帖龄"].setdefault(band, _blank()),
                                by_comments.setdefault(group, _blank())):
@@ -728,6 +794,7 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
                          "最多": max(sizes)} if sizes else {}),
             "像广告位的条数": ads,
             "认不出笔记的条数": other,
+            "查之后才发的帖子（不算）": late,
             "条目类型": dict(sorted(types.items())),
             "条目键名": sorted(keys),
             "按帖龄": by_age,
@@ -859,6 +926,9 @@ def render_report(report: dict[str, Any]) -> str:
             lines.append(f"每页笔记数：最少 {size['最少']}，中位 {size['中位']:g}，最多 {size['最多']}。"
                          f"像广告位的 {block['像广告位的条数']} 条，认不出笔记的 "
                          f"{block['认不出笔记的条数']} 条。")
+        if block.get("查之后才发的帖子（不算）"):
+            lines.append(f"有 {block['查之后才发的帖子（不算）']} 篇帖子是这一轮查完之后才发的，"
+                         "不算在这一轮里（那时候它还不存在，搜不到说明不了什么）。")
         lines += ["", "按帖龄（查的那一刻、按表里的「发布时间」算）："]
         lines += [f"- {band}：{_counts(block['按帖龄'][band])}" for band in AGE_BANDS]
         if block["按评论数"]:
@@ -868,7 +938,9 @@ def render_report(report: dict[str, Any]) -> str:
         lines += ["", "按词："]
         for row in block["按词"]:
             if not row["拿到几页"]:
-                lines.append(f"- {row['词']}：还没查")
+                waiting = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
+                                   for band in AGE_BANDS if band in row["按帖龄"])
+                lines.append(f"- {row['词']}：还没查" + (f"｜{waiting}" if waiting else ""))
                 continue
             state_text = "翻到底了" if row["翻到底了"] else ("查全了" if row["查全了"] else "没查全")
             ages = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
