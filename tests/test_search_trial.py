@@ -1269,6 +1269,25 @@ class TestTableMatching(unittest.TestCase):
         report = visibility.build_report(self.state, posts, tz=BJ, now=AT)
         return report, report["各轮"]["first"]
 
+    def test_a_match_seen_days_later_is_not_backdated_to_the_first_search(self):
+        """一轮隔了几天才续跑完：第 2 天在词甲下没搜到、第 5 天在词乙下搜到的帖子，
+        不能记成「3 天内搜到」；只在词甲那一刻查过的另一篇也说不了「3 天内没搜到」。"""
+        day = 86400
+        self.full(self.a, 1000, at=AT)                       # 词甲：发布后第 2 天查的
+        self.full(self.b, 2000, at=AT + 3 * day)             # 词乙：第 5 天才查
+        table = (self.a, self.b)
+        late_hit = visibility.Post(nid(2105), table, days_before(2.0), None)   # 只在词乙下出现
+        nowhere = visibility.Post(nid(9999), table, days_before(2.0), None)
+        early_hit = visibility.Post(nid(1105), table, days_before(2.0), None)  # 第 2 天就在词甲下
+        report = visibility.build_report(self.state, [late_hit, nowhere, early_hit], tz=BJ,
+                                         now=AT + 3 * day)
+        block = report["各轮"]["first"]
+        day3, day7 = block["按帖龄"]["3天内"], block["按帖龄"]["4到7天"]
+        self.assertEqual((day3["篇数"], day3["前20"], day3["没查全"], day3["没搜到"]), (2, 1, 1, 0))
+        self.assertEqual((day7["篇数"], day7["前20"]), (1, 1))
+        self.assertEqual((report["回答"]["3天内的帖子"], report["回答"]["搜到的"],
+                          report["回答"]["没搜到的"], report["回答"]["没查全的"]), (2, 1, 0, 1))
+
     def test_every_post_is_checked_against_every_keyword_of_its_table(self):
         self.full(self.a, 1000)                    # 词甲：1100.. 1200.. 1300..
         self.full(self.b, 2000)                    # 词乙：2100.. 2200.. 2300..

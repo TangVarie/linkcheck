@@ -1005,20 +1005,28 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         # 说不准它在没查的地方是不是自然排上了，所以是「没查全」。
         for note_id, found_pairs in pairs.items():
             post = merged[note_id]
-            ranks = [rank for _d, _l, rank in found_pairs if rank is not None]
             labels = {label for _d, label, _r in found_pairs}
             missing = ([] if by_design else
                        [d for d in words_of[note_id] if d not in in_round])
             unsearched.update(missing)
-            if ranks:
-                label = rank_band(min(ranks))
-            elif INCOMPLETE in labels or missing:
-                label = INCOMPLETE
+            # 帖龄跟着「这个结论是哪一刻看到的」走。一轮隔了几天才续跑完的时候，同一篇帖子在
+            # 不同的词下面是在不同帖龄查的：第 2 天在甲词下没搜到、第 5 天在乙词下搜到了，
+            # 不能记成「3 天内搜到」。
+            first_seen = min(seen_ats[d] for d, _l, _r in found_pairs)
+            bands = {age_band(post.publish_ms, seen_ats[d], tz) for d, _l, _r in found_pairs}
+            hits = sorted((seen_ats[d], rank) for d, _l, rank in found_pairs if rank is not None)
+            if hits:
+                # 搜到了：按最早搜到它的那一次算帖龄和名次。
+                seen_at, rank = hits[0]
+                label = rank_band(rank)
+                band = age_band(post.publish_ms, seen_at, tz)
             else:
-                label = PAID if PAID in labels else NOT_FOUND
-            # 帖龄按它那张表的词在这一轮里最早查的那一刻算。
-            band = age_band(post.publish_ms,
-                            min(seen_ats[d] for d, _l, _r in found_pairs), tz)
+                band = age_band(post.publish_ms, first_seen, tz)
+                if INCOMPLETE in labels or missing or len(bands) > 1:
+                    # 各个词不是在同一个帖龄段查的：最早那一段里还有词没查，说不了「没搜到」。
+                    label = INCOMPLETE
+                else:
+                    label = PAID if PAID in labels else NOT_FOUND
             group = _comment_group(post.comments, comment_floor)
             for bucket in (by_age[band], by_comments.setdefault(group, _blank())):
                 bucket["篇数"] += 1
