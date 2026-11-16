@@ -158,6 +158,49 @@ def downstream_note(missing) -> str:
             "想要的话在面板「项目」里点这张表的「补齐缺的列」，一次就建上")
 
 
+def search_columns(settings: Settings) -> list[tuple]:
+    """搜索可见用的列，形状同 `expected_schema` 的一行。现在只有运营填的那一列。
+
+    这是第三种列（另两种：巡查列、只给下游用的列），**跟着这张表的「搜索检查」
+    开关走**（`settings.search_check`，登记表里那个复选框，见 registry.apply_overrides）：
+
+    * 开关关着（默认）：缺了不报、「补齐缺的列」不建、新建的表不带——没开的表
+      看不出多了一个功能。直接加进 `expected_schema` 的话，每张老表的体检都会多
+      一条「缺列」，随手点一次「补齐缺的列」就把它建到所有表上。
+    * 开关开着：缺了要报（没有它一个词都查不了）、「补齐缺的列」会建、类型不对照报。
+
+    所以 `schema_problems` 和 `diff` 要拿到**这张表自己的** Settings（面板的项目卡、
+    doctor、「补齐缺的列」都是）；拿全局那份就等于开关永远关着。
+
+    机器写结果的那几列（搜索可见 / 搜索排名 / 搜索检查时间 / 搜索明细）还没有：
+    试跑（visibility.py）一个字都不往表里写，等试跑有了结论再定。
+    """
+    f = settings.fields
+    return [
+        (f.search_keywords, (1, 4), "文本或多选", None,
+         "运营填：这一篇想在哪个词下面被搜到，一格一个词（写了几个只查第一个）；"
+         "空着 = 不查。只有开了「搜索检查」的表才用得上"),
+    ]
+
+
+def _search_problems(settings: Settings, meta: dict) -> list[str]:
+    if not getattr(settings, "search_check", False):
+        return []
+    problems: list[str] = []
+    for name, allowed, type_label, _options, _note in search_columns(settings):
+        info = (meta or {}).get(name)
+        if info is None:
+            problems.append(
+                f"这张表开了「搜索检查」，但缺「{name}」这一列——没有它一个词都查不了。"
+                "巡查不受影响；在面板「项目」里点这张表的「补齐缺的列」就能建上"
+                f"（或者在飞书里手工加一列同名的{type_label.split('或')[0]}列）。")
+        elif info.get("type") not in allowed:
+            problems.append(
+                f"「{name}」的字段类型是「{type_name(info.get('type'))}」，"
+                f"需要「{type_label}」——搜索可见读不了这一列。巡查不受影响。")
+    return problems
+
+
 # 这些 ui_type 和普通数字/文本共用类型码（2/1），但写入行为完全不同：
 # 评分字段封顶 5 星，写 like_count=3000 会失败或被截断。光看类型码抓不到。
 EXOTIC_UI_TYPES = {"Progress": "进度", "Currency": "货币",
@@ -234,6 +277,7 @@ def schema_problems(settings: Settings, meta: dict) -> list[str]:
             f"表里缺这些列（列名要和 config.py 逐字一致）：{'、'.join(missing_optional)}。"
             "机器列没建会被自动跳过（不会写坏表），但对应的数据就落不下来。"
         )
+    problems.extend(_search_problems(settings, meta))
     problems.extend(_readout_problems(meta))
     gaps = [c.name for c in _maintenance_missing(meta)]
     if gaps:
@@ -501,6 +545,18 @@ def diff(settings: Settings, meta: dict) -> SchemaDiff:
             if gap:
                 result.missing_options.append(MissingOptions(
                     column=name, missing=gap, existing=existing))
+    # 搜索可见的列：只有这张表开了「搜索检查」才看（见 search_columns）。
+    if getattr(settings, "search_check", False):
+        for name, allowed, type_label, _options, note in search_columns(settings):
+            info = (meta or {}).get(name)
+            if info is None:
+                result.missing_columns.append(MissingColumn(
+                    name=name, type_code=allowed[0], type_label=type_label,
+                    note=note or ""))
+            elif info.get("type") not in allowed:
+                result.wrong_types.append(WrongType(
+                    column=name, actual=type_name(info.get("type")),
+                    expected=type_label, note=note or ""))
     # 截图读数四列排在巡查列后面：一键建齐时先建机器要用的，而且「数据整理」
     # 一定排在引用它的三个公式前面（readout.COLUMNS 的顺序）。
     missing, wrong_types, wrong_formulas = _readout_diff(meta)

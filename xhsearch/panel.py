@@ -1019,8 +1019,21 @@ class Projects:
         if not meta:
             raise feishu.FeishuError(-1, provision.NOT_A_COLLABORATOR)
         return provision.build_missing(
-            table, schema.diff(self.settings, meta),
+            table, schema.diff(self._settings_for_table(table_id), meta),
             allow_option_patch=self.config.allow_option_patch, log=self.log)
+
+    def _settings_for_table(self, table_id: str) -> Settings:
+        """这张表自己的 Settings（全局 + 登记表里它那一行）。「补齐缺的列」要建哪些
+        取决于这张表的开关（「搜索检查」开了才建「搜索关键词」，见
+        schema.search_columns）。登记表读不到、表不在登记表里：用全局那份，
+        也就是开关全关——宁可少建一列，不能因为读不到就建到不该建的表上。"""
+        try:
+            entry = next((e for e in self.list() if e.table_id == table_id), None)
+        except Exception:                                       # noqa: BLE001
+            entry = None
+        if entry is None:
+            return self.settings
+        return registry.apply_overrides(self.settings, entry)
 
     def add(self, label: str, target: str, note: str, client_token: str) -> str:
         from . import tablespec

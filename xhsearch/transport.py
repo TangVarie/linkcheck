@@ -75,6 +75,10 @@ class Response:
     # 处理，对「失败也收费」的通道来说这一次很可能已经扣了钱。重试要克制
     # （见 runner._call_once），账上也要算它（宁可多记，不能少报）。
     in_doubt: bool = False
+    # 请求**确定没发出去**（建连、TLS 握手、写请求那一步就失败了，urllib 把它
+    # 包成 URLError）。只有这一种失败可以当成「对方没收到」不记账；其它 status 0
+    # （含最后那个 Exception 兜底：读回答时的 TLS / 系统错误）都可能已经发出去了。
+    not_sent: bool = False
 
     @property
     def redirected(self) -> bool:
@@ -162,7 +166,7 @@ def _perform(request: urllib.request.Request, timeout: float,
     except urllib.error.URLError as exc:
         # urllib 只把**发请求那一步**（建连、TLS、写请求）的 OSError 包成
         # URLError：走到这里说明对方根本没收到完整的请求，重试是安全的。
-        return Response(0, "", f"网络错误：{exc.reason}")
+        return Response(0, "", f"网络错误：{exc.reason}", not_sent=True)
     except TimeoutError:
         # 请求已经发完，等回答（或读响应体）的时候超时：对方多半在处理。
         return Response(0, "", f"请求超时（{timeout}s）", in_doubt=True)
