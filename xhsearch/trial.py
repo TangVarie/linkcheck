@@ -1032,6 +1032,12 @@ class Trial:
             if survey.state is None:
                 job.refused = survey.state_error
                 return
+            broken = [r for r in survey.reads if r.column == UNREADABLE]
+            if broken:
+                # 少读了一张表，出的报告就少算那张表的帖：不出，原来那份报告留着
+                job.refused = ("这几张开了「搜索检查」的表读不到：" + "；".join(
+                    f"「{r.label}」{r.error}" for r in broken) + "。报告没重出，原来那份还在")
+                return
             self._publish(job, survey.state, survey.info)
             job.say("报告出好了（没发付费请求，账本没动）")
         except Exception as exc:                                # noqa: BLE001

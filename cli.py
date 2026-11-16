@@ -1821,6 +1821,10 @@ def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, k
             state.save()
         except visibility.StateError as exc:
             print(f"⚠ 最后一次存账本没存上（{exc}）；发出去的每一次在发之前都已经记上了")
+            if getattr(state, "superseded", False):
+                # 存的时候才发现账本被别处存过：另一个试跑接手了。不出报告，免得把它的报告盖掉
+                print("⏹ 另一个试跑接手了，账本和报告以它的为准，这一边不出报告")
+                return 1
         print(f"■ 这一轮：新拿到 {result.fetched} 页，沿用 {result.reused} 页，"
               f"没拿到 {result.failed} 页；发了 {result.requests} 次请求，"
               f"按多了算 ¥{result.yuan:.2f}")

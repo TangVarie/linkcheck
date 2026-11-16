@@ -1385,6 +1385,21 @@ class TestWiring(unittest.TestCase):
             todos="0", projects=0, runs=0, balances=False))
 
 
+class TestReportOnlyNeedsEveryTable(unittest.TestCase):
+    def test_report_only_with_an_unreadable_table_keeps_the_old_report(self):
+        table = SettingsTable()
+        make_trial(table, [("甲表", two_word_table())], Sender(default=by_page)).start("first", 6)
+        before = table.value(trial.KEY_RESULT)
+        table.writes.clear()
+        broken = two_word_table()
+        broken.fields_meta = lambda: None
+        job = make_trial(table, [("甲表", broken)], Sender()).report_only()
+        self.assertIn("读不到", job["refused"])
+        self.assertIn("原来那份还在", job["refused"])
+        self.assertEqual(table.writes, [])
+        self.assertEqual(table.value(trial.KEY_RESULT), before)
+
+
 class TestCliSharesTheStore(unittest.TestCase):
     """`search-trial --state registry` 和面板是同一本账、同一把锁；默认还是本机目录。"""
 
@@ -1413,6 +1428,24 @@ class TestCliSharesTheStore(unittest.TestCase):
                     out.write(code)
                     code = 1
         return code, out.getvalue()
+
+    def test_a_final_save_that_finds_a_newer_ledger_publishes_nothing(self):
+        real = visibility.run_round
+
+        def then_someone_else_saves(*args, **kwargs):
+            result = real(*args, **kwargs)
+            other = trial_store(self.table).load_state()
+            other.data["balance"].append({"round": "x"})
+            other.save()
+            return result
+
+        sender = Sender(default=by_page)
+        with mock.patch.object(visibility, "_send_once", sender), \
+                mock.patch.object(visibility, "run_round", then_someone_else_saves):
+            code, out = self.invoke("--state", "registry")
+        self.assertEqual(code, 1)
+        self.assertIn("这一边不出报告", out)
+        self.assertIsNone(self.table.value(trial.KEY_RESULT))
 
     def test_the_cli_writes_the_same_ledger_the_panel_reads(self):
         sender = Sender(default=by_page)
