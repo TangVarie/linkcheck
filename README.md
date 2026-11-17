@@ -538,6 +538,7 @@ tools/
   probe_channel.py     拿一条真实链接把某条通道走一遍（会真扣费）
   check_id_time.py     核对链接 ID 时间和真实发布时间差几天（只读，C1）
   update_next_check_formula.py  「下次检查时间」换成新版公式、缺的表建上（默认只看，--apply 才改）
+  export_comment_handling.py    评论区处置底稿：每条负面/竞品评论的发现时间、标已处理时间、按竞品条数（只读，出 CSV）
 tests/           1000+ 个测试，全离线
 ```
 
