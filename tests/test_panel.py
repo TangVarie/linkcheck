@@ -3015,12 +3015,35 @@ class TestAdhocAndArchivedSections(unittest.TestCase):
         self.assertIn("class=tab-empty", self._panel(page, "西屋"))
         self.assertNotIn("没有需要处理的行", page)
 
-    def test_fold_rows_are_out_of_batch_selection(self):
+    def test_fold_rows_can_be_picked_one_by_one_but_not_select_all(self):
+        """2026-11-18 运营要的：刷新失败的老帖，在面板上直接勾、直接排队刷新。
+        单独勾是人对这一行拿了主意；全选还是不带它们（排队刷新绕过归档线，花钱）。"""
         page = self._page(self._two_projects())
         fold = self._panel(page, "途鸽")
         fold = fold[fold.index("<details class=fold>"):]
-        self.assertNotIn("type=checkbox", fold)
+        rows = dict(re.findall(r"<tr data-rec='(\w+)'.*?<input type=checkbox class='?([^ >']+(?: solo)?)", fold))
+        self.assertEqual(rows, {"a1": "todoPick solo", "a2": "todoPick solo"})
+        self.assertNotIn("todoAll", fold, "折叠区没有全选")
+        self.assertIn("单独勾", fold, "条下的说明要告诉人可以在这里勾")
         self.assertNotIn("data-key=", fold, "「新」标记只说主列表")
+
+    def test_fold_checkbox_column_lines_up_with_its_header(self):
+        fold = self._panel(self._page(self._two_projects()), "途鸽")
+        fold = fold[fold.index("<details class=fold>"):]
+        head = fold[fold.index("<thead>"):fold.index("</thead>")]
+        first_row = fold[fold.index("<tbody>"):fold.index("</tr>", fold.index("<tbody>"))]
+        self.assertEqual(len(re.findall(r"<th[ >]", head)), len(re.findall(r"<td[ >]", first_row)),
+                         "表头和行的格数对得上")
+
+    def test_script_keeps_fold_checkboxes_and_ignores_a_collapsed_fold(self):
+        script = panel_view._SCRIPT
+        self.assertNotIn('checkbox.closest("td").remove()', script,
+                         "行挪进折叠区时不能再把勾选框拆掉")
+        self.assertIn("!main || t.archived || t.adhoc ? ' solo'", script,
+                      "后台同步新画出来的折叠区行也有勾选框，而且全选不带")
+        self.assertIn('tr.closest("details.fold")', script,
+                      "收起的折叠区里的勾不算进「排队刷新」的行数")
+        self.assertIn('addEventListener("toggle"', script, "收起折叠区就清掉里面的勾")
 
     def test_recent_archived_and_adhoc_rows_join_the_main_list_but_not_select_all(self):
         p = summary.ProjectSnapshot(label="途鸽", app_token="t", table_id="a", todos=[
