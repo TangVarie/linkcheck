@@ -748,8 +748,7 @@ textarea{width:100%;resize:vertical;min-height:72px}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
   .todos .diagnostic{max-width:none}
   .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
-  .fold-t tbody tr{grid-template-columns:minmax(0,1fr)}
-  .fold-t tbody td,.fold-t tbody td.which{grid-column:1}
+  /* 归档折叠区的行和主列表一样有勾选框那一格（2026-11-18 起），用同一套两栏卡片。 */
 }
 """
 
@@ -1018,11 +1017,23 @@ _SCRIPT = r"""
   // 不看可见性就会提交 35 行——而你只看得见 15 行。勾「排队刷新」是要花钱的，
   // 提交的行数必须和眼睛看到的一致。分页之后「看得见」还多一层：
   // 这一行所在的 tab 页得是当前这一页（别的页是 hidden 的）。
+  // 归档折叠区收起来了，里面的行也算看不见。
   function visible(tr){
     if (!tr || !shown(tr)) return false;
+    var fold = tr.closest("details.fold");
+    if (fold && !fold.open) return false;
     var p = panelOf(tr);
     return !(p && p.hidden);
   }
+  // 收起折叠区就把里面的勾清掉：和切走 tab 页一个道理（见 showTab），
+  // 看不见的勾不留着，免得下次展开一点就提交。toggle 不冒泡，在捕获阶段接。
+  var todosHost = document.getElementById("todos");
+  if (todosHost) todosHost.addEventListener("toggle", function(ev){
+    var fold = ev.target;
+    if (!fold.matches || !fold.matches("details.fold") || fold.open) return;
+    fold.querySelectorAll(".todoPick").forEach(function(x){ x.checked = false; });
+    sync();
+  }, true);
   function selected(){
     picks = document.querySelectorAll("#todos .todoPick");
     var out = [];
@@ -1425,8 +1436,9 @@ _SCRIPT = r"""
   }
   function rowHtml(t, main){
     var state = t.work_state || "pending", url = safeUrl(t.post_url), link = safeUrl(t.record_url);
-    var pick = main ? '<td class="nowrap"><input type="checkbox" aria-label="选择 ' + attr(t.label || t.record_id) +
-      ' 排队刷新" class="todoPick' + (t.archived || t.adhoc ? ' solo' : '') + '"></td>' : '';
+    // 归档折叠区里的行也有勾选框（单独勾，「全选」不带：class solo），见 _todo_row。
+    var pick = '<td class="nowrap"><input type="checkbox" aria-label="选择 ' + attr(t.label || t.record_id) +
+      ' 排队刷新" class="todoPick' + (!main || t.archived || t.adhoc ? ' solo' : '') + '"></td>';
     var diagnostic = t.diagnosis || "", digest = t.digest || "";
     var on = state === "processing" ? "processing" : "pending";
     function segment(cls, label, title){
@@ -1484,7 +1496,8 @@ _SCRIPT = r"""
     var table = p.querySelector(archived ? ".fold table" : "table.todos:not(.fold-t)");
     if (!table) {
       table = document.createElement("table"); table.className = "todos" + (archived ? " fold-t" : "");
-      table.innerHTML = '<thead><tr>' + (archived ? '' : '<th><input type="checkbox" class="todoAll" aria-label="全选这一页"></th>') +
+      table.innerHTML = '<thead><tr>' + (archived ? '<th><span class="sr-only">选择</span></th>' :
+        '<th><input type="checkbox" class="todoAll" aria-label="全选这一页"></th>') +
         '<th>帖子 / 素人</th><th>为什么</th><th>诊断信息</th><th>评论数</th><th>最近检查</th><th>处理</th></tr></thead><tbody></tbody>';
       var wrap = document.createElement("div"); wrap.className = "tablewrap todo-wrap"; wrap.appendChild(table);
       if (archived) { var fold = document.createElement("details"); fold.className = "fold";
@@ -1513,8 +1526,9 @@ _SCRIPT = r"""
       var destination = ensurePanel(t, archived);
       if (destination) {
         var checkbox = tr.querySelector(".todoPick");
-        if (archived && checkbox) checkbox.closest("td").remove();
-        if (!archived && !checkbox) { var cell = document.createElement("td"); cell.className = "nowrap";
+        // 挪进折叠区：勾清掉（这一行刚换了地方，别带着之前的勾走）。勾选框留着。
+        if (archived && checkbox && checkbox.checked) { checkbox.checked = false; sync(); }
+        if (!checkbox) { var cell = document.createElement("td"); cell.className = "nowrap";
           cell.innerHTML = '<input type="checkbox" class="todoPick">'; tr.insertBefore(cell, tr.firstChild);
           cell.querySelector("input").addEventListener("change", sync); }
         destination.appendChild(tr);
@@ -1522,9 +1536,10 @@ _SCRIPT = r"""
     }
     var pickBox = tr.querySelector(".todoPick");
     if (pickBox) {
-      pickBox.classList.toggle("solo", !!(t.archived || t.adhoc));
+      var solo = !!(archived || t.archived || t.adhoc);
+      pickBox.classList.toggle("solo", solo);
       pickBox.setAttribute("aria-label", "选择 " + (t.label || t.record_id) + " 排队刷新");
-      if (t.archived || t.adhoc) pickBox.setAttribute("title", "「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾");
+      if (solo) pickBox.setAttribute("title", "「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾");
       else pickBox.removeAttribute("title");
     }
     delete tr.dataset.obsolete;
@@ -2904,11 +2919,11 @@ def _post_link(url: str) -> str:
 
 def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
               resolvable: bool) -> str:
-    """一行待办。主列表和归档折叠区共用，折叠区没有勾选框。
+    """一行待办。主列表和归档折叠区共用。
 
-    已归档 / 没勾巡查的行在主列表里**有勾选框但「全选」不带它**（class solo）：
-    单独勾一行是人对这一行拿了主意；全选一下把老帖和「说了别管」的行一起
-    重刷，是替人改了主意、还要花钱。
+    已归档 / 没勾巡查的行，和归档折叠区里的行，**有勾选框但「全选」不带它**
+    （class solo）：单独勾一行是人对这一行拿了主意（比如刷新失败的老帖想再刷
+    一次）；全选一下把老帖和「说了别管」的行一起重刷，是替人改了主意、还要花钱。
     """
     # 「评论区快照」（整页评论）跟着 show_digest 走，接在诊断后面；「负面评论快照」
     # 不看开关，单独放一格（.negative-snapshot），详情抽屉里有它自己的一节。
@@ -2916,14 +2931,12 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
     if show_digest and todo.digest:
         extra = (f"<div class=muted style='margin-top:4px'>"
                  f"{_e(todo.digest)[:300]}</div>")
-    pick = ""
-    if main:
-        pick_label = f"选择 {_clip(todo.label, 30)} 排队刷新"
-        if todo.archived or todo.adhoc:
-            pick = (f"<td class=nowrap><input type=checkbox class='todoPick solo' aria-label='{_e(pick_label)}' "
-                    "title='「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾'></td>")
-        else:
-            pick = f"<td class=nowrap><input type=checkbox class=todoPick aria-label='{_e(pick_label)}'></td>"
+    pick_label = f"选择 {_clip(todo.label, 30)} 排队刷新"
+    if not main or todo.archived or todo.adhoc:
+        pick = (f"<td class=nowrap><input type=checkbox class='todoPick solo' aria-label='{_e(pick_label)}' "
+                "title='「全选」不会带上它（已归档 / 没勾巡查）。要刷就单独勾'></td>")
+    else:
+        pick = f"<td class=nowrap><input type=checkbox class=todoPick aria-label='{_e(pick_label)}'></td>"
     # data-key 只给主列表：「新」标记说的是「这一屏多了一件要做的事」，
     # 折叠区里的老帖不算。
     key = f" data-key='{_e(todo.key)}'" if main else ""
@@ -2987,7 +3000,10 @@ def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) ->
 
     收起是因为它们大多数时候的正确处置是「取消巡查」，不是「重新刷新」——
     「排队刷新」会绕过归档线，摊开再配上全选，就是一次把钱花在几个月前的
-    内容上。但收起不等于藏起来：以前是一行灰色小字，运营根本不知道有这一块。
+    内容上。所以这里的行能**单独勾**（刷新失败的老帖想再刷一次，就在面板上勾、
+    点上面的「排队刷新」），但表头没有全选。收起来的时候里面的勾自动清掉：
+    按钮上的数只算看得见的行。
+    收起不等于藏起来：以前是一行灰色小字，运营根本不知道有这一块。
     现在是一条带警示色左边线的条，条上就写着几行、各是什么问题。
     跟着项目标签走：每个项目只看得到自己的。
     """
@@ -3007,10 +3023,12 @@ def _fold(todos, offset_hours: float, show_digest: bool, *, resolvable: bool) ->
         "<span class=fold-hint><span class=fold-open>点开看</span>"
         "<span class=fold-close>收起</span></span></summary>"
         "<p class=fold-why>这些帖子超过了归档天数、不再自动刷，问题会一直挂到有人处理。"
-        "「排队刷新」会<b>绕过归档线</b>，所以它们不在上面的列表和批量勾选里——"
         f"多数时候正确的处置是去飞书<b>取消巡查</b>；{done}"
-        "在飞书里单独勾「排队刷新」刷过的，24 小时内会回到上面的列表。</p>"
-        f"<div class='tablewrap todo-wrap'><table class='todos fold-t'><thead><tr>{_TODO_COLUMNS}</tr>"
+        "想再刷一次的（比如刷新失败的），在下面<b>单独勾</b>那几行、点上面的「排队刷新」。"
+        "「排队刷新」会<b>绕过归档线</b>，所以这里没有全选，上面的全选也不会带上它们。"
+        "刷过的 24 小时内会回到上面的列表。</p>"
+        "<div class='tablewrap todo-wrap'><table class='todos fold-t'><thead><tr>"
+        f"<th><span class=sr-only>选择</span></th>{_TODO_COLUMNS}</tr>"
         f"</thead><tbody>{rows}</tbody></table></div></details>")
 
 
