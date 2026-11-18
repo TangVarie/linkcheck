@@ -3045,6 +3045,14 @@ class TestAdhocAndArchivedSections(unittest.TestCase):
                       "收起的折叠区里的勾不算进「排队刷新」的行数")
         self.assertIn('addEventListener("toggle"', script, "收起折叠区就清掉里面的勾")
 
+    def test_phone_cards_in_the_fold_keep_the_checkbox_beside_the_title(self):
+        """Codex 在 #88 指出：手机宽度下折叠区原来是单栏卡片（那时没有勾选框那一格），
+        加了勾选框之后它和标题会挤在同一格里、叠到标题底下。折叠区要用主列表那套两栏。"""
+        page = self._page(self._two_projects())
+        self.assertNotIn(".fold-t tbody tr{grid-template-columns:minmax(0,1fr)}", page)
+        self.assertNotIn(".fold-t tbody td,.fold-t tbody td.which{grid-column:1}", page)
+        self.assertIn(".todos tbody td:first-child{grid-column:1;grid-row:1", page)
+
     def test_recent_archived_and_adhoc_rows_join_the_main_list_but_not_select_all(self):
         p = summary.ProjectSnapshot(label="途鸽", app_token="t", table_id="a", todos=[
             self._todo("n", "途鸽"),

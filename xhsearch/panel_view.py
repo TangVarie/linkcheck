@@ -748,8 +748,7 @@ textarea{width:100%;resize:vertical;min-height:72px}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
   .todos .diagnostic{max-width:none}
   .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
-  .fold-t tbody tr{grid-template-columns:minmax(0,1fr)}
-  .fold-t tbody td,.fold-t tbody td.which{grid-column:1}
+  /* 归档折叠区的行和主列表一样有勾选框那一格（2026-11-18 起），用同一套两栏卡片。 */
 }
 """
 
