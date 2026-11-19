@@ -21,735 +21,791 @@ from typing import Any, Optional
 from . import summary
 
 _STYLE = """
-/* BYWOOD 设计系统 v5.4.0（色板 v5.1）· 界面轨「管理后台」（scenarios/03-dashboard.md）
+/* BYWOOD 设计系统 v6.1 · 界面轨「管理后台」（scenarios/03-dashboard.md、CRAFT.md §八–§十二）
  *
- * v5 品牌换届「青赭双色制」：主色深青接动作与结构，强调色赭石接旧品牌红
- * 的价值与增长；「双箭分发」（藏蓝×正红）连同它的链接尾标一起退役，
- * 标志换成山形。版式零变更——变的是品牌层，不是骨架。
+ * 2026-11-19 从 v5.4.0 升到 v6.1。色值一个没变（色板仍 v5.1），变的是语法：
+ *   · 底色就是角色：后台用画布 + 白表面组织界面，四种底以「块」出现——
+ *     深青 = 证据（KPI 主块）、浅青 = 方法与说明（说明段、AI 草稿条）、
+ *     标志青 = 承诺与识别（登录页、待办清零那一刻）、白表面 = 判断与操作。
+ *   · 五级字号 + 两级数字：12 / 14 / 16 / 24 / 32，数字 40（n1）与 24（n2）；
+ *     粗细只用两端（显示字 900、数字 800、标签 600–700、正文 400），不再出现 500 和 13px。
+ *   · 容器直角，控件 8px（--radius-control），控件内件 calc(var(--radius-control) - 4px)；
+ *     状态标签、表格、卡片、浮层、导航项仍是直角。
+ *   · 线只有三种：发丝线（--hl，带一点青）、强线（--hl2，表头与边缘）、2px 深青顶线（--rule，表格与浮层）。
+ *   · 动效按角色选曲线（--ease-*），只动 transform 与 opacity；不写 CSS 默认 ease、不写 transition: all。
+ *   · 文字链是墨字 + 青色下划线，悬停变实线；赭石只留给图表里「新出现负面」那一种所指。
  *
- * 色板 v5.1「标志青回归」（2026-09-02）：主色由渐变冷端的深档（H196°，
- * 整套读成深湖蓝）收回到标志实心青同色相的深档 #1E5754（H177°，白底
- * 8.25:1）；深色模式主色改渐变暖端 #6AC1BD（深底 8.85:1，按钮仍压墨字）。
- * 标志青由「仅标志图形」放开为**品牌面色**：做底不做字，块内只放
- * 墨字或主色字，每屏 ≤1 块——本面板只在登录页（品牌时刻）开这一块，
- * 后台那一屏（工作层）不开。token 一个没改名，只改值（meta.namingRule）。
+ * token 逐值抄自设计系统 tokens/ui.css（它又派生自 tokens/palette.json），名字也照抄，
+ * 方便和黄金样张 templates/dashboard.html 对照；本页自己加的只有语义浅底、标志的
+ * 深浅切换和下拉箭头这几个，放在 token 块最后。不引外部字体：CSP 是 default-src 'none'，
+ * 面板零外部资源，所以 Archivo / BW Display 写在字体栈最前、本机有就用，没有退回系统字。
  *
- * 色值全部来自 tokens/palette.json 的 screen 节——它是全轨色板的唯一事实源，
- * 任何一处不一致按设计系统的规矩算**构建错误**，不是审美分歧。
- * 这里不引 tokens/globals.css：那是 Tailwind 的 @theme，而这个面板是
- * 零依赖的标准库 http.server 手拼 HTML，引不进来。所以从 palette.json
- * 取值、手写同名 CSS 变量，角色和取值都对齐。token 一律按角色命名不按
- * 色相（meta.namingRule）——上一版的 block-blue/tint-sky 这类色相名，
- * 正是 v4→v5 迁移成本的九成来源。
- *
- * 硬性遵守的几条（DESIGN.md §5 §8 负面清单）：
- *   · 直角制度 border-radius: 0，例外只有本体即圆形的状态点
- *   · 零阴影、零渐变（骨架屏微光是明文例外）、零毛玻璃
- *   · 文字永不用纯黑纯白，只走四阶透明度；深色块内恒白是另一条规则
- *   · 语义色只表状态；浅底上的文字用加深档
- *   · 深色模式只翻 token，组件不写第二套颜色——深色下主按钮改墨字
- *     （亮青上白字只有 2.67:1，palette.json 的 _darkButtonRule）也是
- *     靠 --on-primary 这个 token 翻转实现的
+ * 硬性遵守的几条（DESIGN.md §六 §九，tests/test_design 钉着）：
+ *   · 零阴影（抽屉 --shadow-sheet 除外）、零渐变（骨架亮带除外）、零毛玻璃
+ *   · 深色模式只翻 token，组件不写第二套颜色；主色填充上压 --on-primary，不写死白字
  */
 :root{
-  --primary:#1E5754; --primary-dark:#16413F;
-  --accent:#B8502F; --money:#B8502F;
-  --on-primary:#FFF; --wordmark:#1E5754;
-  --block-primary:#1E5754; --block-accent:#B8502F;
-  --tint-primary:#E3EFEF; --tint-accent:#F8EAE2;
-  /* 品牌面色（v5.1）：标志青做底，块内恒墨字。两种模式同值，所以只在这儿定一次。 */
-  --field-brand:#7ED1CD; --on-field:rgba(0,0,0,.90);
-  --success:#00B578; --warning:#FF8F1F; --danger:#D92B3C;
-  --success-deep:#006B4A; --warning-deep:#995400; --danger-deep:#B02330;
-  --bg:#F3F4F6; --bg-secondary:#EAECEF; --surface:#FFFFFF;
-  --fill:rgba(0,0,0,.045);
-  --text-dark:rgba(0,0,0,.90); --text:rgba(0,0,0,.65);
-  --text-light:rgba(0,0,0,.55); --text-faint:rgba(0,0,0,.30);
-  --border:rgba(0,0,0,.08); --border-strong:#E5E6EB;
-  --tint-danger:rgba(217,43,60,.10);
-  --tint-warning:rgba(255,143,31,.10);
-  --tint-success:rgba(0,181,120,.10);
-  --font-sans:'PingFang SC','Hiragino Sans GB','Microsoft YaHei',-apple-system,
-    BlinkMacSystemFont,'Segoe UI',sans-serif;
-  --font-num:'DIN Alternate','Bahnschrift','Roboto Condensed','Helvetica Neue',
-    var(--font-sans);
+  --radius-control:8px;
+  --primary:#1E5754;--primary-dark:#16413F;--on-primary:#FFFFFF;
+  --accent:#B8502F;--accent-deep:#8A3A20;
+  --block-primary:#1E5754;--block-accent:#B8502F;--tint-primary:#E3EFEF;--tint-accent:#F8EAE2;
+  --deep:#16413F;--color-field-brand:#7ED1CD;--field:var(--color-field-brand);
+  --success:#00B578;--warning:#FF8F1F;--danger:#D92B3C;--on-danger:#FFFFFF;
+  --success-deep:#006B4A;--warning-deep:#995400;--danger-deep:#B02330;
+  --bg:#F3F4F6;--bg2:#EAECEF;--surface:#FFFFFF;--fill:rgba(0,0,0,.045);
+  --t1:rgba(0,0,0,.9);--t2:rgba(0,0,0,.65);--t3:rgba(0,0,0,.55);--t4:rgba(0,0,0,.3);
+  --ink-on-field:rgba(0,0,0,.9);--ink-on-field-2:rgba(0,0,0,.72);
+  --border:rgba(0,0,0,.08);--border-strong:#E5E6EB;
+  --hl:rgba(22,65,63,.16);--hl2:rgba(22,65,63,.6);
+  --rule:#16413F;
+  --skel:rgba(22,65,63,.07);--skel-band:rgba(255,255,255,.75);
+  --scrim:rgba(15,19,24,.48);
+  --shadow-sheet:0 -8px 32px rgba(0,0,0,.1);
+  --f-sans:"PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",-apple-system,system-ui,sans-serif;
+  --f-dsp:"BW Display","PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  --f-num:"Archivo","Helvetica Neue",Arial,sans-serif;
+  --f-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --d1:48px;--d2:32px;--d3:24px;--lede:16px;--body:16px;--sm:14px;--mi:12px;--n1:40px;--n2:24px;
+  --hd:56px;--side:240px;
+  --ease-out:cubic-bezier(0,0,.58,1);--ease-strong:cubic-bezier(.22,1,.36,1);--ease-in:cubic-bezier(.42,0,1,1);
+  --ease-io:cubic-bezier(.42,0,.58,1);--ease-over:cubic-bezier(.34,1.56,.64,1);--ease-cont:cubic-bezier(.32,.72,0,1);
+  --t-press:100ms;--t-hover:150ms;--t-sm:200ms;--t-md:320ms;--t-lg:480ms;
+  /* 本页自己加的：深青块上的字、语义浅底、标志深浅两版的切换、下拉箭头 */
+  --on-deep:#FFFFFF;--on-deep-2:rgba(255,255,255,.72);
+  --tint-danger:rgba(217,43,60,.1);--tint-warning:rgba(255,143,31,.12);--tint-success:rgba(0,181,120,.1);
+  --logo-l:block;--logo-d:none;
+  --chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgba(0,0,0,.55)' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   color-scheme:light;
-  /* 唯一一档阴影：右侧抽屉（行详情）。别处一律不用阴影（见 tests/test_design）。 */
-  --shadow-sheet:-8px 0 24px rgba(0,0,0,.10);
 }
-/* 深色模式：只翻 token。画布仍比表面深一档；深青主块照旧白字（block-primary
- * 不翻，palette.json 深色组它也是 #1E5754）；主按钮换亮青底 + 墨字；
- * 品牌面色不翻（两模式同值，块内照旧墨字）。 */
 [data-theme=dark]{
-  --primary:#6AC1BD; --primary-dark:#48A8A3;
-  --accent:#D97E55; --money:#D97E55;
-  --on-primary:#0F1318; --wordmark:rgba(255,255,255,.92);
-  --block-accent:#A84528;
-  --tint-primary:#163B39; --tint-accent:#3D291F;
-  --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
-  --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
-  --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
-  --fill:rgba(255,255,255,.06);
-  --text-dark:rgba(255,255,255,.92); --text:rgba(255,255,255,.70);
-  --text-light:rgba(255,255,255,.55); --text-faint:rgba(255,255,255,.34);
-  --border:rgba(255,255,255,.10); --border-strong:#2B3440;
-  --tint-danger:rgba(232,87,92,.16);
-  --tint-warning:rgba(255,162,77,.16);
-  --tint-success:rgba(33,177,131,.16);
+  --primary:#6AC1BD;--primary-dark:#48A8A3;--on-primary:#0F1318;
+  --accent:#D97E55;--accent-deep:#D97E55;
+  --block-primary:#1E5754;--block-accent:#A84528;--tint-primary:#163B39;--tint-accent:#3D291F;
+  --success:#21B183;--warning:#FFA24D;--danger:#E8575C;--on-danger:#0F1318;
+  --success-deep:#7FE0BD;--warning-deep:#FFC38A;--danger-deep:#FF9A9E;
+  --bg:#0F1318;--bg2:#151A20;--surface:#1B222B;--fill:rgba(255,255,255,.06);
+  --t1:rgba(255,255,255,.92);--t2:rgba(255,255,255,.7);--t3:rgba(255,255,255,.55);--t4:rgba(255,255,255,.34);
+  --border:rgba(255,255,255,.1);--border-strong:#2B3440;
+  --hl:rgba(255,255,255,.1);--hl2:rgba(255,255,255,.5);--rule:#6AC1BD;
+  --skel:rgba(255,255,255,.07);--skel-band:rgba(255,255,255,.06);
+  --tint-danger:rgba(232,87,92,.16);--tint-warning:rgba(255,162,77,.16);--tint-success:rgba(33,177,131,.16);
+  --logo-l:none;--logo-d:block;
+  --chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgba(255,255,255,.55)' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   color-scheme:dark;
 }
-@media (prefers-color-scheme:dark){
-  :root:not([data-theme=light]){
-    --primary:#6AC1BD; --primary-dark:#48A8A3;
-    --accent:#D97E55; --money:#D97E55;
-    --on-primary:#0F1318; --wordmark:rgba(255,255,255,.92);
-    --block-accent:#A84528;
-    --tint-primary:#163B39; --tint-accent:#3D291F;
-    --success:#21B183; --warning:#FFA24D; --danger:#E8575C;
-    --success-deep:#7FE0BD; --warning-deep:#FFC38A; --danger-deep:#FF9A9E;
-    --bg:#0F1318; --bg-secondary:#151A20; --surface:#1B222B;
-    --fill:rgba(255,255,255,.06);
-    --text-dark:rgba(255,255,255,.92); --text:rgba(255,255,255,.70);
-    --text-light:rgba(255,255,255,.55); --text-faint:rgba(255,255,255,.34);
-    --border:rgba(255,255,255,.10); --border-strong:#2B3440;
-    --tint-danger:rgba(232,87,92,.16);
-    --tint-warning:rgba(255,162,77,.16);
-    --tint-success:rgba(33,177,131,.16);
-    color-scheme:dark;
-  }
-}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --primary:#6AC1BD;--primary-dark:#48A8A3;--on-primary:#0F1318;
+  --accent:#D97E55;--accent-deep:#D97E55;
+  --block-primary:#1E5754;--block-accent:#A84528;--tint-primary:#163B39;--tint-accent:#3D291F;
+  --success:#21B183;--warning:#FFA24D;--danger:#E8575C;--on-danger:#0F1318;
+  --success-deep:#7FE0BD;--warning-deep:#FFC38A;--danger-deep:#FF9A9E;
+  --bg:#0F1318;--bg2:#151A20;--surface:#1B222B;--fill:rgba(255,255,255,.06);
+  --t1:rgba(255,255,255,.92);--t2:rgba(255,255,255,.7);--t3:rgba(255,255,255,.55);--t4:rgba(255,255,255,.34);
+  --border:rgba(255,255,255,.1);--border-strong:#2B3440;
+  --hl:rgba(255,255,255,.1);--hl2:rgba(255,255,255,.5);--rule:#6AC1BD;
+  --skel:rgba(255,255,255,.07);--skel-band:rgba(255,255,255,.06);
+  --tint-danger:rgba(232,87,92,.16);--tint-warning:rgba(255,162,77,.16);--tint-success:rgba(33,177,131,.16);
+  --logo-l:none;--logo-d:block;
+  --chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgba(255,255,255,.55)' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  color-scheme:dark;
+}}
 
-*{box-sizing:border-box;border-radius:0}
+*{box-sizing:border-box}
+*::before,*::after{box-sizing:border-box}
 [hidden]{display:none!important}
-body{margin:0;background:var(--bg);color:var(--text-dark);
-  font:14px/1.6 var(--font-sans);-webkit-font-smoothing:antialiased;
-  text-rendering:optimizeLegibility}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--t2);font:400 var(--sm)/1.6 var(--f-sans);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  transition:background-color var(--t-md) var(--ease-out),color var(--t-md) var(--ease-out)}
+:lang(zh){text-autospace:normal;text-spacing-trim:trim-start}
+::selection{background:var(--field);color:var(--ink-on-field)}
+p,li{text-wrap:pretty}
+/* 文字链：墨字 + 60% 青的下划线，悬停下划线变实（CRAFT §二）。不再用赭石——赭石一屏一个焦点。 */
+a{color:var(--t1);text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:4px;
+  text-decoration-color:var(--hl2);
+  transition:text-decoration-color var(--t-hover) var(--ease-out),color var(--t-hover) var(--ease-out)}
+a:hover{text-decoration-color:currentColor}
 svg{display:block;flex:none}
 @media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
-.num{font-family:var(--font-num);font-variant-numeric:tabular-nums;
-  letter-spacing:-.01em}
-.muted{color:var(--text-light);font-size:12px}
+/* 焦点：2px 环、偏移 3px，颜色取所在底（深青块上是白，见 .kpi .lead 的 --focus） */
+:focus-visible{outline:2px solid var(--focus,var(--primary));outline-offset:3px}
+.num{font-family:var(--f-num);font-variant-numeric:tabular-nums lining-nums;font-stretch:108%;
+  text-autospace:no-autospace}
+.muted{color:var(--t3);font-size:var(--mi)}
 .lead-in{margin:0 0 12px}
 .icon{width:16px;height:16px;stroke:currentColor;stroke-width:1.75;fill:none;
-  stroke-linecap:round;stroke-linejoin:round;display:inline-block;
-  vertical-align:-3px}
+  stroke-linecap:round;stroke-linejoin:round;display:inline-block;vertical-align:-3px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip-path:inset(50%);white-space:nowrap;border:0}
+code{padding:1px 6px;background:var(--fill);font:400 var(--mi)/1.6 var(--f-mono);
+  color:var(--t1);text-autospace:no-autospace;overflow-wrap:anywhere}
 
-/* ---------- 骨架：侧栏 240 + 顶栏 56 + 内容区 24 / max 1440 ---------- */
+/* ---------- 骨架：侧栏 240 + 顶栏 56 + 内容区（最宽 1440） ---------- */
 .app{display:grid;grid-template-columns:240px minmax(0,1fr);min-height:100vh}
-.side{background:var(--surface);border-right:1px solid var(--border);
-  position:sticky;top:0;height:100vh;overflow:auto;display:flex;
-  flex-direction:column}
-.side .brand{height:64px;display:flex;align-items:center;gap:8px;
-  padding:0 16px;border-bottom:1px solid var(--border);flex:none}
-/* 品牌区：山形 mark + 特粗词标（templates/dashboard.html 的定式）。
- * 颜色走 --wordmark：浅底深青、深底白——独立山形在浅底不用标志主青
- * （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。
- * 标志有上限没有下限（v5.1）：页眉 ≤24px，这里的山形 16px。 */
-.brand{color:var(--wordmark)}
-.brand b{font-size:17px;font-weight:800;letter-spacing:-.01em;
-  font-family:'Arial Black','Helvetica Neue',Futura,var(--font-sans)}
-.side .brand span{font-size:12px;color:var(--text-faint)}
-.side nav{padding:8px 0 24px}
-.side .grp{font-size:11px;color:var(--text-faint);padding:0 16px;
-  margin:24px 0 8px;letter-spacing:.08em}
-.side .grp:first-child{margin-top:12px}
-.side nav a{display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;
-  font-size:14px;font-weight:500;color:var(--text);text-decoration:none;
-  transition:background-color .16s ease-out,color .16s ease-out}
-.side nav a .icon{color:var(--text-faint);transition:color .16s ease-out}
-.side nav a:hover{background:var(--fill);text-decoration:none}
-.side nav a:hover .icon,.side nav a.on .icon{color:var(--primary)}
-/* 激活态是主浅调底 + 主色字，不是深青底白字（03 场景点名的高发 bug） */
-.side nav a.on{background:var(--tint-primary);color:var(--primary);
-  font-weight:600}
-.side nav a .cnt{margin-left:auto;font-size:12px;color:var(--text-faint)}
+.main{min-width:0}
+.side{position:sticky;top:0;height:100vh;overflow:auto;display:flex;flex-direction:column;
+  padding:0 12px 16px;background:var(--surface);border-right:1px solid var(--border)}
+/* 品牌区：横版标志原件（山形 + 词标，浅底 teal-on-light、深底 teal-on-dark），页眉 ≤24px（BRAND.md §二） */
+.brand{display:flex;align-items:center;gap:12px;color:var(--t1)}
+.brand svg{height:20px;width:auto}
+.logo-l{display:var(--logo-l)}
+.logo-d{display:var(--logo-d)}
+.side .brand{gap:8px;height:64px;padding:0 12px;flex:none}
+.side .brand svg{height:18px}
+.side .brand span{padding-left:8px;border-left:1px solid var(--hl);font-size:var(--mi);
+  font-weight:600;line-height:16px;white-space:nowrap;color:var(--t3)}
+.side nav{padding:0 0 24px}
+.side .grp{padding:24px 12px 8px;font-size:var(--mi);font-weight:600;color:var(--t3)}
+.side .grp:first-child{padding-top:8px}
+.side nav a{position:relative;display:flex;align-items:center;gap:10px;height:40px;padding:0 12px;
+  font-size:var(--sm);color:var(--t2);text-decoration:none;
+  transition:background-color var(--t-hover) var(--ease-out),color var(--t-hover) var(--ease-out)}
+.side nav a .icon{color:var(--t3);transition:color var(--t-hover) var(--ease-out)}
+.side nav a:hover{background:var(--fill);color:var(--t1)}
+.side nav a:hover .icon{color:var(--t1)}
+/* 激活态是主浅调底 + 主色字，不是深青底白字（03 场景点名的高发 bug）；左缘一根 2px 主色条 */
+.side nav a.on{background:var(--tint-primary);color:var(--primary);font-weight:700}
+.side nav a.on .icon{color:var(--primary)}
+.side nav a.on::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:2px;
+  background:var(--primary)}
+.side nav a .cnt{margin-left:auto;font-family:var(--f-num);font-size:var(--mi);font-weight:700;
+  font-variant-numeric:tabular-nums;color:var(--t3)}
 .side nav a.on .cnt{color:var(--primary)}
-.side .foot{margin-top:auto;padding:16px;font-size:12px;color:var(--text-faint);
-  border-top:1px solid var(--border)}
-.top{height:56px;background:var(--surface);border-bottom:1px solid var(--border);
-  display:flex;align-items:center;gap:12px;padding:0 24px;position:sticky;
-  top:0;z-index:5}
-.top .when{font-size:12px;color:var(--text-light);margin-left:auto;
-  white-space:nowrap}
-.content{padding:24px;max-width:1440px;margin:0 auto}
+.side .foot{margin-top:auto;padding:16px 12px 0;border-top:1px solid var(--hl);font-size:var(--mi);
+  line-height:1.6;color:var(--t3)}
+.side .foot b{font-weight:600;color:var(--t1)}
+.top{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:8px;height:56px;
+  padding:0 24px;background:var(--surface);border-bottom:1px solid var(--border)}
+.top .when{margin-right:auto;font-size:var(--mi);color:var(--t3);white-space:nowrap}
+.top .tools{display:flex;align-items:center;justify-content:flex-end;gap:8px}
+.top form{margin:0}
+.content{max-width:1440px;margin:0 auto;padding:32px 32px 96px}
 
-/* ---------- 标题与编辑式导语 ---------- */
-h1{font-size:24px;font-weight:700;margin:0 0 8px;color:var(--text-dark);
-  letter-spacing:-.02em}
-/* 导语：15px 基色 50%，重点词 90% + semibold（DESIGN.md §3） */
-.lede{font-size:15px;color:var(--text-light);margin:0 0 24px;max-width:78ch}
-.lede b{color:var(--text-dark);font-weight:600}
-h2{font-size:16px;font-weight:600;margin:32px 0 4px;color:var(--text-dark);
-  display:flex;align-items:baseline;gap:8px}
-/* 侧栏走的是原生 hash 跳转，目标会被顶到视口最上沿——而 .top 是 56px 的
- * sticky，正好盖在那儿。点「余额」跳过去看到的会是余额区的第二行。
- * 56 顶栏 + 16 呼吸。 */
+/* ---------- 页头：小标 → d2 标题 → 导语（每屏一句最大的话） ---------- */
+.ph{margin:0 0 32px}
+.eb{margin:0;font-size:var(--sm);font-weight:600;color:var(--t3)}
+h1{margin:8px 0 0;font-family:var(--f-dsp);font-size:var(--d2);font-weight:900;line-height:1.2;
+  color:var(--t1);text-wrap:balance}
+.lede{margin:8px 0 0;max-width:44em;font-size:var(--lede);line-height:1.75;color:var(--t2)}
+.lede b{font-weight:700;color:var(--t1)}
+/* 章节标题：d3 显示字，后面跟一个等宽计数。面板里的块标题（工作台、卡片）用 16/700，见各自规则。 */
+h2{display:flex;align-items:baseline;gap:12px;margin:0;font-size:var(--body);font-weight:700;
+  line-height:1.4;color:var(--t1)}
+.content>h2{margin:48px 0 16px;font-family:var(--f-dsp);font-size:var(--d3);font-weight:900;
+  line-height:1.3}
+/* 侧栏走原生 hash 跳转，目标会被顶到视口最上沿——而 .top 是 56px 的 sticky，正好盖在那儿。
+ * 56 顶栏 + 16 呼吸，和侧栏高亮脚本的判线（72）是同一个数。 */
 h2[id]{scroll-margin-top:72px}
-/* 区块 / 卡片的入口链接。v5 起不再挂双箭尾标——双箭图形语言随换标整体
- * 退役，链接可辨识性交给赭石色 + 下划线悬停态（BRAND.md §4）。 */
-.enter{font-size:13px}
-h2 .n{font-weight:400;color:var(--text-faint)}
-.sub{font-size:13px;color:var(--text-light);margin:0 0 12px;max-width:78ch}
+h2 .n{font-family:var(--f-num);font-size:var(--sm);font-weight:700;color:var(--t3);
+  font-variant-numeric:tabular-nums}
+.enter{font-size:var(--sm);font-weight:600}
+.sub{margin:-8px 0 16px;max-width:60em;font-size:var(--sm);color:var(--t3)}
+.sub b{color:var(--t1)}
+/* 方法与说明：浅青块（DESIGN.md §二「浅青 = 方法与范围」） */
+.intro{margin:-4px 0 16px;padding:16px 20px;background:var(--tint-primary);font-size:var(--sm);
+  line-height:1.75;color:var(--t2)}
+.intro b{color:var(--t1)}
 
-/* ---------- KPI：1 个深青主块 + 最多 3 张白卡 ---------- */
-.kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;
-  margin:0 0 8px}
-.kpi>*{padding:16px 20px;min-height:112px;display:flex;flex-direction:column;
-  justify-content:space-between}
-.kpi .lead{background:var(--block-primary);color:#fff}
-.kpi .lead .k{font-size:13px;color:rgba(255,255,255,.85);letter-spacing:.02em}
-.kpi .lead .n{font-size:40px;font-weight:600;line-height:1.05}
-.kpi .lead .s{font-size:12px;color:rgba(255,255,255,.85)}
-.kpi .box{background:var(--surface);border:1px solid var(--border);
-  border-top:2px solid transparent}
-.kpi .box.warn{border-top-color:var(--danger)}
-.kpi .box .k{font-size:13px;color:var(--text-light);letter-spacing:.02em}
-.kpi .box .n{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
-.kpi .box .s{font-size:12px;color:var(--text-light)}
+/* ---------- KPI：1 块深青证据 + 最多 3 张白卡 ---------- */
+.kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:0}
+.kpi>*{display:flex;flex-direction:column;min-height:160px;padding:20px 24px;background:var(--surface);
+  color:var(--t2)}
+.kpi .k{font-size:var(--sm);font-weight:600;color:var(--t1)}
+.kpi .n{display:block;margin-top:16px;font-size:var(--n1);font-weight:800;font-stretch:112%;
+  letter-spacing:-.015em;line-height:1;color:var(--t1);white-space:nowrap}
+/* 单位贴着数字：显示字、0.4em（DESIGN.md §三） */
+.kpi .n small{margin-left:.08em;font-family:var(--f-dsp);font-size:.4em;font-weight:900;letter-spacing:0}
+.kpi .s{margin-top:auto;padding-top:12px;font-size:var(--mi);line-height:1.6;color:var(--t3)}
+.kpi .lead{--focus:#FFFFFF;background:var(--deep);color:var(--on-deep-2)}
+.kpi .lead .k,.kpi .lead .n{color:var(--on-deep)}
+.kpi .lead .s{color:var(--on-deep-2)}
+/* 要现在做决定的那一格：顶上一根 2px 危险色、数字转危险色加深档 */
+.kpi .box.warn{padding-top:18px;border-top:2px solid var(--danger)}
 .kpi .box.warn .n{color:var(--danger-deep)}
-.kpi .box .n small{font-size:15px;font-weight:500;color:var(--text-light);
-  margin-left:4px}
 
-/* ---------- 表格：表头 44 / 行 48 / 发丝线 / 无斑马纹 ---------- */
+/* ---------- 表格：三线制（2px 深青顶线 · 表头强线 · 行间发丝线），数字列右对齐等宽 ---------- */
 /* 表格自己横向滚动，不把整页撑宽。七列在手机上放不下是必然的，
  * 让页面横滚会把侧栏和顶栏一起推走。 */
 .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .side,.tabs,.tablewrap{scrollbar-width:thin;scrollbar-color:var(--border-strong) transparent}
-table{width:100%;border-collapse:collapse;background:var(--surface);
-  border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;background:var(--surface);border-top:2px solid var(--rule)}
 .tablewrap table{min-width:720px}
 .tablewrap table.todos{min-width:780px}
-th{height:44px;background:var(--bg);font-size:13px;font-weight:500;
-  color:var(--text-light);text-align:left;padding:0 12px;white-space:nowrap}
-td{padding:12px;border-top:1px solid var(--border);font-size:14px;
-  vertical-align:top;color:var(--text)}
-tbody tr{transition:background-color .14s ease-out}
+th{height:40px;padding:0 12px;text-align:left;white-space:nowrap;font-size:var(--mi);font-weight:600;
+  color:var(--t3);background:var(--surface);border-bottom:1px solid var(--hl2)}
+td{padding:12px;border-top:1px solid var(--hl);font-size:var(--sm);vertical-align:top;color:var(--t2)}
+tbody tr:first-child>td{border-top:0}
+tbody tr{transition:background-color var(--t-hover) var(--ease-out)}
 tbody tr:hover{background:var(--fill)}
 td.nowrap{white-space:nowrap}
-/* 数字列整列右对齐，表头跟着数字走，个位对个位 */
 td.right,th.right{text-align:right}
-/* 行操作：13px 主色深青。scenarios/03 明写「行操作用 13px 蓝字链接」，
- * 而模板里通用的 a 是 accent 赭石——仲裁顺序中**场景文件规则高于模板**，
- * 这一处听场景的。 */
-td a.act{font-size:13px;color:var(--primary)}
-/* 帖子身份合成一栏：标题用于定位，素人编号和原帖入口退到第二行。
- * 信息没少，但不再用两个独立列把「为什么」和处置动作挤到屏幕外。 */
-td.which{color:var(--text-dark);min-width:190px;max-width:280px}
-.todo-title{display:block;font-weight:600;line-height:1.45;margin-bottom:4px}
-.todo-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  font-size:12px;color:var(--text-light);line-height:1.45}
-.todo-meta .persona{font-family:var(--font-num);color:var(--text-light)}
-.todo-meta a{font-size:12px;white-space:nowrap}
-.todos td.acts{min-width:168px}
+/* 行操作：文字链（墨字 + 青下划线），和全站的链接一个样子 */
+td a.act{font-size:var(--sm);font-weight:600;color:var(--t1)}
+/* 帖子身份合成一栏：标题用于定位，素人编号和原帖入口退到第二行。 */
+td.which{min-width:190px;max-width:280px;color:var(--t1)}
+.todo-title{display:block;margin-bottom:4px;font-weight:600;line-height:1.5}
+.todo-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:var(--mi);
+  color:var(--t3);line-height:1.5}
+.todo-meta .persona{font-family:var(--f-num);font-variant-numeric:tabular-nums}
+.todo-meta a{font-size:var(--mi);white-space:nowrap;color:var(--t2)}
+.todos td.acts{min-width:200px}
 .todos td.diagnosis{min-width:180px;max-width:320px}
-tr.fresh td:nth-child(2){border-left:3px solid var(--primary)}
-/* 「新」跟在标题后面，不单独占一行把每条新待办撑高 */
-tr.fresh .todo-title::after{content:"新";font-size:12px;color:var(--primary);
-  margin-left:8px;font-weight:600}
+/* 上次看过之后新冒出来的：标题格左缘一根 2px 主色线，标题后跟一个「新」 */
+tr.fresh td:nth-child(2){border-left:2px solid var(--primary)}
+tr.fresh .todo-title::after{content:"新";margin-left:8px;font-size:var(--mi);font-weight:700;
+  color:var(--primary)}
 
-/* ---------- 徽标：高 20、直角、语义浅底 + 加深档字 ---------- */
-.chip{display:inline-block;height:20px;line-height:20px;padding:0 8px;
-  font-size:12px;background:var(--fill);color:var(--text);
-  margin:0 4px 4px 0;white-space:nowrap}
+/* ---------- 状态标签：高 20、直角、语义浅底 + 加深档字（标签不是控件，不用控件圆角） ---------- */
+.chip{display:inline-block;height:20px;margin:0 4px 4px 0;padding:0 8px;font-size:var(--mi);
+  font-weight:600;line-height:20px;white-space:nowrap;vertical-align:middle;background:var(--fill);
+  color:var(--t2)}
 .chip.r{background:var(--tint-danger);color:var(--danger-deep)}
 .chip.a{background:var(--tint-warning);color:var(--warning-deep)}
 .chip.g{background:var(--tint-success);color:var(--success-deep)}
+/* 已归档 / 未巡查：说的是「这一行归谁管」，不是问题本身——描边、不上色 */
+.chip.o{background:none;border:1px solid var(--hl2);line-height:18px;color:var(--t3)}
 
-/* ---------- 卡片与色块 ---------- */
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
-  gap:16px;align-items:start}
-.card{background:var(--surface);border:1px solid var(--border);padding:20px}
-.card.bad{border-color:var(--danger);border-left-width:3px}
-.card h3{margin:0 0 2px;font-size:16px;font-weight:600;color:var(--text-dark)}
-.card .rows{margin:12px 0 0;font-size:14px}
-.card .rows div{display:flex;justify-content:space-between;gap:12px;
-  padding:4px 0;border-top:1px solid var(--border)}
+/* ---------- 卡与行表 ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;align-items:start}
+.card{background:var(--surface);padding:24px}
+.card.bad{padding-top:22px;border-top:2px solid var(--danger)}
+.card h3{margin:0;font-size:var(--body);font-weight:700;line-height:1.4;color:var(--t1)}
+.card .rows{margin:12px 0 0}
+.card .rows div{display:flex;justify-content:space-between;gap:12px;padding:8px 0;
+  border-top:1px solid var(--hl)}
 .card .rows div:first-child{border-top:0}
-.card .rows .lbl{color:var(--text-light)}
-.card .big{font-size:32px;font-weight:600;line-height:1.1;color:var(--text-dark)}
-.project-detail{margin-top:12px;border-top:1px solid var(--border)}
-.project-detail>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  padding:12px 0 4px;color:var(--text);font-size:13px}
-.project-detail>summary .detail-link{margin-left:auto;color:var(--primary);font-size:12px}
+.card .rows .lbl{color:var(--t3)}
+.card .big{margin-top:16px;font-family:var(--f-num);font-size:var(--n1);font-weight:800;
+  font-stretch:112%;letter-spacing:-.015em;line-height:1;color:var(--t1)}
+.card .big+.muted{display:block;margin-top:8px}
+.card>.muted{margin-top:4px}
+.project-detail{margin-top:16px;border-top:1px solid var(--hl)}
+.project-detail>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 0 4px;
+  font-size:var(--sm);color:var(--t2)}
+.project-detail>summary .detail-link{margin-left:auto;font-size:var(--mi);font-weight:600;color:var(--t1)}
 .project-detail .rows{margin-top:8px}
-.project-snapshot{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px;
-  color:var(--text-light)}
-.project-snapshot b{font-family:var(--font-num);font-weight:600;color:var(--text-dark)}
-.project-refresh{margin-top:8px;font-size:12px;color:var(--text-light);line-height:1.55}
-.project-refresh>span:first-child{color:var(--text);margin:0 4px}
+.project-detail .chips{margin-top:8px}
+.project-snapshot{display:flex;gap:8px 16px;flex-wrap:wrap;margin-top:12px;font-size:var(--sm);
+  color:var(--t3)}
+.project-snapshot b{font-family:var(--f-num);font-weight:700;color:var(--t1);
+  font-variant-numeric:tabular-nums}
+.project-refresh{margin-top:8px;font-size:var(--mi);line-height:1.6;color:var(--t3)}
+.project-refresh>span:first-child{margin:0 4px;color:var(--t2)}
 
-/* ---------- 横幅：浅调底 + 文字色阶（禁彩字配浅底） ---------- */
-.problem,.note{padding:12px;margin:12px 0;font-size:13px;
-  display:flex;gap:8px;align-items:flex-start;line-height:1.55}
-.problem{background:var(--tint-danger);color:var(--danger-deep);
-  border-left:3px solid var(--danger)}
-.note{background:var(--tint-warning);color:var(--warning-deep);
-  border-left:3px solid var(--warning)}
+/* ---------- 留在出事的地方：语义浅底 + 2px 语义色顶线 + 加深档字 ---------- */
+.problem,.note{display:flex;gap:8px;align-items:flex-start;margin:12px 0;padding:12px 16px;
+  font-size:var(--sm);line-height:1.6}
+.problem{background:var(--tint-danger);color:var(--danger-deep);border-top:2px solid var(--danger)}
+.note{background:var(--tint-warning);color:var(--warning-deep);border-top:2px solid var(--warning)}
 .problem ul{margin:4px 0 0;padding-left:20px}
 .problem li{margin:4px 0}
 .problem .icon,.note .icon{margin-top:3px}
+.problem a,.note a{color:inherit}
 
-/* ---------- 控件：高 40 / 直角 / 聚焦 2px 主色环 ---------- */
-button{font:600 14px/1 var(--font-sans);height:40px;padding:0 16px;border:0;
-  background:var(--fill);color:var(--text-dark);cursor:pointer}
-button:hover:not(:disabled){background:var(--bg-secondary)}
-button:active:not(:disabled){transform:scale(.98)}
-button:disabled{opacity:.45;cursor:not-allowed}
+/* ---------- 控件：按钮 40 / 36，8px 圆角；按下 = 缩到 .97 + 底色加深，两件事一起变（CRAFT §二） ---------- */
+/* 没带类的 button 是次按钮（灰底墨字）；.primary 是一个区域里唯一的主按钮。 */
+button{display:inline-flex;align-items:center;justify-content:center;height:40px;margin:0;padding:0 16px;
+  border:0;border-radius:var(--radius-control);background:var(--fill);color:var(--t1);
+  font:600 var(--sm)/1 var(--f-sans);white-space:nowrap;cursor:pointer;
+  transition:background-color var(--t-hover) var(--ease-out),color var(--t-hover) var(--ease-out),
+    transform var(--t-press) var(--ease-out)}
+button:hover:not(:disabled){background:var(--border)}
+button:active:not(:disabled){background:var(--border);transform:scale(.97)}
+button:disabled{background:var(--fill);color:var(--t4);cursor:not-allowed;transform:none}
 button.primary{background:var(--primary);color:var(--on-primary)}
-button.primary:hover:not(:disabled){background:var(--primary-dark)}
-button.sm{height:32px;font-size:13px;font-weight:500;padding:0 12px}
-button.danger{background:var(--danger);color:#fff}
-/* 深浅模式开关：右下角悬浮（templates/dashboard.html 的定式）。
- * 不透明 surface + 发丝线成形、零阴影——悬浮件的通用做法（DESIGN.md §5）。 */
-.theme-btn{position:fixed;bottom:20px;right:20px;z-index:99;width:36px;
-  height:36px;padding:0;background:var(--surface);
-  border:1px solid var(--border);color:var(--text);display:flex;
-  align-items:center;justify-content:center}
-/* 有侧栏的那几屏，开关收进侧栏底部专门留出的一格：悬浮在内容区右下角
- * 会压住待办表最右一列（「已处理」）。登录页没有侧栏、窄屏侧栏变顶条，
- * 这两种照旧右下角；不认 :has() 的浏览器也是退回右下角。 */
-@media (min-width:901px){
-  body:has(>.app) .theme-btn{right:auto;left:188px;bottom:16px}
-  .side .foot{padding-bottom:68px}
-}
-input[type=password],input[type=search],input[type=text],input[type=number]{
-  font:14px/1 var(--font-sans);height:40px;padding:0 12px;
-  border:1px solid var(--border-strong);background:var(--surface);
-  color:var(--text-dark);width:100%}
-input:focus-visible,button:focus-visible,a:focus-visible,
-summary:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
-:where(button,input,a,select,summary){transition:background-color .14s ease-out,
-  color .14s ease-out,border-color .14s ease-out,transform .12s ease-out}
-:where(body,.side,.top,.card,.workbench,.kpi>*,table,th,td){
-  transition:background-color .18s ease-out,color .18s ease-out,border-color .18s ease-out}
+button.primary:hover:not(:disabled),button.primary:active:not(:disabled){background:var(--primary-dark)}
+button.primary:disabled{background:var(--fill);color:var(--t4)}
+button.sm{height:36px;padding:0 12px}
+button.danger{background:var(--danger);color:var(--on-danger)}
+button.danger:hover:not(:disabled),button.danger:active:not(:disabled){background:var(--danger-deep)}
+button .icon{margin-right:8px}
+/* 夹在一句说明里的按钮：缩成行内高度，不把整行撑开 */
+.muted button{height:32px;margin:2px 0;padding:0 12px;vertical-align:middle}
+/* 行里、抽屉里的文字按钮（「详情」「撤销」「关闭」）：和文字链同一个样子 */
+button.link{height:auto;min-height:28px;margin-left:12px;padding:0;background:none;font-weight:600;
+  color:var(--t1);text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:4px;
+  text-decoration-color:var(--hl2);transition:text-decoration-color var(--t-hover) var(--ease-out)}
+button.link:hover:not(:disabled),button.link:active:not(:disabled){background:none;
+  text-decoration-color:currentColor;transform:none}
+/* 深浅模式开关：有顶栏的页面放在顶栏工具区（幽灵图标按钮）；登录页没有顶栏，右下角悬浮 */
+.theme-btn{width:36px;height:36px;padding:0;background:transparent;color:var(--t2)}
+.theme-btn .icon{margin:0}
+.theme-btn:hover:not(:disabled),.theme-btn:active:not(:disabled){background:var(--fill);color:var(--t1)}
+body>.theme-btn{position:fixed;right:20px;bottom:20px;z-index:50;background:var(--surface);
+  border:1px solid var(--hl)}
+.top button.ghost{background:transparent;color:var(--t2)}
+.top button.ghost:hover:not(:disabled),.top button.ghost:active:not(:disabled){background:var(--fill);
+  color:var(--t1)}
+/* 输入类：填充底、无描边、8px 圆角；聚焦是 2px 主色环 */
+input[type=password],input[type=search],input[type=text],input[type=number],input[type=date],
+select,textarea{font:400 var(--sm)/1.5 var(--f-sans);color:var(--t1);background-color:var(--fill);
+  border:0;border-radius:var(--radius-control);
+  transition:background-color var(--t-hover) var(--ease-out)}
+input[type=password],input[type=search],input[type=text],input[type=number]{width:100%;height:40px;
+  padding:0 12px}
+input[type=number]{height:36px}
+input[type=date]{height:36px;padding:0 12px}
+input[type=password]:hover,input[type=search]:hover,input[type=text]:hover,input[type=number]:hover,
+input[type=date]:hover,select:hover,textarea:hover{background-color:var(--border)}
+input:focus-visible,select:focus-visible,textarea:focus-visible{outline-offset:2px}
+input::placeholder,textarea::placeholder{color:var(--t3);opacity:1}
+/* 选择框触发器：右侧 16px 下箭头（箭头随深浅两档 token 换色） */
+select{appearance:none;-webkit-appearance:none;height:36px;padding:0 32px 0 12px;
+  background-image:var(--chev);background-repeat:no-repeat;background-position:right 10px center;
+  background-size:16px 16px;cursor:pointer}
+textarea{display:block;width:100%;min-height:72px;padding:8px 12px;line-height:1.6;resize:vertical}
+/* 复选：18、圆角 4（内件档，CRAFT §十二）；勾以 200ms 小确认曲线落定；热区向外扩 */
+input[type=checkbox]{position:relative;appearance:none;-webkit-appearance:none;flex:none;width:18px;
+  height:18px;margin:0 4px 0 0;vertical-align:-4px;border:1.5px solid var(--t3);
+  border-radius:calc(var(--radius-control) - 4px);background:var(--surface);cursor:pointer;
+  transition:border-color var(--t-hover) var(--ease-out),background-color var(--t-hover) var(--ease-out)}
+input[type=checkbox]::before{content:"";position:absolute;left:4.5px;top:1px;width:5px;height:9.5px;
+  border:solid var(--on-primary);border-width:0 2px 2px 0;transform:rotate(45deg) scale(0);
+  transition:transform var(--t-sm) var(--ease-over)}
+input[type=checkbox]::after{content:"";position:absolute;inset:-8px}
+input[type=checkbox]:hover:not(:checked):not(:disabled){border-color:var(--t2)}
+input[type=checkbox]:checked{background:var(--primary);border-color:var(--primary)}
+input[type=checkbox]:checked::before{transform:rotate(45deg) scale(1)}
+input[type=checkbox]:disabled{opacity:.45;cursor:not-allowed}
 
-/* ---------- 登录：品牌时刻，这套面板唯一的一块品牌面色 ---------- */
-/* 登录页是 BRAND.md §2 点名的「品牌时刻」（接收层，BRAND-LANGUAGE §二），
- * 也是本面板唯一一块**品牌面色**（v5.1 起标志青可以做底不做字）：
- * 青底 · 墨字 · 墨版标志，三件套固定不拆。块内不放白字（1.77）、不放赭石
- * （2.81）；主按钮在表单最底，和青面隔着标题与输入框，不相邻。
- * 块内那一句是这个面板的判断（≤14 字），不是口号——语法「判断先行」。
- * 后台那一屏（工作层）不开青面：工作层的青面只给 deck 幕封。 */
-.login{max-width:360px;margin:14vh auto;background:var(--surface);
-  border:1px solid var(--border)}
-.login .field{background:var(--field-brand);color:var(--on-field);
-  padding:20px 28px}
-.login .field .brand{display:flex;align-items:center;gap:8px;color:inherit}
-.login .field .say{margin:12px 0 0;font-size:15px;font-weight:500;
-  color:inherit}
-.login .body{padding:24px 28px 28px}
-.login h1{font-size:20px;margin:0 0 4px}
-.login p{margin:0 0 20px}
-.login button{width:100%}
-.err{color:var(--danger-deep);background:var(--tint-danger);padding:8px 12px;
-  font-size:13px;margin:0 0 16px}
+/* ---------- 登录：品牌时刻，标志青面（青底 · 墨字 · 墨版标志，三件套固定不拆） ---------- */
+/* 青面上那一句是这个面板的判断（≤14 字），用最大的字写；块内不放白字（1.77）、不放赭石（2.81）。
+ * 主按钮在表单最底，和青面隔着标题与输入框。 */
+.login{width:min(400px,calc(100vw - 32px));margin:12vh auto 48px;background:var(--surface)}
+.login .field{padding:24px 32px 28px;background:var(--field);color:var(--ink-on-field)}
+.login .field .brand{color:inherit}
+.login .field .say{margin:32px 0 0;font-family:var(--f-dsp);font-size:var(--d3);font-weight:900;
+  line-height:1.3;color:inherit;text-wrap:balance}
+.login .body{padding:24px 32px 32px}
+.login h1{margin:0;font-family:var(--f-sans);font-size:var(--body);font-weight:700;line-height:1.4}
+.login p{margin:4px 0 20px}
+.login p:empty{margin:0 0 12px}
+.login button{width:100%;height:48px;font-size:var(--body);font-weight:700}
+.err{margin:0 0 16px;padding:8px 12px;background:var(--tint-danger);color:var(--danger-deep);
+  border-top:2px solid var(--danger);font-size:var(--sm)}
 
-/* ---------- 四态：空 / 骨架 ---------- */
-.empty{background:var(--surface);border:1px solid var(--border);padding:32px;
-  text-align:center;color:var(--text-light);font-size:14px}
-.empty .icon{width:24px;height:24px;stroke-width:1.5;margin:0 auto 12px;
-  color:var(--text-faint)}
-.empty .two{font-size:13px;color:var(--text-faint);margin-top:8px}
-/* 骨架屏微光是负面清单 #2 明文豁免的唯一渐变 */
-.sk{background:var(--bg-secondary);background-image:linear-gradient(90deg,
-  rgba(0,0,0,0) 0%,var(--fill) 50%,rgba(0,0,0,0) 100%);
-  background-size:200% 100%;animation:shimmer 1.6s linear infinite;height:14px}
-.sk.tall{height:112px}
-@keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+/* ---------- 空态：两行人话（发生了什么、下一步做什么），不放彩色圆底图标 ---------- */
+.empty{padding:24px;background:var(--surface);font-size:var(--body);font-weight:600;line-height:1.5;
+  color:var(--t1)}
+.empty .icon{display:block;width:20px;height:20px;margin:0 0 12px;color:var(--t3)}
+.empty .two{margin-top:4px;font-size:var(--sm);font-weight:400;line-height:1.6;color:var(--t3)}
+/* 待办清零：值得庆祝的那一刻用标志青面 + 一次落定（CRAFT §一），青面上只有墨字 */
+#todoEmpty{background:var(--field);color:var(--ink-on-field);animation:rise var(--t-lg) var(--ease-strong) both}
+#todoEmpty .icon,#todoEmpty .two{color:var(--ink-on-field-2)}
+/* 骨架：300ms 之后才出现；尺寸位置与真实一致；
+ * 骨架 shimmer 亮带固定在视口上，所有骨架共用一道（CRAFT §八）——渐变禁令的唯一豁免 */
+.sk{display:block;height:12px;background-color:var(--skel);
+  background-image:linear-gradient(90deg,transparent 0,var(--skel-band) 50%,transparent 100%);
+  background-repeat:no-repeat;background-size:320px 100vh;background-attachment:fixed;
+  animation:sk-in var(--t-sm) var(--ease-out) 300ms both,skl-band 1.2s linear infinite}
+.sk.tall{height:160px}
+@keyframes sk-in{from{opacity:0}to{opacity:1}}
+@keyframes skl-band{from{background-position:-320px 0}to{background-position:calc(100vw + 320px) 0}}
 
-/* ---------- 级联入场：动效必须有信息含义 ---------- */
-.stagger-in>*{animation:fade-up .28s cubic-bezier(.22,1,.36,1) both}
-.stagger-in>*:nth-child(2){animation-delay:.055s}
-.stagger-in>*:nth-child(3){animation-delay:.11s}
-.stagger-in>*:nth-child(4){animation-delay:.165s}
-.stagger-in>*:nth-child(n+5){animation-delay:.22s}
-@keyframes fade-up{from{opacity:0;transform:translateY(8px)}
-  to{opacity:1;transform:none}}
-@keyframes detail-in{from{opacity:0;transform:translateY(-4px)}
-  to{opacity:1;transform:none}}
+/* ---------- 进场：只给成组内容，一次，向上 12px，组内间隔 60ms、最多 4 个 ---------- */
+.stagger-in>*{animation:fade-in 360ms var(--ease-out) both,rise var(--t-lg) var(--ease-strong) both}
+.stagger-in>*:nth-child(2){animation-delay:60ms}
+.stagger-in>*:nth-child(3){animation-delay:120ms}
+.stagger-in>*:nth-child(n+4){animation-delay:180ms}
+@keyframes fade-in{from{opacity:0}to{opacity:1}}
+@keyframes fade-out{to{opacity:0;visibility:hidden}}
+@keyframes rise{from{transform:translateY(12px)}to{transform:none}}
+@keyframes detail-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+@keyframes pop-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+@keyframes pop-out{to{opacity:0;transform:translateY(-6px);visibility:hidden}}
 @media (prefers-reduced-motion:reduce){
-  *,*::before,*::after{animation-duration:.01ms!important;
-    animation-iteration-count:1!important;transition-duration:.01ms!important}
+  *,*::before,*::after{transition-duration:150ms!important;animation-duration:1ms!important;
+    animation-iteration-count:1!important}
+  button:active:not(:disabled){transform:none}
+  .sk{animation:none;background-image:none}
+  .drawer,.top-status{transform:none!important}
+  /* 减少动效：保留状态变化与淡入，去掉位移（CRAFT §一） */
+  .stagger-in>*,#todoEmpty,.drawer,.top-status:not(:empty){animation-name:fade-in}
+  .top-status[data-state=ok]{animation-name:fade-in,fade-out}
 }
 
 /* ---------- 其余定式 ---------- */
 .tools{display:flex;gap:12px;align-items:center}
 .searchbox{position:relative;display:flex;align-items:center}
-.searchbox>.icon{position:absolute;left:10px;top:10px;z-index:1;
-  color:var(--text-faint);pointer-events:none}
-.searchbox input{height:36px;padding-left:32px}
-.tools button{height:36px}
+.searchbox>.icon{position:absolute;left:12px;top:10px;z-index:1;color:var(--t3);pointer-events:none}
+.searchbox input{height:36px;padding-left:36px}
 /* 找帖子：放在待办工作台里、项目选择旁边。处理完回来点「已处理」时，
  * 待办一多就靠它定位，不能藏在顶栏角落里。 */
 .work-find{flex:1 1 320px;min-width:0}
 .work-find input{width:100%;min-width:0}
-.find-result{padding:0 16px 12px;font-size:13px;color:var(--text-light)}
-.find-result button{margin:0 2px}
-.find-result b{color:var(--text-dark)}
+.find-result{padding:0 24px 16px;font-size:var(--sm);color:var(--t3)}
+.find-result button{margin:0 4px}
+.find-result b{color:var(--t1)}
 tr.found{outline:2px solid var(--primary);outline-offset:-2px}
-input::placeholder,textarea::placeholder{color:var(--text-faint)}
-.queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
-  margin-bottom:12px;background:var(--surface);border:1px solid var(--border);
-  padding:12px}
-.queuebar .queue-help{font-size:12px;color:var(--text-light)}
-#queueOut{flex:1;min-width:220px}
-.top-status{position:absolute;top:52px;right:24px;z-index:8;max-width:min(520px,90vw);
-  padding:8px 12px;background:var(--surface);border:1px solid var(--border);
-  color:var(--text);font-size:12px}
+/* 顶栏下的状态条：浮层定式（不透明表面 + 发丝线框 + 2px 深青顶线）；「已更新」3 秒后自己退场，
+ * 失败留着不走（需要人知道的失败不能只闪一下，CRAFT §八） */
+.top-status{position:absolute;top:calc(100% + 12px);right:24px;z-index:70;max-width:min(400px,90vw);
+  padding:12px 16px;background:var(--surface);border:1px solid var(--hl);border-top:2px solid var(--rule);
+  font-size:var(--sm);line-height:1.5;color:var(--t2)}
 .top-status:empty{display:none}
-.top-status:not(:empty){animation:detail-in .18s ease-out both}
-.top-status[data-state=error]{background:var(--tint-danger);color:var(--danger-deep);
-  border-color:var(--danger)}
-/* ---------- 待办按项目分页的 tab 条 ---------- */
-/* 设计系统只定了一条：激活 Tab 用主色（DESIGN.md §2）。其余按后台轨控件
- * 规格来：高 40、14/500、直角、发丝线承重；激活 = 主色字 + 2px 主色底线。
- * 不做深底白字的 tab——那是按钮的样子，不是导航的样子。 */
-/* 项目切换：一行一个项目（仍然是 tablist，点哪行看哪个项目的待办）。每行：名字、
- * 要管几行、处理进度条（待处理 / 正在处理 / 已处理各占多长）和三个数、最近检查时间。
- * 以前是一排横着的标签，上面只有「2 +1」「14 +26」两个数，不解释看不懂（2026-11-11）。 */
-.tabs{display:flex;flex-direction:column;margin-bottom:12px;background:var(--surface);
-  border:1px solid var(--border)}
+.top-status:not(:empty){animation:pop-in var(--t-md) var(--ease-out) both}
+.top-status[data-state=ok]{animation:pop-in var(--t-md) var(--ease-out) both,
+  pop-out var(--t-sm) var(--ease-in) 3s forwards}
+.top-status[data-state=error]{border-top-color:var(--danger);color:var(--danger-deep)}
+
+/* ---------- 待办区：一块白表面，里面是排队条、项目切换、三线表 ---------- */
+.todo-panel{padding:20px 24px 24px;background:var(--surface)}
+.queuebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 20px}
+.queuebar .queue-help{font-size:var(--mi);color:var(--t3)}
+#queueOut{flex:1;min-width:220px}
+/* 项目切换：一行一个项目（仍是 tablist）。行是铺满的可点区域：直角、悬停只换底色、按下不缩放。
+ * 激活 = 主浅调底 + 主色字 + 左缘 2px 主色条，和侧栏同一个说法。 */
+.tabs{display:flex;flex-direction:column;margin-bottom:20px;border-top:1px solid var(--hl2);
+  border-bottom:1px solid var(--hl)}
 .tabs:empty{display:none}
-.tabs .tab{height:auto;min-height:44px;padding:8px 16px;background:none;border:0;
-  border-top:1px solid var(--border);font-weight:500;color:var(--text);width:100%;
-  text-align:left;display:grid;align-items:center;gap:4px 16px;
-  grid-template-columns:minmax(120px,1.1fr) minmax(150px,1fr) minmax(72px,.8fr) minmax(250px,1.7fr) minmax(130px,.9fr);
-  transition:background-color .16s ease-out,color .16s ease-out}
+.tabs .tab{position:relative;display:grid;align-items:center;gap:4px 16px;width:100%;height:auto;
+  min-height:48px;padding:8px 12px;border-radius:0;border-top:1px solid var(--hl);background:none;
+  font-weight:400;color:var(--t2);text-align:left;white-space:normal;
+  grid-template-columns:minmax(120px,1.1fr) minmax(150px,1fr) minmax(72px,.8fr) minmax(250px,1.7fr) minmax(130px,.9fr)}
 .tabs .tab:first-child{border-top:0}
 .tabs .tab:hover:not(:disabled){background:var(--fill)}
-.tabs .tab.on{color:var(--primary);background:var(--tint-primary);font-weight:600}
-.tabs .tab-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tabs .tab-count,.tabs .tab-states,.tabs .tab-latest{font-size:12px;font-weight:400;
-  color:var(--text-light);white-space:nowrap}
-.tabs .tab-latest{text-align:right;font-family:var(--font-num)}
+.tabs .tab:active:not(:disabled){background:var(--fill);transform:none}
+.tabs .tab.on{background:var(--tint-primary);color:var(--primary);font-weight:700}
+.tabs .tab.on::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:2px;
+  background:var(--primary)}
+.tabs .tab-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;color:var(--t1)}
+.tabs .tab.on .tab-name{font-weight:700;color:var(--primary)}
+.tabs .tab-count,.tabs .tab-states,.tabs .tab-latest{font-size:var(--mi);font-weight:400;
+  color:var(--t3);white-space:nowrap}
+.tabs .tab-latest{text-align:right;font-family:var(--f-num);font-variant-numeric:tabular-nums}
 .pbar{display:flex;height:8px;background:var(--fill);overflow:hidden}
 .pbar[hidden]{display:block;visibility:hidden}
-.pbar i,.tab-states i{display:block;background:var(--text-faint)}
-.pbar i{height:100%;transition:width .18s ease-out}
-.tab-states i{display:inline-block;width:8px;height:8px;margin:0 4px 0 10px}
+.pbar i,.tab-states i{display:block;background:var(--t4)}
+.pbar i{height:100%}
+.tab-states i{display:inline-block;width:8px;height:8px;margin:0 4px 0 12px}
 .tab-states i:first-child{margin-left:0}
 .pbar .p-pending,.tab-states .p-pending{background:var(--warning)}
 .pbar .p-processing,.tab-states .p-processing{background:var(--primary)}
 @media (max-width:1100px){
+  /* 侧栏收成顶上一条横排导航（黄金样张在 1100 收起侧栏）：1024 的笔记本上待办表不用横滑。 */
+  .app{grid-template-columns:minmax(0,1fr)}
+  .side{position:static;height:auto;padding:0 8px;border-right:0;border-bottom:1px solid var(--border)}
+  .side .brand{height:56px;padding:0 8px}
+  .side nav{display:flex;flex-wrap:nowrap;overflow-x:auto;padding:0 0 8px;
+    -webkit-overflow-scrolling:touch}
+  .side nav a{flex:none;height:36px;padding:0 12px}
+  .side nav a.on::before{left:12px;right:12px;top:auto;bottom:0;width:auto;height:2px}
+  .side .grp,.side .foot{display:none}
+  /* 1024 宽时待办表的七列要挤进内容区：标题列和诊断列的下限各让一点 */
+  .todos td.which{min-width:160px}
+  .todos td.diagnosis{min-width:140px}
   /* 窄了排成两行：名字 + 要管几行；进度条通栏；三个数 + 最近检查。 */
   .tabs .tab{grid-template-columns:minmax(0,1fr) auto}
   .tabs .pbar{grid-column:1 / -1}
   .tabs .tab-states{white-space:normal}
+  .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
-/* tab 上的条数：颜色说的是这个项目最坏的一档（同徽标的加深档），
+/* tab 上的条数：颜色说的是这个项目最坏的一档（同状态标签的加深档），
  * 所以严重度色要压过激活态的主色——信息先于装饰。 */
-.tabs .cnt{display:inline-flex;align-items:center;justify-content:center;min-width:22px;
-  height:20px;padding:0 6px;font-size:12px;font-family:var(--font-num);
-  color:var(--text-light);background:var(--fill);transition:background-color .16s ease-out,
-  color .16s ease-out}
-.tabs .tab.on .cnt{color:var(--primary);background:var(--tint-primary)}
+.tabs .cnt{display:inline-block;min-width:24px;height:20px;padding:0 6px;margin-right:4px;
+  font:700 var(--mi)/20px var(--f-num);font-variant-numeric:tabular-nums;text-align:center;
+  color:var(--t2);background:var(--fill)}
+.tabs .tab.on .cnt{color:var(--primary);background:var(--surface)}
 .tabs .tab .cnt.r{color:var(--danger-deep);background:var(--tint-danger)}
 .tabs .tab .cnt.a{color:var(--warning-deep);background:var(--tint-warning)}
-.proj{display:flex;gap:12px;align-items:flex-start;padding:12px 0;
-  border-top:1px solid var(--border);flex-wrap:wrap}
+/* 「另 N 行已归档」：这个项目底下还收着几行已归档的。淡色，不和主数字抢。 */
+.tabs .more{margin-left:8px}
+.tab-empty{padding:16px 0;font-size:var(--sm);color:var(--t3)}
+
+/* ---------- 项目管理 ---------- */
+#projects{padding:8px 24px;background:var(--surface)}
+#projects.note{padding:12px 16px;background:var(--tint-warning)}
+#projects.problem{padding:12px 16px;background:var(--tint-danger)}
+.proj{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;padding:16px 0;
+  border-top:1px solid var(--hl)}
 .proj:first-child{border-top:0}
 .proj .who{flex:1;min-width:200px}
-.proj .who b{font-weight:600;color:var(--text-dark)}
-.proj .acts{display:flex;gap:8px}
-.proj.off{opacity:.55}
-.addbox{background:var(--surface);border:1px solid var(--border);padding:20px;
-  margin-top:16px}
+.proj .who b{margin-right:4px;font-weight:700;color:var(--t1)}
+.proj .acts{display:flex;gap:8px;flex-wrap:wrap}
+.proj .acts button{height:36px;padding:0 12px}
+.proj.off .who{opacity:.6}
+.addbox{margin-top:16px;padding:24px;background:var(--surface)}
 .addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .addbox input[type=text]{flex:1;min-width:200px}
-.out{margin-top:12px;font-size:13px;white-space:pre-wrap;color:var(--text)}
+.addbox-t{margin:0 0 12px;font-size:var(--body);font-weight:700;color:var(--t1)}
+.out{margin-top:12px;font-size:var(--sm);white-space:pre-wrap;color:var(--t2)}
+.out:empty{margin-top:0}
 /* 新建表给谁开权限：在建表那个框里、发丝线隔开。改这里不用重新部署。 */
-.share{margin-top:16px;padding-top:12px;border-top:1px solid var(--border);
-  font-size:13px}
+.share{margin-top:24px;padding-top:16px;border-top:1px solid var(--hl);font-size:var(--sm)}
 .share .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
-.share .lbl{color:var(--text-light);min-width:7em}
-.share select{height:32px;border:1px solid var(--border-strong);background:var(--surface);
-  color:var(--text-dark);font:13px var(--font-sans);padding:0 8px}
-.share .pick{margin-top:8px;padding:12px;background:var(--bg);
-  border:1px solid var(--border)}
+.share .lbl{min-width:7em;color:var(--t3)}
+.share .pick{margin-top:8px;padding:12px 16px;background:var(--fill)}
 .share .pick label{display:block;margin:4px 0}
+#trial{margin-top:0;padding:24px;border-top:0}
 .ok{color:var(--success-deep)}
-code{background:var(--fill);padding:2px 6px;font-size:13px;
-  font-family:var(--font-num)}
-details>summary{cursor:pointer;font-size:13px;color:var(--text-light);
-  padding:8px 0;user-select:none}
-details[open]>:not(summary){animation:detail-in .18s ease-out both}
+/* 折叠：一根会转的小箭头说明「点开还有」；各处自己写了提示的（展开 / 收起）不再画箭头 */
+details>summary{cursor:pointer;padding:8px 0;font-size:var(--sm);color:var(--t2);user-select:none;
+  list-style:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary .muted{margin-left:8px}
+details>summary::before{content:"";display:inline-block;width:6px;height:6px;margin:0 10px 2px 2px;
+  border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);
+  transition:transform var(--t-sm) var(--ease-out)}
+details[open]>summary::before{transform:rotate(45deg)}
+.fold>summary::before,.work-details>summary::before,.daily>summary::before,
+.project-detail>summary::before{content:none}
+details[open]>:not(summary){animation:detail-in var(--t-sm) var(--ease-out) both}
 .work-details>summary:hover,.daily>summary:hover,.fold>summary:hover,
 .project-detail>summary:hover{background:var(--fill)}
 /* ---------- 每个项目那一页底下的归档折叠区 ----------
- * **默认收起**，但要让人知道有这一块：以前是一行灰色小字，运营根本看不到。
- * 现在是一条白底、警示色左边线的条（同 .note 的语义色用法），条上写着几行、
- * 各是什么问题；点开才是明细。直角、零阴影（DESIGN.md）。 */
-.fold{margin-top:12px;background:var(--surface);border:1px solid var(--border);
-  border-left:3px solid var(--warning)}
-.fold>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  padding:12px 16px;font-size:14px;color:var(--text-dark);list-style:none}
-.fold>summary::-webkit-details-marker{display:none}
+ * **默认收起**，但要让人知道有这一块：一条带 2px 警示色顶线的条，条上写着几行、各是什么问题；
+ * 点开才是明细。 */
+.fold{margin-top:20px;border-top:2px solid var(--warning)}
+.fold>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;font-size:var(--sm);
+  color:var(--t1)}
 .fold>summary .icon{color:var(--warning-deep)}
 .fold>summary .chip{margin:0}
-.fold-t b{color:var(--warning-deep);font-weight:600;font-family:var(--font-num)}
-.fold-hint{margin-left:auto;font-size:13px;color:var(--primary);white-space:nowrap}
-.fold-hint::after{content:"";display:inline-block;width:6px;height:6px;
-  margin:0 2px 2px 8px;border-right:1.5px solid currentColor;
-  border-bottom:1.5px solid currentColor;transform:rotate(45deg);
-  transition:transform .18s ease-out}
-.fold[open] .fold-hint::after{transform:rotate(-135deg);margin-bottom:-2px}
+.fold-t b,.fold>summary b{font-family:var(--f-num);font-weight:700;color:var(--warning-deep)}
+.fold-hint{margin-left:auto;font-size:var(--mi);font-weight:600;color:var(--t1);white-space:nowrap}
+.fold-hint::after{content:"";display:inline-block;width:6px;height:6px;margin:0 2px 2px 8px;
+  border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);
+  transition:transform var(--t-sm) var(--ease-out)}
+.fold[open] .fold-hint::after{transform:translateY(3px) rotate(-135deg)}
 .fold .fold-close,.fold[open] .fold-open{display:none}
 .fold[open] .fold-close{display:inline}
-.fold-why{font-size:13px;color:var(--text-light);margin:0;padding:0 16px 12px;
-  line-height:1.55}
-.fold .tablewrap{border-top:1px solid var(--border)}
-.fold table{border:0}
-.tab-empty{padding:16px;font-size:13px;color:var(--text-light);
-  background:var(--surface);border:1px solid var(--border)}
-/* 「另 N 行已归档」：这个项目底下还收着几行已归档的。淡色，不和主数字抢。 */
-.tabs .more{margin-left:8px}
-/* 已归档 / 未巡查：说的是「这一行归谁管」，不是问题本身——描边、不上色。 */
-.chip.o{background:none;border:1px solid var(--border-strong);line-height:18px;
-  color:var(--text-light)}
-/* 行操作里的文字按钮（「已解决」「撤销」）：和「去这一行」同款 13px 主色字。 */
-button.link{height:auto;min-height:26px;display:inline-flex;align-items:center;
-  padding:0;margin-left:12px;background:none;font-size:13px;font-weight:400;color:var(--primary)}
-button.link:hover:not(:disabled){background:none;text-decoration:underline}
-tr.resolvedNote td{font-size:13px;color:var(--success-deep);
-  background:var(--tint-success)}
-tr.resolvedNote button.link{margin-left:8px}
-.resolved{margin-top:12px}
+.fold-why{margin:0;padding:0 12px 16px;font-size:var(--sm);line-height:1.6;color:var(--t3)}
+.fold-why b{color:var(--t1)}
+.resolved{margin-top:20px}
 .resolved .tablewrap{margin-top:4px}
-#projects{background:var(--surface);border:1px solid var(--border);padding:4px 20px}
-/* 待办工作台：项目、问题层级和处理状态常显；统计与日报按需展开。
- * 首屏的任务是处置，不是先读两排指标。所有指标仍保留原 DOM 和统计口径。 */
-.workbench{background:var(--surface);border:1px solid var(--border);margin:16px 0 12px}
-.work-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px}
-.work-head h2{margin:0;font-size:16px;margin-right:2px}
+tr.resolvedNote td{font-size:var(--sm);color:var(--success-deep);background:var(--tint-success)}
+tr.resolvedNote button.link{margin-left:8px}
+.monitor-help{margin:-8px 0 16px;font-size:var(--sm);color:var(--t3)}
+.monitor-help p{margin:4px 0 0;padding:16px 20px;max-width:none;background:var(--tint-primary);
+  line-height:1.75;color:var(--t2)}
+
+/* ---------- 待办工作台：项目、问题层级和处理状态常显；统计与日报按需展开 ---------- */
+.workbench{margin:16px 0 0;background:var(--surface)}
+.work-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:20px 24px 16px}
+.work-head h2{margin-right:4px}
 .work-head select{min-width:150px;max-width:100%}
-.work-head .field-label{display:flex;align-items:center;gap:6px;font-size:12px;
-  color:var(--text-light)}
-.work-head .field-label select{color:var(--text-dark)}
-.work-context{padding:12px 16px 0;font-size:12px;color:var(--text-light)}
-.work-details{border-top:1px solid var(--border)}
-.work-details>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  padding:12px 16px;color:var(--text);font-size:13px;font-weight:500}
-.work-details>summary::after{content:'展开';margin-left:auto;color:var(--primary);font-size:12px}
-.work-details[open]>summary::after{content:'收起'}
-select,input[type=date],textarea{font:14px/1.5 var(--font-sans);color:var(--text-dark);
-  border:1px solid var(--border-strong);background:var(--surface);padding:8px 10px}
-select,input[type=date]{height:36px}
-select:focus-visible,textarea:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
-textarea{width:100%;resize:vertical;min-height:72px}
-.work-live{margin-left:auto;font-size:12px;color:var(--text-light)}
-.work-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));
-  gap:0;padding:20px 0 12px}
-.work-metric{padding:0 16px;border-right:1px solid var(--border);min-width:0}
-.work-metric:last-child{border-right:0}
-.work-metric .metric-label{display:block;font-size:13px;color:var(--text-light)}
-.work-metric .metric-value{display:block;font:600 30px/1.35 var(--font-num);
-  color:var(--text-dark);margin-top:4px}
-.work-metric .metric-unit{font-size:12px;color:var(--text-light);margin-left:4px}
-.work-metric .metric-note{display:block;font-size:12px;color:var(--text-light);margin-top:2px}
+.work-head .field-label{display:flex;align-items:center;gap:8px;font-size:var(--mi);font-weight:600;
+  color:var(--t3)}
+.work-head .field-label select{font-weight:600;color:var(--t1)}
+.work-source{padding:2px 8px;font-size:var(--mi);font-weight:600;color:var(--primary);
+  background:var(--tint-primary)}
+.work-live{margin-left:auto;font-size:var(--mi);color:var(--t3)}
+.work-context{padding:16px 24px 0;font-size:var(--mi);color:var(--t3)}
+.work-details{border-top:1px solid var(--hl)}
+.work-details>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 24px;
+  font-size:var(--sm);font-weight:600;color:var(--t1)}
+.work-details>summary::after{content:"展开";margin-left:auto;font-size:var(--mi);font-weight:600;
+  color:var(--t2)}
+.work-details[open]>summary::after{content:"收起"}
+.work-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));padding:16px 0 20px}
+.work-metric{min-width:0;padding:0 24px;border-left:1px solid var(--hl)}
+.work-metric:first-child{border-left:0}
+.work-metric .metric-label{display:block;font-size:var(--mi);font-weight:600;color:var(--t3)}
+.work-metric .metric-value{display:block;margin-top:8px;font-family:var(--f-num);font-size:var(--n2);
+  font-weight:700;font-stretch:108%;line-height:1.2;color:var(--t1);font-variant-numeric:tabular-nums}
+.work-metric .metric-unit{margin-left:4px;font-family:var(--f-sans);font-size:var(--mi);font-weight:600;
+  color:var(--t3)}
+.work-metric .metric-note{display:block;margin-top:4px;font-size:var(--mi);color:var(--t3)}
+/* 「比上一期」：数字后面的小标签。往好的方向变是绿的，往坏的方向变是红的，其余灰的；
+ * 方向同时写在字里（少 / 多、箭头），不只靠颜色。没有基准时整个不显示。 */
+.metric-delta{display:inline-block;height:20px;margin-left:8px;padding:0 8px;vertical-align:middle;
+  font:600 var(--mi)/20px var(--f-sans);white-space:nowrap;background:var(--fill);color:var(--t2)}
+.metric-delta.good{background:var(--tint-success);color:var(--success-deep)}
+.metric-delta.bad{background:var(--tint-danger);color:var(--danger-deep)}
 /* ---------- 趋势图：近 14 期，每期两根柱 ----------
  * 赭色 = 这一期新出现负面的帖子，深青 = 这一期标为已处理的帖子。每根柱顶上写着数，
  * 不靠坐标轴读；两个系列颜色之外明度也不同。纯 div 画，零依赖。 */
-.trend{padding:4px 16px 16px;border-top:1px solid var(--border)}
-.trend-head{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;padding:12px 0 8px}
-.trend-title{font-size:13px;color:var(--text-dark)}
-.trend-legend{font-size:12px;color:var(--text-light)}
+.trend{padding:0 24px 20px;border-top:1px solid var(--hl)}
+.trend-head{display:flex;align-items:baseline;gap:8px 16px;flex-wrap:wrap;padding:16px 0 12px}
+.trend-title{font-size:var(--sm);font-weight:700;color:var(--t1)}
+.trend-legend{font-size:var(--mi);color:var(--t3)}
 .trend-legend i{display:inline-block;width:8px;height:8px;margin:0 4px 0 12px}
 .trend-legend i:first-child{margin-left:0}
 .t-found{background:var(--accent)}
 .t-handled{background:var(--primary)}
 .trend-chart{display:grid;grid-template-columns:repeat(14,minmax(0,1fr));gap:8px}
 .t-col{min-width:0;text-align:center}
-.t-bars{display:flex;align-items:flex-end;gap:2px;height:96px;border-bottom:1px solid var(--border-strong)}
+.t-bars{display:flex;align-items:flex-end;gap:2px;height:96px;border-bottom:1px solid var(--hl2)}
 .t-bar{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;
   align-items:center}
-.t-bar b{font:500 11px/16px var(--font-num);color:var(--text)}
-.t-bar i{display:block;width:100%;max-width:18px;min-height:1px}
-.t-date{display:block;margin-top:4px;font:400 11px/16px var(--font-num);color:var(--text-light);
-  white-space:nowrap}
+.t-bar b{font:700 var(--mi)/16px var(--f-num);color:var(--t2)}
+.t-bar i{display:block;width:100%;max-width:16px;min-height:1px}
+.t-date{display:block;margin-top:4px;font:400 var(--mi)/16px var(--f-num);color:var(--t3);white-space:nowrap}
 .t-col.live .t-bar i{opacity:.55}
-.t-col.live .t-date{color:var(--primary)}
-.trend-note{margin-top:8px;font-size:12px;color:var(--text-light)}
+.t-col.live .t-date{font-weight:700;color:var(--primary)}
+.trend-note{margin-top:8px;font-size:var(--mi);color:var(--t3)}
 @media (max-width:700px){
   /* 窄屏只留最近 7 期：14 期挤在手机上数字会叠在一起。 */
   .trend-chart{grid-template-columns:repeat(7,minmax(0,1fr))}
   .t-col:nth-child(-n+7){display:none}
 }
-/* 「比上一期」：数字后面的小标签。往好的方向变是绿的，往坏的方向变是红的，其余灰的；
- * 方向同时写在字里（少 / 多、箭头），不只靠颜色。没有基准时整个不显示。 */
-.metric-delta{display:inline-block;height:20px;padding:0 8px;margin-left:8px;
-  font:500 12px/20px var(--font-sans);vertical-align:middle;white-space:nowrap;
-  background:var(--fill);color:var(--text)}
-.metric-delta.good{background:var(--tint-success);color:var(--success-deep)}
-.metric-delta.bad{background:var(--tint-danger);color:var(--danger-deep)}
-.work-source{font-size:12px;color:var(--primary);background:var(--tint-primary);padding:2px 8px}
-.work-states{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 16px}
-.work-states .caption{font-size:12px;color:var(--text-light);margin-right:4px}
-.work-states button{height:32px;font-size:13px;font-weight:500;padding:0 10px;background:none;
-  border:1px solid var(--border)}
-.work-states button[aria-pressed=true]{color:var(--primary);background:var(--tint-primary);
-  border-color:var(--primary)}
-.work-states b{font-family:var(--font-num);margin-left:6px}
-.work-summary{padding:0 16px 12px;color:var(--text-light);font-size:12px}
-.daily{border-top:1px solid var(--border)}
-.daily>summary{padding:12px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
-  color:var(--text-dark);font-weight:500}
-.daily>summary::after{content:'展开';margin-left:auto;font-size:12px;color:var(--primary)}
-.daily[open]>summary::after{content:'收起'}
-.daily-body{padding:0 16px 16px}
+/* 处理状态筛选：2–5 个短选项、设一个值 → 分段（CRAFT §九）。轨是填充底、8px；
+ * 选中项是表面色 + 发丝线、圆角 4（内件档）；未选是注字色。 */
+.work-states{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:0 24px 16px}
+.work-states .caption{font-size:var(--mi);color:var(--t3)}
+.seg{display:inline-flex;align-items:center;gap:0;height:36px;padding:4px;
+  border-radius:var(--radius-control);background:var(--fill);vertical-align:middle}
+.seg button{height:28px;padding:0 12px;border:1px solid transparent;
+  border-radius:calc(var(--radius-control) - 4px);background:transparent;font-weight:600;color:var(--t3)}
+.seg button:hover:not(:disabled),.seg button:active:not(:disabled){background:transparent;
+  color:var(--t1);transform:none}
+.seg button[aria-pressed=true]{background:var(--surface);border-color:var(--border-strong);
+  color:var(--t1);cursor:default}
+.seg button b{margin-left:6px;font-family:var(--f-num);font-weight:700;font-variant-numeric:tabular-nums}
+.work-summary{padding:0 24px 16px;font-size:var(--mi);color:var(--t3)}
+.daily{border-top:1px solid var(--hl)}
+.daily>summary{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 24px;
+  font-size:var(--sm);font-weight:600;color:var(--t1)}
+.daily>summary::after{content:"展开";margin-left:auto;font-size:var(--mi);font-weight:600;color:var(--t2)}
+.daily[open]>summary::after{content:"收起"}
+.daily-body{padding:0 24px 24px}
 .daily-tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:4px 0 16px}
-.daily-tools label{font-size:13px;color:var(--text-light)}
+.daily-tools label{font-size:var(--sm);color:var(--t3)}
 .daily-tools .copy{margin-left:auto}
-.daily-text{min-height:140px;line-height:1.65;font-size:14px}
+.daily-text{min-height:160px;font-size:var(--sm);line-height:1.75}
 .daily-extra{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
-.daily-extra label{font-size:13px;display:block;color:var(--text);margin-bottom:8px}
-.daily-extra .muted{font-weight:400;margin-left:6px}
-.daily-evidence{font-size:13px;line-height:1.8;margin:12px 0;color:var(--text)}
-.daily-limits{font-size:12px;color:var(--warning-deep);margin:8px 0;padding-left:18px}
-.daily-message{font-size:12px;color:var(--text-light);min-height:20px;margin-top:8px}
-.daily-fold{margin-top:12px;border-top:1px solid var(--border);padding-top:12px}
-.daily-fold>summary{font-size:13px;color:var(--text-light)}
+.daily-extra label{display:block;margin-bottom:8px;font-size:var(--sm);font-weight:600;color:var(--t1)}
+.daily-extra .muted{margin-left:8px;font-weight:400}
+.daily-evidence{margin:12px 0;font-size:var(--sm);line-height:1.8;color:var(--t2)}
+.daily-limits{margin:8px 0;padding-left:20px;font-size:var(--mi);color:var(--warning-deep)}
+.daily-message{min-height:20px;margin-top:8px;font-size:var(--mi);color:var(--t3)}
+.daily-fold{margin-top:16px;padding-top:8px;border-top:1px solid var(--hl)}
+.daily-fold>summary{font-size:var(--sm);color:var(--t2)}
 .daily-fold .daily-extra{margin-top:12px}
-.daily-fold p{font-size:12px;margin:8px 0;color:var(--text-light)}
-.draft-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
-  margin:12px 0 4px;padding:8px 12px;background:var(--bg)}
-.draft-state{font-size:12px;color:var(--text-light);flex:1;min-width:180px}
+.daily-fold p{margin:8px 0;font-size:var(--mi);color:var(--t3)}
+/* AI 草稿条：浅青（方法与说明），AI 出初稿、人定稿 */
+.draft-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:12px 0 4px;padding:12px 16px;
+  background:var(--tint-primary)}
+.draft-state{flex:1;min-width:180px;font-size:var(--mi);color:var(--t2)}
 .draft-state[data-state=ok]{color:var(--success-deep)}
 .draft-state[data-state=err]{color:var(--danger-deep)}
 .draft-bar button{flex:none}
 /* 诊断信息那一格：一句摘要 +「详情」。完整内容（.diagnostic-body）不在格子里展开，
- * 点「详情」或点这一行，在右侧抽屉里看——以前挤在窄列里点小三角展开，一行被撑得很高。 */
-.diagnostic{font-size:13px;color:var(--text);max-width:26em}
+ * 点「详情」或点这一行，在右侧抽屉里看。 */
+.diagnostic{max-width:26em;font-size:var(--sm);color:var(--t2)}
 .diagnostic .diagnostic-summary{margin-right:8px}
+.diagnostic button.link{margin-left:0}
 .todos tbody tr[data-rec]{cursor:pointer}
 .todos tbody tr.in-drawer td{background:var(--tint-primary)}
 /* ---------- 行详情抽屉 ----------
- * 这一行的全部信息：原因、处理状态、直达链接、完整诊断、负面评论快照，最下面才是标题正文
- * ——它是整段笔记文案，放最上面会把要看的东西全挤下去（2026-11-12）。
- * 不遮罩、不锁页面：开着它也能点别的行（内容跟着换）。
- * 上、中、下各一个「关闭」，都钉在抽屉上不跟着内容滚：上面一条、左边沿中间一个把手、
- * 下面一条。内容再长，手边总有一个。
- * z-index 压过右下角的深浅模式按钮（窄屏时它正好落在下面那条「关闭」上）。 */
-.drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);z-index:100;
-  background:var(--surface);border-left:1px solid var(--border);
-  box-shadow:var(--shadow-sheet);display:flex;flex-direction:column;
-  animation:drawer-in .18s ease-out both}
+ * 这一行的全部信息：原因、处理状态、直达链接、完整诊断、负面评论快照，最下面才是标题正文。
+ * 不遮罩、不锁页面：开着它也能点别的行（内容跟着换）。上、中、下各一个「关闭」，都钉在抽屉上
+ * 不跟着内容滚。抽屉是全系统唯一带阴影的东西；从右侧滑入，共享元素曲线。 */
+.drawer{position:fixed;top:0;right:0;bottom:0;z-index:100;width:min(480px,100vw);display:flex;
+  flex-direction:column;background:var(--surface);border-left:1px solid var(--hl);
+  box-shadow:var(--shadow-sheet);animation:drawer-in var(--t-md) var(--ease-cont) both}
 .drawer[hidden]{display:none}
-@keyframes drawer-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
-.drawer-head{flex:none;display:flex;align-items:center;gap:12px;padding:12px 20px;
-  border-bottom:1px solid var(--border)}
-.drawer-meta{flex:1;min-width:0;font-size:14px;font-weight:600;color:var(--text-dark);
+@keyframes drawer-in{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
+.drawer-head{flex:none;display:flex;align-items:center;gap:12px;padding:16px 24px;
+  border-bottom:1px solid var(--hl)}
+.drawer-meta{flex:1;min-width:0;font-size:var(--body);font-weight:700;line-height:1.5;color:var(--t1);
   overflow-wrap:anywhere}
-.drawer-scroll{flex:1;min-height:0;overflow-y:auto;padding:16px 20px 24px}
-.drawer-foot{flex:none;padding:12px 20px;border-top:1px solid var(--border)}
-.drawer-foot button{width:100%;height:36px;font-size:13px;font-weight:500;
-  background:none;border:1px solid var(--border-input);color:var(--text)}
-.drawer-foot button:hover:not(:disabled){background:var(--bg-secondary)}
-.drawer-handle{position:absolute;left:-29px;top:50%;margin-top:-36px;width:28px;height:72px;
-  padding:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
-  font-size:12px;font-weight:500;
-  background:var(--surface);border:1px solid var(--border);border-right:0;color:var(--text-light)}
-.drawer-handle:hover:not(:disabled){background:var(--bg-secondary);color:var(--text-dark)}
-.drawer-handle:active:not(:disabled){transform:none}
-.drawer-facts{display:flex;gap:32px;margin:12px 0 0;font-size:13px}
-.drawer-facts dt{color:var(--text-light)}
-.drawer-facts dd{margin:2px 0 0;color:var(--text-dark);font-family:var(--font-num);font-size:15px}
-.drawer-acts{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;margin-top:16px;
-  padding:12px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
-.drawer-acts a{font-size:13px;color:var(--primary)}
-.drawer h4{margin:16px 0 8px;font-size:13px;font-weight:600;color:var(--text-dark)}
-.drawer-body,.drawer-title{font-size:13px;line-height:1.7;white-space:pre-wrap;
-  overflow-wrap:anywhere;color:var(--text)}
-/* 负面评论快照：一条评论一行，条与条之间一道细线。 */
-.drawer-snapshot{font-size:13px;line-height:1.7;overflow-wrap:anywhere;color:var(--text)}
-.drawer-snapshot div{padding:8px 0;border-top:1px solid var(--border)}
+.drawer-scroll{flex:1;min-height:0;overflow-y:auto;padding:16px 24px 24px}
+.drawer-foot{flex:none;padding:12px 24px;border-top:1px solid var(--hl)}
+.drawer-foot button{width:100%}
+.drawer-handle{position:absolute;left:-29px;top:50%;width:28px;height:72px;margin-top:-36px;padding:0;
+  flex-direction:column;gap:4px;border:1px solid var(--hl);border-right:0;border-radius:0;
+  background:var(--surface);font-size:var(--mi);color:var(--t2);white-space:normal}
+.drawer-handle:hover:not(:disabled),.drawer-handle:active:not(:disabled){background:var(--fill);
+  color:var(--t1);transform:none}
+.drawer-facts{display:flex;gap:32px;margin:16px 0 0;font-size:var(--sm)}
+.drawer-facts dt{font-size:var(--mi);font-weight:600;color:var(--t3)}
+.drawer-facts dd{margin:4px 0 0;font-family:var(--f-num);font-size:var(--body);font-weight:700;
+  color:var(--t1);font-variant-numeric:tabular-nums}
+.drawer-acts{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;margin-top:16px;padding:12px 0;
+  border-top:1px solid var(--hl);border-bottom:1px solid var(--hl)}
+.drawer-acts a{font-size:var(--sm);font-weight:600}
+.drawer-acts button.link{margin-left:0}
+.drawer h4{margin:24px 0 8px;font-size:var(--mi);font-weight:600;color:var(--t3)}
+.drawer-body,.drawer-title{font-size:var(--sm);line-height:1.75;white-space:pre-wrap;
+  overflow-wrap:anywhere;color:var(--t2)}
+/* 负面评论快照：一条评论一行，条与条之间一道发丝线。 */
+.drawer-snapshot{font-size:var(--sm);line-height:1.75;overflow-wrap:anywhere;color:var(--t2)}
+.drawer-snapshot div{padding:8px 0;border-top:1px solid var(--hl)}
 .drawer-snapshot div:first-child{padding-top:0;border-top:0}
 /* 抽屉占满整屏宽时左边沿外面没有地方了：把手收进来，内容让出位置。 */
 @media (max-width:480px){
-  .drawer-handle{left:0;border-left:0;border-right:1px solid var(--border)}
+  .drawer-handle{left:0;border-left:0;border-right:1px solid var(--hl)}
   .drawer-scroll,.drawer-head,.drawer-foot{padding-left:40px}
 }
-/* 「处理」一格：三段切换「待处理 | 正在处理 | 已处理」，当前状态那一段高亮；下面一行
- * 「去飞书这一行」。以前是一个状态徽标 + 「正在处理」「已处理」两个文字按钮——同一行
- * 两个「正在处理」，一个是状态一个是按钮，运营分不清（2026-11-11）。 */
-.seg{display:inline-flex;gap:2px;padding:2px;background:var(--fill);vertical-align:middle}
-.seg button{height:28px;padding:0 10px;font-size:13px;font-weight:500;background:none;
-  color:var(--text);border:1px solid transparent}
-.seg button:hover:not(:disabled):not([aria-pressed=true]){background:var(--bg-secondary)}
-.seg button[aria-pressed=true]{background:var(--surface);color:var(--primary);font-weight:600;
-  border-color:var(--border-strong);cursor:default}
-.todos td.acts .seg+.act{display:block;margin-top:6px}
-.work-error{display:block;font-size:12px;color:var(--danger-deep);max-width:22em;white-space:normal}
-.monitor-help{margin:8px 0 16px;font-size:13px;color:var(--text-light)}
-.monitor-help p{margin:8px 0}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
-  clip:rect(0,0,0,0);white-space:nowrap;border:0}
+/* 行里的「处理」一格：三段分段「待处理 | 正在处理 | 已处理」，当前状态那一段是选中块；
+ * 下面一行「去飞书这一行」。 */
+.todos td.acts .seg+.act{display:block;margin-top:8px}
+.work-error{display:block;max-width:22em;font-size:var(--mi);font-weight:600;color:var(--danger-deep);
+  white-space:normal}
+.foot-note{margin-top:12px;max-width:60em;font-size:var(--mi);line-height:1.7;color:var(--t3)}
 @media (max-width:900px){
-  .app{grid-template-columns:minmax(0,1fr)}
-  .side{position:static;height:auto;border-right:0;
-    border-bottom:1px solid var(--border)}
-  .side nav{display:flex;flex-wrap:nowrap;overflow-x:auto;padding:8px;
-    -webkit-overflow-scrolling:touch}
-  .side nav a{height:36px;padding:0 12px;flex:none}
-  .side .grp,.side .foot{display:none}
-  .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
   .grid{grid-template-columns:minmax(0,1fr)}
-  .content{padding:16px}
-  /* 顶栏在窄屏会溢出：固定 220px 的搜索框 + 按钮 + 时间戳 + 退出，
-   * 加左右各 24px padding，375px 宽根本排不下，时间戳和退出会被挤出屏幕。
-   * 搜索框改成可伸缩、时间戳藏起来（那个宽度下它不是决策信息）。 */
+  .content{padding:24px 16px 72px}
+  /* 顶栏在窄屏会溢出：按钮 + 时间戳 + 退出，375px 排不下。
+   * 时间戳藏起来（那个宽度下它不是决策信息），按钮各自缩到图标或短字。 */
   .top{padding:0 16px;gap:8px}
   .tools{flex:1;min-width:0}
   .work-find{flex:1 1 100%}
   .top .when{display:none}
-  .work-head{padding:12px}
+  .top .tools{margin-left:auto}
+  .work-head{padding:16px}
   .work-head h2{width:100%}
   .work-head .field-label{flex:1;min-width:140px}
   .work-head select{flex:1;min-width:0;width:100%}
   .work-live{width:100%;margin-left:0}
   .top-status{right:16px;max-width:calc(100vw - 32px)}
-  .work-metrics{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px 0;row-gap:16px}
+  .work-context{padding:12px 16px 0}
+  .work-details>summary,.daily>summary{padding:12px 16px}
+  .work-metrics{grid-template-columns:repeat(2,minmax(0,1fr));padding:12px 0 16px;row-gap:16px}
   .work-metric{padding:0 16px}
-  .work-metric:nth-child(2n){border-right:0}
-  .work-metric .metric-value{font-size:28px}
-  .work-states{padding:12px 16px 8px}
-  .work-summary{padding:4px 16px 12px}
-  .daily>summary{padding:12px 16px}
+  .work-metric:nth-child(2n+1){border-left:0}
+  .work-states{padding:0 16px 12px}
+  .work-summary{padding:0 16px 12px}
+  .find-result{padding:0 16px 12px}
+  .trend{padding:0 16px 16px}
   .daily-body{padding:0 16px 16px}
   .daily-extra{grid-template-columns:1fr}
   .daily-tools .copy{margin-left:0}
+  .todo-panel{padding:16px}
+  .content>h2{margin-top:40px}
+  .card,.addbox,#trial{padding:20px 16px}
+  #projects{padding:4px 16px}
 }
 /* 手机上的待办不是一张必须横滑才能处理的表，而是一组处置卡。
  * 所有字段与按钮都保留；桌面表格的 DOM、勾选逻辑和 API 完全不变。 */
 @media (max-width:700px){
+  .kpi{gap:8px}
+  .kpi>*{min-height:0;padding:16px}
+  .kpi .box.warn{padding-top:14px}
+  .kpi .n{font-size:32px}
+  .todo-panel{padding:0;background:transparent}
+  .queuebar{margin-bottom:12px;padding:12px 16px;background:var(--surface)}
+  .tabs{margin-bottom:12px;background:var(--surface);border-top:2px solid var(--rule)}
+  .tabs .tab-states{grid-column:1 / -1;white-space:nowrap}
+  .tabs .tab-latest{grid-column:1 / -1;text-align:left}
+  .fold{background:var(--surface)}
   /* 只有待办表变卡片；已处理记录、运行历史这些还是表，留在自己的框里横滑，
    * 不能把整页撑宽、把「撤销」挤到屏幕外。 */
   .tablewrap.todo-wrap{overflow-x:visible}
   .tablewrap table.todos{min-width:0;border:0;background:transparent}
   .todos thead{display:none}
-  .todos tbody{display:grid;gap:12px}
-  .todos tbody tr{display:grid;grid-template-columns:24px minmax(0,1fr);gap:0 8px;
-    background:var(--surface);border:1px solid var(--border);padding:12px}
-  .todos tbody td{display:block;grid-column:2;border:0;padding:4px 0;
-    min-width:0;max-width:none}
-  .todos tbody td:first-child{grid-column:1;grid-row:1;padding-top:5px}
+  .todos tbody{display:grid;gap:8px}
+  .todos tbody tr{display:grid;grid-template-columns:24px minmax(0,1fr);gap:0 8px;padding:16px;
+    background:var(--surface)}
+  .todos tbody tr:hover{background:var(--surface)}
+  .todos tbody td{display:block;grid-column:2;border:0;padding:4px 0;min-width:0;max-width:none}
+  .todos tbody td:first-child{grid-column:1;grid-row:1;padding-top:4px}
   .todos tbody td.which{grid-column:2;grid-row:1;padding-top:0}
   .todos tbody td.reasons{padding-top:8px}
-  .todos tbody td.comments::before{content:'评论数';color:var(--text-light);
-    font-size:12px;margin-right:8px}
-  .todos tbody td.when::before{content:'最近检查';color:var(--text-light);
-    font-size:12px;margin-right:8px}
-  .todos tbody td.acts{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;
-    border-top:1px solid var(--border);margin-top:8px;padding-top:12px;white-space:normal}
+  .todos tbody td.comments::before{content:"评论数";margin-right:8px;font-family:var(--f-sans);
+    font-size:var(--mi);color:var(--t3)}
+  .todos tbody td.when::before{content:"最近检查";margin-right:8px;font-size:var(--mi);color:var(--t3)}
+  .todos tbody td.acts{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:8px;
+    padding-top:12px;border-top:1px solid var(--hl);white-space:normal}
   .todos tbody td.comments{text-align:left}
   .todos tbody td.acts .seg+.act{display:inline;margin-top:0}
-  .todos tbody td.acts .seg button{height:32px}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
   .todos .diagnostic{max-width:none}
   .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
+  .fold .todos tbody tr{border-top:1px solid var(--hl)}
   /* 归档折叠区的行和主列表一样有勾选框那一格（2026-11-18 起），用同一套两栏卡片。 */
 }
+@media print{.side,.top,.drawer,body>.theme-btn{display:none}.app{display:block}}
 """
 
 # ⚠️ 这段脚本会**原样进到页面里**，所以连注释都不放 emoji——
@@ -2104,17 +2160,17 @@ _SCRIPT = r"""
       var inputs = byGroup[g].map(function(p){
         var v = e.thresholds && e.thresholds[p.column] != null ? e.thresholds[p.column] : "";
         var def = p.default_text || (p.default == null ? "默认不扫" : "默认 " + p.default);
-        return "<label class=muted style='display:inline-block;margin:0 12px 6px 0'>" +
+        return "<label class=muted style='display:inline-block;margin:0 12px 8px 0'>" +
           esc(p.label) + " <input type=number min=" + Number(p.min || 0) +
           (p.max != null ? " max=" + Number(p.max) : "") + " style='width:104px' data-col='" +
           attr(p.column) + "' value='" + attr(String(v)) + "' placeholder='" + attr(def) + "'>" +
           (p.hint ? "<div class=muted style='font-size:12px;max-width:520px'>" + esc(p.hint) + "</div>" : "") +
           "</label>";
       }).join("");
-      return (g ? "<div style='margin:6px 0 2px'><b>" + esc(g) + "</b></div>" : "") + inputs;
+      return (g ? "<div style='margin:8px 0 4px'><b>" + esc(g) + "</b></div>" : "") + inputs;
     }).join("");
     return "<div class=thr data-rec='" + attr(e.record_id) + "' hidden style='flex-basis:100%;margin-top:8px'>" +
-      "<div class=muted style='margin-bottom:6px'>只改这个项目。空着 = 用全局默认（格子里灰字那个数）。" +
+      "<div class=muted style='margin-bottom:8px'>只改这个项目。空着 = 用全局默认（格子里灰字那个数）。" +
       "保存前先点「先算给我看」：会算出改前改后未来 30 天大概花多少钱。" +
       "熔断比例、两击定罪、冷却、单轮预算<b>不能逐表</b>——它们有跨表语义，" +
       "逐表不同会让「这一轮该不该熔」说不清。</div>" +
@@ -2126,11 +2182,11 @@ _SCRIPT = r"""
   // 搜索检查：这张表参不参加「搜索可见试跑」。和数字参数分开存——开了也不花钱
   // （搜索只有人在下面「搜索可见试跑」那一栏点了确认才发），用不着先算。
   function searchCheckForm(e){
-    return "<div class=schk style='margin-top:16px;padding-top:12px;border-top:1px solid var(--border)'>" +
+    return "<div class=schk style='margin-top:16px;padding-top:12px;border-top:1px solid var(--hl)'>" +
       "<div style='margin:0 0 4px'><b>搜索可见试跑</b></div>" +
       "<label><input type=checkbox data-search-check" + (e.search_check ? " checked" : "") +
       "> 搜索检查（搜索可见试跑）</label>" +
-      "<div class=muted style='font-size:12px;max-width:560px;margin:4px 0 6px'>" +
+      "<div class=muted style='font-size:12px;max-width:560px;margin:4px 0 8px'>" +
       "勾上 = 这张表参加搜索可见试跑：试跑会读这张表「搜索关键词」那一列里写的词。" +
       "勾上本身不花钱，巡查也不受影响；花钱的只有下面「搜索可见试跑」那一栏里你点了确认的按钮。" +
       "</div><div><button type=button data-search-save>保存搜索检查</button></div>" +
@@ -2140,9 +2196,9 @@ _SCRIPT = r"""
   // 花费，用不着先算；改了数字没算、只想改排除词的人也不该被「先算给我看」挡住。
   function excludesForm(e){
     var words = (e.blue_word_excludes || []).join("、");
-    return "<div class=excl style='margin-top:16px;padding-top:12px;border-top:1px solid var(--border)'>" +
+    return "<div class=excl style='margin-top:16px;padding-top:12px;border-top:1px solid var(--hl)'>" +
       "<div style='margin:0 0 4px'><b>蓝词排除词</b></div>" +
-      "<div class=muted style='font-size:12px;max-width:560px;margin-bottom:6px'>" +
+      "<div class=muted style='font-size:12px;max-width:560px;margin-bottom:8px'>" +
       "竞品名等不往「蓝词字段」里记的词，扫到也不记、不叫截图。逗号或顿号分隔，每个至少 2 个字。" +
       "中文按包含算（「奥佳华」也排掉「奥佳华7598vpro」），英文按整个单词、不分大小写" +
       "（「sis」排掉「sis黑胶」，不排「analysis」）。已经记进「蓝词字段」的词不会自动删，要清理找技术。" +
@@ -2370,7 +2426,7 @@ _SCRIPT = r"""
       "<div id=chatPick class=pick hidden></div>" +
       (opts ? "<div class=srow><span class=lbl>给已建的表补权限</span><select id=shareApply>" + opts + "</select> " +
         "<button type=button class=sm data-share=apply>按上面的设置补</button> <span class=muted>应用得是那张表的所有者或可管理</span></div>" : "") +
-      (s.owner_configured ? "<div class=muted style='margin-top:6px'>建完会把所有权转给后台配置的人（<code>FEISHU_TABLE_OWNER</code>），应用保留可管理</div>" : "") +
+      (s.owner_configured ? "<div class=muted style='margin-top:8px'>建完会把所有权转给后台配置的人（<code>FEISHU_TABLE_OWNER</code>），应用保留可管理</div>" : "") +
       "<div id=shareOut class=out></div>";
   }
   function shareSay(html, cls){
@@ -2562,7 +2618,7 @@ _SCRIPT = r"""
     html.push(buttons.join(""));
     if (!j.key_ok) html.push("<div class=problem>「跑」的按钮现在是灰的、点不动：面板还没配 TikHub 的 Key（TIKHUB_API_KEY）。这不是你能在页面上解决的——找技术在 Railway 的面板服务上配一次（手册「第 0 步」），他说配好了之后刷新这一页，按钮就能点了。</div>");
     var laterShown = (j.rounds || []).some(function(r){ return r.name !== "first" && r.visible; });
-    if (first && !laterShown) html.push("<div class=muted style='margin-top:6px'>后面几轮（最新排序、隔一小时 / 隔一天再查、翻到第 10 页）是拿来和第一轮比的：要第一轮至少拿到过一页之后才会出现在这里。" +
+    if (first && !laterShown) html.push("<div class=muted style='margin-top:8px'>后面几轮（最新排序、隔一小时 / 隔一天再查、翻到第 10 页）是拿来和第一轮比的：要第一轮至少拿到过一页之后才会出现在这里。" +
       (first.ran ? "第一轮点过了，但一页都还没拿到——先按上面进度里说的原因处理，再点一次第一轮。" : "") + "</div>");
     html.push("<div id=trialConfirm class=out></div>");
     box.innerHTML = html.join("");
@@ -2579,7 +2635,7 @@ _SCRIPT = r"""
           (job.run ? " 发了 " + job.run.requests + " 次请求，" + money(job.run.yuan) +
             (job.run.todo ? "；<b>还差 " + job.run.todo + " 页</b>，再点一次同一个按钮只补这几页" : "") : ""));
     box.innerHTML = "<div>" + head + "</div>" +
-      (job.lines && job.lines.length ? "<div class=muted style='margin-top:6px'>" + job.lines.map(esc).join("\n") + "</div>" : "");
+      (job.lines && job.lines.length ? "<div class=muted style='margin-top:8px'>" + job.lines.map(esc).join("\n") + "</div>" : "");
   }
   function renderTrialReport(){
     var j = trialState, box = trialPart("trialReport");
@@ -2590,7 +2646,7 @@ _SCRIPT = r"""
       (r && r.text ? "<button type=button class=sm data-trial=copy>复制报告</button> " : "") +
       "<span class=muted>" + (r && r.at ? "下面这一份是 " + chinaTime(r.at * 1000, true) + " 出的" : "还没有报告：跑过一轮，或点「只重出报告」之后会出现在这里") + "</span></div>";
     if (r && r.note) html += "<div class=muted>" + esc(r.note) + "</div>";
-    if (r && r.text) html += "<div class=out id=trialReportText style='border:1px solid var(--border);padding:12px;background:var(--bg)'>" + esc(r.text) + "</div>";
+    if (r && r.text) html += "<div class=out id=trialReportText style='padding:16px;background:var(--fill)'>" + esc(r.text) + "</div>";
     box.innerHTML = html;
   }
   function renderTrial(){
@@ -2728,33 +2784,207 @@ def _icon(name: str, cls: str = "icon") -> str:
             f'{body}</svg>')
 
 
-# 品牌山形 mark（v5 换标：四条弧带自下而上层叠成山脊）。几何逐字取自
-# logo/elements/bywood-mark-current.svg——禁止重绘、旋转、拆散弧带
-# （BRAND.md §4）。颜色走 currentColor，由 .brand 的 --wordmark 定：
-# 浅底深青、深底白、品牌面色上墨字（青山形在青面上会消失，用墨版）。
-# 标志主青 #7ED1CD 不进这个图形：独立山形在浅底一律不用青
-# （白底 1.77:1，没有词标兜底就是一团雾，BRAND.md §3）。
-_MARK = (
-    '<svg width="52" height="16" viewBox="0 0 292.502 90" role="img"'
-    ' aria-label="BYWOOD"><path fill="currentColor" d="M67.727 34.135'
-    'C32.985 45.255 0 45.001 0 45.001L0 45.001L0 51.75C0 51.75 32.855 52.048 '
-    '67.502 40.949L67.502 40.949C103.083 29.553 140.552 6.749 146.251 6.749'
-    'L146.251 6.749C151.956 6.749 189.472 29.567 225.076 40.975L225.076 40.975'
-    'C259.694 52.066 292.502 51.75 292.502 51.75L292.502 51.75L292.502 45.001'
-    'C292.502 45.001 259.826 45.36 225.309 34.291L225.309 34.291'
-    'C189.665 22.865 152.058 0 146.44 0L146.44 0C140.655 0 103.273 22.756 '
-    '67.727 34.135M67.313 56.789C32.182 59.782 0 58.502 0 58.502L0 58.502'
-    'L0 65.251C0 65.251 32.178 66.531 67.277 63.538L67.277 63.538'
-    'C97.807 60.934 130.553 54 146.251 54L146.251 54C161.942 54 194.648 60.931 '
-    '225.156 63.535L225.156 63.535C260.284 66.528 292.502 65.251 292.502 65.251'
-    'L292.502 65.251L292.502 58.502C292.502 58.502 260.273 59.779 225.171 '
-    '56.782L225.171 56.782C194.687 54.182 162.036 47.251 146.44 47.251'
-    'L146.44 47.251C130.65 47.251 97.869 54.185 67.313 56.789M0 72L0 78.749'
-    'C0 78.749 135 74.251 146.251 74.251L146.251 74.251C157.502 74.251 '
-    '292.502 78.749 292.502 78.749L292.502 78.749L292.502 72C292.502 72 '
-    '157.502 67.502 146.44 67.502L146.44 67.502C135 67.502 0 72 0 72M0 90'
-    'L292.502 90L292.502 83.251L0 83.251Z"/></svg>'
-)
+# 横版标志原件（山形 + 词标），几何逐字取自设计系统 logo/horizontal/——禁止重绘、拉伸、
+# 拆散弧带（BRAND.md §二）。三种调用，按所在的底选（BRAND.md §二 的调用表）：
+#   · 浅底 teal-on-light：青山形 + 青 W + 墨词标（侧栏）
+#   · 深底 teal-on-dark：同一套几何，词标换白（深色模式的侧栏）
+#   · 标志青底 black：青山形在青面上会消失，一律墨版（登录页的青面）
+# 浅 / 深两版都画进页面，由 token --logo-l / --logo-d 切换显示，深色模式只翻 token。
+# 标志青 #7ED1CD 只在这两版的原件里出现（tests/test_design 认 aria-label="BYWOOD" 的 svg）。
+_LOGO_VIEWBOX = '0 0 733.115 90.004'
+_LOGO_D0 = (
+    'M67.727 34.134C32.981 45.259 0 45.001 0 45.001L0 45.001L0 51.753C0 51.753 '
+    '32.854 52.051 67.498 40.953L67.498 40.953C103.08 29.553 140.549 6.753 '
+    '146.251 6.753L146.251 6.753C151.953 6.753 189.472 29.571 225.076 '
+    '40.978L225.076 40.978C259.691 52.066 292.497 51.753 292.497 51.753L292.497 '
+    '51.753L292.497 45.001C292.497 45.001 259.825 45.36 225.309 34.295L225.309 '
+    '34.295C189.665 22.866 152.058 0 146.436 0L146.436 0C140.654 0 103.269 22.76 '
+    '67.727 34.134M67.312 56.789C32.177 59.782 0 58.502 0 58.502L0 58.502L0 '
+    '65.251C0 65.251 32.174 66.535 67.276 63.542L67.276 63.542C97.807 60.935 '
+    '130.548 54 146.251 54L146.251 54C161.938 54 194.643 60.935 225.155 '
+    '63.535L225.155 63.535C260.279 66.531 292.497 65.251 292.497 65.251L292.497 '
+    '65.251L292.497 58.502C292.497 58.502 260.268 59.779 225.167 56.782L225.167 '
+    '56.782C194.686 54.182 162.036 47.251 146.436 47.251L146.436 47.251C130.65 '
+    '47.251 97.865 54.186 67.312 56.789M0 72.004L0 78.753C0 78.753 135 74.252 '
+    '146.251 74.252L146.251 74.252C157.497 74.252 292.497 78.753 292.497 '
+    '78.753L292.497 78.753L292.497 72.004C292.497 72.004 157.497 67.502 146.436 '
+    '67.502L146.436 67.502C135 67.502 0 72.004 0 72.004M0 90.004L292.498 '
+    '90.004L292.498 83.251L0 83.251Z')
+
+_LOGO_D1 = (
+    'M622.377 25.873C617.639 28.847 613.981 32.916 611.403 38.073L611.403 '
+    '38.073C608.821 43.237 607.53 48.975 607.53 55.288L607.53 55.288C607.53 '
+    '61.906 608.759 67.841 611.221 73.092L611.221 73.092C613.679 78.343 617.261 '
+    '82.459 621.967 85.43L621.967 85.43C626.672 88.404 632.272 89.895 638.77 '
+    '89.895L638.77 89.895C645.327 89.895 650.971 88.404 655.708 85.43L655.708 '
+    '85.43C660.444 82.459 664.04 78.343 666.498 73.092L666.498 73.092C668.959 '
+    '67.841 670.188 61.906 670.188 55.288L670.188 55.288C670.188 48.975 668.897 '
+    '43.237 666.315 38.073L666.315 38.073C663.738 32.916 660.064 28.847 655.297 '
+    '25.873L655.297 25.873C650.53 22.899 645.021 21.408 638.77 21.408L638.77 '
+    '21.408C632.578 21.408 627.112 22.899 622.377 25.873M630.072 74.182C627.614 '
+    '72.331 625.716 69.782 624.381 66.535L624.381 66.535C623.043 63.288 622.377 '
+    '59.567 622.377 55.379L622.377 55.379C622.377 51.371 623.043 47.79 624.381 '
+    '44.633L624.381 44.633C625.716 41.477 627.614 38.986 630.072 37.164L630.072 '
+    '37.164C632.53 35.342 635.429 34.433 638.77 34.433L638.77 34.433C642.166 '
+    '34.433 645.113 35.342 647.602 37.164L647.602 37.164C650.09 38.986 651.988 '
+    '41.477 653.293 44.633L653.293 44.633C654.599 47.79 655.254 51.371 655.254 '
+    '55.379L655.254 55.379C655.254 59.567 654.599 63.288 653.293 66.535L653.293 '
+    '66.535C651.988 69.782 650.09 72.331 647.602 74.182L647.602 74.182C645.113 '
+    '76.037 642.166 76.96 638.77 76.96L638.77 76.96C635.429 76.96 632.53 76.037 '
+    '630.072 74.182M557.625 25.873C552.891 28.847 549.232 32.916 546.65 '
+    '38.073L546.65 38.073C544.068 43.237 542.781 48.975 542.781 55.288L542.781 '
+    '55.288C542.781 61.906 544.01 67.841 546.468 73.092L546.468 73.092C548.927 '
+    '78.343 552.508 82.459 557.214 85.43L557.214 85.43C561.92 88.404 567.519 '
+    '89.895 574.018 89.895L574.018 89.895C580.574 89.895 586.221 88.404 590.956 '
+    '85.43L590.956 85.43C595.694 82.459 599.29 78.343 601.748 73.092L601.748 '
+    '73.092C604.206 67.841 605.436 61.906 605.436 55.288L605.436 55.288C605.436 '
+    '48.975 604.145 43.237 601.566 38.073L601.566 38.073C598.985 32.916 595.312 '
+    '28.847 590.549 25.873L590.549 25.873C585.781 22.899 580.269 21.408 574.018 '
+    '21.408L574.018 21.408C567.825 21.408 562.359 22.899 557.625 25.873M565.319 '
+    '74.182C562.861 72.331 560.963 69.782 559.629 66.535L559.629 66.535C558.294 '
+    '63.288 557.625 59.567 557.625 55.379L557.625 55.379C557.625 51.371 558.294 '
+    '47.79 559.629 44.633L559.629 44.633C560.963 41.477 562.861 38.986 565.319 '
+    '37.164L565.319 37.164C567.782 35.342 570.679 34.433 574.018 34.433L574.018 '
+    '34.433C577.417 34.433 580.363 35.342 582.85 37.164L582.85 37.164C585.342 '
+    '38.986 587.235 41.477 588.545 44.633L588.545 44.633C589.846 47.79 590.501 '
+    '51.371 590.501 55.379L590.501 55.379C590.501 59.567 589.846 63.288 588.545 '
+    '66.535L588.545 66.535C587.235 69.782 585.342 72.331 582.85 74.182L582.85 '
+    '74.182C580.363 76.037 577.417 76.96 574.018 76.96L574.018 76.96C570.679 '
+    '76.96 567.782 76.037 565.319 74.182M675.104 22.684L675.104 88.709L698.512 '
+    '88.709C709.258 88.709 717.713 85.916 723.873 80.331L723.873 80.331C730.036 '
+    '74.746 733.115 66.215 733.115 54.742L733.115 54.742C733.115 47.942 731.781 '
+    '42.142 729.108 37.345L729.108 37.345C726.439 32.55 722.6 28.91 717.589 '
+    '26.419L717.589 26.419C712.581 23.928 706.647 22.684 699.785 22.684L699.785 '
+    '22.684ZM689.312 34.797L698.327 34.797C704.763 34.797 709.698 36.648 713.126 '
+    '40.353L713.126 40.353C716.555 44.055 718.272 48.942 718.272 55.015L718.272 '
+    '55.015C718.272 62.662 716.526 68.16 713.036 71.499L713.036 71.499C709.545 '
+    '74.836 704.217 76.506 697.054 76.506L697.054 76.506L689.312 76.506ZM413.042 '
+    '22.684L397.927 48.731L397.745 48.731L383.265 22.684L366.236 22.684L390.457 '
+    '62.753L390.457 88.709L404.665 88.709L404.665 62.844L429.163 22.684ZM317.876 '
+    '22.684L317.876 88.709L346.745 88.709C353.483 88.709 358.995 87.179 363.276 '
+    '84.11L363.276 84.11C367.556 81.044 369.694 76.265 369.694 69.768L369.694 '
+    '69.768C369.694 65.698 368.54 62.222 366.236 59.339L366.236 59.339C363.926 '
+    '56.455 360.134 54.68 354.85 54.011L354.85 54.011L354.85 53.738C359.04 '
+    '52.829 362.166 51.142 364.232 48.684L364.232 48.684C366.294 46.226 367.326 '
+    '43.327 367.326 39.985L367.326 39.985C367.326 36.465 366.342 33.4 364.366 '
+    '30.79L364.366 30.79C362.392 28.179 359.647 26.175 356.127 24.779L356.127 '
+    '24.779C352.603 23.382 348.625 22.684 344.195 22.684L344.195 22.684ZM331.992 '
+    '34.888L341.465 34.888C345.167 34.888 347.93 35.434 349.752 36.528L349.752 '
+    '36.528C351.571 37.618 352.483 39.2 352.483 41.262L352.483 41.262C352.483 '
+    '43.51 351.723 45.284 350.206 46.59L350.206 46.59C348.686 47.895 346.439 '
+    '48.549 343.465 48.549L343.465 48.549L331.992 48.549ZM331.992 60.204L343.741 '
+    '60.204C347.505 60.204 350.341 60.902 352.254 62.299L352.254 62.299C354.166 '
+    '63.695 355.123 65.851 355.123 68.764L355.123 68.764C355.123 71.436 354.181 '
+    '73.397 352.301 74.64L352.301 74.64C350.418 75.884 347.959 76.506 344.923 '
+    '76.506L344.923 76.506L331.992 76.506Z')
+
+_LOGO_D2 = (
+    'M530.996 22.502L501.749 85.182L501.749 22.502L490.498 22.502L488.246 '
+    '22.502L476.995 22.502L447.749 85.182L447.749 22.502L434.246 22.502L434.246 '
+    '90L445.497 90L447.749 90L458.995 90L488.246 27.324L488.246 90L499.498 '
+    '90L501.749 90L512.999 90L544.497 22.502Z')
+
+_LOGO_INK_VIEWBOX = '0 0 733.12 90'
+_LOGO_INK_D0 = (
+    'M67.727 34.135C32.985 45.255 0 45.001 0 45.001L0 45.001L0 51.75C0 51.75 '
+    '32.855 52.048 67.502 40.949L67.502 40.949C103.083 29.553 140.552 6.749 '
+    '146.251 6.749L146.251 6.749C151.956 6.749 189.472 29.567 225.076 '
+    '40.975L225.076 40.975C259.694 52.066 292.502 51.75 292.502 51.75L292.502 '
+    '51.75L292.502 45.001C292.502 45.001 259.826 45.36 225.309 34.291L225.309 '
+    '34.291C189.665 22.865 152.058 0 146.44 0L146.44 0C140.655 0 103.273 22.756 '
+    '67.727 34.135M67.313 56.789C32.182 59.782 0 58.502 0 58.502L0 58.502L0 '
+    '65.251C0 65.251 32.178 66.531 67.277 63.538L67.277 63.538C97.807 60.934 '
+    '130.553 54 146.251 54L146.251 54C161.942 54 194.648 60.931 225.156 '
+    '63.535L225.156 63.535C260.284 66.528 292.502 65.251 292.502 65.251L292.502 '
+    '65.251L292.502 58.502C292.502 58.502 260.273 59.779 225.171 56.782L225.171 '
+    '56.782C194.687 54.182 162.036 47.251 146.44 47.251L146.44 47.251C130.65 '
+    '47.251 97.869 54.185 67.313 56.789M0 72L0 78.749C0 78.749 135 74.251 '
+    '146.251 74.251L146.251 74.251C157.502 74.251 292.502 78.749 292.502 '
+    '78.749L292.502 78.749L292.502 72C292.502 72 157.502 67.502 146.44 '
+    '67.502L146.44 67.502C135 67.502 0 72 0 72M0 90L292.502 90L292.502 83.251L0 '
+    '83.251Z')
+
+_LOGO_INK_D1 = (
+    'M622.378 25.87C617.644 28.844 613.985 32.913 611.403 38.073L611.403 '
+    '38.073C608.821 43.233 607.535 48.971 607.535 55.284L607.535 55.284C607.535 '
+    '61.902 608.764 67.841 611.221 73.087L611.221 73.087C613.68 78.342 617.262 '
+    '82.454 621.967 85.43L621.967 85.43C626.672 88.404 632.272 89.891 638.771 '
+    '89.891L638.771 89.891C645.327 89.891 650.974 88.404 655.708 85.43L655.708 '
+    '85.43C660.447 82.454 664.044 78.342 666.501 73.087L666.501 73.087C668.96 '
+    '67.841 670.188 61.902 670.188 55.284L670.188 55.284C670.188 48.971 668.898 '
+    '43.233 666.32 38.073L666.32 38.073C663.738 32.913 660.065 28.844 655.302 '
+    '25.87L655.302 25.87C650.534 22.895 645.021 21.407 638.771 21.407L638.771 '
+    '21.407C632.578 21.407 627.112 22.895 622.378 25.87M630.072 74.182C627.615 '
+    '72.331 625.716 69.782 624.382 66.531L624.382 66.531C623.047 63.284 622.378 '
+    '59.564 622.378 55.375L622.378 55.375C622.378 51.368 623.047 47.786 624.382 '
+    '44.629L624.382 44.629C625.716 41.474 627.615 38.982 630.072 37.164L630.072 '
+    '37.164C632.534 35.343 635.432 34.429 638.771 34.429L638.771 34.429C642.171 '
+    '34.429 645.116 35.343 647.603 37.164L647.603 37.164C650.094 38.982 651.989 '
+    '41.474 653.298 44.629L653.298 44.629C654.6 47.786 655.255 51.368 655.255 '
+    '55.375L655.255 55.375C655.255 59.564 654.6 63.284 653.298 66.531L653.298 '
+    '66.531C651.989 69.782 650.094 72.331 647.603 74.182L647.603 74.182C645.116 '
+    '76.033 642.171 76.96 638.771 76.96L638.771 76.96C635.432 76.96 632.534 '
+    '76.033 630.072 74.182M557.629 25.87C552.89 28.844 549.232 32.913 546.655 '
+    '38.073L546.655 38.073C544.072 43.233 542.781 48.971 542.781 55.284L542.781 '
+    '55.284C542.781 61.902 544.015 67.841 546.473 73.087L546.473 73.087C548.93 '
+    '78.342 552.513 82.454 557.218 85.43L557.218 85.43C561.923 88.404 567.523 '
+    '89.891 574.022 89.891L574.022 89.891C580.578 89.891 586.225 88.404 590.959 '
+    '85.43L590.959 85.43C595.695 82.454 599.291 78.342 601.752 73.087L601.752 '
+    '73.087C604.211 67.841 605.44 61.902 605.44 55.284L605.44 55.284C605.44 '
+    '48.971 604.149 43.233 601.567 38.073L601.567 38.073C598.989 32.913 595.316 '
+    '28.844 590.548 25.87L590.548 25.87C585.782 22.895 580.272 21.407 574.022 '
+    '21.407L574.022 21.407C567.829 21.407 562.363 22.895 557.629 25.87M565.323 '
+    '74.182C562.865 72.331 560.967 69.782 559.632 66.531L559.632 66.531C558.294 '
+    '63.284 557.629 59.564 557.629 55.375L557.629 55.375C557.629 51.368 558.294 '
+    '47.786 559.632 44.629L559.632 44.629C560.967 41.474 562.865 38.982 565.323 '
+    '37.164L565.323 37.164C567.782 35.343 570.68 34.429 574.022 34.429L574.022 '
+    '34.429C577.418 34.429 580.364 35.343 582.854 37.164L582.854 37.164C585.342 '
+    '38.982 587.24 41.474 588.545 44.629L588.545 44.629C589.851 47.786 590.505 '
+    '51.368 590.505 55.375L590.505 55.375C590.505 59.564 589.851 63.284 588.545 '
+    '66.531L588.545 66.531C587.24 69.782 585.342 72.331 582.854 74.182L582.854 '
+    '74.182C580.364 76.033 577.418 76.96 574.022 76.96L574.022 76.96C570.68 '
+    '76.96 567.782 76.033 565.323 74.182M531 22.499L501.749 85.178L501.749 '
+    '22.499L490.498 22.499L488.251 22.499L477 22.499L447.749 85.178L447.749 '
+    '22.499L434.251 22.499L434.251 90L445.498 90L447.749 90L459 90L488.251 '
+    '27.32L488.251 90L499.502 90L501.749 90L513 90L544.498 22.499ZM675.109 '
+    '22.684L675.109 88.709L698.513 88.709C709.258 88.709 717.713 85.917 723.876 '
+    '80.328L723.876 80.328C730.036 74.746 733.12 66.214 733.12 54.738L733.12 '
+    '54.738C733.12 47.939 731.781 42.142 729.113 37.345L729.113 37.345C726.44 '
+    '32.55 722.599 28.906 717.592 26.415L717.592 26.415C712.582 23.927 706.647 '
+    '22.684 699.789 22.684L699.789 22.684ZM689.316 34.793L698.331 34.793C704.764 '
+    '34.793 709.698 36.647 713.131 40.35L713.131 40.35C716.56 44.055 718.276 '
+    '48.942 718.276 55.011L718.276 55.011C718.276 62.662 716.527 68.157 713.04 '
+    '71.494L713.04 71.494C709.545 74.836 704.218 76.506 697.054 76.506L697.054 '
+    '76.506L689.316 76.506ZM413.047 22.684L397.927 48.728L397.745 48.728L383.265 '
+    '22.684L366.236 22.684L390.462 62.753L390.462 88.709L404.669 88.709L404.669 '
+    '62.844L429.167 22.684ZM317.88 22.684L317.88 88.709L346.749 88.709C353.487 '
+    '88.709 358.996 87.175 363.276 84.11L363.276 84.11C367.556 81.044 369.698 '
+    '76.262 369.698 69.764L369.698 69.764C369.698 65.698 368.541 62.222 366.236 '
+    '59.338L366.236 59.338C363.927 56.455 360.135 54.681 354.855 54.011L354.855 '
+    '54.011L354.855 53.738C359.043 52.826 362.167 51.143 364.233 48.684L364.233 '
+    '48.684C366.298 46.222 367.331 43.324 367.331 39.985L367.331 39.985C367.331 '
+    '36.465 366.341 33.396 364.371 30.785L364.371 30.785C362.396 28.179 359.647 '
+    '26.175 356.127 24.778L356.127 24.778C352.607 23.382 348.629 22.684 344.196 '
+    '22.684L344.196 22.684ZM331.993 34.884L341.465 34.884C345.167 34.884 347.93 '
+    '35.433 349.753 36.524L349.753 36.524C351.574 37.618 352.483 39.197 352.483 '
+    '41.262L352.483 41.262C352.483 43.505 351.723 45.283 350.207 46.589L350.207 '
+    '46.589C348.691 47.895 346.443 48.546 343.469 48.546L343.469 48.546L331.993 '
+    '48.546ZM331.993 60.204L343.742 60.204C347.505 60.204 350.345 60.902 352.258 '
+    '62.299L352.258 62.299C354.171 63.695 355.127 65.848 355.127 68.764L355.127 '
+    '68.764C355.127 71.437 354.185 73.393 352.301 74.637L352.301 74.637C350.421 '
+    '75.884 347.96 76.506 344.927 76.506L344.927 76.506L331.993 76.506Z')
+
+
+def _logo(word_fill: str, cls: str) -> str:
+    return (f'<svg class="{cls}" viewBox="{_LOGO_VIEWBOX}" width="163" height="20" role="img" '
+            f'aria-label="BYWOOD"><path fill="#7ED1CD" d="{_LOGO_D0}"/>'
+            f'<path fill="{word_fill}" d="{_LOGO_D1}"/><path fill="#7ED1CD" d="{_LOGO_D2}"/></svg>')
+
+
+_LOGO = _logo("#000000", "logo-l") + _logo("#FFFFFF", "logo-d")
+_LOGO_INK = (f'<svg viewBox="{_LOGO_INK_VIEWBOX}" width="163" height="20" role="img" '
+             f'aria-label="BYWOOD"><path fill="#000000" d="{_LOGO_INK_D0}"/>'
+             f'<path fill="#000000" d="{_LOGO_INK_D1}"/></svg>')
 
 
 # 行详情抽屉的骨架：内容由脚本在点「详情」/ 点行时从那一行搬进来（fillDrawer）。
@@ -2779,14 +3009,19 @@ _DRAWER = (
     "</aside>")
 
 
-def _shell(title: str, body: str, *, csrf: str = "") -> str:
-    # 深浅模式开关挂在 body 直下（模板同款）——登录页、骨架页、概览页都有，
-    # 不能只有取到数的那一屏。图标固定月亮，两种模式下都是它（模板如此）。
-    theme_btn = ("<button class=theme-btn id=themeBtn type=button "
-                 f"aria-label='切换深浅模式'>{_icon('moon')}</button>")
+# 深浅模式开关。登录页、骨架页、概览页都有，不能只有取到数的那一屏：有顶栏的页面放进顶栏
+# 工具区（黄金样张 templates/dashboard.html 的位置），登录页没有顶栏，由 _shell 挂在 body 直下、
+# 右下角悬浮。图标固定月亮，两种模式下都是它（样张如此）。
+_THEME_BTN = ("<button class=theme-btn id=themeBtn type=button "
+              f"aria-label='切换深浅模式' title=切换深浅模式>{_icon('moon')}</button>")
+
+
+def _shell(title: str, body: str, *, csrf: str = "", theme_in_body: bool = True) -> str:
+    theme_btn = _THEME_BTN if theme_in_body else ""
     return (
-        "<!doctype html><html lang=zh-CN><head><meta charset=utf-8>"
+        "<!doctype html><html lang=zh-CN data-bw-track=ui><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<meta name=color-scheme content='light dark'>"
         f"<title>{_e(title)}</title><style>{_STYLE}</style></head>"
         f"<body data-csrf=\"{_e(csrf)}\">{theme_btn}{body}"
         f"<script>{_SCRIPT}</script></body></html>"
@@ -2795,12 +3030,12 @@ def _shell(title: str, body: str, *, csrf: str = "") -> str:
 
 def login_page(message: str = "") -> str:
     error = f"<p class=err>{_e(message)}</p>" if message else ""
-    # 品牌面色三件套：青底 · 墨字 · 墨版标志（山形走 currentColor，
-    # .field 的 color 就是墨）。那一句是这个面板的判断，登录前先看到它。
+    # 登录页是品牌时刻：标志青面三件套——青底 · 墨字 · 墨版标志（青山形在青面上会消失）。
+    # 那一句是这个面板的判断，登录前先看到它，用这一页最大的字写（DESIGN.md §一「一屏一句判断」）。
     return _shell("监控面板", f"""
 <div class=login>
   <div class=field>
-    <div class=brand>{_MARK}<b>BYWOOD</b></div>
+    <div class=brand>{_LOGO_INK}</div>
     <p class=say>面板负责发现，飞书负责处理。</p>
   </div>
   <div class=body>
@@ -3215,8 +3450,8 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
       {no_publish}
       {coverage}
     </div>
-    <div style='margin-top:9px'>{_counts_chips(p.traffic_tag_counts)}</div>
-    <div style='margin-top:5px'>{_counts_chips(p.refresh_status_counts)}</div>
+    <div class=chips>{_counts_chips(p.traffic_tag_counts)}</div>
+    <div class=chips style='margin-top:4px'>{_counts_chips(p.refresh_status_counts)}</div>
   </details>
 </div>"""
 
@@ -3301,11 +3536,11 @@ def _projects_section(config) -> str:
              else "自动补选项：<b>关</b>（缺选项只给清单，"
                   "在废表上验过再开 <code>PANEL_ALLOW_OPTION_PATCH=1</code>）")
     return f"""<h2 id=s-manage>项目</h2>
-<div class=muted style='margin-bottom:8px'>加表、停用、移除都在这儿。
-「移除」只是不再监控，<b>不动你飞书表里的任何数据</b>。{patch}</div>
-<div id=projects><div class=sk style='margin:14px 0;width:70%'></div><div class=sk style='margin:14px 0;width:55%'></div><div class=sk style='margin:14px 0;width:62%'></div></div>
+<p class=sub>加表、停用、移除都在这儿。
+「移除」只是不再监控，<b>不动你飞书表里的任何数据</b>。{patch}</p>
+<div id=projects><div class=sk style='margin:16px 0;width:70%'></div><div class=sk style='margin:16px 0;width:55%'></div><div class=sk style='margin:16px 0;width:62%'></div></div>
 <div class=addbox>
-  <div style='font-weight:600;margin-bottom:8px'>加一张表</div>
+  <div class=addbox-t>加一张表</div>
   <div class=row>
     <label class=sr-only for=addLabel>项目名</label>
     <input type=text id=addLabel placeholder='项目名，比如 途鸽三期'>
@@ -3332,14 +3567,14 @@ def _trial_section() -> str:
     （会花钱，先看最多花多少再点确认）→ 看报告。上限这些数由服务端给，这里不写死。
     """
     return """<h2 id=s-trial>搜索可见试跑</h2>
-<div class=muted style='margin-bottom:8px'>只回答一个问题：我们的帖子发出去三天，在表里写的那些词下面，
+<p class=intro>只回答一个问题：我们的帖子发出去三天，在表里写的那些词下面，
 搜索结果的前几页里<b>看不看得见</b>。它<b>不会自己跑</b>：只有你在这里点了才查。
 会花钱的只有「跑…」那几个按钮，点了先告诉你最多花多少，你再点一次确认才开始；
 其余按钮都不花钱。<b>从上往下按第 1 步到第 4 步做</b>；开始之前，先在上面「加表 / 改配置」里点要试的表的
 「参数」勾上「搜索检查」，再让运营把要查的词填进那张飞书表的「搜索关键词」列（一个标签一个词，
-几张表加起来最多 15 个）。</div>
+几张表加起来最多 15 个）。</p>
 <div class='addbox share' id=trial>
-  <div id=trialStatus><div class=sk style='margin:14px 0;width:70%'></div><div class=sk style='margin:14px 0;width:55%'></div></div>
+  <div id=trialStatus><div class=sk style='margin:16px 0;width:70%'></div><div class=sk style='margin:16px 0;width:55%'></div></div>
   <div id=trialActs></div>
   <div id=trialOut class=out></div>
   <div id=trialJob class=out></div>
@@ -3398,7 +3633,7 @@ def _outage_note(outages) -> str:
                     "两家能力相同，判定不受影响——只是换了一家在花钱。")
         blocks.append(
             f"<div><b>{_e(o.label)} 发不出请求了</b>（{money}）。{what}</div>")
-    fix = ("<div class=muted style='margin-top:6px'>"
+    fix = ("<div class=muted style='margin-top:8px'>"
            "去对应后台充值即可恢复；充值后受影响的行会按各自节奏自动刷回来，"
            "但<b>发布超过 30 天的行已归档、不再自动刷</b>，要手动勾「排队刷新」。"
            "</div>")
@@ -3483,10 +3718,10 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
            "下面是上一次还能用的读数。</span></div>" if balance_error else "")
     return (f"<h2 id=s-balance>余额</h2>{err}{note}"
             f"<div class=grid>{''.join(cards)}</div>"
-            "<div class=muted style='margin-top:8px'>这两个查询端点是两家"
+            "<p class=foot-note>这两个查询端点是两家"
             "<b>官方标明零费用</b>的（TikHub 计价表 <code>endpoint_cost: 0.0</code>；"
             "SocialDataX <code>x-socialdatax-cost-points: 0</code>）—— "
-            "看余额本身不花钱。</div>")
+            "看余额本身不花钱。</p>")
 
 
 def _workbench(projects, *, resolvable: bool, reports=None) -> str:
@@ -3515,10 +3750,10 @@ def _workbench(projects, *, resolvable: bool, reports=None) -> str:
   <div class=find-result id=findResult role=status aria-live=polite hidden></div>
   <div class=work-states role=group aria-label='按待办处理状态筛选'>
     <span class=caption>全部异常待办 · 行（含归档 / 临时检查）</span>
-    <button type=button data-work-filter=all aria-pressed=true>全部</button>
+    <span class=seg><button type=button data-work-filter=all aria-pressed=true>全部</button>
     <button type=button data-work-filter=pending aria-pressed=false>待处理<b id=workPending>—</b></button>
     <button type=button data-work-filter=processing aria-pressed=false>正在处理<b id=workProcessing>—</b></button>
-    <button type=button data-work-filter=resolved aria-pressed=false>已处理<b id=workResolved>—</b></button>
+    <button type=button data-work-filter=resolved aria-pressed=false>已处理<b id=workResolved>—</b></button></span>
   </div>
   <details class=work-details id=workDetails>
     <summary>项目数据与每日汇报<span class=muted>当前负面按帖子去重</span></summary>
@@ -3591,27 +3826,30 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
         # 要读完整张表，第一次可能要好几秒——一个空盒子看着像坏了。
         boxes = "".join("<div class='sk tall'></div>" for _ in range(4))
         lines = "".join(
-            f"<div class=sk style='margin:10px 0;width:{w}%'></div>"
+            f"<div class=sk style='margin:12px 0;width:{w}%'></div>"
             for w in (92, 78, 85, 60))
         problem = (f"<div class=problem>{_icon('alert-circle')}"
                    f"<span>{_e(error)}</span></div>" if error else "")
         inner = f"""<div class=app>
 <aside class=side>
-  <div class=brand>{_MARK}<b>BYWOOD</b><span>监控</span></div>
+  <div class=brand>{_LOGO}<span>监控</span></div>
 </aside>
 <div class=main>
-  <div class=top><span class=when>正在第一次取数…</span></div>
-  <div class=content>
-    <h1>内容监控面板</h1>
-    <p class=lede>正在把每张表读一遍，第一次要几秒钟。这一步<b>不花钱</b>——
-      飞书读表不计费。</p>
+  <div class=top><span class=when>正在第一次取数…</span><span class=tools>{_THEME_BTN}</span></div>
+  <div class=content aria-busy=true>
+    <header class=ph>
+      <p class=eb>小红书 / 抖音笔记巡检</p>
+      <h1>内容监控面板</h1>
+      <p class=lede>正在把每张表读一遍，第一次要几秒钟。这一步<b>不花钱</b>——
+        飞书读表不计费。</p>
+    </header>
     {problem}
     <div class=kpi>{boxes}</div>
-    <div style='margin-top:24px'>{lines}</div>
+    <div class=card style='margin-top:16px'>{lines}</div>
   </div>
 </div>
 </div>"""
-        return _shell("监控面板", inner, csrf=csrf)
+        return _shell("监控面板", inner, csrf=csrf, theme_in_body=False)
 
     todos = overview.todos()
     # 每张表内部按 max_todos 截掉的 + 跨表拉平之后再截掉的。两个都要算，
@@ -3711,7 +3949,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
     inner = f"""<div class=app>
 <aside class=side>
-  <div class=brand>{_MARK}<b>BYWOOD</b><span>监控</span></div>
+  <div class=brand>{_LOGO}<span>监控</span></div>
   {nav}
   <div class=foot>面板只读飞书表，<b>不发巡查的付费请求</b>。<br>
     要刷新某一行，勾「排队刷新」，cron 五分钟内接手。<br>
@@ -3719,17 +3957,20 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 </aside>
 <div class=main>
   <div class=top>
+    <span class=when id=dataWhen>数据于 {_e(when)} 取得</span>
     <span class=tools>
       <button id=refresh type=button class=sm>重新取数</button>
+      {_THEME_BTN}
+      <form method=post action=/logout><button type=submit class='sm ghost'>退出</button></form>
     </span>
-    <span class=when id=dataWhen>数据于 {_e(when)} 取得</span>
     <span id=refreshStatus class=top-status role=status aria-live=polite></span>
-    <form method=post action=/logout style='margin:0 0 0 12px'>
-      <button type=submit class=sm>退出</button></form>
   </div>
   <div class=content>
-    <h1>内容监控面板</h1>
-    <p class=lede>{lede}</p>
+    <header class=ph>
+      <p class=eb>小红书 / 抖音笔记巡检</p>
+      <h1>内容监控面板</h1>
+      <p class=lede>{lede}</p>
+    </header>
     {_outage_note(outages or [])}{stale_note}{domain_note}
     <div class='kpi stagger-in'>{bar}</div>
 
@@ -3740,10 +3981,10 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
       （红 = 有风控 / 失效 / 刷新失败），每一页里按严重度排序；筛选时各标签上显示命中数。
       点「去飞书这一行」直接落到飞书表里那一行——面板负责发现，具体处理在飞书里做{resolve_hint}。
       已归档的老帖收在各自项目那一页的底下。{hidden_note}</p></details>
-    {_todo_table(todos, offset_hours, config.show_digest,
+    <div class=todo-panel>{_todo_table(todos, offset_hours, config.show_digest,
                  project_order=[p.label for p in projects],
                  folded=overview.archived_todos(), resolved=overview.resolved,
-                 resolvable=resolvable)}
+                 resolvable=resolvable)}</div>
 
     <h2 id=s-proj>各项目 <span class=n>{len(projects)}</span></h2>
     {empty_note}{disabled_note}<div class=grid>{''.join(_project_card(p, offset_hours) for p in projects)}</div>
@@ -3758,12 +3999,12 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
   </div>
 </div>
 </div>{_DRAWER}"""
-    return _shell("监控面板", inner, csrf=csrf)
+    return _shell("监控面板", inner, csrf=csrf, theme_in_body=False)
 
 
 def _sidebar_nav(*, todos, projects: int, runs: int,
                  balances: bool) -> str:
-    """侧栏导航。导航项高 40、图标 20 + 文字 14/500，激活 = 雾蓝底 + 蓝字。
+    """侧栏导航。导航项高 40、图标 16 + 文字 14，激活 = 主浅调底 + 主色字 + 左缘 2px 主色条。
 
     带上每一项的条数：侧栏在这个面板里不只是跳转，它是**第二处**告诉你
     「哪儿有事」的地方——收着的时候也能一眼看出待办有多少。
