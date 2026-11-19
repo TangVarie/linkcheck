@@ -1,7 +1,9 @@
 """面板的 HTML。单文件、内联样式和脚本、**零外部资源**。
 
-没有 CDN、没有字体、没有图标库：一个内部监控面板不该因为某个 CDN 不通就
+没有 CDN、没有图标库：一个内部监控面板不该因为某个 CDN 不通就
 变成一张白纸，而且 CSP 里 `default-src 'none'` 本来就把外链全挡了。
+设计系统要的两份字体（标题 BW Display、数字 Archivo）放在仓库里，由面板自己的
+`/fonts/` 路由同源发出（见 `panel_fonts.py`），不是外链。
 
 排版的取舍：**待办列表放在最上面，项目卡片在下面。**
 运营打开这个页面的问题是「现在有什么要我处理的」，不是「各项目的统计值」。
@@ -18,7 +20,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from . import summary
+from . import panel_fonts, summary
 
 _STYLE = """
 /* BYWOOD 设计系统 v6.1 · 界面轨「管理后台」（scenarios/03-dashboard.md、CRAFT.md §八–§十二）
@@ -37,8 +39,9 @@ _STYLE = """
  *
  * token 逐值抄自设计系统 tokens/ui.css（它又派生自 tokens/palette.json），名字也照抄，
  * 方便和黄金样张 templates/dashboard.html 对照；本页自己加的只有语义浅底、标志的
- * 深浅切换和下拉箭头这几个，放在 token 块最后。不引外部字体：CSP 是 default-src 'none'，
- * 面板零外部资源，所以 Archivo / BW Display 写在字体栈最前、本机有就用，没有退回系统字。
+ * 深浅切换和下拉箭头这几个，放在 token 块最后。字体：BW Display（标题）与 Archivo（数字）
+ * 是仓库自带的子集，由面板的 /fonts/ 同源发出（panel_fonts.py，CSP 只多放 font-src 'self'），
+ * 这份样式前面那两条 @font-face 就是它们；读不到时退回字体栈里的系统字。
  *
  * 硬性遵守的几条（DESIGN.md §六 §九，tests/test_design 钉着）：
  *   · 零阴影（抽屉 --shadow-sheet 除外）、零渐变（骨架亮带除外）、零毛玻璃
@@ -3017,6 +3020,11 @@ _DRAWER = (
     "</aside>")
 
 
+# 面板自带的两份字体（BW Display 标题、Archivo 数字），同源从 /fonts/ 来，见 panel_fonts。
+# 读不到文件时是空串：字体栈退回系统字，页面照样出。
+_FONT_FACES = panel_fonts.font_face_css()
+
+
 # 深浅模式开关。登录页、骨架页、概览页都有，不能只有取到数的那一屏：有顶栏的页面放进顶栏
 # 工具区（黄金样张 templates/dashboard.html 的位置），登录页没有顶栏，由 _shell 挂在 body 直下、
 # 右下角悬浮。图标固定月亮，两种模式下都是它（样张如此）。
@@ -3030,7 +3038,7 @@ def _shell(title: str, body: str, *, csrf: str = "", theme_in_body: bool = True)
         "<!doctype html><html lang=zh-CN data-bw-track=ui><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         "<meta name=color-scheme content='light dark'>"
-        f"<title>{_e(title)}</title><style>{_STYLE}</style></head>"
+        f"<title>{_e(title)}</title><style>{_FONT_FACES}{_STYLE}</style></head>"
         f"<body data-csrf=\"{_e(csrf)}\">{theme_btn}{body}"
         f"<script>{_SCRIPT}</script></body></html>"
     )

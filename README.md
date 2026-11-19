@@ -525,6 +525,8 @@ xhsearch/
   summary.py     跨表聚合：一批 record → 一个项目的快照。纯函数
   panel.py       监控面板的 HTTP 服务。**只读、不刷表**（日报 AI 草稿按需）
   panel_view.py  面板的单文件 HTML（内联样式和脚本，零外部资源）
+  panel_fonts.py 面板自带的两份字体（标题 BW Display、数字 Archivo），由面板同源发出
+  fonts/         上面那两份字体的子集文件、来源说明与 OFL 许可证
   report_ai.py   日报 AI 草稿：DeepSeek Flash，证据最小化、竞品必须可核验
   panel_settings.py  面板上点出来的设置（存在注册表那个 base 里的一张键值表）
   visibility.py  搜索可见试跑的规则：读词、发请求、记账、出报告（只有人亲手起才会走到：
@@ -539,6 +541,7 @@ tools/
   check_id_time.py     核对链接 ID 时间和真实发布时间差几天（只读，C1）
   update_next_check_formula.py  「下次检查时间」换成新版公式、缺的表建上（默认只看，--apply 才改）
   export_comment_handling.py    评论区处置底稿：每条负面/竞品评论的发现时间、标已处理时间、按竞品条数（只读，出 CSV）
+  build_panel_fonts.py          重出面板字体子集（改了标题文案时用；要 fonttools，面板运行不需要）
 tests/           1000+ 个测试，全离线
 ```
 

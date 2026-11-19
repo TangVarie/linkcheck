@@ -1036,6 +1036,47 @@ class TestOverHttp(unittest.TestCase):
             touch.assert_called()
             view.assert_called()
 
+    # —— 面板自带的字体（panel_fonts）——
+    def _raw(self, path):
+        import urllib.error
+        import urllib.request
+        try:
+            resp = urllib.request.urlopen(f"http://localhost:{self.port}{path}", timeout=5)
+            return resp.status, resp.read(), resp.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), exc.headers
+
+    def test_fonts_are_served_same_origin_without_a_session(self):
+        """登录页也用这两份字体，所以免鉴权；它们是公开的 OFL 字体。URL 带内容哈希，
+        缓存一年 immutable——字体一换 URL 就换。"""
+        from xhsearch import panel_fonts
+        self.assertEqual(set(panel_fonts.URLS), {"display", "archivo"},
+                         "xhsearch/fonts/ 里少了字体文件")
+        for url in panel_fonts.URLS.values():
+            status, body, headers = self._raw(url)
+            self.assertEqual(status, 200, url)
+            self.assertEqual(body[:4], b"wOF2", "不是 woff2")
+            self.assertEqual(body, panel_fonts.ROUTES[url])
+            self.assertEqual(headers.get("Content-Type"), "font/woff2")
+            self.assertEqual(headers.get("Cache-Control"), "public, max-age=31536000, immutable")
+            self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+
+    def test_only_the_hashed_font_urls_exist(self):
+        """路由只查那张表，不拼路径：不带哈希的名字、目录里的别的文件、`..` 一律 404，
+        而且 404 不带长缓存。"""
+        for path in ("/fonts/display.woff2", "/fonts/archivo.woff2", "/fonts/OFL.txt",
+                     "/fonts/display.chars.txt", "/fonts/../panel.py", "/fonts/%2e%2e/panel.py",
+                     "/fonts/"):
+            status, _body, headers = self._raw(path)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(headers.get("Cache-Control"), "no-store", path)
+
+    def test_csp_allows_fonts_only_from_itself(self):
+        csp = self._call("/healthz")[2].get("Content-Security-Policy", "")
+        directives = {c.split()[0]: c.split()[1:] for c in csp.split(";") if c.split()}
+        self.assertEqual(directives.get("font-src"), ["'self'"],
+                         "字体只许来自面板自己：不放外链，也不放 data:")
+
     # —— 无需登录 ——
     def test_healthz_needs_no_password(self):
         status, body, _ = self._call("/healthz")

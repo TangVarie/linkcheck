@@ -531,11 +531,18 @@ class TestNoEmojiIcons(unittest.TestCase):
 
     def test_icons_are_inlined_not_fetched(self):
         """CSP 是 default-src 'none'，而且这个项目零依赖——
-        图标只能内联，不能是外链或字体图标。"""
+        图标只能内联，不能是外链或字体图标。字体只有面板自带的两份，
+        从自己的 /fonts/ 路由来（panel_fonts）。"""
+        from xhsearch import panel_fonts
         html = render()
         self.assertIn("<svg class=\"icon\"", html)
-        for pattern in ("<link", "@font-face", "cdn.", "unpkg", "googleapis"):
+        for pattern in ("<link", "cdn.", "unpkg", "googleapis", "@import"):
             self.assertNotIn(pattern, html, f"页面引了外部资源：{pattern}")
+        faces = re.findall(r"@font-face\{([^}]*)\}", html)
+        self.assertEqual(len(faces), 2)
+        for face in faces:
+            for url in re.findall(r"url\(([^)]*)\)", face):
+                self.assertIn(url, panel_fonts.ROUTES, f"字体不是面板自带的那两份：{url}")
 
 
 class TestDashboardComponents(unittest.TestCase):
@@ -918,6 +925,63 @@ class TestV61Grammar(unittest.TestCase):
         self.assertIn('class="logo-l"', panel_view._LOGO)
         self.assertIn('class="logo-d"', panel_view._LOGO)
         self.assertIn(".logo-l{display:var(--logo-l)}", self.css)
+
+
+
+class TestEmbeddedFonts(unittest.TestCase):
+    """面板自带的两份字体（xhsearch/fonts/，见 panel_fonts 与那个目录的 README）。"""
+
+    def _display_texts(self):
+        """页面上用显示字体（--f-dsp）排的字：页面标题、章节标题、登录页那一句、
+        大数字后面的单位。和 _STYLE 里用 var(--f-dsp) 的那几条规则一一对应。"""
+        cfg = panel.PanelConfig.from_env({"PANEL_PASSWORD": "a-long-enough-password"})
+        skeleton = panel_view.overview_page(overview=None, error="", fetched_at=0.0, config=cfg)
+        points = panel_view._balance_section(
+            [balance.Balance(channel="socialdatax", label="SocialDataX", amount=8520,
+                             unit="POINT", yuan=85.2)], "", None, cfg, [])
+        pages = [render(), skeleton, panel_view.login_page(""), points]
+        texts = []
+        for html in pages:
+            texts += re.findall(r"<h1>([^<]+)</h1>", html)
+            texts += [t.strip() for t in re.findall(r"<h2 id=s-[\w-]+>([^<]+)", html)]
+            texts += re.findall(r"<p class=say>([^<]+)</p>", html)
+            texts += [t.strip() for t in re.findall(
+                r"class='(?:n|big) num'>[^<]*<small>([^<]+)</small>", html)]
+        return texts
+
+    def test_every_display_glyph_is_in_the_subset(self):
+        """BW Display 只收了标题里用到的字。改了标题文案、字不在子集里，那几个字会
+        退回系统字、粗细对不上——这时跑 tools/build_panel_fonts.py 重出子集。"""
+        from xhsearch import panel_fonts
+        covered = set(panel_fonts.covered_chars())
+        self.assertTrue(covered, "xhsearch/fonts/display.chars.txt 读不到")
+        texts = self._display_texts()
+        self.assertIn("面板负责发现，飞书负责处理。", texts)
+        self.assertIn("积分", texts)
+        missing = {c for t in texts for c in t if not c.isspace()} - covered
+        self.assertEqual(missing, set(), "这些字不在 BW Display 子集里，"
+                         "把它们写进 panel_fonts.DISPLAY_TEXT 再跑 tools/build_panel_fonts.py")
+        self.assertLessEqual(set(panel_fonts.DISPLAY_TEXT) - {" "}, covered)
+
+    def test_display_font_rules_match_the_text_the_test_collects(self):
+        """上一条只查它认得的那几种元素；样式里新加一条用显示字体的规则而没在这里登记，
+        它就漏查了。所以把「哪些规则用 --f-dsp」也钉住。"""
+        css = css_without_comments()
+        users = {sel.strip() for sel, decls in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+                 if "var(--f-dsp)" in decls}
+        self.assertEqual(users, {"h1", ".content>h2", ".kpi .n small", ".login .field .say",
+                                 ".card .big small"})
+
+    def test_the_fonts_ship_with_their_licence(self):
+        from xhsearch import panel_fonts
+        licence = (panel_fonts.FONT_DIR / "OFL.txt").read_text(encoding="utf-8")
+        self.assertIn("SIL Open Font License, Version 1.1", licence)
+        self.assertIn("The Archivo Project Authors", licence)
+        self.assertIn("Adobe", licence)
+        for name in ("display", "archivo"):
+            data = (panel_fonts.FONT_DIR / f"{name}.woff2").read_bytes()
+            self.assertEqual(data[:4], b"wOF2")
+            self.assertLess(len(data), 64 * 1024, f"{name}.woff2 超过 64KB，子集多半没裁")
 
 
 if __name__ == "__main__":
