@@ -1,12 +1,18 @@
-"""面板视觉的机器闸（BYWOOD 设计系统 v5.4.0 · 色板 v5.1 · 界面轨「管理后台」）。
+"""面板视觉的机器闸（BYWOOD 设计系统 v6.1 · 色板 v5.1 · 界面轨「管理后台」）。
 
-设计系统自己带一个 `tools/check-design.py`，但那个工具在**设计系统包里**，
+设计系统自己带一个 `tools/check-design.py`（v4.1），但那个工具在**设计系统包里**，
 不在这个仓库——CI 上跑不到。所以把它管的那几条里**最容易在改样式时踩回去**
-的，在这里用离线测试钉一遍：色板外色值、圆角、阴影、渐变、毛玻璃、emoji 当图标。
+的，在这里用离线测试钉一遍：色板外色值、标志青只做底、圆角两档、阴影、渐变、
+毛玻璃、动效写法、emoji 当图标。
 
-这不是复述整份规范（那会变成维护两份），只钉六条**不需要看上下文就能判**的
-硬规则 + 两条这一轨特有的构件上限。品牌跑偏在这个体系里算构建错误，
-不是审美分歧——那就得有个东西在构建时会红。
+这不是复述整份规范（那会变成维护两份），只钉**不需要看上下文就能判**的硬规则 +
+这一轨特有的几条构件约束。品牌跑偏在这个体系里算构建错误，不是审美分歧——
+那就得有个东西在构建时会红。
+
+v6.1（2026-11-19）相对 v5.4 改了的规则，这里跟着改了：控件圆角 8px 与内件 4px
+（v5.9 起）、文字链由赭石改为墨字 + 青下划线、标志青面除登录页外还给「待办清零」
+那一刻、标志青 token 改名 --color-field-brand（v4.1 闸只认这个名字）、
+新增 [MOTION] 与字号档位两条。
 """
 
 import re
@@ -77,9 +83,10 @@ PALETTE = {
 }
 
 # 标志青 #7ED1CD 在标志图形之外唯一合法的写法：做底（v5.1 品牌面色）。
-# 与设计系统 tools/check-design.py 的 RE_TEAL_FIELD 同一条判据。
+# 与设计系统 tools/check-design.py v4.1 的 RE_TEAL_FIELD 同一条判据：整段
+# background 声明，或 token 定义 --color-field-brand。
 RE_TEAL_FIELD = re.compile(
-    r"(?i)(background(?:-color)?\s*:[^;{}]*#7ED1CD|--field-brand\s*:\s*#7ED1CD)")
+    r"(?i)(background(?:-color)?\s*:[^;{}]*|--color-field-brand\s*:[^;{}]*)")
 
 
 class TestPalette(unittest.TestCase):
@@ -129,33 +136,46 @@ class TestPalette(unittest.TestCase):
 
 
 class TestBrandField(unittest.TestCase):
-    """品牌面色（v5.1）：标志青做底。BRAND.md §2 的用法纪律——
-    每屏 ≤1 块、块内只放墨字或主色字、不放白字不放赭石、标志用墨版。"""
+    """标志青面（DESIGN.md §二「承诺与识别」）：青面三件套——青底 · 墨字 · 墨版标志；
+    不放白字（1.77）、不放赭石（2.81）、不放青色山形。"""
 
     def test_the_login_page_has_exactly_one_field(self):
-        """登录页是品牌时刻（接收层），青面的主场；一块，不多。"""
+        """登录页是品牌时刻（识别），青面的主场；一块，不多。"""
         html = panel_view.login_page("")
         self.assertEqual(html.count("class=field>"), 1)
 
-    def test_the_dashboard_has_none(self):
-        """后台那一屏是工作层：工作层的青面只给 deck 幕封（BRAND-LANGUAGE §二），
-        管理后台不开。"""
-        self.assertNotIn("class=field>", render())
+    def test_the_dashboard_uses_the_field_only_for_the_all_clear(self):
+        """后台用画布 + 白表面组织界面，四种底以块出现（scenarios/03 v6 适配）。
+        标志青只给「值得庆祝的那一刻」（CRAFT §一）：待办清零。不给装饰，不给任何
+        天天出现的东西——除了文字选中色（ui.css 原样）和登录页，样式里只有它一处。"""
+        css = css_without_comments()
+        body = css.split("*{box-sizing", 1)[1]
+        owners = set()
+        for selector, decls in re.findall(r"([^{}]+)\{([^{}]*)\}", body):
+            if re.search(r"background(?:-color)?:var\(--field\)", decls):
+                owners.add(selector.strip())
+        self.assertEqual(owners, {"::selection", ".login .field", "#todoEmpty"})
+        self.assertNotIn("class=field>", render(), "后台那一屏不开登录页那块青面")
+        self.assertIn("id=todoEmpty", render(), "fixture 没有待办时应该出现清零那一块")
 
     def test_ink_on_teal_and_the_mono_mark(self):
-        """三件套固定不拆：青底 · 墨字 · 墨版标志。块的文字色是墨（rgba 黑
-        .9），山形走 currentColor 继承它——青山形在青面上会消失。"""
+        """三件套固定不拆：青底 · 墨字 · 墨版标志。块的文字色是墨（rgba 黑 .9）；
+        标志用 logo/horizontal/bywood-horizontal-black 原件——青山形在青面上会消失。"""
         css = css_without_comments()
         rule = re.search(r"\.login \.field\{([^}]+)\}", css)
         self.assertIsNotNone(rule, "登录页没有品牌面色块的样式")
-        self.assertIn("background:var(--field-brand)", rule.group(1))
-        self.assertIn("color:var(--on-field)", rule.group(1))
+        self.assertIn("background:var(--field)", rule.group(1))
+        self.assertIn("color:var(--ink-on-field)", rule.group(1))
         root = re.search(r":root\{([^}]+)\}", css).group(1)
-        self.assertRegex(root, r"--on-field:rgba\(0,0,0,\.9\d*\)")
-        # 块里的标志继承块的字色，不走浅底那套 --wordmark
+        self.assertRegex(root, r"--ink-on-field:rgba\(0,0,0,\.9\d*\)")
+        self.assertIn("--field:var(--color-field-brand)", root)
         brand = re.search(r"\.login \.field \.brand\{([^}]+)\}", css)
         self.assertIsNotNone(brand)
         self.assertIn("color:inherit", brand.group(1))
+        html = panel_view.login_page("")
+        field = re.search(r"<div class=field>(.*?)</div>\s*<div class=body>", html, re.S).group(1)
+        self.assertIn(panel_view._LOGO_INK, field)
+        self.assertNotIn("#7ED1CD", panel_view._LOGO_INK.upper(), "青面上的标志必须是墨版")
 
     def test_nothing_white_or_ochre_inside_the_field(self):
         """白字压青 1.77、赭石压青 2.81，都不过。块内不放链接（赭）、
@@ -170,9 +190,11 @@ class TestBrandField(unittest.TestCase):
             self.assertNotIn(banned, inner, f"青面块里出现了 {banned}")
 
     def test_the_field_is_the_same_teal_in_both_modes(self):
-        """palette.json：fieldBrand 两模式同值，块内墨字——深色模式不翻它。"""
+        """palette.json：fieldBrand 两模式同值，块内墨字——深色模式不翻它。
+        名字照 tokens/ui.css 写 --color-field-brand：check-design.py v4.1 的
+        [LOGO] 围栏只认这个名字，写成别的名字会被当成「标志青当前景用」。"""
         css = css_without_comments()
-        self.assertEqual(css.count("--field-brand:#7ED1CD"), 1,
+        self.assertEqual(css.count("--color-field-brand:#7ED1CD"), 1,
                          "品牌面色只在 :root 定一次，深色块不该再写一遍")
 
     def test_the_field_carries_one_judgement_not_a_slogan(self):
@@ -444,17 +466,33 @@ def css_without_comments() -> str:
 
 
 class TestFlatRules(unittest.TestCase):
-    """直角 / 零阴影 / 零渐变 / 零毛玻璃。"""
+    """容器直角、控件圆角两档 / 零阴影 / 零渐变 / 零毛玻璃。"""
+
+    # 控件：按钮、输入类、选择框、分段的轨。圆角只许落在这些东西上（DESIGN.md §六）。
+    CONTROL = re.compile(r"(?:^|[\s>+~])(?:button|input|select|textarea)(?:[.:\[][^\s]*)?$|(?:^|\s)\.seg$")
 
     def setUp(self):
         self.css = css_without_comments()
 
-    def test_no_rounded_corners(self):
-        """圆角是通用 AI 视觉的第一标志，本系统不用。
-        例外只有本体即圆形的东西，届时要带 `/* ok: 理由 */`。"""
+    def test_corners_are_square_or_one_of_two_control_steps(self):
+        """容器（卡、块、表格、标签、浮层、导航项）一律 0；控件写 var(--radius-control)（8px），
+        控件内件（复选框、分段滑块）写 calc(var(--radius-control) - 4px)（CRAFT §十二）。
+        字面量 8px 也不放行：圆角只有这一个 token，改它要改 token。"""
+        allowed = ("0", "50%", "var(--radius-control)", "calc(var(--radius-control) - 4px)")
         for value in re.findall(r"border-radius\s*:\s*([^;}]+)", self.css):
-            self.assertIn(value.strip(), ("0", "50%"),
-                          f"border-radius: {value.strip()}")
+            self.assertIn(value.strip(), allowed, f"border-radius: {value.strip()}")
+        self.assertEqual(re.findall(r"--radius-[\w-]+\s*:\s*([^;}]+)", self.css), ["8px"],
+                         "圆角只有 --radius-control 一个 token，值 8px")
+
+    def test_control_radius_never_lands_on_a_container(self):
+        body = self.css.split("*{box-sizing", 1)[1]
+        for selector, decls in re.findall(r"([^{}]+)\{([^{}]*)\}", body):
+            if "radius-control" not in decls:
+                continue
+            for part in selector.split(","):
+                part = part.strip()
+                self.assertRegex(part, self.CONTROL,
+                                 f"控件圆角写在了不是控件的东西上：{part}")
 
     def test_no_shadows(self):
         found = [v for v in re.findall(r"box-shadow\s*:\s*([^;}]+)", self.css)
@@ -493,11 +531,18 @@ class TestNoEmojiIcons(unittest.TestCase):
 
     def test_icons_are_inlined_not_fetched(self):
         """CSP 是 default-src 'none'，而且这个项目零依赖——
-        图标只能内联，不能是外链或字体图标。"""
+        图标只能内联，不能是外链或字体图标。字体只有面板自带的两份，
+        从自己的 /fonts/ 路由来（panel_fonts）。"""
+        from xhsearch import panel_fonts
         html = render()
         self.assertIn("<svg class=\"icon\"", html)
-        for pattern in ("<link", "@font-face", "cdn.", "unpkg", "googleapis"):
+        for pattern in ("<link", "cdn.", "unpkg", "googleapis", "@import"):
             self.assertNotIn(pattern, html, f"页面引了外部资源：{pattern}")
+        faces = re.findall(r"@font-face\{([^}]*)\}", html)
+        self.assertEqual(len(faces), 2)
+        for face in faces:
+            for url in re.findall(r"url\(([^)]*)\)", face):
+                self.assertIn(url, panel_fonts.ROUTES, f"字体不是面板自带的那两份：{url}")
 
 
 class TestDashboardComponents(unittest.TestCase):
@@ -542,17 +587,20 @@ class TestDashboardComponents(unittest.TestCase):
         html = render() + panel_view.login_page("x")
         self.assertNotIn("»", html, "双箭已随 v5 换标退役，页面上不该再出现")
 
-    def test_row_actions_are_small_and_blue(self):
-        """scenarios/03：「行操作用 13px 蓝字链接」（v5 落在主色深青上）。
-
-        模板里通用的 `a` 是 accent 赭石，和这条冲突——仲裁顺序里
-        **场景文件规则高于可执行模板**，所以行操作听场景的。
-        """
+    def test_links_are_ink_with_a_teal_underline(self):
+        """v6 的文字链（CRAFT §二、components/ui.css 的 .lnk）：墨字 + 60% 青的下划线，
+        悬停下划线变实。v5 那套「链接一律赭石」退了——赭石一屏只给一个焦点
+        （DESIGN.md §二），满页的链接把它用光了。行操作跟着全站链接走，字号进档位（sm 14）。"""
         css = css_without_comments()
+        link = re.search(r"(?m)^a\{([^}]+)\}", css)
+        self.assertIsNotNone(link)
+        self.assertIn("color:var(--t1)", link.group(1))
+        self.assertIn("text-decoration-color:var(--hl2)", link.group(1))
+        self.assertNotIn("var(--accent)", link.group(1))
+        self.assertIn("a:hover{text-decoration-color:currentColor}", css)
         rule = re.search(r"td a\.act\{([^}]+)\}", css)
         self.assertIsNotNone(rule, "行操作链接没有单独的样式")
-        self.assertIn("13px", rule.group(1))
-        self.assertIn("var(--primary)", rule.group(1))
+        self.assertIn("var(--sm)", rule.group(1))
         self.assertIn("class=act", render())
 
     def test_a_space_between_a_number_and_a_chinese_unit(self):
@@ -634,8 +682,9 @@ class TestNavigationEdges(unittest.TestCase):
         里面任何一个宽东西都会把整个网格撑过视口。桌面那档写的是
         `minmax(0,1fr)`，窄屏这档漏了同一个保险。"""
         css = css_without_comments()
-        narrow = re.search(r"@media \(max-width:900px\)\{(.*?)\n\}",
-                           css, re.S).group(1)
+        # 侧栏收起、网格变单列的那一档（v6.1 起是 1100，黄金样张的断点）
+        narrow = next(m.group(1) for m in re.finditer(r"@media \(max-width:\d+px\)\{(.*?)\n\}", css, re.S)
+                      if ".side{position:static" in m.group(1))
         app = re.search(r"\.app\{grid-template-columns:([^}]+)\}", narrow)
         self.assertIsNotNone(app)
         self.assertIn("minmax(0,", app.group(1),
@@ -783,8 +832,8 @@ class TestDarkMode(unittest.TestCase):
                              f"组件区出现了深色专属色值 {token}")
 
     def test_the_toggle_is_on_every_page(self):
-        """右下角的深浅开关走 templates/dashboard.html 的定式，挂在 body
-        直下——登录页和骨架页也要有，不能只有取到数的那一屏。"""
+        """深浅开关登录页和骨架页也要有，不能只有取到数的那一屏。有顶栏的页面放在
+        顶栏工具区（templates/dashboard.html 的位置），登录页没顶栏，右下角悬浮。"""
         skeleton = panel_view.overview_page(
             overview=None, error="", fetched_at=0.0,
             config=panel.PanelConfig.from_env({
@@ -792,6 +841,10 @@ class TestDarkMode(unittest.TestCase):
         for html in (render(), panel_view.login_page("x"), skeleton):
             self.assertIn("id=themeBtn", html)
             self.assertIn("aria-label='切换深浅模式'", html)
+            self.assertEqual(html.count("id=themeBtn"), 1)
+        for html in (render(), skeleton):
+            top = re.search(r"<div class=top>(.*?)</div>", html, re.S).group(1)
+            self.assertIn("id=themeBtn", top, "有顶栏的页面，开关在顶栏里")
 
     def test_the_choice_is_restored_and_falls_back_to_the_system(self):
         """开关的两半，各钉一条：存过的选择要在下次打开时生效；没存过时
@@ -803,6 +856,132 @@ class TestDarkMode(unittest.TestCase):
                       "没存过偏好时不看系统状态，第一下会翻错方向")
         self.assertIn("dataset.theme", js,
                       "开关必须只翻 <html data-theme>，不许改组件样式")
+
+
+
+class TestV61Grammar(unittest.TestCase):
+    """v6.1 新加的几条：动效写法（闸 [MOTION]）、字号档位、粗细两端、界面轨标记。"""
+
+    def setUp(self):
+        self.css = css_without_comments()
+
+    def test_motion_uses_role_curves_and_only_moves_transform_and_opacity(self):
+        """CRAFT §一：CSS 默认 ease 不是选择；transition: all 不许；不动布局属性。
+        判据与 check-design.py v4.1 的 [MOTION] 同。"""
+        layout = re.compile(r"^(?:width|height|min-width|min-height|max-width|max-height|top|left|"
+                            r"right|bottom|inset(?:-[a-z-]+)?|margin(?:-[a-z-]+)?|padding(?:-[a-z-]+)?)$")
+        decls = re.findall(r"(?<![-\w])(transition|animation)(-property|-timing-function)?\s*:\s*([^;{}]+)",
+                           self.css)
+        self.assertTrue(decls)
+        for prop, sub, value in decls:
+            self.assertNotRegex(value, r"(?<![-\w])ease(?![-\w])", f"{prop}{sub}: {value} 用了默认 ease")
+            if prop == "transition" and sub in ("", "-property"):
+                for seg in value.split(","):
+                    first = seg.strip().split()[0]
+                    self.assertNotEqual(first, "all", "transition: all")
+                    self.assertNotRegex(first, layout, f"transition 动了布局属性 {first}")
+        for name, body in re.findall(r"@keyframes\s+([\w-]+)\s*\{((?:[^{}]*\{[^{}]*\})*)[^{}]*\}", self.css):
+            self.assertNotRegex(body, r"(?<![-\w])(width|height|top|left|right|bottom|margin|padding|inset)\s*:",
+                                f"@keyframes {name} 动了布局属性")
+
+    def test_type_sizes_stay_on_the_scale(self):
+        """后台档：12 / 14 / 16 / 24 / 32 / 40 / 48（DESIGN.md §三、tokens/ui.css）。
+        v5 留下的 11 / 13 / 15 / 17 / 30px 一个都不该再出现。"""
+        sizes = {int(v) for v in re.findall(r"font-size:\s*(\d+)px", self.css)}
+        sizes |= {int(v) for v in re.findall(r"--(?:d1|d2|d3|lede|body|sm|mi|n1|n2):(\d+)px", self.css)}
+        self.assertLessEqual(sizes, {12, 14, 16, 24, 32, 40, 48}, f"档位外的字号：{sorted(sizes)}")
+
+    def test_weights_use_the_two_ends(self):
+        """粗细只用两端：显示字 900 / 800，标签 600–700，正文 400。500 对 600 这种看不出差别的组合不出现。"""
+        weights = set(re.findall(r"font-weight:\s*(\d+)", self.css))
+        weights |= set(re.findall(r"font:\s*(\d00)\s", self.css))
+        self.assertLessEqual(weights, {"400", "600", "700", "800", "900"}, f"粗细：{sorted(weights)}")
+
+    def test_buttons_press_with_scale_and_a_darker_fill_together(self):
+        """CRAFT §二：按下要两件事一起变——缩到 .97，底色同时到加深档。"""
+        rule = re.search(r"(?m)^button:active:not\(:disabled\)\{([^}]+)\}", self.css)
+        self.assertIsNotNone(rule)
+        self.assertIn("scale(.97)", rule.group(1))
+        self.assertIn("background:", rule.group(1))
+
+    def test_filled_buttons_never_hard_code_white_text(self):
+        """[ONFILL]：主色 / 危险色填充上的字走 --on-primary / --on-danger——深色模式下亮青上
+        白字只有 2.11:1。"""
+        for _sel, decls in re.findall(r"([^{}]+)\{([^{}]*)\}", self.css):
+            if re.search(r"background(?:-color)?:var\(--(?:primary|danger)\)", decls):
+                self.assertNotRegex(decls, r"(?<![-\w])color:\s*(?:#fff(?:fff)?|white)\b")
+
+    def test_the_page_declares_the_ui_track(self):
+        """<html data-bw-track="ui">：设计系统 audit.py 据此按界面轨量（不查章节换底）。"""
+        for html in (render(), panel_view.login_page("")):
+            self.assertIn("<html lang=zh-CN data-bw-track=ui>", html)
+
+    def test_the_sidebar_uses_the_horizontal_logo_originals(self):
+        """侧栏是浅底默认：teal-on-light；深色模式换 teal-on-dark（只差词标那一笔的颜色），
+        由 token 切换显示，不写第二套组件样式。"""
+        html = render()
+        side = re.search(r"<aside class=side>(.*?)</aside>", html, re.S).group(1)
+        self.assertIn(panel_view._LOGO, side)
+        self.assertIn('class="logo-l"', panel_view._LOGO)
+        self.assertIn('class="logo-d"', panel_view._LOGO)
+        self.assertIn(".logo-l{display:var(--logo-l)}", self.css)
+
+
+
+class TestEmbeddedFonts(unittest.TestCase):
+    """面板自带的两份字体（xhsearch/fonts/，见 panel_fonts 与那个目录的 README）。"""
+
+    def _display_texts(self):
+        """页面上用显示字体（--f-dsp）排的字：页面标题、章节标题、登录页那一句、
+        大数字后面的单位。和 _STYLE 里用 var(--f-dsp) 的那几条规则一一对应。"""
+        cfg = panel.PanelConfig.from_env({"PANEL_PASSWORD": "a-long-enough-password"})
+        skeleton = panel_view.overview_page(overview=None, error="", fetched_at=0.0, config=cfg)
+        points = panel_view._balance_section(
+            [balance.Balance(channel="socialdatax", label="SocialDataX", amount=8520,
+                             unit="POINT", yuan=85.2)], "", None, cfg, [])
+        pages = [render(), skeleton, panel_view.login_page(""), points]
+        texts = []
+        for html in pages:
+            texts += re.findall(r"<h1>([^<]+)</h1>", html)
+            texts += [t.strip() for t in re.findall(r"<h2 id=s-[\w-]+>([^<]+)", html)]
+            texts += re.findall(r"<p class=say>([^<]+)</p>", html)
+            texts += [t.strip() for t in re.findall(
+                r"class='(?:n|big) num'>[^<]*<small>([^<]+)</small>", html)]
+        return texts
+
+    def test_every_display_glyph_is_in_the_subset(self):
+        """BW Display 只收了标题里用到的字。改了标题文案、字不在子集里，那几个字会
+        退回系统字、粗细对不上——这时跑 tools/build_panel_fonts.py 重出子集。"""
+        from xhsearch import panel_fonts
+        covered = set(panel_fonts.covered_chars())
+        self.assertTrue(covered, "xhsearch/fonts/display.chars.txt 读不到")
+        texts = self._display_texts()
+        self.assertIn("面板负责发现，飞书负责处理。", texts)
+        self.assertIn("积分", texts)
+        missing = {c for t in texts for c in t if not c.isspace()} - covered
+        self.assertEqual(missing, set(), "这些字不在 BW Display 子集里，"
+                         "把它们写进 panel_fonts.DISPLAY_TEXT 再跑 tools/build_panel_fonts.py")
+        self.assertLessEqual(set(panel_fonts.DISPLAY_TEXT) - {" "}, covered)
+
+    def test_display_font_rules_match_the_text_the_test_collects(self):
+        """上一条只查它认得的那几种元素；样式里新加一条用显示字体的规则而没在这里登记，
+        它就漏查了。所以把「哪些规则用 --f-dsp」也钉住。"""
+        css = css_without_comments()
+        users = {sel.strip() for sel, decls in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+                 if "var(--f-dsp)" in decls}
+        self.assertEqual(users, {"h1", ".content>h2", ".kpi .n small", ".login .field .say",
+                                 ".card .big small"})
+
+    def test_the_fonts_ship_with_their_licence(self):
+        from xhsearch import panel_fonts
+        licence = (panel_fonts.FONT_DIR / "OFL.txt").read_text(encoding="utf-8")
+        self.assertIn("SIL Open Font License, Version 1.1", licence)
+        self.assertIn("The Archivo Project Authors", licence)
+        self.assertIn("Adobe", licence)
+        for name in ("display", "archivo"):
+            data = (panel_fonts.FONT_DIR / f"{name}.woff2").read_bytes()
+            self.assertEqual(data[:4], b"wOF2")
+            self.assertLess(len(data), 64 * 1024, f"{name}.woff2 超过 64KB，子集多半没裁")
 
 
 if __name__ == "__main__":

@@ -57,8 +57,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
-from . import (channels as channels_mod, feishu, negatives, panel_settings, panel_view,
-               provision, railway, readout, registry, report_ai as report_ai_mod,
+from . import (channels as channels_mod, feishu, negatives, panel_fonts, panel_settings,
+               panel_view, provision, railway, readout, registry, report_ai as report_ai_mod,
                schema, summary, tablespec, trial as trial_mod)
 
 tablespec_BadTarget = tablespec.BadTarget
@@ -2165,6 +2165,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             # 免鉴权：Railway 要拿它判活，而健康检查不该需要口令。
             # 它只回一个字面量，不泄露任何东西。
             return self._send(200, b"ok", "text/plain; charset=utf-8")
+        if path.startswith("/fonts/"):
+            # 面板自带的两份字体（panel_fonts）。免鉴权：登录页也要用，而且是公开的 OFL 字体。
+            # 只认那张表里带内容哈希的 URL，不拼路径、不碰文件系统；URL 一变内容就变，
+            # 所以可以缓存一年。
+            font = panel_fonts.ROUTES.get(path)
+            if font is None:
+                return self._send(404, b"not found", "text/plain; charset=utf-8")
+            return self._send(200, font, panel_fonts.CONTENT_TYPE,
+                              cache=panel_fonts.CACHE_CONTROL)
         if path == "/":
             if not self._authed():
                 return self._send_html(200, self.deps.render_login(""))
@@ -2501,16 +2510,18 @@ class PanelHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length)
 
     # —— 响应 ——
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(self, status: int, body: bytes, content_type: str, *,
+              cache: str = "no-store") -> None:
         self.send_response(status)
         # 响应头全部是写死的常量：send_header 不校验 CRLF，
-        # 任何把用户输入放进头里的路径都是头注入。
+        # 任何把用户输入放进头里的路径都是头注入。`cache` 也只会是常量
+        # （默认 no-store；只有带哈希的字体文件用 panel_fonts.CACHE_CONTROL）。
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header(
             "Content-Security-Policy",
             # connect-src 少了这一条，fetch() 会退到 default-src 'none'，
@@ -2518,8 +2529,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             # `TypeError: Failed to fetch`——项目列表、加表、体检、新建、
             # 重新取数、勾排队刷新，全都点不动，而服务端一切正常、
             # 请求根本没发出去。CSP 只有真浏览器认，urllib 测试看不见它。
+            # font-src 'self'：面板自带的字体从自己的 /fonts/ 路由来（panel_fonts），
+            # 不放开任何外部来源。
             "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; "
-            "script-src 'unsafe-inline'; img-src data:; form-action 'self'; "
+            "script-src 'unsafe-inline'; img-src data:; font-src 'self'; form-action 'self'; "
             "base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         if self.command != "HEAD":
