@@ -2874,8 +2874,8 @@ class TestChannelOutageOnThePage(unittest.TestCase):
                                            config(), [self._Outage()])
         self.assertIn("card bad", html)
         self.assertIn("发不出请求了", html)
-        # 另一家照常是白卡（金额带千分位）
-        self.assertIn("8,520 积分", html)
+        # 另一家照常是白卡（金额带千分位）。单位单独一个 <small>，按渲染出来的字查。
+        self.assertIn("8,520 积分", re.sub(r"<[^>]+>", "", html))
 
 
 # ---------------------------------------------------------------- 不在主列表里的异常

@@ -202,8 +202,8 @@ h2 .n{font-family:var(--f-num);font-size:var(--sm);font-weight:700;color:var(--t
 .sub{margin:-8px 0 16px;max-width:60em;font-size:var(--sm);color:var(--t3)}
 .sub b{color:var(--t1)}
 /* 方法与说明：浅青块（DESIGN.md §二「浅青 = 方法与范围」） */
-.intro{margin:-4px 0 16px;padding:16px 20px;background:var(--tint-primary);font-size:var(--sm);
-  line-height:1.75;color:var(--t2)}
+.intro{max-width:56em;margin:-4px 0 16px;padding:16px 20px;background:var(--tint-primary);
+  font-size:var(--sm);line-height:1.75;color:var(--t2)}
 .intro b{color:var(--t1)}
 
 /* ---------- KPI：1 块深青证据 + 最多 3 张白卡 ---------- */
@@ -219,8 +219,7 @@ h2 .n{font-family:var(--f-num);font-size:var(--sm);font-weight:700;color:var(--t
 .kpi .lead{--focus:#FFFFFF;background:var(--deep);color:var(--on-deep-2)}
 .kpi .lead .k,.kpi .lead .n{color:var(--on-deep)}
 .kpi .lead .s{color:var(--on-deep-2)}
-/* 要现在做决定的那一格：顶上一根 2px 危险色、数字转危险色加深档 */
-.kpi .box.warn{padding-top:18px;border-top:2px solid var(--danger)}
+/* 要现在做决定的那一格：数字转危险色加深档 */
 .kpi .box.warn .n{color:var(--danger-deep)}
 
 /* ---------- 表格：三线制（2px 深青顶线 · 表头强线 · 行间发丝线），数字列右对齐等宽 ---------- */
@@ -250,8 +249,7 @@ td.which{min-width:190px;max-width:280px;color:var(--t1)}
 .todo-meta a{font-size:var(--mi);white-space:nowrap;color:var(--t2)}
 .todos td.acts{min-width:200px}
 .todos td.diagnosis{min-width:180px;max-width:320px}
-/* 上次看过之后新冒出来的：标题格左缘一根 2px 主色线，标题后跟一个「新」 */
-tr.fresh td:nth-child(2){border-left:2px solid var(--primary)}
+/* 上次看过之后新冒出来的：标题后跟一个主色的「新」 */
 tr.fresh .todo-title::after{content:"新";margin-left:8px;font-size:var(--mi);font-weight:700;
   color:var(--primary)}
 
@@ -268,7 +266,6 @@ tr.fresh .todo-title::after{content:"新";margin-left:8px;font-size:var(--mi);fo
 /* ---------- 卡与行表 ---------- */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;align-items:start}
 .card{background:var(--surface);padding:24px}
-.card.bad{padding-top:22px;border-top:2px solid var(--danger)}
 .card h3{margin:0;font-size:var(--body);font-weight:700;line-height:1.4;color:var(--t1)}
 .card .rows{margin:12px 0 0}
 .card .rows div{display:flex;justify-content:space-between;gap:12px;padding:8px 0;
@@ -277,12 +274,15 @@ tr.fresh .todo-title::after{content:"新";margin-left:8px;font-size:var(--mi);fo
 .card .rows .lbl{color:var(--t3)}
 .card .big{margin-top:16px;font-family:var(--f-num);font-size:var(--n1);font-weight:800;
   font-stretch:112%;letter-spacing:-.015em;line-height:1;color:var(--t1)}
+.card .big small{margin-left:.08em;font-family:var(--f-dsp);font-size:.4em;font-weight:900;letter-spacing:0}
 .card .big+.muted{display:block;margin-top:8px}
 .card>.muted{margin-top:4px}
 .project-detail{margin-top:16px;border-top:1px solid var(--hl)}
 .project-detail>summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 0 4px;
   font-size:var(--sm);color:var(--t2)}
 .project-detail>summary .detail-link{margin-left:auto;font-size:var(--mi);font-weight:600;color:var(--t1)}
+.project-detail .d-close,.project-detail[open] .d-open{display:none}
+.project-detail[open] .d-close{display:inline}
 .project-detail .rows{margin-top:8px}
 .project-detail .chips{margin-top:8px}
 .project-snapshot{display:flex;gap:8px 16px;flex-wrap:wrap;margin-top:12px;font-size:var(--sm);
@@ -292,14 +292,17 @@ tr.fresh .todo-title::after{content:"新";margin-left:8px;font-size:var(--mi);fo
 .project-refresh{margin-top:8px;font-size:var(--mi);line-height:1.6;color:var(--t3)}
 .project-refresh>span:first-child{margin:0 4px;color:var(--t2)}
 
-/* ---------- 留在出事的地方：语义浅底 + 2px 语义色顶线 + 加深档字 ---------- */
-.problem,.note{display:flex;gap:8px;align-items:flex-start;margin:12px 0;padding:12px 16px;
-  font-size:var(--sm);line-height:1.6}
-.problem{background:var(--tint-danger);color:var(--danger-deep);border-top:2px solid var(--danger)}
-.note{background:var(--tint-warning);color:var(--warning-deep);border-top:2px solid var(--warning)}
+/* ---------- 留在出事的地方：语义浅底 + 加深档字 ----------
+ * 里面是一句连着读的话（金额、天数夹在句子里），所以按正文排，不用弹性布局——
+ * 弹性布局会把句子里的花速、天数各拆成一列。图标浮在左边，后面那段自成一块、整齐缩进。
+ * 不加状态色的边线：线只有发丝线、强线、深青顶线三种（DESIGN.md §六）。 */
+.problem,.note{display:block;margin:12px 0;padding:12px 16px;font-size:var(--sm);line-height:1.6}
+.problem{background:var(--tint-danger);color:var(--danger-deep)}
+.note{background:var(--tint-warning);color:var(--warning-deep)}
+.problem>.icon,.note>.icon{float:left;margin:3px 8px 0 0}
+.problem>.icon+span,.note>.icon+span{display:block;overflow:hidden}
 .problem ul{margin:4px 0 0;padding-left:20px}
 .problem li{margin:4px 0}
-.problem .icon,.note .icon{margin-top:3px}
 .problem a,.note a{color:inherit}
 
 /* ---------- 控件：按钮 40 / 36，8px 圆角；按下 = 缩到 .97 + 底色加深，两件事一起变（CRAFT §二） ---------- */
@@ -382,7 +385,7 @@ input[type=checkbox]:disabled{opacity:.45;cursor:not-allowed}
 .login p:empty{margin:0 0 12px}
 .login button{width:100%;height:48px;font-size:var(--body);font-weight:700}
 .err{margin:0 0 16px;padding:8px 12px;background:var(--tint-danger);color:var(--danger-deep);
-  border-top:2px solid var(--danger);font-size:var(--sm)}
+  font-size:var(--sm)}
 
 /* ---------- 空态：两行人话（发生了什么、下一步做什么），不放彩色圆底图标 ---------- */
 .empty{padding:24px;background:var(--surface);font-size:var(--body);font-weight:600;line-height:1.5;
@@ -446,7 +449,7 @@ tr.found{outline:2px solid var(--primary);outline-offset:-2px}
 .top-status:not(:empty){animation:pop-in var(--t-md) var(--ease-out) both}
 .top-status[data-state=ok]{animation:pop-in var(--t-md) var(--ease-out) both,
   pop-out var(--t-sm) var(--ease-in) 3s forwards}
-.top-status[data-state=error]{border-top-color:var(--danger);color:var(--danger-deep)}
+.top-status[data-state=error]{font-weight:600;color:var(--danger-deep)}
 
 /* ---------- 待办区：一块白表面，里面是排队条、项目切换、三线表 ---------- */
 .todo-panel{padding:20px 24px 24px;background:var(--surface)}
@@ -494,6 +497,9 @@ tr.found{outline:2px solid var(--primary);outline-offset:-2px}
   /* 1024 宽时待办表的七列要挤进内容区：标题列和诊断列的下限各让一点 */
   .todos td.which{min-width:160px}
   .todos td.diagnosis{min-width:140px}
+  .todos td.acts .seg button{padding:0 10px}
+  .content{padding:24px 24px 72px}
+  .todo-panel{padding:16px}
   /* 窄了排成两行：名字 + 要管几行；进度条通栏；三个数 + 最近检查。 */
   .tabs .tab{grid-template-columns:minmax(0,1fr) auto}
   .tabs .pbar{grid-column:1 / -1}
@@ -523,6 +529,7 @@ tr.found{outline:2px solid var(--primary);outline-offset:-2px}
 .proj .who b{margin-right:4px;font-weight:700;color:var(--t1)}
 .proj .acts{display:flex;gap:8px;flex-wrap:wrap}
 .proj .acts button{height:36px;padding:0 12px}
+.proj .acts button[data-act=remove]{color:var(--danger-deep)}
 .proj.off .who{opacity:.6}
 .addbox{margin-top:16px;padding:24px;background:var(--surface)}
 .addbox .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
@@ -532,8 +539,9 @@ tr.found{outline:2px solid var(--primary);outline-offset:-2px}
 .out:empty{margin-top:0}
 /* 新建表给谁开权限：在建表那个框里、发丝线隔开。改这里不用重新部署。 */
 .share{margin-top:24px;padding-top:16px;border-top:1px solid var(--hl);font-size:var(--sm)}
-.share .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
-.share .lbl{min-width:7em;color:var(--t3)}
+.share .srow{margin-top:8px;line-height:2}
+.share .srow>button,.share .srow>select,.share .srow>.chip{vertical-align:middle;margin:2px 4px 2px 0}
+.share .lbl{display:inline-block;min-width:7em;color:var(--t3)}
 .share .pick{margin-top:8px;padding:12px 16px;background:var(--fill)}
 .share .pick label{display:block;margin:4px 0}
 #trial{margin-top:0;padding:24px;border-top:0}
@@ -550,14 +558,14 @@ details[open]>summary::before{transform:rotate(45deg)}
 .fold>summary::before,.work-details>summary::before,.daily>summary::before,
 .project-detail>summary::before{content:none}
 details[open]>:not(summary){animation:detail-in var(--t-sm) var(--ease-out) both}
-.work-details>summary:hover,.daily>summary:hover,.fold>summary:hover,
-.project-detail>summary:hover{background:var(--fill)}
+.work-details>summary:hover,.daily>summary:hover,.project-detail>summary:hover{background:var(--fill)}
 /* ---------- 每个项目那一页底下的归档折叠区 ----------
- * **默认收起**，但要让人知道有这一块：一条带 2px 警示色顶线的条，条上写着几行、各是什么问题；
+ * **默认收起**，但要让人知道有这一块：一条警示浅底的条，条上写着几行、各是什么问题；
  * 点开才是明细。 */
-.fold{margin-top:20px;border-top:2px solid var(--warning)}
+.fold{margin-top:20px}
 .fold>summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;font-size:var(--sm);
-  color:var(--t1)}
+  color:var(--t1);background:var(--tint-warning)}
+.fold[open]>summary{margin-bottom:12px}
 .fold>summary .icon{color:var(--warning-deep)}
 .fold>summary .chip{margin:0}
 .fold-t b,.fold>summary b{font-family:var(--f-num);font-weight:700;color:var(--warning-deep)}
@@ -568,7 +576,7 @@ details[open]>:not(summary){animation:detail-in var(--t-sm) var(--ease-out) both
 .fold[open] .fold-hint::after{transform:translateY(3px) rotate(-135deg)}
 .fold .fold-close,.fold[open] .fold-open{display:none}
 .fold[open] .fold-close{display:inline}
-.fold-why{margin:0;padding:0 12px 16px;font-size:var(--sm);line-height:1.6;color:var(--t3)}
+.fold-why{margin:0;padding:0 0 16px;font-size:var(--sm);line-height:1.6;color:var(--t3)}
 .fold-why b{color:var(--t1)}
 .resolved{margin-top:20px}
 .resolved .tablewrap{margin-top:4px}
@@ -771,7 +779,6 @@ tr.resolvedNote button.link{margin-left:8px}
 @media (max-width:700px){
   .kpi{gap:8px}
   .kpi>*{min-height:0;padding:16px}
-  .kpi .box.warn{padding-top:14px}
   .kpi .n{font-size:32px}
   .todo-panel{padding:0;background:transparent}
   .queuebar{margin-bottom:12px;padding:12px 16px;background:var(--surface)}
@@ -801,7 +808,6 @@ tr.resolvedNote button.link{margin-left:8px}
   .todos tbody td.acts .seg+.act{display:inline;margin-top:0}
   .todos tbody td.acts button.link{margin-left:0;min-height:32px}
   .todos .diagnostic{max-width:none}
-  .todos tbody tr.fresh td:nth-child(2){padding-left:8px}
   .fold .todos tbody tr{border-top:1px solid var(--hl)}
   /* 归档折叠区的行和主列表一样有勾选框那一格（2026-11-18 起），用同一套两栏卡片。 */
 }
@@ -2775,6 +2781,8 @@ _ICON_PATHS = {
     "search": ('<circle cx="11" cy="11" r="8"/>'
                '<path d="m21 21-4.3-4.3"/>'),
     "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+    "list-todo": ('<rect x="3" y="5" width="6" height="6"/><path d="m3 17 2 2 4-4"/>'
+                  '<path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>'),
 }
 
 
@@ -3439,7 +3447,7 @@ def _project_card(p: summary.ProjectSnapshot, offset_hours: float) -> str:
     <span>卡住 <b>{p.stale_rows}</b> 行</span></div>
   {refresh}
   <details class=project-detail{' open' if problems else ''}>
-    <summary>费用、巡检与字段详情<span class=detail-link>查看</span></summary>
+    <summary>费用、巡检与字段详情<span class=detail-link><span class=d-open>查看</span><span class=d-close>收起</span></span></summary>
     <div class=rows>
       <div><span class=lbl>在管 / 已归档</span><span>{p.total_rows} / {p.archived_rows} 行</span></div>
       <div><span class=lbl>到期待刷</span><span>{due_text}</span></div>
@@ -3664,11 +3672,11 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
         # 而它其实已经下线了——这正是要在这里说破的那个落差。
         out = down.get(b.channel)
         if out is not None and not b.error:
-            main = (f"${b.amount:,.2f}" if b.unit == "USD"
-                    else f"{b.amount:,.0f} 积分")
+            main = (_e(f"${b.amount:,.2f}") if b.unit == "USD"
+                    else f"{b.amount:,.0f}<small> 积分</small>")
             cards.append(
                 f"<div class='card bad'><h3>{_e(b.label)}</h3>"
-                f"<div class='big num'>{_e(main)}</div>"
+                f"<div class='big num'>{main}</div>"
                 f"<div class=problem>{_icon('alert-circle')}"
                 f"<span>发不出请求了：发一次要 ¥{out.one_call_yuan:.3f}，"
                 f"只剩 ¥{out.yuan_left:.2f}</span></div>"
@@ -3683,21 +3691,22 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
                 "或检查 Key 是不是过期了</div></div>")
             continue
         # 金额一律带千分位：「18240 积分」紧挨着「$21.40」，一个有分隔一个没有，
-        # 位数要一位一位数。
+        # 位数要一位一位数。单位按大数字的单位排（显示字 0.4em，DESIGN.md §三），
+        # 所以单独一个 <small>；数字是本地格式化的，不含用户输入。
         if b.unit == "USD":
-            main = f"${b.amount:,.2f}"
+            main = _e(f"${b.amount:,.2f}")
             sub = (f"≈ ¥{b.yuan:,.2f}（按 {b.rate:g} 折算）"
                    if b.yuan is not None else "")
             sub_cls = "muted num"
         else:
-            main = f"{b.amount:,.0f} 积分"
+            main = f"{b.amount:,.0f}<small> 积分</small>"
             sub = f"≈ ¥{b.yuan:,.2f}" if b.yuan is not None else ""
             sub_cls = "muted num"
         credit = (f"<div class=muted>另有赠送额度 {b.free_credit:g}</div>"
                   if b.free_credit else "")
         cards.append(
             f"<div class=card><h3>{_e(b.label)}</h3>"
-            f"<div class='big num'>{_e(main)}</div>"
+            f"<div class='big num'>{main}</div>"
             f"<div class='{sub_cls}'>{_e(sub)}</div>{credit}</div>")
 
     note = ""
@@ -4010,7 +4019,7 @@ def _sidebar_nav(*, todos, projects: int, runs: int,
     「哪儿有事」的地方——收着的时候也能一眼看出待办有多少。
     """
     operational = [
-        ("s-work", "layout-grid", "待办工作台", ""),
+        ("s-work", "list-todo", "待办工作台", ""),
         ("s-todo", "alert-circle", "要人管的行", str(todos)),   # 可能带 `+`
         ("s-proj", "layout-grid", "各项目", str(projects)),
     ]
