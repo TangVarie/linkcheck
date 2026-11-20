@@ -23,16 +23,17 @@ from typing import Any, Optional
 from . import panel_fonts, summary
 
 _STYLE = """
-/* BYWOOD 设计系统 v6.1 · 界面轨「管理后台」（scenarios/03-dashboard.md、CRAFT.md §八–§十二）
+/* BYWOOD 设计系统 v6.3 · 界面轨「管理后台」（scenarios/03-dashboard.md、CRAFT-UI.md §八–§十一、CRAFT.md §十二）
  *
- * 2026-11-19 从 v5.4.0 升到 v6.1。色值一个没变（色板仍 v5.1），变的是语法：
+ * 2026-11-19 从 v5.4.0 升到 v6.1，2026-11-20 跟到 v6.3（线上载体的容器改圆角，见文末「圆角」一节）。
+ * 色值一个没变（色板仍 v5.1），变的是语法：
  *   · 底色就是角色：后台用画布 + 白表面组织界面，四种底以「块」出现——
  *     深青 = 证据（KPI 主块）、浅青 = 方法与说明（说明段、AI 草稿条）、
  *     标志青 = 承诺与识别（登录页、待办清零那一刻）、白表面 = 判断与操作。
- *   · 五级字号 + 两级数字：12 / 14 / 16 / 24 / 32，数字 40（n1）与 24（n2）；
+ *   · 七个字级 + 两级数字：12 / 14 / 16 / 24 / 32，数字 40（n1）与 24（n2）；
  *     粗细只用两端（显示字 900、数字 800、标签 600–700、正文 400），不再出现 500 和 13px。
- *   · 容器直角，控件 8px（--radius-control），控件内件 calc(var(--radius-control) - 4px)；
- *     状态标签、表格、卡片、浮层、导航项仍是直角。
+ *   · 两条线两种形状（v6.3）：线上载体容器 12（--radius-container）、控件 8（--radius-control），
+ *     嵌一层减 4；表格、顶栏、进度条仍直角。
  *   · 线只有三种：发丝线（--hl，带一点青）、强线（--hl2，表头与边缘）、2px 深青顶线（--rule，表格与浮层）。
  *   · 动效按角色选曲线（--ease-*），只动 transform 与 opacity；不写 CSS 默认 ease、不写 transition: all。
  *   · 文字链是墨字 + 青色下划线，悬停变实线；赭石只留给图表里「新出现负面」那一种所指。
@@ -48,7 +49,7 @@ _STYLE = """
  *   · 深色模式只翻 token，组件不写第二套颜色；主色填充上压 --on-primary，不写死白字
  */
 :root{
-  --radius-control:8px;
+  --radius-control:8px;--radius-container:12px;
   --primary:#1E5754;--primary-dark:#16413F;--on-primary:#FFFFFF;
   --accent:#B8502F;--accent-deep:#8A3A20;
   --block-primary:#1E5754;--block-accent:#B8502F;--tint-primary:#E3EFEF;--tint-accent:#F8EAE2;
@@ -399,7 +400,7 @@ input[type=checkbox]:disabled{opacity:.45;cursor:not-allowed}
 #todoEmpty{background:var(--field);color:var(--ink-on-field);animation:rise var(--t-lg) var(--ease-strong) both}
 #todoEmpty .icon,#todoEmpty .two{color:var(--ink-on-field-2)}
 /* 骨架：300ms 之后才出现；尺寸位置与真实一致；
- * 骨架 shimmer 亮带固定在视口上，所有骨架共用一道（CRAFT §八）——渐变禁令的唯一豁免 */
+ * 骨架 shimmer 亮带固定在视口上，所有骨架共用一道（CRAFT-UI §八）——渐变禁令的唯一豁免 */
 .sk{display:block;height:12px;background-color:var(--skel);
   background-image:linear-gradient(90deg,transparent 0,var(--skel-band) 50%,transparent 100%);
   background-repeat:no-repeat;background-size:320px 100vh;background-attachment:fixed;
@@ -444,7 +445,7 @@ input[type=checkbox]:disabled{opacity:.45;cursor:not-allowed}
 .find-result b{color:var(--t1)}
 tr.found{outline:2px solid var(--primary);outline-offset:-2px}
 /* 顶栏下的状态条：浮层定式（不透明表面 + 发丝线框 + 2px 深青顶线）；「已更新」3 秒后自己退场，
- * 失败留着不走（需要人知道的失败不能只闪一下，CRAFT §八） */
+ * 失败留着不走（需要人知道的失败不能只闪一下，CRAFT-UI §八） */
 .top-status{position:absolute;top:calc(100% + 12px);right:24px;z-index:70;max-width:min(400px,90vw);
   padding:12px 16px;background:var(--surface);border:1px solid var(--hl);border-top:2px solid var(--rule);
   font-size:var(--sm);line-height:1.5;color:var(--t2)}
@@ -649,7 +650,7 @@ tr.resolvedNote button.link{margin-left:8px}
   .trend-chart{grid-template-columns:repeat(7,minmax(0,1fr))}
   .t-col:nth-child(-n+7){display:none}
 }
-/* 处理状态筛选：2–5 个短选项、设一个值 → 分段（CRAFT §九）。轨是填充底、8px；
+/* 处理状态筛选：2–5 个短选项、设一个值 → 分段（CRAFT-UI §九）。轨是填充底、8px；
  * 选中项是表面色 + 发丝线、圆角 4（内件档）；未选是注字色。 */
 .work-states{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:0 24px 16px}
 .work-states .caption{font-size:var(--mi);color:var(--t3)}
@@ -735,7 +736,9 @@ tr.resolvedNote button.link{margin-left:8px}
 .drawer-snapshot div:first-child{padding-top:0;border-top:0}
 /* 抽屉占满整屏宽时左边沿外面没有地方了：把手收进来，内容让出位置。 */
 @media (max-width:480px){
-  .drawer-handle{left:0;border-left:0;border-right:1px solid var(--hl)}
+  .drawer{border-radius:0}
+  .drawer-handle{left:0;border-left:0;border-right:1px solid var(--hl);
+    border-radius:0 var(--radius-control) var(--radius-control) 0}
   .drawer-scroll,.drawer-head,.drawer-foot{padding-left:40px}
 }
 /* 行里的「处理」一格：三段分段「待处理 | 正在处理 | 已处理」，当前状态那一段是选中块；
@@ -744,6 +747,26 @@ tr.resolvedNote button.link{margin-left:8px}
 .work-error{display:block;max-width:22em;font-size:var(--mi);font-weight:600;color:var(--danger-deep);
   white-space:normal}
 .foot-note{margin-top:12px;max-width:60em;font-size:var(--mi);line-height:1.7;color:var(--t3)}
+/* ---------- 圆角（v6.3，DESIGN.md §六、CRAFT.md §十二）----------
+ * 线上载体用圆角：容器 12、控件 8，嵌一层减 4（12 → 8 → 4）。
+ *   · 容器 12：KPI 块、白表面面板、卡、说明块、告警块、登录卡、浮层（刷新状态条）。
+ *   · 嵌在容器里的块 8：卡里的告警、日报的 AI 草稿条、折叠区的条、待办清零那一块、群选择区。
+ *   · 控件 8：按钮、输入、分段的轨（各自规则里已写），侧栏导航项（v6.3 起导航项算控件）。
+ *   · 4：状态标签、计数徽标、比上一期、数据来源、行内代码、骨架线；复选框与分段滑块（各自规则里已写）。
+ *   · 仍然直角：顶栏、侧栏本体、表格与项目行表、进度条、图例色块——铺满宽度或画图的东西没有角可圆。
+ *   · 抽屉贴着视口右边：只圆靠内容的左侧两个角；占满整屏宽时不圆。
+ * 内层紧贴外层边缘、没有内边距的（工作台里的各段、登录卡顶上的青面），不另写圆角，
+ * 由外层 overflow:clip 裁出来。 */
+.kpi>*,.workbench,.todo-panel,.card,.addbox,#projects,.empty,.intro,.monitor-help p,
+.problem,.note,.login,.top-status{border-radius:var(--radius-container)}
+.workbench,.login,.top-status{overflow:clip}
+.card .problem,.card .note,.err,.draft-bar,.fold>summary,.todo-panel #todoEmpty,.share .pick,
+#trialReportText{border-radius:calc(var(--radius-container) - 4px)}
+.side nav a{border-radius:var(--radius-control)}
+.chip,.tabs .cnt,.metric-delta,.work-source,code,.sk{border-radius:calc(var(--radius-control) - 4px)}
+.sk.tall{border-radius:var(--radius-container)}
+.drawer{border-radius:var(--radius-container) 0 0 var(--radius-container)}
+.drawer-handle{border-radius:var(--radius-control) 0 0 var(--radius-control)}
 @media (max-width:900px){
   .grid{grid-template-columns:minmax(0,1fr)}
   .content{padding:24px 16px 72px}
@@ -787,6 +810,10 @@ tr.resolvedNote button.link{margin-left:8px}
   .queuebar{margin-bottom:12px;padding:12px 16px;background:var(--surface)}
   .tabs{margin-bottom:12px;background:var(--surface);border-top:2px solid var(--rule)}
   .tabs .tab-states{grid-column:1 / -1;white-space:nowrap}
+  /* 手机上待办区拆成一块块独立的表面：各自是容器，12；折叠区的条贴着外层边缘，由外层裁 */
+  .queuebar,.tabs,.fold,.todos tbody tr,.todo-panel #todoEmpty{border-radius:var(--radius-container)}
+  .tabs,.fold{overflow:clip}
+  .fold>summary{border-radius:0}
   .tabs .tab-latest{grid-column:1 / -1;text-align:left}
   .fold{background:var(--surface)}
   /* 只有待办表变卡片；已处理记录、运行历史这些还是表，留在自己的框里横滑，
