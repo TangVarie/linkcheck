@@ -1,6 +1,6 @@
-"""面板视觉的机器闸（BYWOOD 设计系统 v6.1 · 色板 v5.1 · 界面轨「管理后台」）。
+"""面板视觉的机器闸（BYWOOD 设计系统 v6.3 · 色板 v5.1 · 界面轨「管理后台」）。
 
-设计系统自己带一个 `tools/check-design.py`（v4.1），但那个工具在**设计系统包里**，
+设计系统自己带一个 `tools/check-design.py`（v4.2），但那个工具在**设计系统包里**，
 不在这个仓库——CI 上跑不到。所以把它管的那几条里**最容易在改样式时踩回去**
 的，在这里用离线测试钉一遍：色板外色值、标志青只做底、圆角两档、阴影、渐变、
 毛玻璃、动效写法、emoji 当图标。
@@ -9,6 +9,7 @@
 这一轨特有的几条构件约束。品牌跑偏在这个体系里算构建错误，不是审美分歧——
 那就得有个东西在构建时会红。
 
+v6.3（2026-11-20）线上载体的容器改圆角：容器 12、控件 8、嵌一层减 4，表格与顶栏仍直角。
 v6.1（2026-11-19）相对 v5.4 改了的规则，这里跟着改了：控件圆角 8px 与内件 4px
 （v5.9 起）、文字链由赭石改为墨字 + 青下划线、标志青面除登录页外还给「待办清零」
 那一刻、标志青 token 改名 --color-field-brand（v4.1 闸只认这个名字）、
@@ -466,33 +467,70 @@ def css_without_comments() -> str:
 
 
 class TestFlatRules(unittest.TestCase):
-    """容器直角、控件圆角两档 / 零阴影 / 零渐变 / 零毛玻璃。"""
+    """圆角两档（v6.3）/ 零阴影 / 零渐变 / 零毛玻璃。"""
 
-    # 控件：按钮、输入类、选择框、分段的轨。圆角只许落在这些东西上（DESIGN.md §六）。
-    CONTROL = re.compile(r"(?:^|[\s>+~])(?:button|input|select|textarea)(?:[.:\[][^\s]*)?$|(?:^|\s)\.seg$")
+    # 写整值 var(--radius-control) 的只许是控件：按钮、输入类、分段的轨、侧栏导航项（v6.3 起算控件）。
+    CONTROL = re.compile(r"(?:^|[\s>+~])(?:button|input|select|textarea)(?:[.:\[][^\s]*)?$"
+                         r"|(?:^|\s)\.seg$|^\.side nav a$")
+    ONE = ("0", "var(--radius-container)", "var(--radius-control)",
+           "calc(var(--radius-container) - 4px)", "calc(var(--radius-control) - 4px)")
 
     def setUp(self):
         self.css = css_without_comments()
 
-    def test_corners_are_square_or_one_of_two_control_steps(self):
-        """容器（卡、块、表格、标签、浮层、导航项）一律 0；控件写 var(--radius-control)（8px），
-        控件内件（复选框、分段滑块）写 calc(var(--radius-control) - 4px)（CRAFT §十二）。
-        字面量 8px 也不放行：圆角只有这一个 token，改它要改 token。"""
-        allowed = ("0", "50%", "var(--radius-control)", "calc(var(--radius-control) - 4px)")
+    def rules(self, *, media: bool = True):
+        body = self.css.split("*{box-sizing", 1)[1]
+        if not media:     # 只看默认（桌面）那一套，不看窄屏覆盖
+            body = re.sub(r"@media[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}", "", body)
+        return re.findall(r"([^{}]+)\{([^{}]*)\}", body)
+
+    def test_corners_use_only_the_two_tokens_and_their_nested_step(self):
+        """线上载体（DESIGN.md §六 v6.3）：容器 var(--radius-container)（12），控件
+        var(--radius-control)（8），嵌一层写 calc(… - 4px)；贴边的只圆一侧，用这几个值的
+        分角写法。字面量（含 12px、8px 本身）不放行：圆角只有这两个 token。"""
         for value in re.findall(r"border-radius\s*:\s*([^;}]+)", self.css):
-            self.assertIn(value.strip(), allowed, f"border-radius: {value.strip()}")
-        self.assertEqual(re.findall(r"--radius-[\w-]+\s*:\s*([^;}]+)", self.css), ["8px"],
-                         "圆角只有 --radius-control 一个 token，值 8px")
+            value = value.strip()
+            if value == "50%":
+                continue                      # 本体是圆的东西
+            parts = re.findall(r"calc\(var\([^)]*\)\s*-\s*4px\)|var\([^)]*\)|\S+", value)
+            self.assertTrue(1 <= len(parts) <= 4, value)
+            for part in parts:
+                self.assertIn(part, self.ONE, f"border-radius: {value}")
+        tokens = dict(re.findall(r"(--radius-[\w-]+)\s*:\s*([^;}]+)", self.css))
+        self.assertEqual(tokens, {"--radius-control": "8px", "--radius-container": "12px"},
+                         "圆角只有两个 token：容器 12、控件 8")
 
     def test_control_radius_never_lands_on_a_container(self):
-        body = self.css.split("*{box-sizing", 1)[1]
-        for selector, decls in re.findall(r"([^{}]+)\{([^{}]*)\}", body):
-            if "radius-control" not in decls:
+        """整值的控件圆角（8）落在卡、块、面板上就错了一档：容器写 --radius-container。"""
+        for selector, decls in self.rules():
+            if not re.search(r"border-radius:var\(--radius-control\)(?:[;}]|$)", decls):
                 continue
             for part in selector.split(","):
-                part = part.strip()
-                self.assertRegex(part, self.CONTROL,
-                                 f"控件圆角写在了不是控件的东西上：{part}")
+                self.assertRegex(part.strip(), self.CONTROL,
+                                 f"控件圆角写在了不是控件的东西上：{part.strip()}")
+
+    def test_containers_are_rounded_and_full_bleed_things_stay_square(self):
+        """容器 12：KPI 块、白表面、卡、登录卡、浮层；嵌一层 8。顶栏、表格、项目行表、
+        进度条铺满宽度，没有角可圆（DESIGN.md §六「仍然直角」）。"""
+        radius = {}
+        for selector, decls in self.rules(media=False):
+            m = re.search(r"border-radius:([^;}]+)", decls)
+            if m:
+                for part in selector.split(","):
+                    radius.setdefault(part.strip(), m.group(1).strip())
+        for container in (".kpi>*", ".workbench", ".todo-panel", ".card", ".login",
+                          ".top-status", ".problem"):
+            self.assertEqual(radius.get(container), "var(--radius-container)", container)
+        for nested in (".card .problem", ".draft-bar", ".todo-panel #todoEmpty"):
+            self.assertEqual(radius.get(nested), "calc(var(--radius-container) - 4px)", nested)
+        self.assertEqual(radius.get(".chip"), "calc(var(--radius-control) - 4px)")
+        self.assertEqual(radius.get(".drawer"),
+                         "var(--radius-container) 0 0 var(--radius-container)",
+                         "抽屉贴着右边：只圆靠内容的两个角")
+        for square in (".top", "table", ".tabs .tab", ".pbar", ".side"):
+            self.assertIn(radius.get(square, "0"), ("0",), f"{square} 应该是直角")
+        # 圆角容器里贴边的段落不另写圆角，由外层裁
+        self.assertRegex(self.css, r"\.workbench,\.login,\.top-status\{overflow:clip\}")
 
     def test_no_shadows(self):
         found = [v for v in re.findall(r"box-shadow\s*:\s*([^;}]+)", self.css)
