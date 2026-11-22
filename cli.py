@@ -1786,6 +1786,10 @@ def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, k
 
     result = None
     if paid:
+        if lease is not None:
+            problem = lease.check()        # 读表、展开短链可能拖了很久；先核租约再落盘
+            if problem:
+                sys.exit(f"{problem}。一分钱没花")
         try:
             state.save()                   # 词的编号先落盘
         except visibility.StateError as exc:
@@ -1793,10 +1797,6 @@ def _search_trial_locked(options: dict, round_, state_dir, settings: Settings, k
         _all, now_digests, _left = visibility.select(
             round_, [d for _w, d in ordered], state)
         need, _have = visibility.plan(round_, now_digests, state)
-        if lease is not None:
-            problem = lease.check()        # 读表、展开短链可能拖了很久
-            if problem:
-                sys.exit(f"{problem}。一分钱没花")
         print(f"▶ {round_.label}：还要发最多 {need} 次（约 ¥{need * price:.2f}，失败重试的也算在这 "
               f"{need} 次里）；"
               f"账本上已经 {state.calls} 次 / ¥{state.yuan:.2f}，"
