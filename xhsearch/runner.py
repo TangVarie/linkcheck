@@ -2134,6 +2134,13 @@ def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: i
             # 第二次了：结论照写，标签照打。熔断只拦第一次。
             continue
         outcome.fields.pop(f.traffic_status, None)
+        if outcome.tag_plan is not None:
+            for col in outcome.tag_plan.coupled:
+                outcome.fields.pop(col, None)
+            outcome.tag_plan = None
+        if outcome.blue_word_plan is not None:
+            # 本轮流量状态被熔断作废，不按作废的档位写蓝词复扫/提醒账；下一正常轮会重扫。
+            outcome.blue_word_plan = None
         if outcome.status in (STATUS_GONE, STATUS_SUSPECT):
             outcome.status = STATUS_FAILED
             # 「已确认存活=取消」作废：上游故障轮不能把一批活帖的勾全摘掉。
@@ -2141,8 +2148,6 @@ def _void_gone_writes(report: RunReport, settings: Settings, gone: int, total: i
             # 排队勾保留：运营的请求还没得到答案，等待期过后自动再看一次。
             # 时间戳和计数**保留**：它们就是「已经看过一次」的跨轮记忆。
             outcome.fields.pop(f.queued, None)
-            # 标签重算材料撤销：这一行本轮不碰标签列。
-            outcome.tag_plan = None
             # 追加而不是覆盖：原始错误文案里带着 request_id，是找厂商排查的唯一凭据。
             original = str(outcome.fields.get(f.failure_reason) or "")
             hold = settings.safety.breaker_recheck_hours

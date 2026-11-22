@@ -38,10 +38,21 @@ SocialDataX `xhs/note/comment/list` 是 `10` 积分。差别是明摆着的，�
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from . import transport
+
+
+def _finite_float(value: Any) -> float:
+    """解析余额数值；拒绝 bool（在 Python 中是 int 子类）与 NaN / Inf。"""
+    if isinstance(value, bool):
+        raise ValueError("bool is not a numeric balance")
+    num = float(value)
+    if not math.isfinite(num):
+        raise ValueError("non-finite balance")
+    return num
 
 # 最后一次对着两家的机器可读定义核对「这两个端点零费用」的日期。
 FREE_CHECKED_ON = "2026-08-26"
@@ -155,7 +166,7 @@ def read_tikhub(api_key: str, *, base: str, usd_to_cny: float,
         out.error = "返回里没有 user_data.balance"
         return out
     try:
-        out.amount = float(user["balance"])
+        out.amount = _finite_float(user["balance"])
     except (TypeError, ValueError):
         out.error = f"balance 不是数字：{user['balance']!r}"
         return out
@@ -163,13 +174,14 @@ def read_tikhub(api_key: str, *, base: str, usd_to_cny: float,
     credit = user.get("free_credit")
     if credit is not None:
         try:
-            out.free_credit = float(credit)
+            out.free_credit = _finite_float(credit)
         except (TypeError, ValueError):
             pass
     # 账户被停用时余额可能还很好看，但一个请求都发不出去——那比余额低更急。
     if user.get("account_disabled") is True:
         out.error = "账户被停用（余额读到了，但调不动接口）"
         out.amount = None
+        out.yuan = None
     return out
 
 
@@ -191,7 +203,7 @@ def read_socialdatax(api_key: str, *, base: str, get=None) -> Balance:
         out.error = "返回里没有 balance"
         return out
     try:
-        out.amount = float(body["balance"])
+        out.amount = _finite_float(body["balance"])
     except (TypeError, ValueError):
         out.error = f"balance 不是数字：{body['balance']!r}"
         return out
