@@ -2462,14 +2462,23 @@ class PanelHandler(BaseHTTPRequestHandler):
         return f"Path=/;{secure} HttpOnly; SameSite=Strict"
 
     def _client_key(self) -> str:
-        """限速的分桶键。Railway 的边缘会带 X-Forwarded-For，取第一跳。
+        """限速的分桶键。
 
-        它是可以伪造的，所以桶数有上界（见 LoginThrottle）——
-        伪造只能绕过限速，不能把限速变成内存耗尽。
+        先认 X-Real-IP（边缘代理自己写的），再认 X-Forwarded-For 的**最右边**一段
+        ——那一段是离我们最近的那一跳代理追加的，客户端改不了；最左边那段是客户端
+        自己就能塞进请求头的，拿它分桶等于让攻击者每次换个桶，限速形同虚设。
+        都没有就用 TCP 对端地址。
+
+        就算判断错了（换了平台、多了一层代理），桶数也有上界（见 LoginThrottle）——
+        最坏只是限速变松，不会把限速变成内存耗尽。
         """
+        real = (self.headers.get("X-Real-IP") or "").strip()
+        if real:
+            return real[:64]
         forwarded = self.headers.get("X-Forwarded-For") or ""
-        first = forwarded.split(",")[0].strip()
-        return (first or self.client_address[0] or "?")[:64]
+        hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+        last = hops[-1] if hops else ""
+        return (last or self.client_address[0] or "?")[:64]
 
     # —— 会话 ——
     def _authed(self) -> bool:
