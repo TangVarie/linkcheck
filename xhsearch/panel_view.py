@@ -3208,7 +3208,7 @@ def _todo_row(todo, offset_hours: float, show_digest: bool, *, main: bool,
     extra = ""
     if show_digest and todo.digest:
         extra = (f"<div class=muted style='margin-top:4px'>"
-                 f"{_e(todo.digest)[:300]}</div>")
+                 f"{_e(todo.digest[:300])}</div>")
     pick_label = f"选择 {_clip(todo.label, 30)} 排队刷新"
     if not main or todo.archived or todo.adhoc:
         pick = (f"<td class=nowrap><input type=checkbox class='todoPick solo' aria-label='{_e(pick_label)}' "

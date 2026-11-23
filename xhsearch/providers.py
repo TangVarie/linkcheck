@@ -380,6 +380,12 @@ def _sdx_parse(platform: str, purpose: str, http_status: int, content_type: str,
                body: str, request_id: str = "", api_key: str = "") -> Result:
     result = parse_response(http_status, content_type, body, request_id)
     if not isinstance(result, Ok):
+        if api_key and api_key in result.message:
+            return Err(
+                result.kind, result.code, _redact(result.message, api_key),
+                http_status=result.http_status, request_id=result.request_id,
+                definitive=result.definitive,
+            )
         return result
     problem = _sdx_shape_error(platform, purpose, result.data)
     if problem is None:
@@ -399,7 +405,7 @@ def _sdx_parse(platform: str, purpose: str, http_status: int, content_type: str,
     # 归 UNKNOWN 的话它不在 FAILOVER_KINDS 里，配好的备胎一次都不会被尝试——
     # 主通道 schema 一漂移就是整轮全灭，而旁边有条好通道闲着，
     # 那正好否定了双通道存在的理由。
-    snippet = json.dumps(result.data, ensure_ascii=False)[:300]
+    snippet = _redact(json.dumps(result.data, ensure_ascii=False), api_key)[:300]
     return Err(
         Failure.TRANSPORT, "unexpected_shape",
         f"{platform}/{purpose} 的成功响应形状不对（{problem}）：{snippet}",
@@ -860,16 +866,20 @@ def _tikhub_normalize(platform: str, purpose: str, payload: dict[str, Any],
 
     if platform == "xhs" and purpose == "detail":
         core = inner.get("data")
-        note_list =core[0].get("note_list") if isinstance(core, list) and core and isinstance(core[0], dict) else None
-        if note_list and not isinstance(note_list, list):
-            # 有内容但形状不认识（比如上游把 list 改成了 dict）：这是协议漂移，
-            # 不是「笔记没了」。硬下 [0] 会 KeyError 炸穿；按 GONE 定罪更是误杀。
-            # 分类同 _sdx_shape_error：这家的契约坏了 → 换另一家试试。
+        if core == []:
+            # 干净的死亡信号：不存在的笔记，data 直接是 []（实测）。
+            return Err(Failure.GONE, "no_note", "详情接口没有返回任何笔记，笔记已不存在或不可见",
+                       http_status=http_status, request_id=request_id, definitive=True)
+        if not (isinstance(core, list) and core and isinstance(core[0], dict)
+                and "note_list" in core[0] and isinstance(core[0]["note_list"], list)):
+            # 形状不认识（比如上游把 data / note_list 改成了 dict、缺键或 null）：这是协议漂移，
+            # 不是「笔记没了」。按 GONE 定罪会造成一击误杀；归 TRANSPORT 让备胎接手。
             return Err(Failure.TRANSPORT, "unexpected_shape",
                        _redact(json.dumps(inner, ensure_ascii=False), api_key)[:300],
                        http_status=http_status, request_id=request_id)
+        note_list = core[0]["note_list"]
         if not note_list:
-            # 干净的死亡信号：不存在的笔记，data 直接是 []（实测）。
+            # 干净的死亡信号：上游给了空 note_list。
             return Err(Failure.GONE, "no_note", "详情接口没有返回任何笔记，笔记已不存在或不可见",
                        http_status=http_status, request_id=request_id, definitive=True)
         note = note_list[0] if isinstance(note_list[0], dict) else {}
@@ -974,7 +984,7 @@ def _tikhub_parse(platform: str, purpose: str, http_status: int, content_type: s
         )
 
     if not isinstance(payload, dict):
-        return Err(Failure.UNKNOWN, "unexpected_body", (body or "")[:500],
+        return Err(Failure.UNKNOWN, "unexpected_body", _redact(body or "", api_key)[:500],
                    http_status=http_status, request_id=request_id)
 
     # 失败信封：整个错误对象塞在 detail 里。也兜住 Cloudflare 拦截时那种

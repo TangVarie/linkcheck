@@ -127,13 +127,13 @@ def _expand(url: str, platform: _Platform, *, fetch: Optional[Fetch],
     current = (url or "").strip()
     if not current:
         return Expansion(None, "空链接")
+    current = _with_scheme(current)
+    if not platform.ours(current):
+        return Expansion(None, f"不是{platform.name}域名，不展开：{current[:120]}")
     # 链接本身已经带 ID：不发请求。调用方一般不会走到这里，但别为此发一次网络。
     found = platform.id_in_url(current)
     if found:
         return Expansion(found, final_url=current)
-    current = _with_scheme(current)
-    if not platform.ours(current):
-        return Expansion(None, f"不是{platform.name}域名，不展开：{current[:120]}")
 
     made = 0
     for _ in range(max(1, max_hops)):

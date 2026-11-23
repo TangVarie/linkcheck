@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -489,6 +490,7 @@ class Bitable:
         self.route = route
         self.timeout = timeout
         self._token: Optional[_Token] = None
+        self._token_lock = threading.Lock()
 
     # ---------- 鉴权 ----------
 
@@ -498,31 +500,32 @@ class Bitable:
         飞书对重复请求会返回同一个未过期的 token，所以这里不需要跨进程缓存，
         每次冷启动重新取一次是安全的。
         """
-        now = time.monotonic()
-        if self._token and self._token.expires_at > now:
-            return self._token.value
+        with self._token_lock:
+            now = time.monotonic()
+            if self._token and self._token.expires_at > now:
+                return self._token.value
 
-        # 带重试：token 是整轮的第一步，一次网络抖动就断送整轮太不值。
-        resp = transport.post_with_retry(
-            f"{BASE}/auth/v3/tenant_access_token/internal",
-            {"Content-Type": "application/json; charset=utf-8"},
-            json.dumps({"app_id": self.app_id, "app_secret": self.app_secret}),
-            timeout=self.timeout,
-            should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
-        )
-        payload = resp.json()
-        if not isinstance(payload, dict):
-            raise FeishuError(-1, f"取 token 失败：HTTP {resp.status} {resp.body[:200]}")
-        code = payload.get("code")
-        if code not in (0, None):
-            _raise_business_error(payload, resp)
+            # 带重试：token 是整轮的第一步，一次网络抖动就断送整轮太不值。
+            resp = transport.post_with_retry(
+                f"{BASE}/auth/v3/tenant_access_token/internal",
+                {"Content-Type": "application/json; charset=utf-8"},
+                json.dumps({"app_id": self.app_id, "app_secret": self.app_secret}),
+                timeout=self.timeout,
+                should_retry=lambda r: r.status == 0 or r.status >= 500 or r.status == 429,
+            )
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                raise FeishuError(-1, f"取 token 失败：HTTP {resp.status} {resp.body[:200]}")
+            code = payload.get("code")
+            if code not in (0, None):
+                _raise_business_error(payload, resp)
 
-        value = payload.get("tenant_access_token")
-        if not value:
-            raise FeishuError(-1, f"响应里没有 tenant_access_token：{resp.body[:200]}")
-        expire = int(payload.get("expire", 7200))
-        self._token = _Token(value, now + max(expire - 300, 60))
-        return value
+            value = payload.get("tenant_access_token")
+            if not value:
+                raise FeishuError(-1, f"响应里没有 tenant_access_token：{resp.body[:200]}")
+            expire = int(payload.get("expire", 7200))
+            self._token = _Token(value, now + max(expire - 300, 60))
+            return value
 
     def _headers(self) -> dict[str, str]:
         return {

@@ -790,7 +790,8 @@ class Trial:
                 out["lease"] = {"who": str(holder.get("who") or ""),
                                 "round": str(holder.get("round") or ""),
                                 "text": describe_holder(holder, self._clock()),
-                                "mine": bool(out["job"] and out["job"]["running"])}
+                                "mine": bool(out["job"] and out["job"]["running"]
+                                             and out["job"].get("kind") == "run")}
             out["result"] = self.store.load_result()
         except Exception:                                       # noqa: BLE001
             pass                    # 账本读不到的话下面会说；这两样只是显示用

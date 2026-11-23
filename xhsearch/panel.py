@@ -979,6 +979,7 @@ class Projects:
         self.config = config
         self.settings = settings
         self.log = log
+        self._store_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -1066,13 +1067,17 @@ class Projects:
 
     def _store(self) -> panel_settings.SettingsStore:
         store = getattr(self, "_settings_store", None)
-        if store is None:
-            target = tablespec.parse_target(self.config.registry_target,
-                                            default_label="registry")
-            store = panel_settings.SettingsStore(
-                self._workspace(), self._bitable, target.app_token, log=self.log)
-            self._settings_store = store
-        return store
+        if store is not None:
+            return store
+        with self._store_lock:
+            store = getattr(self, "_settings_store", None)
+            if store is None:
+                target = tablespec.parse_target(self.config.registry_target,
+                                                default_label="registry")
+                store = panel_settings.SettingsStore(
+                    self._workspace(), self._bitable, target.app_token, log=self.log)
+                self._settings_store = store
+            return store
 
     def _stored_chats(self) -> list:
         raw = self._store().get_json(panel_settings.KEY_EDITOR_CHATS, [])
@@ -1427,6 +1432,7 @@ class DailyReports:
         self._cache: dict = {}
         self._lock = threading.Lock()
         self._read_lock = threading.Lock()
+        self._journal_lock = threading.Lock()
         self._version = 0
         self.warning = ""
         self.resolutions = None
@@ -1437,14 +1443,17 @@ class DailyReports:
         self._trend_lock = threading.Lock()
 
     def _journal(self):
-        if self._journal_value is None:
-            from .daily_report import Journal
-            target = tablespec.parse_target(self.projects.config.registry_target,
-                                            default_label="registry")
-            self._journal_value = Journal(self.projects._workspace(),
-                                          self.projects._bitable, target.app_token,
-                                          allow_create=False)
-        return self._journal_value
+        if self._journal_value is not None:
+            return self._journal_value
+        with self._journal_lock:
+            if self._journal_value is None:
+                from .daily_report import Journal
+                target = tablespec.parse_target(self.projects.config.registry_target,
+                                                default_label="registry")
+                self._journal_value = Journal(self.projects._workspace(),
+                                              self.projects._bitable, target.app_token,
+                                              allow_create=False)
+            return self._journal_value
 
     def get(self, overview: Optional[summary.Overview], *, date: str = "",
             table_id: str = "", with_events: bool = False):
@@ -1662,7 +1671,13 @@ class Resolutions:
         if first:
             self._read(now, version)            # 手里什么都没有，只能等这一次
         else:
-            self._spawn(lambda: self._read(now, version))
+            try:
+                self._spawn(lambda: self._read(now, version))
+            except Exception as exc:            # noqa: BLE001 — 线程拉起失败不能把 _reading 永久锁死
+                with self._lock:
+                    self._reading = False
+                    self._failed_at = now
+                self.log(f"⚠ 后台重读「已解决」记录失败（{type(exc).__name__}: {exc}）")
         with self._lock:
             return self._live(self._data)
 
@@ -2159,6 +2174,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.log_message(fmt, *args)
 
     # —— 路由 ——
+    def do_HEAD(self):                                          # noqa: N802
+        return self.do_GET()
+
     def do_GET(self):                                           # noqa: N802
         path = urlparse(self.path).path
         if path == "/healthz":
@@ -2722,11 +2740,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 # 历史把正在巡查的表盖成「已停用」。
                 entries: dict = {}
                 for e in projects.list():
-                    if not e.table_id:
+                    if not (e.app_token and e.table_id):
                         continue
-                    seen = entries.get(e.table_id)
+                    ekey = (e.app_token, e.table_id)
+                    seen = entries.get(ekey)
                     if seen is None or (e.usable and not seen.usable):
-                        entries[e.table_id] = e
+                        entries[ekey] = e
             except Exception as exc:                            # noqa: BLE001
                 # 读不到注册表就确认不了这些表还在不在监控中。宁可这次不勾：
                 # 勾错了要悬到下次启用才发现，重试只是再点一下。
@@ -2734,7 +2753,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "error": f"读不到注册表，没法确认这些表还在监控中，"
                              f"这次一行都没勾。稍后再试：{exc}"})
             for key in list(grouped):
-                entry = entries.get(key[1])
+                entry = entries.get(key)
                 name = entry.label if entry and entry.label else key[1]
                 if entry is None:
                     why = "不在监控清单里（已移除？）"
