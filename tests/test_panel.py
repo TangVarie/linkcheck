@@ -358,7 +358,8 @@ class TestLoginThrottle(unittest.TestCase):
         self.assertFalse(throttle.blocked("ip", now=1100))
 
     def test_bucket_count_is_bounded(self):
-        """X-Forwarded-For 可以伪造。伪造只能绕过限速，
+        """分桶键在换了平台、边缘不写来源头时能被伪造（见
+        PanelHandler._client_key）。伪造只能绕过限速，
         不能把限速本身变成内存耗尽。"""
         throttle = panel.LoginThrottle()
         for i in range(5000):
@@ -2398,6 +2399,13 @@ class TestQueueRefusesTablesNotUnderWatch(unittest.TestCase):
         self.assertIn("「坏的」配置有误", joined)
         self.assertIn("不在监控清单里", joined)
         self.assertNotIn("失败", joined, "拒勾是决定，不是写入失败，别混进 failures 的口径")
+        # 移除、停用的表页面上本来不显示，勾得到就是页面过期了：说出来，并说刷新。
+        # 配置有误跟页面新旧无关，刷新也没用，不能这么说。
+        by_name = {line.split("」")[0].lstrip("「"): line for line in payload["skipped"]}
+        for name in ("tblGONE", "停了"):
+            self.assertIn("页面已过期", by_name[name])
+            self.assertIn("刷新页面", by_name[name])
+        self.assertNotIn("刷新", by_name["坏的"])
 
     def test_a_disabled_duplicate_row_does_not_shadow_the_live_one(self):
         """注册表允许同一张表「一行在用 + 一行停用的历史」（查重只看在用的行）。

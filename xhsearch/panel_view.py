@@ -4127,6 +4127,12 @@ def _runway_box(runway, config, outages=()) -> list:
     sub = f"按 ¥{runway.yuan_per_day:.2f}/天 的实际花速"
     if runway.partial:
         sub += "，有一家读不到，这是下界"
+    elif getattr(runway, "includes_tikhub", False):
+        # TikHub 账户还被外部语料抓取（另一个服务，每周两趟）从同一个余额扣钱，
+        # 这里的花速没算它，天数约高估四分之一（显示 14 天实际约 11 天）。
+        # 只在 TikHub 余额算进来了、两家都读到时说：没配 TikHub 就无从谈起；
+        # 有一家读不到时前半句说的是「下界」，再说「实际更少」两句就打架了。
+        sub += "（TikHub 余额另与外部抓取共用，实际能跑的天数约少两成）"
     return [_kpi_box(f"{runway.days:.0f}", "余额还够跑", sub, unit="天",
                      sub_money=True,
                      warn=runway.days <= max(alert_days, warn_days))]
