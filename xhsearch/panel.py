@@ -838,6 +838,9 @@ class Runway:
     hours_covered: float = 0.0
     # 有通道读不到余额时，`yuan_left` 是**下界**，days 也就是下界。
     partial: bool = False
+    # TikHub 的余额算进来了。那个账户还被外部语料抓取共用，花速里没有
+    # 那部分，days 会偏多——页面要说一句（见 panel_view._runway_box）。
+    includes_tikhub: bool = False
     reason: str = ""
 
     @property
@@ -887,7 +890,9 @@ def runway_from_runs(balances: list, runs: list) -> Runway:
                       reason="最近这些轮一分钱没花，算不出花速（也就不用担心）")
     return Runway(days=yuan_left / per_day, yuan_per_day=per_day,
                   yuan_left=yuan_left, runs_used=len(finished),
-                  hours_covered=hours, partial=partial)
+                  hours_covered=hours, partial=partial,
+                  includes_tikhub=any(getattr(b, "channel", "") == balance_mod.TIKHUB
+                                      for b in usable))
 
 
 # 面板对**业务表数据**唯一允许写的列。只有一个元素，而且不会变长。
@@ -2099,8 +2104,9 @@ class LoginThrottle:
             hits = [t for t in self._buckets.get(key, []) if now - t < self._window]
             hits.append(now)
             self._buckets[key] = hits
-            # 桶数有上界：伪造 X-Forwarded-For 就能无限撑大这个 dict，
-            # 那是把限速本身变成内存耗尽的洞。
+            # 桶数有上界：分桶键一旦能伪造（换了平台、边缘不写来源头，
+            # 见 PanelHandler._client_key），伪造的人每次换一个键就能无限
+            # 撑大这个 dict，那是把限速本身变成内存耗尽的洞。
             if len(self._buckets) > 4096:
                 self._buckets = {key: hits}
 
@@ -2462,14 +2468,41 @@ class PanelHandler(BaseHTTPRequestHandler):
         return f"Path=/;{secure} HttpOnly; SameSite=Strict"
 
     def _client_key(self) -> str:
-        """限速的分桶键。Railway 的边缘会带 X-Forwarded-For，取第一跳。
+        """限速的分桶键。
 
-        它是可以伪造的，所以桶数有上界（见 LoginThrottle）——
-        伪造只能绕过限速，不能把限速变成内存耗尽。
+        先认 X-Real-IP（边缘代理自己写的），再认 X-Forwarded-For 的**最右边**一段
+        ——那一段是离我们最近的那一跳代理追加的，客户端改不了；最左边那段是客户端
+        自己就能塞进请求头的，拿它分桶等于让攻击者每次换个桶，限速形同虚设。
+        都没有就用 TCP 对端地址。
+
+        同名头出现不止一行时取**最后一行**（X-Forwarded-For 是把各行拼起来再取最右边
+        一段）。Railway 文档只说边缘会带 X-Real-IP，没说客户端自己带了一行时边缘是
+        覆盖还是再加一行；取最后一行，两种做法下拿到的都是边缘写的那行。
+        `self.headers.get` 只给第一行，边缘是追加的话那正好是客户端写的那行。
+
+        判断错了的两个方向：
+        - 换了平台、边缘不写这两个头：退到客户端能伪造的值，限速变松。桶数有上界
+          （见 LoginThrottle），最坏是限速失效，不会变成内存耗尽。
+        - 键变成某一层代理的地址，全员共用一个桶：任何人连错 LOGIN_MAX_FAILURES 次
+          就把整个团队锁在门外 LOGIN_WINDOW_SECONDS 秒，正是 LoginThrottle 说不做的
+          全局锁定。会这样的三种情况：① 请求里根本没有 X-Real-IP（不在 Railway 上），
+          又有内网代理往 X-Forwarded-For 最右边追加自己的地址；② 边缘和应用之间的
+          内网代理把 X-Real-IP 重设成它看到的对端（比如 nginx 的
+          `proxy_set_header X-Real-IP $remote_addr`，写进去的是边缘的地址）——这种
+          代理要把边缘写的 X-Real-IP 原样传下去，不要重设；③ 在 Railway 边缘前面再挂
+          CDN 或别的代理：边缘写的 X-Real-IP 就是那层的出口地址，配置救不回来，
+          得改这里的代码，改认那层自己写的客户端 IP 头。
+        - X-Real-IP 被某一跳合并成一行逗号分隔的值时，整串会被当成键（客户端能在
+          前面塞值）；Railway 边缘没见过这样做，换平台时再核。
         """
-        forwarded = self.headers.get("X-Forwarded-For") or ""
-        first = forwarded.split(",")[0].strip()
-        return (first or self.client_address[0] or "?")[:64]
+        reals = self.headers.get_all("X-Real-IP") or []
+        real = reals[-1].strip() if reals else ""
+        if real:
+            return real[:64]
+        forwarded = ",".join(self.headers.get_all("X-Forwarded-For") or [])
+        hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+        last = hops[-1] if hops else ""
+        return (last or self.client_address[0] or "?")[:64]
 
     # —— 会话 ——
     def _authed(self) -> bool:
@@ -2752,19 +2785,25 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {
                     "error": f"读不到注册表，没法确认这些表还在监控中，"
                              f"这次一行都没勾。稍后再试：{exc}"})
+            # 移除和停用的表页面上本来就不显示，还能勾到它，说明这页是在那之前
+            # 打开的——要把「页面过期了、刷新」说出来，不然运营只看到一句
+            # 「不在清单里」，不知道发生了什么、该做什么。
+            stale = "多半是这页打开之后表被{}了，页面已过期，刷新页面再看"
             for key in list(grouped):
                 entry = entries.get(key)
                 name = entry.label if entry and entry.label else key[1]
                 if entry is None:
-                    why = "不在监控清单里（已移除？）"
+                    why, hint = "不在监控清单里", stale.format("移除")
                 elif not entry.enabled:
-                    why = "已停用——先在下面「项目」里启用，再来勾"
+                    why, hint = "已停用", (stale.format("停用")
+                                           + "，真要刷它就先在下面「项目」里启用再勾")
                 elif entry.problem:
-                    why = f"配置有误（{entry.problem}）"
+                    why, hint = f"配置有误（{entry.problem}）", ""
                 else:
                     continue
                 skipped.append(f"「{name}」{why}，cron 不会刷它，"
-                               f"这 {len(grouped.pop(key))} 行没勾")
+                               f"这 {len(grouped.pop(key))} 行没勾"
+                               + (f"——{hint}" if hint else ""))
 
         queued, failures = 0, []
         # 真勾上了的行。前端只给它们标「排队中」：拒掉的表、整表写炸的、

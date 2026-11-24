@@ -1280,7 +1280,7 @@ def render_report(report: dict[str, Any]) -> str:
         lines += [f"- {tag}：{count} 次" for tag, count in report["失败的页"].items()]
     if report["余额对账"]:
         lines += ["", "## 余额对账（看失败的页收没收钱）", "",
-                  "同一时间巡查也在花同一个余额，所以这个差只能当参考。"]
+                  "同一时间巡查与外部语料抓取也在共用同一个余额，所以这个差只能当参考。"]
         for item in report["余额对账"]:
             lines.append(f"- {item.get('round')}：发了 {item.get('requests')} 次请求，"
                          f"余额少了 ${item.get('drop_usd')}")

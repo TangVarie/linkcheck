@@ -1226,6 +1226,7 @@ class TestReport(unittest.TestCase):
                       "哪个词下面都没搜到 1 篇", text)
         self.assertIn("first：unknown（HTTP 400）：1 次", text)
         self.assertIn("余额少了 $0.03", text)
+        self.assertIn("外部语料抓取也在共用同一个余额", text)
         self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["花费"]["次数上限"], 280)
 
     def test_report_before_any_page_says_so(self):
