@@ -16,9 +16,14 @@
 * **巡查不受影响**：sweep / queue / row / estimate 一行都没改，不会多发一次请求。
   搜索那个端点登记在 providers 里，但 rows.plan_calls 从不排它。
 * **不往项目表写一个字**：只读「搜索关键词」和几列现成的（链接、发布时间、巡查状态）。
-* **不留任何客户的东西**：进度文件（本地那份，或者面板存在登记表 base 里的那份，见
-  `trial.py`）只有笔记 ID、名次和几个计数，关键词只存哈希；报告只有计数，词用 K01、K02
-  代替。标题、昵称、正文在 providers 归一化那一步就丢了，这里根本拿不到。
+* **报告里没有客户的东西**：报告只有计数，词用 K01、K02 代替。进度文件（本地那份，
+  或者面板存在登记表 base 里的那份，见 `trial.py`）里关键词只存哈希；页只有笔记 ID、
+  名次和几个计数。昵称、正文在 providers 归一化那一步就丢了，这里根本拿不到。
+* **2026-11-25 起多留了两样，只给登录了的面板页看**（负责人要的，见 `found_posts`、
+  `top_lists`）：每个词按综合排序第 1 页前 20 篇别人笔记的标题、赞评藏、打开链接要带的
+  xsec_token（进度文件的 `top`）；和我们自己被搜到的帖子的链接、飞书那一行（跟着报告存在
+  「面板设置」表里，不在报告文字里）。别人笔记的标题里常常就带着搜的那个词——所以进度文件
+  不再是「一个字的词都没有」，只是词本身不存。
 
 ## 钱：闸门在代码里，发之前查
 
@@ -60,12 +65,13 @@ import os
 import re
 import statistics
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from . import feishu, protocol, providers, transport
+from . import feishu, links, protocol, providers, transport
 from .rows import SORT_DEFAULT, SORT_LATEST, STATUS_GONE, STATUS_SUSPECT, Row
 
 TRIAL_NAME = "search-visibility-2026-11"
@@ -134,6 +140,12 @@ UNREADABLE = "unreadable_page"
 # 第 1 页有笔记、却没给翻页要回传的会话值：后面的页翻不了，这一页也不留。
 NO_SESSION = "no_session"
 SESSION_KEYS = ("search_id", "search_session_id")
+
+# 排在前面的笔记：每个词留第 1 页前几篇，留哪几样（见 State 的 `top`）。
+TOP_KEEP = 20
+TOP_FIELDS = ("title", "liked", "comments", "collected", "type", "token")
+# 我们自己被搜到的帖子，面板上最多列几篇（按最好的名次排）。
+FOUND_LIST_MAX = 100
 
 
 # ---------- 读表：哪些帖子、哪些词 ----------
@@ -245,6 +257,11 @@ class Post:
     keywords: tuple[str, ...] = ()
     publish_ms: Optional[int] = None   # 表里填的「发布时间」；空着就是 None，不猜
     comments: Optional[int] = None     # 表里现成的评论数
+    # 这一篇在哪儿（2026-11-25 加的，给面板列「搜到的帖子」用；不进报告）：
+    # 哪张表（调用方给的名字，见 intake 的 `names`）、飞书哪一行、表里那一格链接。
+    table: str = ""
+    record_id: str = ""
+    url: str = ""
 
 
 @dataclass
@@ -271,7 +288,8 @@ class Intake:
 
 
 def intake(tables: Iterable[Iterable[tuple[Row, Any]]], *,
-           resolve: Optional[Callable[[str], Optional[str]]] = None) -> Intake:
+           resolve: Optional[Callable[[str], Optional[str]]] = None,
+           names: Optional[list[str]] = None) -> Intake:
     """一张表一份（行, 那一行「搜索关键词」的原始格子）→ 要查的词和要对的帖子。
 
     **词是表的**：一张表的词 = 它所有行里写过的词合起来（去重，按第一次出现排）。
@@ -282,10 +300,13 @@ def intake(tables: Iterable[Iterable[tuple[Row, Any]]], *,
     一个词都没写的表整张不看（连免费的短链展开都不做）。
     `resolve` 是免费的短链展开（链接 → 笔记 ID 或 None）；不给就不展开，
     短链行只记个数（--dry-run 用：那时帖子数是下界）。
+    `names`：和 `tables` 一一对应的表名，记进每篇帖子的 `Post.table`（面板拿它找回
+    是哪张表、拼飞书行的链接）；不给就是空串。
     """
     out = Intake()
     seen_words: dict[str, str] = {}
-    for table in tables:
+    for index, table in enumerate(tables):
+        name = names[index] if names is not None and index < len(names) else ""
         rows = list(table)
         out.tables += 1
         out.rows += len(rows)
@@ -342,7 +363,9 @@ def intake(tables: Iterable[Iterable[tuple[Row, Any]]], *,
             seen_posts.add(note_id)
             posts.append(Post(note_id=note_id, keywords=group,
                               publish_ms=row.publish_time_ms,
-                              comments=row.previous_comment_count))
+                              comments=row.previous_comment_count,
+                              table=name, record_id=row.record_id,
+                              url=links.first_url(row.link_cell) or note_url(note_id)))
         out.short_links += pending
         if not posts and not pending:
             continue                          # 没有一篇能对的帖子：这张表的词不查
@@ -378,7 +401,13 @@ class State:
          "rounds": {"轮": {"at": 最近一次跑这一轮是哪一刻（秒）,
                           "kw": [这一轮定下来要查的词的哈希]}},
          "failures": [{"round", "kw", "page", "kind", "http", "at"}],
-         "balance": [{"round", "drop_usd", "requests", "at"}]}
+         "balance": [{"round", "drop_usd", "requests", "at"}],
+         "top": {词的哈希: {"round", "at", "notes": [{"id", "rank", "title", "liked",
+                  "comments", "collected", "type", "token"}], "keys": [笔记本体的键名]}}}
+
+    `top` 是 2026-11-25 加的：每个词最近一次按综合排序拿到的第 1 页里，排在前面的
+    （最多 `TOP_KEEP` 篇）笔记的标题、赞评藏和打开链接要带的 xsec_token。只给登录了的
+    面板页看（`top_lists`），不进报告。之前存的进度文件没有它，读的时候补一个空的。
     """
 
     def __init__(self, path: Path):
@@ -386,6 +415,7 @@ class State:
         self.data: dict[str, Any] = {
             "version": STATE_VERSION, "trial": TRIAL_NAME, "calls": 0, "yuan": 0.0,
             "keywords": {}, "pages": {}, "rounds": {}, "failures": [], "balance": [],
+            "top": {},
         }
 
     @classmethod
@@ -412,6 +442,7 @@ class State:
             raise StateError(f"进度文件不是这次试跑的（{where}）"
                              + (f"，{remedy}" if remedy else ""))
         data.setdefault("rounds", {})     # 早先存的进度文件没有这一项
+        data.setdefault("top", {})        # 2026-11-25 之前存的也没有这一项
         for key, default in self.data.items():
             if not isinstance(data.get(key), type(default)) \
                     and not (key == "yuan" and isinstance(data.get(key), int)):
@@ -554,7 +585,31 @@ class State:
             "sid": {k: str(data[k]) for k in SESSION_KEYS if data.get(k)},
         }
         self.data["pages"][self.page_key(round_name, digest, page)] = record
+        round_ = ROUNDS.get(round_name)
+        if page == 1 and round_ is not None and round_.sort == SORT_DEFAULT:
+            self._keep_top(round_name, digest, notes, data, at)
         return record
+
+    def _keep_top(self, round_name: str, digest: str, notes: list[dict[str, Any]],
+                  data: dict[str, Any], at: float) -> None:
+        """这个词按综合排序的第 1 页：排在前面的笔记留下给人看的几样，盖掉上一次的。
+        「最新」那一轮不算——那是刚发的帖子，不是排在前面的。广告不算，名次只在自然结果里数。"""
+        kept: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for note in notes:
+            note_id = str(note.get("note_id") or "")
+            if note.get("ad") or not note_id or note_id in seen:
+                continue
+            seen.add(note_id)
+            entry: dict[str, Any] = {"id": note_id, "rank": len(seen)}
+            detail = note.get("detail")
+            if isinstance(detail, dict):
+                entry.update((k, str(v)) for k, v in detail.items() if k in TOP_FIELDS and v)
+            kept.append(entry)
+            if len(kept) >= TOP_KEEP:
+                break
+        self.data["top"][digest] = {"round": round_name, "at": int(at), "notes": kept,
+                                    "keys": [str(k) for k in data.get("note_keys") or []][:80]}
 
     def note_failure(self, round_name: str, digest: str, page: int,
                      kind: str, http: Optional[int], at: float,
@@ -1082,6 +1137,8 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         rounds[round_.name] = {
             "说明": round_.label,
             "词是当时记下的": recorded,
+            "词数": len(digests),
+            "每个词翻几页": round_.pages,
             "页": {"计划": round_.pages * len(digests), "拿到": have, "还差": need,
                    "失败过": sum(1 for f in state.data["failures"]
                               if f.get("round") == round_.name)},
@@ -1177,9 +1234,136 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
     return report
 
 
+# ---------- 给登录了的面板页看的两张清单（不进报告）----------
+
+XHS_NOTE_URL = "https://www.xiaohongshu.com/explore/"
+
+
+def note_url(note_id: str, token: str = "") -> str:
+    """一篇小红书笔记的网页链接。只有 ID 的链接在浏览器里常常打不开（docs/面板.md），
+    带上搜索结果给的 xsec_token 才比较容易打开；token 过几天会失效。"""
+    url = XHS_NOTE_URL + urllib.parse.quote(note_id, safe="")
+    if token:
+        url += "?" + urllib.parse.urlencode({"xsec_token": token, "xsec_source": "pc_search"})
+    return url
+
+
+def found_posts(state: State, posts: list[Post], *, tz: timezone,
+                limit: int = FOUND_LIST_MAX) -> list[dict[str, Any]]:
+    """我们自己被搜到的帖子：每篇在哪一轮、哪个词下面、排第几位。**纯函数。**
+
+    2026-11-25 运营要的（「给到搜到的帖子链接 / 去飞书这一行」）。只给登录了的面板页列
+    清单，**不进报告**，报告还是只有计数。对法和报告一样：每篇帖子对它那张表在每一轮
+    查的每个词，名次只在自然结果里数；那个词查的时候帖子还没发出来的不算。
+
+        [{"note_id", "table", "record_id", "url", "best": 最好的名次,
+          "hits": [{"round", "label", "k": "K01", "rank", "band", "age", "at"}]}]
+
+    按最好的名次排，最多 `limit` 篇。
+    """
+    merged: dict[str, Post] = {}
+    words_of: dict[str, set[str]] = {}
+    for post in posts:
+        merged.setdefault(post.note_id, post)
+        words_of.setdefault(post.note_id, set()).update(keyword_hash(w) for w in post.keywords)
+    by_word: dict[str, list[str]] = {}
+    for note_id, digests in words_of.items():
+        for digest in digests:
+            by_word.setdefault(digest, []).append(note_id)
+    out: dict[str, dict[str, Any]] = {}
+    for round_ in ROUNDS.values():
+        selected, _recorded = state.selection(round_.name)
+        round_at = state.round_at(round_.name)
+        for digest in selected:
+            found = listing(round_, digest, state)
+            if not found.pages:
+                continue
+            number = state.number(digest)
+            seen_at = found.at or round_at
+            for note_id in by_word.get(digest, []):
+                post = merged[note_id]
+                if post.publish_ms is not None and post.publish_ms > seen_at * 1000:
+                    continue                  # 那时候它还没发出来
+                rank = found.rank(note_id)
+                if rank is None:
+                    continue
+                entry = out.setdefault(note_id, {
+                    "note_id": note_id, "table": post.table, "record_id": post.record_id,
+                    "url": post.url, "best": rank, "hits": []})
+                entry["best"] = min(entry["best"], rank)
+                entry["hits"].append({
+                    "round": round_.name, "label": round_.label,
+                    "k": f"K{number:02d}" if number is not None else "",
+                    "rank": rank, "band": rank_band(rank),
+                    "age": age_band(post.publish_ms, seen_at, tz), "at": int(seen_at)})
+    ranked = sorted(out.values(), key=lambda e: (e["best"], e["note_id"]))
+    for entry in ranked:
+        entry["hits"].sort(key=lambda h: (h["rank"], h["k"], h["round"]))
+    return ranked[:limit]
+
+
+def top_lists(state: State) -> list[dict[str, Any]]:
+    """每个词排在前面的笔记（State 的 `top`），按词的编号排。给登录了的面板页看。
+
+        [{"k": "K01", "digest", "round", "label", "at", "keys": [笔记本体的键名],
+          "notes": [{"rank", "id", "url", "has_token", "title", "liked", "comments",
+                     "collected", "type"}]}]（后五样拿不到就没有那个键）
+    """
+    out: list[tuple[int, dict[str, Any]]] = []
+    for digest, entry in (state.data.get("top") or {}).items():
+        number = state.number(digest)
+        if number is None or not isinstance(entry, dict):
+            continue
+        round_ = ROUNDS.get(str(entry.get("round") or ""))
+        notes = []
+        for note in entry.get("notes") or []:
+            if not isinstance(note, dict) or not note.get("id"):
+                continue
+            token = str(note.get("token") or "")
+            item: dict[str, Any] = {"rank": int(note.get("rank") or 0), "id": str(note["id"]),
+                                    "url": note_url(str(note["id"]), token),
+                                    "has_token": bool(token)}
+            item.update((k, str(note[k])) for k in TOP_FIELDS if k != "token" and note.get(k))
+            notes.append(item)
+        out.append((number, {
+            "k": f"K{number:02d}", "digest": digest,
+            "round": round_.name if round_ else "", "label": round_.label if round_ else "",
+            "at": int(entry.get("at") or 0), "keys": [str(k) for k in entry.get("keys") or []],
+            "notes": notes}))
+    return [entry for _n, entry in sorted(out, key=lambda pair: pair[0])]
+
+
+def _found(bucket: dict[str, int]) -> int:
+    return sum(bucket.get(label, 0) for label in FOUND_BANDS)
+
+
+def _share(found: int, checked: int, unknown: int) -> str:
+    """搜到的比例。分母是查全了的篇数：没查全的说不准，不算进去。"""
+    if not checked:
+        return ""
+    pct = f"{found / checked:.0%}"
+    return f"（查全的 {checked} 篇里占 {pct}）" if unknown else f"（{pct}）"
+
+
 def _counts(bucket: dict[str, int]) -> str:
-    shown = [f"{label} {bucket[label]}" for label in RESULT_LABELS if bucket.get(label)]
-    return f"{bucket['篇数']} 篇" + (f"：{' · '.join(shown)}" if shown else "")
+    """一组帖子 → 「9 篇，搜到 0 篇（0%）」。搜到的再分档；只在付费位、没查全的单列。
+
+    2026-11-25 运营要的：每一组都直接写搜到的比例，不用自己拿篇数去除。
+    """
+    total = bucket["篇数"]
+    if not total:
+        return "0 篇"
+    found = _found(bucket)
+    unknown = bucket.get(INCOMPLETE, 0)
+    text = f"{total} 篇，搜到 {found} 篇{_share(found, total - unknown, unknown)}"
+    bands = [f"{label} {bucket[label]}" for label in FOUND_BANDS if bucket.get(label)]
+    if bands:
+        text += "：" + " · ".join(bands)
+    if bucket.get(PAID):
+        text += f"；只在付费位（广告）{bucket[PAID]} 篇，不算搜到"
+    if unknown:
+        text += f"；没查全（说不准，不算进比例）{unknown} 篇"
+    return text
 
 
 def render_report(report: dict[str, Any]) -> str:
@@ -1202,7 +1386,8 @@ def render_report(report: dict[str, Any]) -> str:
                         if read["太长没收的词"] else "")
                      + (f"；像一句话、整格没收的 {read['像整句话没收的格子']} 格"
                         if read.get("像整句话没收的格子") else "") + "。")
-    lines.append("词是表的：一张表里写过的词都算这张表的，这张表每一篇帖子和每一个词都对一遍。")
+    lines.append("怎么对：一张表「搜索关键词」列里写过的词都算这张表的。查的时候，拿这张表的"
+                 "**每一篇**帖子去每一个词的搜索结果里找，不看帖子的标题、正文、话题里有没有写这个词。")
     lines += ["", "## 先回答那个问题", ""]
     unread = report.get("读不懂的页") or {}
     if unread.get("页数"):
@@ -1217,27 +1402,46 @@ def render_report(report: dict[str, Any]) -> str:
         lines.append("第一轮里还没有「发布 3 天内」的帖子有结果——要么第一轮还没跑，"
                      "要么这几张表的帖子都超过 3 天了（看下面按帖龄的表）。")
     else:
+        unknown = answer["没查全的"]
         lines.append(
             f"发布 3 天内的帖子 {answer['3天内的帖子']} 篇，综合排序前 3 页里"
-            f"至少在一个词下面搜到 {answer['搜到的']} 篇，"
+            f"至少在一个词下面搜到 {answer['搜到的']} 篇"
+            + _share(answer["搜到的"], answer["3天内的帖子"] - unknown, unknown) + "，"
             f"哪个词下面都没搜到 {answer['没搜到的']} 篇"
             + (f"，只出现在付费位 {answer['只在付费位的']} 篇" if answer.get("只在付费位的") else "")
-            + (f"，没查全（说不准）{answer['没查全的']} 篇" if answer["没查全的"] else "") + "。")
+            + (f"，没查全（说不准）{unknown} 篇" if unknown else "") + "。")
+        if not answer["搜到的"] and answer["没搜到的"]:
+            lines.append("一篇都没搜到：先别急着下结论，手册（docs/搜索可见试跑.md）「五、报告怎么看」里"
+                         "「一篇都没搜到，先查这三件事」那一段，有不花钱就能查的办法。")
     lines.append("「没搜到」只是说前几页里没有，不等于没被收录；名次是供应商那一刻看到的，"
                  "不是某个读者看到的。")
     for name, block in report["各轮"].items():
         pages = block["页"]
+        words, per = block.get("词数"), block.get("每个词翻几页")
+        how = (f"{words} 个词，每个词翻 {per} 页，一共计划 {pages['计划']} 页"
+               if words is not None and per else f"计划 {pages['计划']} 页")
         lines += ["", f"## {block['说明']}（{name}）", "",
-                  f"页：计划 {pages['计划']}，拿到 {pages['拿到']}，还差 {pages['还差']}，"
+                  f"页：{how}；拿到 {pages['拿到']}，还差 {pages['还差']}，"
                   f"失败过 {pages['失败过']} 次。"]
         if not block.get("词是当时记下的", True):
             lines.append("这一轮是早先的进度文件，没记当时查的是哪几个词：下面的词是按留下的页和"
                          "失败记录推的，可能多列了没查过的词（列成「还没查」）。再跑一次这一轮就会记下。")
         size = block["每页笔记数"]
         if size:
-            lines.append(f"每页笔记数：最少 {size['最少']}，中位 {size['中位']:g}，最多 {size['最多']}。"
-                         f"像广告位的 {block['像广告位的条数']} 条，认不出笔记的 "
-                         f"{block['认不出笔记的条数']} 条。")
+            types = block.get("条目类型") or {}
+            ad_items = sum(int(n) for kind, n in types.items() if providers.is_ad_type(kind))
+            other, ad_notes = block["认不出笔记的条数"], block["像广告位的条数"]
+            line = (f"每页认得出的笔记：最少 {size['最少']} 篇，中位 {size['中位']:g}，"
+                    f"最多 {size['最多']}。")
+            if ad_items:
+                line += f"结果里有 {ad_items} 条是广告（类型名是 ads 一类），广告不算名次。"
+            if other:
+                line += (f"认不出是哪篇笔记的 {other} 条"
+                         + ("，就是这些广告。" if other == ad_items and not ad_notes
+                            else "，不算名次。"))
+            if ad_notes:
+                line += f"认得出笔记、但标着广告的 {ad_notes} 条，不算名次。"
+            lines.append(line)
         if block.get("查之后才发的帖子（不算）"):
             lines.append(f"有 {block['查之后才发的帖子（不算）']} 篇帖子是这一轮查完之后才发的，"
                          "不算在这一轮里（那时候它还不存在，搜不到说明不了什么）。")
@@ -1255,22 +1459,25 @@ def render_report(report: dict[str, Any]) -> str:
             lines += ["", "按评论数："]
             lines += [f"- {group}：{_counts(bucket)}"
                       for group, bucket in block["按评论数"].items()]
-        lines += ["", "按词（写了这个词的表的帖子，在这个词下面出现了几篇、排在哪一档）："]
+        lines += ["", "按词（每个词都拿这张表的全部帖子去对，不是只对标题、正文里写了这个词的帖子，"
+                      "所以每个词后面的篇数一样多。看的是这些帖子在这个词的搜索结果里出现了几篇、排在哪一档）："]
         for row in block["按词"]:
             total = row.get("帖子") or _blank()
             ages = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
                             for band in AGE_BANDS if band in row["按帖龄"])
-            tail = (f"｜帖子 {_counts(total)}｜{ages}" if total["篇数"] else "｜没有帖子")
+            detail = ([f"  全部：{_counts(total)}", f"  按帖龄：{ages}"]
+                      if total["篇数"] else ["  这一轮没有要对的帖子"])
             if not row["拿到几页"]:
-                lines.append(f"- {row['词']}：还没查{tail if total['篇数'] else ''}")
+                lines += [f"- {row['词']}：还没查，一页都没拿到", *detail]
                 continue
-            state_text = "翻到底了" if row["翻到底了"] else ("查全了" if row["查全了"] else "没查全")
-            lines.append(f"- {row['词']}：拿到 {row['拿到几页']} 页，看了前 {row['看了前几位']} 位"
-                         f"（{state_text}）{tail}")
+            state_text = ("翻到底了，后面没有了" if row["翻到底了"]
+                          else ("查全了" if row["查全了"] else "没查全，有页没拿到"))
+            lines += [f"- {row['词']}：这个词翻了 {row['拿到几页']} 页，里面一共 {row['看了前几位']} 篇"
+                      f"笔记（广告不算；{state_text}）", *detail]
         if block["条目类型"] or block["条目键名"]:
-            lines += ["", "结果条目的类型：" + ("、".join(
+            lines += ["", "（给技术看）结果条目的类型：" + ("、".join(
                 f"{k} {v}" for k, v in block["条目类型"].items()) or "（没有）"),
-                      "结果条目里出现过的键名：" + ("、".join(block["条目键名"]) or "（没有）")]
+                      "（给技术看）结果条目里出现过的键名：" + ("、".join(block["条目键名"]) or "（没有）")]
     if report["名次稳不稳"]:
         lines += ["", "## 名次稳不稳（和第一轮比；一篇帖子在一个词下面算一次）", ""]
         for name, tally in report["名次稳不稳"].items():

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 import cli
-from xhsearch import (panel, protocol, providers, registry, rows as rows_mod, schema,
+from xhsearch import (panel, protocol, providers, registry, rows as rows_mod, runner, schema,
                       transport, visibility)
 from xhsearch.config import Settings
 
@@ -136,11 +136,45 @@ class TestSearchParse(unittest.TestCase):
         self.assertEqual(result.data["search_id"], "sid-1")
         self.assertEqual(result.data["search_session_id"], "ssid-1")
 
-    def test_titles_and_nicknames_never_leave_the_provider(self):
+    def test_body_and_nicknames_never_leave_the_provider(self):
+        """2026-11-25 起标题、赞评藏、xsec_token 留下给面板列「排在前面的帖子」；
+        正文、作者昵称还是一个字都不往外带。"""
         result = self.parse(body([item(1), item(2)]))
         dumped = json.dumps(result.data, ensure_ascii=False)
-        for secret in ("某某品牌的标题", "正文正文", "某某昵称"):
+        for secret in ("正文正文", "某某昵称"):
             self.assertNotIn(secret, dumped)
+        self.assertEqual(result.data["notes"][0]["detail"], {"title": "某某品牌的标题"})
+        self.assertEqual(result.data["note_keys"], ["desc", "id", "title", "user"])
+
+    def test_details_read_from_the_usual_field_names(self):
+        card = {"id": nid(1), "title": "  标题\n换行  ", "liked_count": "1.2万",
+                "comments_count": 0, "collected_count": 37, "type": "video",
+                "xsec_token": "ABCdef123+/=_-", "desc": "正文正文"}
+        nested = {"id": nid(2), "display_title": "另一个", "type": "normal",
+                  "interact_info": {"liked_count": "88", "comment_count": "5"}}
+        flat_token = {"model_type": "note", "xsec_token": "TOKEN_on_item_1",
+                      "note": {"id": nid(3)}}
+        result = self.parse(body([{"model_type": "note", "note": card},
+                                  {"model_type": "note", "note": nested}, flat_token]))
+        details = [n.get("detail") for n in result.data["notes"]]
+        self.assertEqual(details[0], {"title": "标题 换行", "liked": "1.2万", "comments": "0",
+                                      "collected": "37", "type": "video",
+                                      "token": "ABCdef123+/=_-"})
+        self.assertEqual(details[1], {"title": "另一个", "liked": "88", "comments": "5",
+                                      "type": "normal"})
+        self.assertEqual(details[2], {"token": "TOKEN_on_item_1"})
+
+    def test_a_token_that_does_not_look_like_one_is_dropped(self):
+        for bad in ("短", "has space in it", "a" * 201, "<script>x</script>", "x&y=z&a=b"):
+            card = {"id": nid(1), "xsec_token": bad}
+            result = self.parse(body([{"model_type": "note", "note": card}]))
+            self.assertNotIn("detail", result.data["notes"][0], bad)
+
+    def test_a_long_title_is_cut(self):
+        card = {"id": nid(1), "title": "字" * 100}
+        result = self.parse(body([{"model_type": "note", "note": card}]))
+        self.assertEqual(len(result.data["notes"][0]["detail"]["title"]),
+                         providers.TITLE_MAX_CHARS)
 
     def test_cards_that_are_not_notes_are_counted_not_ranked(self):
         topic = {"model_type": "hot_query", "id": "abc", "queries": []}
@@ -153,10 +187,16 @@ class TestSearchParse(unittest.TestCase):
         result = self.parse(body([item(1, kind="ads"), item(2, ads_info={"x": 1}), item(3)]))
         self.assertEqual([n["ad"] for n in result.data["notes"]], [True, True, False])
 
+    def test_ad_type_names_are_matched_by_word_not_substring(self):
+        self.assertEqual([providers.is_ad_type(k) for k in
+                          ("ads", "AD_card", "native-advert", "note", "hot_query", "load", None)],
+                         [True, True, True, False, False, False, False])
+
     def test_note_id_can_sit_on_the_item_itself(self):
         flat = {"note_id": nid(7).upper(), "display_title": "标题"}
         result = self.parse(body([flat]))
-        self.assertEqual(result.data["notes"], [{"note_id": nid(7), "ad": False}])
+        self.assertEqual(result.data["notes"],
+                         [{"note_id": nid(7), "ad": False, "detail": {"title": "标题"}}])
 
     def test_session_is_found_one_level_up_too(self):
         text = json.dumps({"code": 200, "data": {
@@ -633,10 +673,16 @@ class TestLedger(unittest.TestCase):
         run("first", [("某某品牌", visibility.keyword_hash("某某品牌"))], state,
             Sender(default=by_page))
         text = pathlib.Path(self.dir.name, "state.json").read_text(encoding="utf-8")
-        self.assertNotIn("某某品牌", text)
         self.assertNotIn("某某昵称", text)
+        self.assertNotIn("正文正文", text)
         self.assertNotIn(KEY, text)
         self.assertNotIn("http", text)
+        # 词本身只存哈希。别人笔记的标题（2026-11-25 起留着给面板看）里常常带着这个词，
+        # 那是对方写的字；除掉标题之后，账本里一个字的词都不该有。
+        data = json.loads(text)
+        titles = [n.pop("title") for entry in data["top"].values() for n in entry["notes"]]
+        self.assertEqual(titles, ["某某品牌的标题"] * 20)
+        self.assertNotIn("某某品牌", json.dumps(data, ensure_ascii=False))
 
     def test_state_dir_must_be_outside_the_repo(self):
         repo = pathlib.Path(cli.__file__).resolve().parent
@@ -1087,8 +1133,10 @@ class TestReport(unittest.TestCase):
         self.assertEqual(block["按评论数"]["评论数到 20 条"]["没查全"], 1)
         self.assertEqual(block["按词"][1]["按帖龄"]["3天内"]["没查全"], 1)
         text = visibility.render_report(report)
-        self.assertIn("至少在一个词下面搜到 1 篇，哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", text)
-        self.assertIn("K02：还没查｜帖子 1 篇：没查全 1｜3天内 1 篇：没查全 1", text)
+        self.assertIn("至少在一个词下面搜到 1 篇（查全的 1 篇里占 100%），哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", text)
+        self.assertIn("- K02：还没查，一页都没拿到\n"
+                      "  全部：1 篇，搜到 0 篇；没查全（说不准，不算进比例）1 篇\n"
+                      "  按帖龄：3天内 1 篇，搜到 0 篇；没查全（说不准，不算进比例）1 篇", text)
 
     def test_posts_under_a_keyword_the_cap_stopped_before_are_incomplete(self):
         other = "另一个词"
@@ -1222,7 +1270,7 @@ class TestReport(unittest.TestCase):
                 self.assertNotIn(forbidden, content)
         text = text_path.read_text(encoding="utf-8")
         self.assertIn("K01", text)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇（50%），"
                       "哪个词下面都没搜到 1 篇", text)
         self.assertIn("first：unknown（HTTP 400）：1 次", text)
         self.assertIn("余额少了 $0.03", text)
@@ -1310,7 +1358,46 @@ class TestTableMatching(unittest.TestCase):
         self.assertEqual((rows["K02"]["篇数"], rows["K02"]["21到40"], rows["K02"]["41到60"],
                           rows["K02"]["没搜到"]), (5, 1, 1, 3))
         text = visibility.render_report(report)
-        self.assertIn("K01：拿到 3 页，看了前 60 位（查全了）｜帖子 5 篇：前20 1 · 没搜到 4", text)
+        self.assertIn("- K01：这个词翻了 3 页，里面一共 60 篇笔记（广告不算；查全了）\n"
+                      "  全部：5 篇，搜到 1 篇（20%）：前20 1\n", text)
+
+    def test_the_report_reads_plainly_when_nothing_is_found(self):
+        """2026-11-25 第一轮实测的样子：每页有几条类型是 `ads` 的广告（认不出笔记 ID），
+        我们的帖子一篇都没出现。运营看不懂的几处：「写了这个词的表的帖子」、每个词「拿到 3 页」
+        和总共 12 页对不上、广告被说成「认不出笔记的」、没有比例。"""
+        self.state.mark_round("first", AT, [visibility.keyword_hash(w) for w in (self.a, self.b)])
+        for word, start in ((self.a, 1000), (self.b, 2000)):
+            for page in (1, 2, 3):
+                ids = range(start + page * 100, start + page * 100 + 18)
+                self.state.keep_page("first", visibility.keyword_hash(word), page, {
+                    "notes": [{"note_id": nid(i), "ad": False} for i in ids],
+                    "items": 20, "other_items": 2, "model_types": {"note": 18, "ads": 2},
+                    "item_keys": ["ads", "model_type", "note"], "search_id": "s"}, AT)
+        table = (self.a, self.b)
+        posts = [self.post(9000 + i, table, age_days=age) for i, age in enumerate((1, 2, 5, 30))]
+        report, block = self.first(posts)
+        text = visibility.render_report(report)
+        self.assertIn("至少在一个词下面搜到 0 篇（0%），哪个词下面都没搜到 2 篇。", text)
+        self.assertIn("一篇都没搜到：先别急着下结论", text)
+        self.assertIn("页：2 个词，每个词翻 3 页，一共计划 6 页；拿到 6", text)
+        self.assertIn("结果里有 12 条是广告（类型名是 ads 一类），广告不算名次。"
+                      "认不出是哪篇笔记的 12 条，就是这些广告。", text)
+        self.assertNotIn("写了这个词的表的帖子", text)
+        self.assertIn("每个词都拿这张表的全部帖子去对，不是只对标题、正文里写了这个词的帖子", text)
+        self.assertIn("- K01：这个词翻了 3 页，里面一共 54 篇笔记（广告不算；查全了）\n"
+                      "  全部：4 篇，搜到 0 篇（0%）\n"
+                      "  按帖龄：3天内 2 篇，搜到 0 篇（0%）；4到7天 1 篇，搜到 0 篇（0%）；"
+                      "更早 1 篇，搜到 0 篇（0%）", text)
+        self.assertIn("- 3天内：2 篇，搜到 0 篇（0%）", text)
+        self.assertEqual((block["词数"], block["每个词翻几页"]), (2, 3))
+
+    def test_a_partly_found_group_shows_its_share_without_the_unchecked_posts(self):
+        bucket = {**visibility._blank(), "篇数": 5, "前20": 1, "41到60": 1, "没搜到": 1,
+                  "付费位": 1, "没查全": 1}
+        self.assertEqual(visibility._counts(bucket),
+                         "5 篇，搜到 2 篇（查全的 4 篇里占 50%）：前20 1 · 41到60 1；"
+                         "只在付费位（广告）1 篇，不算搜到；没查全（说不准，不算进比例）1 篇")
+        self.assertEqual(visibility._counts(visibility._blank()), "0 篇")
 
     def test_best_rank_wins_when_a_post_shows_under_two_keywords(self):
         self.keep(self.a, 1, [*range(100, 150), 7])       # 第 51 位
@@ -1459,6 +1546,106 @@ class TestTableMatching(unittest.TestCase):
         self.assertEqual((result.reused, result.requests), (3, 0))
         self.assertIn("最多 15 个", state.register([f"新词{i}" for i in range(15)]))
         self.assertEqual(state.data["keywords"], {digest: 1})
+
+
+class TestPanelLists(unittest.TestCase):
+    """2026-11-25：给登录了的面板页的两张清单——我们自己被搜到的帖子、每个词排在前面的
+    帖子。都不进报告（报告还是只有计数，见 TestReport.test_report_is_counts_only）。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.state = fresh_state(self.dir.name)
+        self.a, self.b = "词甲", "词乙"
+        self.state.register([self.a, self.b])
+        self.da, self.db = (visibility.keyword_hash(w) for w in (self.a, self.b))
+
+    def keep(self, digest, page, ids, *, round_name="first", at=AT, ads=(), detail=None):
+        notes = [{"note_id": nid(i), "ad": i in ads, **({"detail": detail(i)} if detail else {})}
+                 for i in ids]
+        return self.state.keep_page(round_name, digest, page, {
+            "notes": notes, "items": len(notes), "search_id": "s",
+            "note_keys": ["id", "title"]}, at)
+
+    def test_page_one_keeps_the_top_notes_without_ads_or_repeats(self):
+        def detail(i):
+            return {"title": f"标题{i}", "liked": str(i), "token": f"tok{i:06d}", "junk": "x"}
+        self.keep(self.da, 1, [5, 6, 7, 5, *range(100, 130)], ads=(6,), detail=detail)
+        top = self.state.data["top"][self.da]
+        self.assertEqual((top["round"], top["at"], top["keys"]), ("first", int(AT), ["id", "title"]))
+        self.assertEqual(len(top["notes"]), visibility.TOP_KEEP)
+        self.assertEqual(top["notes"][0], {"id": nid(5), "rank": 1, "title": "标题5",
+                                           "liked": "5", "token": "tok000005"})
+        self.assertEqual([n["id"] for n in top["notes"][:3]], [nid(5), nid(7), nid(100)])
+        self.assertEqual(top["notes"][-1]["rank"], visibility.TOP_KEEP)
+
+    def test_only_page_one_of_a_default_sort_round_counts_and_the_latest_wins(self):
+        self.keep(self.da, 1, [1, 2])
+        self.keep(self.da, 2, [3, 4])
+        self.keep(self.da, 1, [8, 9], round_name="latest")       # 最新排序：刚发的，不是排在前面的
+        self.assertEqual([n["id"] for n in self.state.data["top"][self.da]["notes"]],
+                         [nid(1), nid(2)])
+        self.keep(self.da, 1, [10], round_name="repeat2", at=AT + 86400)
+        top = self.state.data["top"][self.da]
+        self.assertEqual((top["round"], top["at"], [n["id"] for n in top["notes"]]),
+                         ("repeat2", int(AT) + 86400, [nid(10)]))
+
+    def test_a_ledger_saved_before_the_lists_existed_still_loads(self):
+        path = pathlib.Path(self.dir.name, "old.json")
+        data = visibility.State(path).data
+        del data["top"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(visibility.State.load(path).data["top"], {})
+
+    def test_top_lists_carry_openable_links_in_keyword_order(self):
+        self.keep(self.db, 1, [3], detail=lambda _i: {"title": "乙的第一", "type": "video"})
+        self.keep(self.da, 1, [1, 2], detail=lambda i: (
+            {"token": "AB+c/=d_e-f"} if i == 1 else {"title": "没带 token"}))
+        lists = visibility.top_lists(self.state)
+        self.assertEqual([entry["k"] for entry in lists], ["K01", "K02"])
+        first, second = lists[0]["notes"]
+        self.assertEqual(first["url"], f"https://www.xiaohongshu.com/explore/{nid(1)}"
+                                        "?xsec_token=AB%2Bc%2F%3Dd_e-f&xsec_source=pc_search")
+        self.assertTrue(first["has_token"])
+        self.assertNotIn("token", first)
+        self.assertEqual((second["url"], second["title"], second["has_token"]),
+                         (f"https://www.xiaohongshu.com/explore/{nid(2)}", "没带 token", False))
+        self.assertEqual(lists[1]["notes"][0]["type"], "video")
+
+    def test_found_posts_say_where_each_of_ours_showed_up(self):
+        self.state.mark_round("first", AT, [self.da, self.db])
+        for page in (1, 2, 3):
+            self.keep(self.da, page, range(1000 + page * 100, 1000 + page * 100 + 20))
+            self.keep(self.db, page, range(2000 + page * 100, 2000 + page * 100 + 20))
+
+        def post(n, age=2.0):
+            return visibility.Post(nid(n), (self.a, self.b), days_before(age), None,
+                                   table="app|tbl", record_id=f"rec{n}", url=f"https://x/{n}")
+        # 最后一篇是查完之后才发的：那时候它还不存在，不算搜到。
+        posts = [post(2305), post(1105), post(9999), post(1210, age=-1)]
+        found = visibility.found_posts(self.state, posts, tz=BJ)
+        self.assertEqual([f["note_id"] for f in found], [nid(1105), nid(2305)])   # 名次好的在前
+        self.assertEqual({k: found[0][k] for k in ("table", "record_id", "url", "best")},
+                         {"table": "app|tbl", "record_id": "rec1105", "url": "https://x/1105",
+                          "best": 6})
+        self.assertEqual(found[0]["hits"], [{
+            "round": "first", "label": visibility.ROUNDS["first"].label, "k": "K01",
+            "rank": 6, "band": "前20", "age": "3天内", "at": int(AT)}])
+        self.assertEqual((found[1]["best"], found[1]["hits"][0]["band"]), (46, "41到60"))
+        self.assertEqual(len(visibility.found_posts(self.state, posts, tz=BJ, limit=1)), 1)
+
+    def test_intake_records_where_each_post_lives(self):
+        f = Settings().fields
+        full = {"record_id": "recA", "fields": {
+            f.link: f"看这个 https://www.xiaohongshu.com/explore/{nid(1)}?xsec_token=T1 好",
+            f.publish_time: days_before(1), f.search_keywords: "词甲"}}
+        bare = {"record_id": "recB", "fields": {f.link: nid(2), f.publish_time: days_before(1)}}
+        rows = [(runner.row_from_record(r, Settings()), r["fields"].get(f.search_keywords))
+                for r in (full, bare)]
+        info = visibility.intake([rows], names=["app|tbl"])
+        self.assertEqual([(p.table, p.record_id, p.url) for p in info.posts], [
+            ("app|tbl", "recA", f"https://www.xiaohongshu.com/explore/{nid(1)}?xsec_token=T1"),
+            ("app|tbl", "recB", f"https://www.xiaohongshu.com/explore/{nid(2)}")])
 
 
 class TestReportSelection(unittest.TestCase):
@@ -1631,7 +1818,7 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(sender.requests), 6)
         self.assertIn("新拿到 6 页", out)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇（50%），"
                       "哪个词下面都没搜到 1 篇", out)
         for forbidden in ("某某品牌", "第二个词", nid(100), "tikhub.", KEY):
             self.assertNotIn(forbidden, out)
@@ -1666,7 +1853,7 @@ class TestCommand(unittest.TestCase):
         self.assertIn("还差 3 页", out)
         # 词是表的：第一个词没查到，但另一个词下面搜到的那一篇照样算搜到；
         # 两个词下面都没有的那一篇，因为有一个词没查全，说不准。
-        self.assertIn("至少在一个词下面搜到 1 篇，哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", out)
+        self.assertIn("至少在一个词下面搜到 1 篇（查全的 1 篇里占 100%），哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", out)
         with mock.patch.object(visibility, "_send_once", sender):       # 再跑补得上
             code, out = self.invoke()
         self.assertEqual(code, 0)
@@ -1678,7 +1865,7 @@ class TestCommand(unittest.TestCase):
         self.table._records.append(trial_record(998, "某某品牌", age_days=-1))
         code, out = self.invoke("--report-only")
         self.assertEqual(code, 0)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇（50%），"
                       "哪个词下面都没搜到 1 篇。", out)
         self.assertIn("有 1 篇帖子是这一轮查完之后才发的", out)
 
@@ -1816,7 +2003,7 @@ class TestCommand(unittest.TestCase):
             code, out = self.invoke()
         self.assertEqual((code, len(sender.requests)), (0, 6))     # 2 个词 × 3 页
         self.assertIn("读到 4 行，填了「搜索关键词」的 1 行", out)
-        self.assertIn("发布 3 天内的帖子 3 篇，综合排序前 3 页里至少在一个词下面搜到 2 篇，"
+        self.assertIn("发布 3 天内的帖子 3 篇，综合排序前 3 页里至少在一个词下面搜到 2 篇（67%），"
                       "哪个词下面都没搜到 1 篇", out)
         report = json.loads(pathlib.Path(self.dir.name, "report.json").read_text(encoding="utf-8"))
         self.assertEqual((report["词"], report["帖子"]), (2, 4))

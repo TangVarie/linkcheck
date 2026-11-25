@@ -1279,8 +1279,13 @@ class Projects:
     def trial_tables(self) -> list:
         """搜索可见试跑读哪几张表：登记表里开了「搜索检查」、正在巡查的那些。
         → [(项目名, 飞书表)]。和命令行同一个口径（cli._search_trial_tables）。"""
-        return [(e.label, self._bitable(e.app_token, e.table_id))
-                for e in self.list() if e.usable and e.search_check]
+        out = []
+        for e in self.list():
+            if e.usable and e.search_check:
+                table = self._bitable(e.app_token, e.table_id)
+                table.route = e.route         # 拼「搜到的帖子」那一行的飞书链接要用
+                out.append((e.label, table))
+        return out
 
     def trial_store(self) -> "trial_mod.TrialStore":
         """试跑的账本、租约存在哪：登记表 base 里的「面板设置」表（见 trial.py）。"""
@@ -3117,7 +3122,8 @@ def build_trial(config: PanelConfig, projects: Projects,
         return found.amount if found.ok else None
 
     return trial_mod.Trial(projects.trial_tables, projects.trial_store(), settings, key,
-                           balance=balance if key and config.tikhub_base else None)
+                           balance=balance if key and config.tikhub_base else None,
+                           feishu_base=config.feishu_base)
 
 
 def reconciling(produce: Callable[[], summary.Overview], resolutions: Resolutions,

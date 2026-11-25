@@ -2677,14 +2677,70 @@ _SCRIPT = r"""
     var j = trialState, box = trialPart("trialReport");
     if (!box || !j || j.enabled === false) { if (box) box.innerHTML = ""; return; }
     var busy = !!(j.job && j.job.running), r = j.result;
-    var html = "<div style='margin-top:16px'><b>第 4 步 · 看报告</b> <span class=muted>只有计数：没有词、没有链接、没有笔记 ID，可以直接转给别人</span></div>" +
+    var html = "<div style='margin-top:16px'><b>第 4 步 · 看报告</b> <span class=muted>报告文字只有计数（没有词、没有链接、没有笔记 ID），可以直接转给别人；报告下面那两张清单只在这一页上</span></div>" +
       "<div class=srow><button type=button class=sm data-trial=report" + (busy ? " disabled" : "") + ">只重出报告（不花钱）</button> " +
       (r && r.text ? "<button type=button class=sm data-trial=copy>复制报告</button> " : "") +
       "<span class=muted>" + (r && r.at ? "下面这一份是 " + chinaTime(r.at * 1000, true) + " 出的" : "还没有报告：跑过一轮，或点「只重出报告」之后会出现在这里") + "</span></div>";
     if (r && r.note) html += "<div class=muted>" + esc(r.note) + "</div>";
     if (r && r.text) html += "<div class=out id=trialReportText style='padding:16px;background:var(--fill)'>" + esc(r.text) + "</div>";
+    html += trialFoundHtml(j, r) + trialTopHtml(j);
     box.innerHTML = html;
   }
+  // 两张清单（2026-11-25 加的）：只在登录了的这一页上，不在报告文字里，「复制报告」不带它们。
+  function trialLink(url, text){
+    var u = safeUrl(url);
+    return u ? "<a href='" + attr(u) + "' target=_blank rel='noopener noreferrer'>" + text + "</a>" : text;
+  }
+  function trialWords(j){
+    var words = {};
+    ((j.keywords || {}).list || []).forEach(function(w){ words[w.k] = w.word; });
+    return words;
+  }
+  function trialFoundHtml(j, r){
+    if (!r || !r.text) return "";
+    var html = "<div style='margin-top:24px'><b>我们自己被搜到的帖子</b> <span class=muted>只在这一页显示，不在报告文字里</span></div>";
+    if (!r.found) return html + "<div class=muted>这一份报告出的时候还没有这张清单。点上面「只重出报告（不花钱）」就有了。</div>";
+    if (!r.found.length) return html + "<div class=muted>这一份报告里一篇都没搜到，所以这里是空的。</div>";
+    var words = trialWords(j);
+    html += r.found.map(function(f){
+      var where = (f.hits || []).map(function(h){
+        return esc(h.k) + (words[h.k] ? "（" + esc(words[h.k]) + "）" : "") + " 第 " + h.rank + " 位" +
+          " <span class=muted>" + esc(BUTTONS_LABEL[h.round] || h.round) + "，那时发布" + esc(h.age) + "</span>";
+      }).join("；");
+      return "<div class=srow><b>第 " + f.best + " 位</b> " + esc(f.project || "") + " · " +
+        trialLink(f.post_url, "打开帖子") + " · " + trialLink(f.record_url, "去飞书这一行") +
+        "<div class=muted style='margin-left:8px'>" + where + "</div></div>";
+    }).join("");
+    if (r.found_cut) html += "<div class=muted>清单太长，存的时候只留了名次靠前的一部分。</div>";
+    return html;
+  }
+  function trialTopHtml(j){
+    var lists = j.top || [], words = trialWords(j);
+    var html = "<div style='margin-top:24px'><b>每个词排在前面的帖子</b> <span class=muted>综合排序第 1 页，广告不算；只在这一页显示，不进报告</span></div>";
+    if (!lists.length) return html + "<div class=muted>还没有。第一轮跑的时候还不留标题和链接，要再跑一次综合排序的轮次才有：上面「隔一小时再查一遍」或「隔一天再查一遍」任选一个，按钮旁边写着最多花多少。</div>";
+    html += lists.map(function(l){
+      var notes = l.notes || [];
+      var word = l.word || words[l.k] || "";
+      var head = esc(l.k) + (word ? "　" + esc(word) : "") + " <span class=muted>" + notes.length + " 篇 · " +
+        esc(BUTTONS_LABEL[l.round] || l.round) + (l.at ? " · " + chinaTime(l.at * 1000, true) + " 拿的" : "") + "</span>";
+      var body = notes.map(function(n){
+        var stats = [n.liked ? "赞 " + esc(n.liked) : "", n.comments ? "评 " + esc(n.comments) : "",
+          n.collected ? "藏 " + esc(n.collected) : "",
+          n.type === "video" ? "视频" : (n.type === "normal" ? "图文" : "")].filter(Boolean).join(" · ");
+        return "<div class=srow>" + n.rank + ". " + trialLink(n.url, n.title ? esc(n.title) : "（没拿到标题）") +
+          (stats ? " <span class=muted>" + stats + "</span>" : "") + "</div>";
+      }).join("");
+      var notesTitled = notes.some(function(n){ return n.title; });
+      var tip = "";
+      if (notes.length && !notesTitled) tip += "<div class=muted>这一份没拿到标题：对方的字段名和代码猜的不一样。笔记里的键名是 " +
+        esc((l.keys || []).join("、") || "（没有）") + "，把这一句发给技术。</div>";
+      if (notes.some(function(n){ return !n.has_token; })) tip += "<div class=muted>有的链接没带 xsec_token，在浏览器里可能打不开；打不开就把标题复制到 App 里搜。</div>";
+      return "<details style='margin-top:8px'><summary>" + head + "</summary>" + tip + body + "</details>";
+    }).join("");
+    return html + "<div class=muted style='margin-top:8px'>链接里带的 xsec_token 是搜索那一刻给的，过几天会失效；打不开就复制标题到小红书 App 里搜。</div>";
+  }
+  var BUTTONS_LABEL = {first: "第一轮", latest: "最新排序那一轮", repeat1: "隔一小时再查一遍",
+    repeat2: "隔一天再查一遍", depth: "前两个词翻到第 10 页"};
   function renderTrial(){
     renderTrialStatus(); renderTrialActs();
     renderTrialJob(trialState ? trialState.job : null); renderTrialReport();
