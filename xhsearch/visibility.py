@@ -1082,6 +1082,8 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
         rounds[round_.name] = {
             "说明": round_.label,
             "词是当时记下的": recorded,
+            "词数": len(digests),
+            "每个词翻几页": round_.pages,
             "页": {"计划": round_.pages * len(digests), "拿到": have, "还差": need,
                    "失败过": sum(1 for f in state.data["failures"]
                               if f.get("round") == round_.name)},
@@ -1177,9 +1179,37 @@ def build_report(state: State, posts: list[Post], *, tz: timezone,
     return report
 
 
+def _found(bucket: dict[str, int]) -> int:
+    return sum(bucket.get(label, 0) for label in FOUND_BANDS)
+
+
+def _share(found: int, checked: int, unknown: int) -> str:
+    """搜到的比例。分母是查全了的篇数：没查全的说不准，不算进去。"""
+    if not checked:
+        return ""
+    pct = f"{found / checked:.0%}"
+    return f"（查全的 {checked} 篇里占 {pct}）" if unknown else f"（{pct}）"
+
+
 def _counts(bucket: dict[str, int]) -> str:
-    shown = [f"{label} {bucket[label]}" for label in RESULT_LABELS if bucket.get(label)]
-    return f"{bucket['篇数']} 篇" + (f"：{' · '.join(shown)}" if shown else "")
+    """一组帖子 → 「9 篇，搜到 0 篇（0%）」。搜到的再分档；只在付费位、没查全的单列。
+
+    2026-11-25 运营要的：每一组都直接写搜到的比例，不用自己拿篇数去除。
+    """
+    total = bucket["篇数"]
+    if not total:
+        return "0 篇"
+    found = _found(bucket)
+    unknown = bucket.get(INCOMPLETE, 0)
+    text = f"{total} 篇，搜到 {found} 篇{_share(found, total - unknown, unknown)}"
+    bands = [f"{label} {bucket[label]}" for label in FOUND_BANDS if bucket.get(label)]
+    if bands:
+        text += "：" + " · ".join(bands)
+    if bucket.get(PAID):
+        text += f"；只在付费位（广告）{bucket[PAID]} 篇，不算搜到"
+    if unknown:
+        text += f"；没查全（说不准，不算进比例）{unknown} 篇"
+    return text
 
 
 def render_report(report: dict[str, Any]) -> str:
@@ -1202,7 +1232,8 @@ def render_report(report: dict[str, Any]) -> str:
                         if read["太长没收的词"] else "")
                      + (f"；像一句话、整格没收的 {read['像整句话没收的格子']} 格"
                         if read.get("像整句话没收的格子") else "") + "。")
-    lines.append("词是表的：一张表里写过的词都算这张表的，这张表每一篇帖子和每一个词都对一遍。")
+    lines.append("怎么对：一张表「搜索关键词」列里写过的词都算这张表的。查的时候，拿这张表的"
+                 "**每一篇**帖子去每一个词的搜索结果里找，不看帖子的标题、正文、话题里有没有写这个词。")
     lines += ["", "## 先回答那个问题", ""]
     unread = report.get("读不懂的页") or {}
     if unread.get("页数"):
@@ -1217,27 +1248,46 @@ def render_report(report: dict[str, Any]) -> str:
         lines.append("第一轮里还没有「发布 3 天内」的帖子有结果——要么第一轮还没跑，"
                      "要么这几张表的帖子都超过 3 天了（看下面按帖龄的表）。")
     else:
+        unknown = answer["没查全的"]
         lines.append(
             f"发布 3 天内的帖子 {answer['3天内的帖子']} 篇，综合排序前 3 页里"
-            f"至少在一个词下面搜到 {answer['搜到的']} 篇，"
+            f"至少在一个词下面搜到 {answer['搜到的']} 篇"
+            + _share(answer["搜到的"], answer["3天内的帖子"] - unknown, unknown) + "，"
             f"哪个词下面都没搜到 {answer['没搜到的']} 篇"
             + (f"，只出现在付费位 {answer['只在付费位的']} 篇" if answer.get("只在付费位的") else "")
-            + (f"，没查全（说不准）{answer['没查全的']} 篇" if answer["没查全的"] else "") + "。")
+            + (f"，没查全（说不准）{unknown} 篇" if unknown else "") + "。")
+        if not answer["搜到的"] and answer["没搜到的"]:
+            lines.append("一篇都没搜到：先别急着下结论，手册（docs/搜索可见试跑.md）「五、报告怎么看」里"
+                         "「一篇都没搜到，先查这三件事」那一段，有不花钱就能查的办法。")
     lines.append("「没搜到」只是说前几页里没有，不等于没被收录；名次是供应商那一刻看到的，"
                  "不是某个读者看到的。")
     for name, block in report["各轮"].items():
         pages = block["页"]
+        words, per = block.get("词数"), block.get("每个词翻几页")
+        how = (f"{words} 个词，每个词翻 {per} 页，一共计划 {pages['计划']} 页"
+               if words is not None and per else f"计划 {pages['计划']} 页")
         lines += ["", f"## {block['说明']}（{name}）", "",
-                  f"页：计划 {pages['计划']}，拿到 {pages['拿到']}，还差 {pages['还差']}，"
+                  f"页：{how}；拿到 {pages['拿到']}，还差 {pages['还差']}，"
                   f"失败过 {pages['失败过']} 次。"]
         if not block.get("词是当时记下的", True):
             lines.append("这一轮是早先的进度文件，没记当时查的是哪几个词：下面的词是按留下的页和"
                          "失败记录推的，可能多列了没查过的词（列成「还没查」）。再跑一次这一轮就会记下。")
         size = block["每页笔记数"]
         if size:
-            lines.append(f"每页笔记数：最少 {size['最少']}，中位 {size['中位']:g}，最多 {size['最多']}。"
-                         f"像广告位的 {block['像广告位的条数']} 条，认不出笔记的 "
-                         f"{block['认不出笔记的条数']} 条。")
+            types = block.get("条目类型") or {}
+            ad_items = sum(int(n) for kind, n in types.items() if providers.is_ad_type(kind))
+            other, ad_notes = block["认不出笔记的条数"], block["像广告位的条数"]
+            line = (f"每页认得出的笔记：最少 {size['最少']} 篇，中位 {size['中位']:g}，"
+                    f"最多 {size['最多']}。")
+            if ad_items:
+                line += f"结果里有 {ad_items} 条是广告（类型名是 ads 一类），广告不算名次。"
+            if other:
+                line += (f"认不出是哪篇笔记的 {other} 条"
+                         + ("，就是这些广告。" if other == ad_items and not ad_notes
+                            else "，不算名次。"))
+            if ad_notes:
+                line += f"认得出笔记、但标着广告的 {ad_notes} 条，不算名次。"
+            lines.append(line)
         if block.get("查之后才发的帖子（不算）"):
             lines.append(f"有 {block['查之后才发的帖子（不算）']} 篇帖子是这一轮查完之后才发的，"
                          "不算在这一轮里（那时候它还不存在，搜不到说明不了什么）。")
@@ -1255,22 +1305,25 @@ def render_report(report: dict[str, Any]) -> str:
             lines += ["", "按评论数："]
             lines += [f"- {group}：{_counts(bucket)}"
                       for group, bucket in block["按评论数"].items()]
-        lines += ["", "按词（写了这个词的表的帖子，在这个词下面出现了几篇、排在哪一档）："]
+        lines += ["", "按词（每个词都拿这张表的全部帖子去对，不是只对标题、正文里写了这个词的帖子，"
+                      "所以每个词后面的篇数一样多。看的是这些帖子在这个词的搜索结果里出现了几篇、排在哪一档）："]
         for row in block["按词"]:
             total = row.get("帖子") or _blank()
             ages = "；".join(f"{band} {_counts(row['按帖龄'][band])}"
                             for band in AGE_BANDS if band in row["按帖龄"])
-            tail = (f"｜帖子 {_counts(total)}｜{ages}" if total["篇数"] else "｜没有帖子")
+            detail = ([f"  全部：{_counts(total)}", f"  按帖龄：{ages}"]
+                      if total["篇数"] else ["  这一轮没有要对的帖子"])
             if not row["拿到几页"]:
-                lines.append(f"- {row['词']}：还没查{tail if total['篇数'] else ''}")
+                lines += [f"- {row['词']}：还没查，一页都没拿到", *detail]
                 continue
-            state_text = "翻到底了" if row["翻到底了"] else ("查全了" if row["查全了"] else "没查全")
-            lines.append(f"- {row['词']}：拿到 {row['拿到几页']} 页，看了前 {row['看了前几位']} 位"
-                         f"（{state_text}）{tail}")
+            state_text = ("翻到底了，后面没有了" if row["翻到底了"]
+                          else ("查全了" if row["查全了"] else "没查全，有页没拿到"))
+            lines += [f"- {row['词']}：这个词翻了 {row['拿到几页']} 页，里面一共 {row['看了前几位']} 篇"
+                      f"笔记（广告不算；{state_text}）", *detail]
         if block["条目类型"] or block["条目键名"]:
-            lines += ["", "结果条目的类型：" + ("、".join(
+            lines += ["", "（给技术看）结果条目的类型：" + ("、".join(
                 f"{k} {v}" for k, v in block["条目类型"].items()) or "（没有）"),
-                      "结果条目里出现过的键名：" + ("、".join(block["条目键名"]) or "（没有）")]
+                      "（给技术看）结果条目里出现过的键名：" + ("、".join(block["条目键名"]) or "（没有）")]
     if report["名次稳不稳"]:
         lines += ["", "## 名次稳不稳（和第一轮比；一篇帖子在一个词下面算一次）", ""]
         for name, tally in report["名次稳不稳"].items():

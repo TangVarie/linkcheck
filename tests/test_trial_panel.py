@@ -781,7 +781,7 @@ class TestPaidRun(unittest.TestCase):
         text = made.status()["result"]["text"]
         self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇", text)
         self.assertIn("花费：发了 6 次请求", text)
-        self.assertIn("- K01：拿到 3 页", text)
+        self.assertIn("- K01：这个词翻了 3 页", text)
 
     def test_nothing_stored_or_logged_holds_client_material(self):
         logs = []

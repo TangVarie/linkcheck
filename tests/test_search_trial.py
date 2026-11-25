@@ -153,6 +153,11 @@ class TestSearchParse(unittest.TestCase):
         result = self.parse(body([item(1, kind="ads"), item(2, ads_info={"x": 1}), item(3)]))
         self.assertEqual([n["ad"] for n in result.data["notes"]], [True, True, False])
 
+    def test_ad_type_names_are_matched_by_word_not_substring(self):
+        self.assertEqual([providers.is_ad_type(k) for k in
+                          ("ads", "AD_card", "native-advert", "note", "hot_query", "load", None)],
+                         [True, True, True, False, False, False, False])
+
     def test_note_id_can_sit_on_the_item_itself(self):
         flat = {"note_id": nid(7).upper(), "display_title": "标题"}
         result = self.parse(body([flat]))
@@ -1087,8 +1092,10 @@ class TestReport(unittest.TestCase):
         self.assertEqual(block["按评论数"]["评论数到 20 条"]["没查全"], 1)
         self.assertEqual(block["按词"][1]["按帖龄"]["3天内"]["没查全"], 1)
         text = visibility.render_report(report)
-        self.assertIn("至少在一个词下面搜到 1 篇，哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", text)
-        self.assertIn("K02：还没查｜帖子 1 篇：没查全 1｜3天内 1 篇：没查全 1", text)
+        self.assertIn("至少在一个词下面搜到 1 篇（查全的 1 篇里占 100%），哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", text)
+        self.assertIn("- K02：还没查，一页都没拿到\n"
+                      "  全部：1 篇，搜到 0 篇；没查全（说不准，不算进比例）1 篇\n"
+                      "  按帖龄：3天内 1 篇，搜到 0 篇；没查全（说不准，不算进比例）1 篇", text)
 
     def test_posts_under_a_keyword_the_cap_stopped_before_are_incomplete(self):
         other = "另一个词"
@@ -1222,7 +1229,7 @@ class TestReport(unittest.TestCase):
                 self.assertNotIn(forbidden, content)
         text = text_path.read_text(encoding="utf-8")
         self.assertIn("K01", text)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇（50%），"
                       "哪个词下面都没搜到 1 篇", text)
         self.assertIn("first：unknown（HTTP 400）：1 次", text)
         self.assertIn("余额少了 $0.03", text)
@@ -1310,7 +1317,46 @@ class TestTableMatching(unittest.TestCase):
         self.assertEqual((rows["K02"]["篇数"], rows["K02"]["21到40"], rows["K02"]["41到60"],
                           rows["K02"]["没搜到"]), (5, 1, 1, 3))
         text = visibility.render_report(report)
-        self.assertIn("K01：拿到 3 页，看了前 60 位（查全了）｜帖子 5 篇：前20 1 · 没搜到 4", text)
+        self.assertIn("- K01：这个词翻了 3 页，里面一共 60 篇笔记（广告不算；查全了）\n"
+                      "  全部：5 篇，搜到 1 篇（20%）：前20 1\n", text)
+
+    def test_the_report_reads_plainly_when_nothing_is_found(self):
+        """2026-11-25 第一轮实测的样子：每页有几条类型是 `ads` 的广告（认不出笔记 ID），
+        我们的帖子一篇都没出现。运营看不懂的几处：「写了这个词的表的帖子」、每个词「拿到 3 页」
+        和总共 12 页对不上、广告被说成「认不出笔记的」、没有比例。"""
+        self.state.mark_round("first", AT, [visibility.keyword_hash(w) for w in (self.a, self.b)])
+        for word, start in ((self.a, 1000), (self.b, 2000)):
+            for page in (1, 2, 3):
+                ids = range(start + page * 100, start + page * 100 + 18)
+                self.state.keep_page("first", visibility.keyword_hash(word), page, {
+                    "notes": [{"note_id": nid(i), "ad": False} for i in ids],
+                    "items": 20, "other_items": 2, "model_types": {"note": 18, "ads": 2},
+                    "item_keys": ["ads", "model_type", "note"], "search_id": "s"}, AT)
+        table = (self.a, self.b)
+        posts = [self.post(9000 + i, table, age_days=age) for i, age in enumerate((1, 2, 5, 30))]
+        report, block = self.first(posts)
+        text = visibility.render_report(report)
+        self.assertIn("至少在一个词下面搜到 0 篇（0%），哪个词下面都没搜到 2 篇。", text)
+        self.assertIn("一篇都没搜到：先别急着下结论", text)
+        self.assertIn("页：2 个词，每个词翻 3 页，一共计划 6 页；拿到 6", text)
+        self.assertIn("结果里有 12 条是广告（类型名是 ads 一类），广告不算名次。"
+                      "认不出是哪篇笔记的 12 条，就是这些广告。", text)
+        self.assertNotIn("写了这个词的表的帖子", text)
+        self.assertIn("每个词都拿这张表的全部帖子去对，不是只对标题、正文里写了这个词的帖子", text)
+        self.assertIn("- K01：这个词翻了 3 页，里面一共 54 篇笔记（广告不算；查全了）\n"
+                      "  全部：4 篇，搜到 0 篇（0%）\n"
+                      "  按帖龄：3天内 2 篇，搜到 0 篇（0%）；4到7天 1 篇，搜到 0 篇（0%）；"
+                      "更早 1 篇，搜到 0 篇（0%）", text)
+        self.assertIn("- 3天内：2 篇，搜到 0 篇（0%）", text)
+        self.assertEqual((block["词数"], block["每个词翻几页"]), (2, 3))
+
+    def test_a_partly_found_group_shows_its_share_without_the_unchecked_posts(self):
+        bucket = {**visibility._blank(), "篇数": 5, "前20": 1, "41到60": 1, "没搜到": 1,
+                  "付费位": 1, "没查全": 1}
+        self.assertEqual(visibility._counts(bucket),
+                         "5 篇，搜到 2 篇（查全的 4 篇里占 50%）：前20 1 · 41到60 1；"
+                         "只在付费位（广告）1 篇，不算搜到；没查全（说不准，不算进比例）1 篇")
+        self.assertEqual(visibility._counts(visibility._blank()), "0 篇")
 
     def test_best_rank_wins_when_a_post_shows_under_two_keywords(self):
         self.keep(self.a, 1, [*range(100, 150), 7])       # 第 51 位
@@ -1631,7 +1677,7 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(sender.requests), 6)
         self.assertIn("新拿到 6 页", out)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇（50%），"
                       "哪个词下面都没搜到 1 篇", out)
         for forbidden in ("某某品牌", "第二个词", nid(100), "tikhub.", KEY):
             self.assertNotIn(forbidden, out)
@@ -1666,7 +1712,7 @@ class TestCommand(unittest.TestCase):
         self.assertIn("还差 3 页", out)
         # 词是表的：第一个词没查到，但另一个词下面搜到的那一篇照样算搜到；
         # 两个词下面都没有的那一篇，因为有一个词没查全，说不准。
-        self.assertIn("至少在一个词下面搜到 1 篇，哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", out)
+        self.assertIn("至少在一个词下面搜到 1 篇（查全的 1 篇里占 100%），哪个词下面都没搜到 0 篇，没查全（说不准）1 篇", out)
         with mock.patch.object(visibility, "_send_once", sender):       # 再跑补得上
             code, out = self.invoke()
         self.assertEqual(code, 0)
@@ -1678,7 +1724,7 @@ class TestCommand(unittest.TestCase):
         self.table._records.append(trial_record(998, "某某品牌", age_days=-1))
         code, out = self.invoke("--report-only")
         self.assertEqual(code, 0)
-        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇，"
+        self.assertIn("发布 3 天内的帖子 2 篇，综合排序前 3 页里至少在一个词下面搜到 1 篇（50%），"
                       "哪个词下面都没搜到 1 篇。", out)
         self.assertIn("有 1 篇帖子是这一轮查完之后才发的", out)
 
@@ -1816,7 +1862,7 @@ class TestCommand(unittest.TestCase):
             code, out = self.invoke()
         self.assertEqual((code, len(sender.requests)), (0, 6))     # 2 个词 × 3 页
         self.assertIn("读到 4 行，填了「搜索关键词」的 1 行", out)
-        self.assertIn("发布 3 天内的帖子 3 篇，综合排序前 3 页里至少在一个词下面搜到 2 篇，"
+        self.assertIn("发布 3 天内的帖子 3 篇，综合排序前 3 页里至少在一个词下面搜到 2 篇（67%），"
                       "哪个词下面都没搜到 1 篇", out)
         report = json.loads(pathlib.Path(self.dir.name, "report.json").read_text(encoding="utf-8"))
         self.assertEqual((report["词"], report["帖子"]), (2, 4))

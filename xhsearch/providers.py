@@ -700,6 +700,14 @@ _XHS_NOTE_ID_CHARS = frozenset("0123456789abcdef")
 # 广告怎么标对方文档没写。这里只认键名或类型名里明摆着带 ad 的；认出来的不计入
 # 自然排名。试跑报告会把一页里出现过的键名和类型名列出来，对着改这张表。
 _SEARCH_AD_KEYS = ("ads_info", "ad_info", "is_ads", "is_ad", "ads", "ad")
+_SEARCH_AD_TYPE_WORDS = frozenset({"ad", "ads", "advert", "advertisement"})
+
+
+def is_ad_type(kind: Any) -> bool:
+    """条目类型名看起来是不是广告（`ads`、`ad_card` 这种，按词认，不按子串）。
+    2026-11-25 第一轮实测：广告条目的类型就叫 `ads`，里面没有认得出的笔记 ID。"""
+    words = set(str(kind or "").lower().replace("_", " ").replace("-", " ").split())
+    return bool(words & _SEARCH_AD_TYPE_WORDS)
 
 
 def _is_xhs_note_id(value: Any) -> bool:
@@ -724,8 +732,7 @@ def _search_item(item: Any) -> tuple[Optional[str], bool, str]:
     kind = str(item.get("model_type") or card.get("model_type") or "")[:40]
     note_id = next((str(card[k]).lower() for k in ("note_id", "id")
                     if _is_xhs_note_id(card.get(k))), None)
-    words = set(kind.lower().replace("_", " ").replace("-", " ").split())
-    is_ad = bool(words & {"ad", "ads", "advert", "advertisement"})
+    is_ad = is_ad_type(kind)
     for holder in (item, card):
         if any(holder.get(k) for k in _SEARCH_AD_KEYS):
             is_ad = True
