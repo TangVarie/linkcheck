@@ -64,6 +64,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -715,20 +716,73 @@ def _is_xhs_note_id(value: Any) -> bool:
             and all(ch in _XHS_NOTE_ID_CHARS for ch in value.lower()))
 
 
+def _search_card(item: dict[str, Any]) -> dict[str, Any]:
+    """app_v2 把笔记本体包在 `items[].note` 里（web 端是 `note_card`），两种都认，
+    都不是就当它自己是笔记本体。"""
+    for key in ("note", "note_card"):
+        if isinstance(item.get(key), dict):
+            return item[key]
+    return item
+
+
+# 排在前面的笔记留几样给人看（2026-11-25 负责人定的：要能打开的链接、标题、点赞数）。
+# 字段名**没实测过**：第一轮只量了条目外层的键名（ads、model_type、note…），`note` 里面
+# 长什么样没看过。下面几种常见叫法都认，认不到就空着；`note_keys` 把 `note` 里出现过的
+# 键名（只有名字）带回去，对着改这张表。
+_DETAIL_TITLE = ("title", "display_title", "name")
+_DETAIL_COUNTS = {
+    "liked": ("liked_count", "like_count", "likes"),
+    "comments": ("comments_count", "comment_count"),
+    "collected": ("collected_count", "collect_count"),
+}
+_XSEC_TOKEN = re.compile(r"^[A-Za-z0-9+/=_.\-]{8,200}$")
+TITLE_MAX_CHARS = 60
+
+
+def _present(holder: Any, names: tuple[str, ...]) -> Any:
+    if not isinstance(holder, dict):
+        return None
+    for name in names:
+        value = holder.get(name)
+        if value is not None and value != "" and not isinstance(value, (dict, list, bool)):
+            return value
+    return None
+
+
+def _search_details(item: dict[str, Any], card: dict[str, Any]) -> dict[str, str]:
+    """一条笔记结果里给人看的几样 → {"title", "liked", "comments", "collected", "type",
+    "token"}，没有的键不出现。全是字符串：点赞数对方可能给「1.2万」这种。"""
+    out: dict[str, str] = {}
+    title = _present(card, _DETAIL_TITLE)
+    if title is not None:
+        text = " ".join(str(title).split())[:TITLE_MAX_CHARS]
+        if text:
+            out["title"] = text
+    interact = card.get("interact_info")
+    for name, keys in _DETAIL_COUNTS.items():
+        value = _present(card, keys)
+        if value is None:
+            value = _present(interact, keys)
+        if value is not None:
+            out[name] = str(value).strip()[:12]
+    kind = _present(card, ("type",))
+    if kind is not None:
+        out["type"] = str(kind)[:20]
+    token = _present(card, ("xsec_token",)) or _present(item, ("xsec_token",))
+    if token is not None and _XSEC_TOKEN.match(str(token)):
+        out["token"] = str(token)
+    return out
+
+
 def _search_item(item: Any) -> tuple[Optional[str], bool, str]:
     """搜索结果里的一条 →（笔记 ID 或 None, 像不像广告位, 类型名）。
 
-    app_v2 把笔记本体包在 `items[].note` 里（web 端是 `note_card`），两种都认，
-    都不是就当它自己是笔记本体。ID 认 `note_id` 或 `id`，必须是 24 位十六进制
+    ID 认 `note_id` 或 `id`，必须是 24 位十六进制
     ——话题卡、搜索建议卡这些也有 id，但不是这个形状。
     """
     if not isinstance(item, dict):
         return None, False, "非对象"
-    card = item
-    for key in ("note", "note_card"):
-        if isinstance(item.get(key), dict):
-            card = item[key]
-            break
+    card = _search_card(item)
     kind = str(item.get("model_type") or card.get("model_type") or "")[:40]
     note_id = next((str(card[k]).lower() for k in ("note_id", "id")
                     if _is_xhs_note_id(card.get(k))), None)
@@ -754,12 +808,15 @@ def _search_session(inner: dict[str, Any], core: dict[str, Any]) -> dict[str, st
 
 def _tikhub_search(inner: dict[str, Any], http_status: int, request_id: str,
                    api_key: str) -> Result:
-    """搜索那一页 → 归一化形状。**只留 ID、顺序和几个计数**，标题、作者、正文
-    一个字都不往外带：
+    """搜索那一页 → 归一化形状。留 ID、顺序、几个计数，和每条笔记给人看的几样
+    （标题、赞评藏、图文还是视频、打开链接要带的 xsec_token；2026-11-25 加的）。
+    作者、正文、图片一个字都不往外带：
 
-        {"notes": [{"note_id", "ad": bool}]（按页面顺序，只有认得出笔记 ID 的）,
+        {"notes": [{"note_id", "ad": bool, "detail": {见 _search_details}}]
+                  （按页面顺序，只有认得出笔记 ID 的；detail 一样都没认到就没有这个键）,
          "items": 这一页一共几条, "other_items": 认不出笔记 ID 的有几条,
          "model_types": {类型名: 条数}, "item_keys": [条目里出现过的键名],
+         "note_keys": [笔记本体里出现过的键名],
          "search_id", "search_session_id"（没给就没有这两个键）}
 
     成功信封实测过的只有外层（另一个仓库在用同一个端点）：
@@ -788,6 +845,7 @@ def _tikhub_search(inner: dict[str, Any], http_status: int, request_id: str,
     notes: list[dict[str, Any]] = []
     model_types: dict[str, int] = {}
     keys: set[str] = set()
+    note_keys: set[str] = set()
     other = 0
     for item in raw_items:
         note_id, is_ad, kind = _search_item(item)
@@ -797,13 +855,21 @@ def _tikhub_search(inner: dict[str, Any], http_status: int, request_id: str,
         if note_id is None:
             other += 1
             continue
-        notes.append({"note_id": note_id, "ad": is_ad})
+        card = _search_card(item)
+        if card is not item:
+            note_keys.update(str(k)[:40] for k in card)
+        note: dict[str, Any] = {"note_id": note_id, "ad": is_ad}
+        detail = _search_details(item, card)
+        if detail:
+            note["detail"] = detail
+        notes.append(note)
     return Ok({
         "notes": notes,
         "items": len(raw_items),
         "other_items": other,
         "model_types": model_types,
         "item_keys": sorted(keys)[:60],
+        "note_keys": sorted(note_keys)[:80],
         **_search_session(inner, core),
     }, request_id=request_id)
 

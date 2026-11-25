@@ -87,7 +87,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from . import panel_settings, providers, runner, shortlink, visibility
+from . import panel_settings, providers, runner, shortlink, summary, visibility
 
 KEY_PREFIX = "trial.search."
 KEY_STATE_PREFIX = KEY_PREFIX + "state."
@@ -416,10 +416,16 @@ class TrialStore:
         return value if isinstance(value, dict) else None
 
     def save_result(self, result: dict[str, Any]) -> None:
-        """最近一份报告的文字（只有计数）。存不上只是面板重启后看不到上一份，不影响账本。"""
+        """最近一份报告的文字（只有计数），和「搜到的帖子」那张清单（`found`）。
+        存不上只是面板重启后看不到上一份，不影响账本。一格装不下时先砍清单、留报告。"""
         text = json.dumps(result, ensure_ascii=False)
+        found = result.get("found")
+        while len(text) > panel_settings.CELL_MAX_CHARS and isinstance(found, list) and found:
+            found = found[:len(found) // 2]
+            text = json.dumps({**result, "found": found, "found_cut": True}, ensure_ascii=False)
         if len(text) > panel_settings.CELL_MAX_CHARS:
-            text = json.dumps({**result, "text": "", "note": "报告太长，没存进表里；点「只重出报告」再出一份"},
+            text = json.dumps({**result, "text": "", "found": [], "found_cut": bool(found),
+                               "note": "报告太长，没存进表里；点「只重出报告」再出一份"},
                               ensure_ascii=False)
         self.settings_store.write_text(KEY_RESULT, text)
 
@@ -559,6 +565,7 @@ class TableRead:
     label: str
     table_id: str = ""
     app_token: str = ""
+    route: str = "base"            # 飞书链接走 /base/ 还是 /wiki/，只用来拼给人点的链接
     column: str = COLUMN_OK        # 「搜索关键词」那一列：ok / missing / wrong_type / unreadable
     error: str = ""
     rows: int = 0
@@ -576,7 +583,8 @@ def read_tables(tables: Iterable[tuple[str, Any]], settings: Any) -> list[TableR
     out: list[TableRead] = []
     for label, table in tables:
         read = TableRead(label=label, table_id=str(getattr(table, "table_id", "") or ""),
-                         app_token=str(getattr(table, "app_token", "") or ""))
+                         app_token=str(getattr(table, "app_token", "") or ""),
+                         route=str(getattr(table, "route", "") or "base"))
         out.append(read)
         try:
             meta = table.fields_meta()
@@ -609,6 +617,11 @@ def read_tables(tables: Iterable[tuple[str, Any]], settings: Any) -> list[TableR
                                visibility.keyword_cell(cell, info.get("type"))))
         read.rows = len(records)
     return out
+
+
+def table_name(read: TableRead) -> str:
+    """一张表在 `visibility.Post.table` 里记成什么：app_token|table_id，不会重名。"""
+    return f"{read.app_token}|{read.table_id}"
 
 
 def table_words(pairs: list) -> list[str]:
@@ -708,8 +721,10 @@ class Trial:
                  resolver: Optional[Callable[[], Callable[[str], Optional[str]]]] = None,
                  balance: Optional[Callable[[], Optional[float]]] = None,
                  spawn: Callable[[Callable[[], None]], None] = _spawn_thread,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print,
+                 feishu_base: str = "https://feishu.cn"):
         self._tables = tables
+        self.feishu_base = feishu_base
         self.store = store
         self.settings = settings
         self.api_key = api_key
@@ -728,8 +743,9 @@ class Trial:
     def _survey(self, *, resolve: Optional[Callable[[str], Optional[str]]] = None,
                 state: Optional[visibility.State] = None) -> _Survey:
         reads = read_tables(self._tables(), self.settings)
-        info = visibility.intake([r.pairs for r in reads if r.column == COLUMN_OK],
-                                 resolve=resolve)
+        usable = [r for r in reads if r.column == COLUMN_OK]
+        info = visibility.intake([r.pairs for r in usable], resolve=resolve,
+                                 names=[table_name(r) for r in usable])
         out = _Survey(reads=reads, info=info, state=state)
         if out.state is None:
             try:
@@ -766,7 +782,7 @@ class Trial:
                        "keyword_chars": visibility.MAX_KEYWORD_CHARS},
             "column": self.settings.fields.search_keywords,
             "job": self.job(), "tables": [], "rounds": [], "problem": "", "lease": None,
-            "result": None, "ledger": None, "keywords": None,
+            "result": None, "ledger": None, "keywords": None, "top": [],
         }
         try:
             survey = self._survey()
@@ -802,6 +818,8 @@ class Trial:
         out["ledger"] = {"calls": state.calls, "yuan": round(state.yuan, 2),
                          "calls_left": visibility.MAX_CALLS - state.calls,
                          "yuan_left": round(visibility.MAX_YUAN - state.yuan, 2)}
+        # 每个词排在前面的笔记（标题、链接）：只给登录了的这一页，不进报告。
+        out["top"] = self._top_lists(state, survey)
         known = set(state.data["keywords"])
         seen = {visibility.keyword_hash(w) for w in info.keywords}
         total = len(known | seen)
@@ -1007,7 +1025,7 @@ class Trial:
                     "再点一次同一个按钮只补没拿到的")
         elif result.todo:
             job.say(f"  还差 {result.todo} 页没拿到。再点一次同一个按钮只补这几页")
-        self._publish(job, state, survey.info)
+        self._publish(job, state, survey)
 
     def _read_balance(self) -> Optional[float]:
         if self._balance is None:
@@ -1017,18 +1035,51 @@ class Trial:
         except Exception:                                       # noqa: BLE001
             return None
 
-    def _publish(self, job: Job, state: visibility.State, info: visibility.Intake) -> None:
-        """出报告（只有计数），存一份到表里：刷新页面、重新部署之后都还看得到。"""
+    def _publish(self, job: Job, state: visibility.State, survey: _Survey) -> None:
+        """出报告（只有计数），存一份到表里：刷新页面、重新部署之后都还看得到。
+
+        同一份里还存着「我们自己被搜到的帖子」那张清单（`found`，2026-11-25 加的）：
+        帖子链接、飞书那一行。它只在登录了的面板页上显示，不在报告文字里，
+        「复制报告」不会带上它。"""
+        info = survey.info
+        tz = self.settings.display.tz()
         report = visibility.build_report(
-            state, info.posts, tz=self.settings.display.tz(),
+            state, info.posts, tz=tz,
             comment_floor=self.settings.thresholds.tier_evaluating,
             intake_info=info, now=self._clock())
         try:
             self.store.save_result({"at": int(self._clock()), "kind": job.kind,
                                     "round": job.round, "run": job.run,
-                                    "text": visibility.render_report(report)})
+                                    "text": visibility.render_report(report),
+                                    "found": self._found_list(state, survey, tz)})
         except Exception as exc:                                # noqa: BLE001
             job.say(f"  ⚠ 报告没存进表里（{type(exc).__name__}）；点「只重出报告」再出一份")
+
+    def _found_list(self, state: visibility.State, survey: _Survey, tz: Any) -> list[dict]:
+        """`visibility.found_posts` 加上项目名和飞书那一行的链接。"""
+        tables = {table_name(r): r for r in survey.reads}
+        out = []
+        for entry in visibility.found_posts(state, survey.info.posts, tz=tz):
+            read = tables.get(entry["table"])
+            record = ""
+            if read is not None and entry["record_id"]:
+                record = summary.record_url(self.feishu_base, read.app_token, read.table_id,
+                                            entry["record_id"], route=read.route)
+            out.append({"project": read.label if read is not None else "",
+                        "record_url": record, "post_url": entry["url"],
+                        "note_id": entry["note_id"], "best": entry["best"],
+                        "hits": entry["hits"]})
+        return out
+
+    def _top_lists(self, state: visibility.State, survey: _Survey) -> list[dict]:
+        """每个词排在前面的笔记，词的原文跟着（只给登录了的页面）。"""
+        words = {digest: word for word, digest in survey.ordered}
+        out = []
+        for entry in visibility.top_lists(state):
+            digest = entry.pop("digest")
+            entry["word"] = words.get(digest, "")
+            out.append(entry)
+        return out
 
     # —— 只重出报告（不花钱）——
 
@@ -1059,7 +1110,7 @@ class Trial:
             if stale:
                 job.refused = stale
                 return
-            self._publish(job, survey.state, survey.info)
+            self._publish(job, survey.state, survey)
             job.say("报告出好了（没发付费请求，账本没动）")
         except Exception as exc:                                # noqa: BLE001
             job.error = f"出报告的时候出错了（{type(exc).__name__}）"

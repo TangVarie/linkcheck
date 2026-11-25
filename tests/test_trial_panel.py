@@ -763,6 +763,67 @@ class TestDryRunAndReportOnly(unittest.TestCase):
         self.assertEqual(self.table.keys(), [trial.KEY_RESULT])
 
 
+class TestPanelLists(unittest.TestCase):
+    """2026-11-25：报告下面的两张清单。只在登录了的这一页上，不在报告文字里。"""
+
+    def setUp(self):
+        self.table = SettingsTable()
+
+    def test_the_found_list_rides_with_the_report_and_links_to_the_row(self):
+        business = two_word_table()
+        business.app_token, business.route = "bascnBIZ", "wiki"
+        made = make_trial(self.table, [("甲表", business)], Sender(default=by_page))
+        made.feishu_base = "https://acme.feishu.cn"
+        made.start("first", 6)
+        result = made.status()["result"]
+        found = result["found"]
+        self.assertEqual([(f["note_id"], f["best"]) for f in found], [(nid(100), 1), (nid(300), 41)])
+        self.assertEqual(found[0]["project"], "甲表")
+        self.assertEqual(found[0]["record_url"],
+                         "https://acme.feishu.cn/wiki/bascnBIZ?table=tblTRIAL&record=rec100")
+        self.assertEqual(found[0]["post_url"], f"https://www.xiaohongshu.com/explore/{nid(100)}")
+        self.assertEqual([(h["k"], h["rank"]) for h in found[0]["hits"]], [("K01", 1), ("K02", 1)])
+        self.assertNotIn(nid(100), result["text"])
+
+    def test_report_only_rebuilds_the_found_list_for_free(self):
+        sender = Sender(default=by_page)
+        made = make_trial(self.table, [("甲表", two_word_table())], sender)
+        made.start("first", 6)
+        self.table.rows = [r for r in self.table.rows
+                           if r["fields"][panel_settings.COL_KEY] != trial.KEY_RESULT]
+        made.report_only()
+        self.assertEqual(len(made.status()["result"]["found"]), 2)
+        self.assertEqual(len(sender.requests), 6)                   # 没再发请求
+
+    def test_status_carries_the_top_lists_with_the_word(self):
+        made = make_trial(self.table, [("甲表", two_word_table())], Sender(default=by_page))
+        self.assertEqual(made.status()["top"], [])                  # 还没跑过
+        made.start("first", 6)
+        top = made.status()["top"]
+        self.assertEqual([(e["k"], e["word"], e["round"]) for e in top],
+                         [("K01", WORD_A, "first"), ("K02", WORD_B, "first")])
+        self.assertEqual(len(top[0]["notes"]), 20)
+        self.assertEqual((top[0]["notes"][0]["rank"], top[0]["notes"][0]["title"]),
+                         (1, "某某品牌的标题"))
+        self.assertNotIn("digest", top[0])
+
+    def test_an_oversized_found_list_is_cut_before_the_report_is(self):
+        store = trial_store(self.table)
+        found = [{"note_id": nid(i), "record_url": "https://feishu.cn/" + "x" * 900}
+                 for i in range(300)]
+        store.save_result({"at": 1, "text": "报告", "found": found})
+        saved = json.loads(self.table.value(trial.KEY_RESULT))
+        self.assertEqual(saved["text"], "报告")
+        self.assertTrue(saved["found_cut"])
+        self.assertTrue(0 < len(saved["found"]) < 300)
+        self.assertEqual(saved["found"][0]["note_id"], nid(0))      # 留的是名次靠前的
+
+    def test_the_page_script_has_both_lists(self):
+        for name in ("function trialFoundHtml", "function trialTopHtml", "去飞书这一行",
+                     "每个词排在前面的帖子"):
+            self.assertIn(name, panel_view._SCRIPT)
+
+
 class TestPaidRun(unittest.TestCase):
     def setUp(self):
         self.table = SettingsTable()
@@ -788,11 +849,17 @@ class TestPaidRun(unittest.TestCase):
         made = make_trial(self.table, self.tables, Sender(default=by_page))
         made.log = logs.append
         job = made.start("first", 6)
-        everything = json.dumps([r["fields"] for r in self.table.rows], ensure_ascii=False) \
-            + "\n".join(logs) + "\n".join(job["lines"])
+        said = "\n".join(logs) + "\n".join(job["lines"])
         for forbidden in (WORD_A, WORD_B, "某某品牌的标题", "某某昵称", "xiaohongshu.com", KEY):
-            self.assertNotIn(forbidden, everything)
-        self.assertNotIn(nid(100), self.table.value(trial.KEY_RESULT))      # 报告里没有笔记 ID
+            self.assertNotIn(forbidden, said)                               # 日志、进度里都没有
+        stored = json.dumps([r["fields"] for r in self.table.rows], ensure_ascii=False)
+        for forbidden in ("某某昵称", "正文正文", KEY):
+            self.assertNotIn(forbidden, stored)                             # 存的东西里也没有
+        result = json.loads(self.table.value(trial.KEY_RESULT))
+        for forbidden in (WORD_A, WORD_B, "某某品牌的标题", nid(100)):
+            self.assertNotIn(forbidden, result["text"])                     # 报告里没有词、标题、笔记 ID
+        # 「搜到的帖子」清单跟着报告存着（只给登录了的页面看）。
+        self.assertEqual([f["note_id"] for f in result["found"]], [nid(100), nid(300)])
 
     def test_the_confirmed_maximum_is_rechecked_on_the_server(self):
         """页面上确认的是「最多 3 次」，真要发 6 次：不跑，一分钱不花。"""
@@ -1169,6 +1236,15 @@ class TestSwitch(unittest.TestCase):
         projects = self.projects(table)
         self.assertEqual([label for label, _t in projects.trial_tables()], ["甲表"])
         self.assertEqual(projects.trial_tables()[0][1].table_id, "tblAAA")
+
+    def test_a_wiki_table_keeps_its_route_for_the_row_links(self):
+        """「搜到的帖子」清单里「去飞书这一行」的链接：知识库里的表要走 /wiki/。"""
+        table = RegistryTable({**OLD_COLUMNS, registry.COL_SEARCH_CHECK: 7}, [registry_row(**{
+            registry.COL_SEARCH_CHECK: True,
+            registry.COL_TARGET: "https://acme.feishu.cn/wiki/wikcnAAA?table=tblAAA"})])
+        _label, business = self.projects(table).trial_tables()[0]
+        self.assertEqual((business.app_token, business.table_id, business.route),
+                         ("wikcnAAA", "tblAAA", "wiki"))
 
     def test_a_disabled_table_is_not_read_by_the_trial(self):
         table = RegistryTable({**OLD_COLUMNS, registry.COL_SEARCH_CHECK: 7}, [
