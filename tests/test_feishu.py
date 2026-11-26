@@ -129,6 +129,16 @@ class TestTransientReadRetry(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(slept.call_count, 1)
 
+    def test_an_internal_error_on_a_read_is_retried_too(self):
+        """1255001 InternalError：2026-11-26 14:44–14:54 飞书抖了十分钟，cron 两轮读
+        「途鸽第一期」各报一次、整张跳过、退出码 1，Railway 记成失败；同一轮别的表照常。"""
+        records, sent, slept = self._search([
+            feishu_err(feishu.INTERNAL_ERROR_CODE, "InternalError"),
+            ok({"items": [{"record_id": "rec1"}], "has_more": False}),
+        ])
+        self.assertEqual([r["record_id"] for r in records], ["rec1"])
+        self.assertEqual((len(sent), slept.call_count), (2, 1))
+
     def test_it_gives_up_after_a_bounded_number_of_tries_and_says_so(self):
         with self.assertRaises(feishu.FeishuError) as ctx:
             self._search([feishu_err(1254002, "Fail")] * feishu._READ_ATTEMPTS)
