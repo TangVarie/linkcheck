@@ -739,8 +739,8 @@ def _call(
                 protocol.Failure.UNKNOWN, "unsupported_link",
                 f"当前可用通道（{'、'.join(usable)}）不支持这种链接形态："
                 f"无法从链接中提取{call.platform}作品 ID。"
-                "请在表里贴含数字 ID 的完整链接，或配置 SOCIALDATAX_API_KEY"
-                "（SocialDataX 直接吃短链和分享文案）",
+                "请在表里贴含数字 ID 的完整链接，或配置 SOCIALDATAX_API_KEY 并在面板"
+                "「余额」那一栏打开 SocialDataX 备用通道（它直接吃短链和分享文案）",
             )
         return protocol.Err(
             protocol.Failure.AUTH, "no_channel",
