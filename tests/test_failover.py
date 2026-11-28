@@ -202,6 +202,34 @@ class TestFailover(FailoverTest):
         self.assertFalse(report.fatal)
         self.assertEqual(report.outcomes[0].status, runner.STATUS_OK)
 
+    def test_a_tikhub_400_outage_is_caught_by_the_standby(self):
+        """2026-11-28：TikHub 整段回 400，以前每一行都「刷新失败」、备胎一次没试。"""
+        rows = [xhs_row(f"rec{i}") for i in range(3)]
+        report = self.run_with(
+            on_get=lambda i: tikhub_err(400, "请求失败，请重试。本次请求不会被扣费。"),
+            on_post=lambda i: sdx_ok_comments() if i % 2 == 0 else sdx_ok_detail(),
+            rows=rows,
+        )
+        self.assertEqual([o.status for o in report.outcomes], [runner.STATUS_OK] * 3)
+        self.assertEqual(report.used_providers, {"socialdatax": 6})
+        # 400 不计费：这一轮的账只有 SocialDataX 那几次。
+        self.assertAlmostEqual(report.cost_yuan, 0.10 * 6, places=6)
+
+    def test_a_400_does_not_blacklist_tikhub_for_the_round(self):
+        """400 可能只是这一行的事（参数它不认）：不能像 401 那样整轮拉黑，
+        下一行照样先问 TikHub——它是便宜的那一家。"""
+        rows = [xhs_row(f"rec{i}") for i in range(2)]
+        replies = iter([tikhub_err(400, "请求失败，请重试。本次请求不会被扣费。"),
+                        tikhub_ok_detail(), tikhub_ok_comments(), tikhub_ok_detail()])
+        report = self.run_with(
+            on_get=lambda i: next(replies),
+            on_post=lambda i: sdx_ok_comments(),
+            rows=rows,
+        )
+        self.assertEqual([o.status for o in report.outcomes], [runner.STATUS_OK] * 2)
+        self.assertEqual(len(self.post_calls), 1)
+        self.assertEqual(len(self.get_calls), 4)
+
     def test_both_channels_down_is_finally_fatal(self):
         report = self.run_with(
             on_get=lambda i: tikhub_err(401, "无效的API令牌"),
@@ -497,7 +525,7 @@ class TestXhsShortLinkExpansion(FailoverTest):
     def test_a_400_after_a_failed_expansion_says_both(self):
         report = self.run_with(
             on_get=lambda i: tikhub_err(400, "请求失败，请重试。本次请求不会被扣费。"),
-            on_post=lambda i: self.fail("400 不该换通道"),
+            on_post=lambda i: self.fail("只配了 TikHub，没有备胎可换"),
             rows=[self._row()], keys={"tikhub": "t-key"})
         reason = report.outcomes[0].fields[self.settings.fields.failure_reason]
         self.assertIn("请求失败", reason)

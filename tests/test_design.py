@@ -57,9 +57,14 @@ def render() -> str:
                            unit="USD", yuan=90.0, rate=7.2)]
     rw = panel.Runway(days=9.0, yuan_per_day=14.6, yuan_left=132.0,
                       runs_used=12, hours_covered=24.0)
+    # 备用通道开关卡和「全部刷新失败」那条带子也进 fixture：金额带 num、数字和量词之间
+    # 留空格、不许 emoji 这几条，新加的文案一样要守。
+    from xhsearch import channels, standby
+    switch = standby.View(state=standby.State(enabled=False), platforms=("xhs", "douyin"))
+    streak = channels.FailingStreak(runs=3, rows=12, since=1756200000.0)
     return panel_view.overview_page(
         overview=ov, error="", fetched_at=1756209600.0, config=cfg,
-        balances=bal, runway=rw, runs=[FakeRun()])
+        balances=bal, runway=rw, runs=[FakeRun()], standby=switch, streak=streak)
 
 
 # tokens/palette.json v5.1 的 screen 节（light + dark）+ brand 节 + 中性值。

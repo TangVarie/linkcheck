@@ -308,6 +308,38 @@ class TestTikhubErrors(unittest.TestCase):
             "xhs", "comments", 502, "text/html", "<html>bad gateway</html>", "", KEY)
         self.assertIs(res.kind, Failure.TRANSPORT)
 
+    # 2026-11-28 那五个半小时里 TikHub 每一次都回的原文。
+    OUTAGE_400 = json.dumps({"detail": {
+        "code": 400, "request_id": "d8b34cae",
+        "message_zh": "请求失败，请重试。请查看下方文档核对参数，使用默认演示参数测试，"
+                      "并将响应 JSON 提交给支持团队。本次请求不会被扣费。"}},
+        ensure_ascii=False)
+
+    def test_a_400_on_a_monitoring_endpoint_lets_the_standby_try(self):
+        """以前归 UNKNOWN：不在 FAILOVER_KINDS 里，备胎一次都不试。"""
+        for platform, purpose in (("xhs", "comments"), ("xhs", "detail"),
+                                  ("douyin", "comments"), ("douyin", "detail")):
+            with self.subTest(platform=platform, purpose=purpose):
+                res = providers.get_provider("tikhub").parse(
+                    platform, purpose, 400, "application/json", self.OUTAGE_400, "", KEY)
+                self.assertIsInstance(res, Err)
+                self.assertIs(res.kind, Failure.TRANSPORT)
+                self.assertIn(res.kind, providers.FAILOVER_KINDS)
+                self.assertFalse(res.definitive)
+                self.assertIn("请求失败", res.message)
+                self.assertEqual(res.request_id, "d8b34cae")
+
+    def test_a_400_is_not_billed_so_switching_costs_one_call_not_two(self):
+        from xhsearch import runner
+        res = self.parse(400, self.OUTAGE_400)
+        self.assertFalse(runner._was_billed("tikhub", res))
+
+    def test_a_400_on_search_stays_row_level(self):
+        """搜索只走 TikHub，没有备胎可换；归 TRANSPORT 只会让试跑多记一笔账。"""
+        res = providers.get_provider("tikhub").parse(
+            "xhs", providers.SEARCH, 400, "application/json", self.OUTAGE_400, "", KEY)
+        self.assertIs(res.kind, Failure.UNKNOWN)
+
 
 class TestChannels(unittest.TestCase):
     def test_default_prefers_tikhub_but_keeps_a_spare(self):

@@ -2824,6 +2824,29 @@ _SCRIPT = r"""
       }
     });
   }
+
+  // ---- SocialDataX 备用通道开关（见 xhsearch/standby.py）----
+  // 按钮可能在三处：余额区的开关卡、顶部「全部刷新失败」那条带子、「发不出请求了」那条带子。
+  // 写的只是「面板设置」里一格，不发付费请求；改完重载，三处和卡片上的状态一起换。
+  document.addEventListener("click", function(e){
+    var b = e.target.closest ? e.target.closest("button[data-standby]") : null;
+    if (!b) return;
+    var on = b.dataset.standby === "on";
+    // 报错要说在点的地方：顶上那条带子里点的，卡片里的状态行在页面底下，看不见。
+    var status = b.closest("#standbyBox") ? document.getElementById("standbyStatus") : null;
+    function sayStandby(msg){ if (status) status.textContent = msg; else if (msg) alert(msg); }
+    if (on && !confirm("打开 SocialDataX 备用通道？\n\n从下一轮 cron 起（5 分钟内），TikHub 失败的请求改走 SocialDataX，每次扣它一次积分；小红书走它的那几轮不判置顶、不扫蓝词。\n\nTikHub 恢复了记得回来关掉。")) return;
+    b.disabled = true;
+    fetch("/api/standby", {method: "POST",
+      headers: {"X-Panel-Token": token, "Content-Type": "application/json"},
+      body: JSON.stringify({enabled: on})})
+      .then(function(r){ return r.json().then(function(j){
+        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        if (status) status.textContent = (j.enabled ? "已打开" : "已关掉") + "，页面重载中…";
+        location.reload();
+      }); })
+      .catch(function(err){ b.disabled = false; sayStandby("没改成：" + errText(err)); });
+  });
 })();
 """
 
@@ -3681,7 +3704,90 @@ def _trial_section() -> str:
 </div>"""
 
 
-def _outage_note(outages) -> str:
+_PLATFORM_LABELS = {"xhs": "小红书", "douyin": "抖音"}
+
+
+def _standby_button(view, *, enabled: bool, primary: bool) -> str:
+    """开 / 关备用通道的那个按钮。改不了的时候不出按钮——出一个灰按钮让人去点，
+    不如直接把为什么改不了写出来（卡片里写着）。"""
+    if view is None or not view.writable:
+        return ""
+    label = "打开 SocialDataX 备用通道" if enabled else "关掉备用通道"
+    cls = " class=primary" if primary else ""
+    return (f"<button type=button{cls} data-standby={'on' if enabled else 'off'}>"
+            f"{label}</button>")
+
+
+def _standby_box(view, offset_hours: float = 8.0) -> str:
+    """余额区里那张「SocialDataX 备用通道」开关卡。管不着（SocialDataX 在哪儿都不是
+    备胎）就不出。语义见 standby.py：默认关，TikHub 出事时运营在这里打开。"""
+    if view is None or not view.relevant:
+        return ""
+    state = view.state
+    where = "、".join(_PLATFORM_LABELS.get(p, p) for p in view.platforms)
+    if state.error and not state.locked:
+        chip = "<span class='chip a'>读不到，按关处理</span>"
+        now = (f"读不到这个开关（{_e(state.error)}）。cron 读不到时也按<b>关</b>处理，"
+               "所以这会儿 TikHub 失败的请求不会改走 SocialDataX。")
+    elif state.enabled:
+        chip = "<span class='chip g'>已打开</span>"
+        when = (f"，{_e(_stamp(state.changed_at_ms, offset_hours))} 打开的"
+                if state.changed_at_ms else "")
+        now = (f"{where}的请求先走 TikHub；TikHub 失败的那一次改走 SocialDataX 顶上{when}。"
+               "TikHub 好好的时候它一次都不会被用到，用到一次扣一次 SocialDataX 的积分。")
+    else:
+        chip = "<span class='chip o'>已关闭</span>"
+        now = (f"{where}只走 TikHub。TikHub 发不出请求（余额用完、整段报错）的那几轮，"
+               "到期的行会直接「刷新失败」，不会改走 SocialDataX。")
+    cost = ("<p class=muted>打开之后：每次顶上来扣 SocialDataX 一次（<span class=num>¥0.10</span>），"
+            "小红书比 TikHub 贵约四成、抖音贵十几倍；小红书走它的那几轮<b>不判置顶、不扫蓝词</b>"
+            "（置顶那一列不碰，不会写错）。TikHub 恢复了就回来关掉。</p>")
+    if not view.writable:
+        foot = f"<p class=muted>面板上改不了：{_e(view.why_locked)}</p>"
+    elif not view.key_seen:
+        foot = ("<p class=muted>改了从下一轮 cron 起生效（5 分钟内）。面板服务上没配 "
+                "<code>SOCIALDATAX_API_KEY</code>，看不到 cron 那边配没配——没配的话开了也没有用。</p>")
+    else:
+        foot = ("<p class=muted>改了从下一轮 cron 起生效（5 分钟内）。已经「刷新失败」的行要等"
+                "各自的下次检查时间；急的话在上面「要人管的行」里勾上它们点「排队刷新」。</p>")
+    button = _standby_button(view, enabled=not state.enabled, primary=not state.enabled)
+    acts = (f"<div class=row>{button}<span class=muted id=standbyStatus role=status "
+            f"aria-live=polite></span></div>" if button else "")
+    return (f"<div class=addbox id=standbyBox><p class=addbox-t>SocialDataX 备用通道 {chip}</p>"
+            f"<p>{now}</p>{cost}{acts}{foot}</div>")
+
+
+def _streak_note(streak, view, offset_hours: float = 8.0) -> str:
+    """「最近连着几轮一行都没刷成」那条告警带（见 channels.failing_streak）。
+
+    2026-11-28 TikHub 整段回 400 时，余额卡全是绿的，面板上唯一的痕迹是待办里一行行
+    冒出来的「刷新失败」——看着像几条帖子的事，而不是整条通道停了。
+    """
+    if streak is None:
+        return ""
+    since = (f"自 {_e(_stamp(int(streak.since * 1000), offset_hours))} 起，"
+             if streak.since else "")
+    head = (f"<b>{since}最近 {streak.runs} 轮处理的 {streak.rows} 行全部「刷新失败」</b>，"
+            "一行都没取成功。这不像是哪几条帖子的问题，多半是数据通道出了事"
+            "（2026-11-28 那次就是 TikHub 对每个请求都回 400）。"
+            "具体原因看下面「运行历史」和待办里那几行的诊断信息。")
+    if view is not None and view.relevant and not view.state.enabled:
+        if view.writable:
+            act = ("<div style='margin-top:8px'>SocialDataX 备用通道现在关着。确认是 TikHub 的问题，"
+                   "可以先打开它顶上：" + _standby_button(view, enabled=True, primary=False)
+                   + "</div>")
+        else:
+            act = (f"<div style='margin-top:8px'>SocialDataX 备用通道现在关着，面板上改不了："
+                   f"{_e(view.why_locked)}</div>")
+    elif view is not None and view.relevant and view.state.enabled:
+        act = ("<div style='margin-top:8px'>SocialDataX 备用通道<b>已经开着</b>，还是全部失败："
+               "两家都不通，或者问题不在数据通道（看诊断信息）。</div>")
+    else:
+        act = ""
+    return (f"<div class=problem>{_icon('alert-circle')}<span>{head}{act}</span></div>")
+
+
+def _outage_note(outages, standby=None) -> str:
     """「有通道发不出请求了」那条告警带。**放在最上面**，在别的提示之前。
 
     它要回答的不是「余额还剩多少」（那是下面余额区的事），而是运营此刻真正
@@ -3736,22 +3842,32 @@ def _outage_note(outages) -> str:
            "去对应后台充值即可恢复；充值后受影响的行会按各自节奏自动刷回来，"
            "但<b>发布超过 30 天的行已归档、不再自动刷</b>，要手动勾「排队刷新」。"
            "</div>")
+    if (standby is not None and standby.relevant and not standby.state.enabled
+            and any(o.stopped for o in outages)):
+        # 没有备胎是因为备用通道关着（它的 Key 是配着的）：充值之前能先做的一件事。
+        button = _standby_button(standby, enabled=True, primary=False)
+        fix += ("<div style='margin-top:8px'>SocialDataX 备用通道关着，所以没有通道顶上。"
+                + ("充值到账之前可以先打开它：" + button if button
+                   else f"面板上改不了：{_e(standby.why_locked)}") + "</div>")
     return (f"<div class=problem>{_icon('alert-triangle')}"
             f"<span>{''.join(blocks)}{fix}</span></div>")
 
 
-def _balance_section(balances, balance_error: str, runway, config, outages=()) -> str:
-    """余额那一块。
+def _balance_section(balances, balance_error: str, runway, config, outages=(),
+                     standby=None, offset_hours: float = 8.0) -> str:
+    """余额那一块，连同「SocialDataX 备用通道」那张开关卡（它和两家的余额是同一件事：
+    此刻靠谁在跑、跑不动了怎么办）。
 
     ⚠️ **读不到就说读不到，绝不显示 ¥0。** 真的余额为 0 和读不到余额，
     要人做的事完全相反（一个去充值，一个去查 Key），而 ¥0 长得像前者。
     这和「缺列时 estimate 报 ¥0.00」是同一类错误。
     """
+    switch = _standby_box(standby, offset_hours)
     if not balances and not balance_error:
-        return ""
+        return f"<h2 id=s-balance>余额</h2>{switch}" if switch else ""
     if not balances:
         return (f"<h2 id=s-balance>余额</h2><div class=empty>"
-                + _icon("wallet") + f"{_e(balance_error)}</div>")
+                + _icon("wallet") + f"{_e(balance_error)}</div>{switch}")
 
     warn_days = getattr(config, "runway_warn_days", 14.0)
     alert_days = getattr(config, "runway_alert_days", 5.0)
@@ -3817,7 +3933,7 @@ def _balance_section(balances, balance_error: str, runway, config, outages=()) -
            f"取余额失败：{_e(balance_error)}，"
            "下面是上一次还能用的读数。</span></div>" if balance_error else "")
     return (f"<h2 id=s-balance>余额</h2>{err}{note}"
-            f"<div class=grid>{''.join(cards)}</div>"
+            f"<div class=grid>{''.join(cards)}</div>{switch}"
             "<p class=foot-note>这两个查询端点是两家"
             "<b>官方标明零费用</b>的（TikHub 计价表 <code>endpoint_cost: 0.0</code>；"
             "SocialDataX <code>x-socialdatax-cost-points: 0</code>）—— "
@@ -3919,7 +4035,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
                   runs=None, log_error: str = "",
                   balances=None, balance_error: str = "", runway=None,
                   outages=None, offset_hours: float = 8.0,
-                  resolvable: bool = False, reports=None) -> str:
+                  resolvable: bool = False, reports=None,
+                  standby=None, streak=None) -> str:
     # resolvable = 面板接上了注册表、「已解决」有地方存（见 panel.Resolutions）。
     if overview is None:
         # 四态里的「骨架加载」。给骨架而不是一句「正在取数」，是因为这一屏
@@ -4044,7 +4161,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
         # 余额整块读失败时 `_balance_section` 仍然渲染一个 id=s-balance 的
         # 错误区块——侧栏这边也得有入口，否则「余额出事了」这个信息恰好在
         # 它最该出现的时候从导航里消失。
-        balances=bool(balances) or bool(balance_error))
+        balances=(bool(balances) or bool(balance_error)
+                  or bool(standby is not None and standby.relevant)))
     when = _stamp(int(fetched_at * 1000) if fetched_at else None, offset_hours)
 
     inner = f"""<div class=app>
@@ -4071,7 +4189,7 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
       <h1>内容监控面板</h1>
       <p class=lede>{lede}</p>
     </header>
-    {_outage_note(outages or [])}{stale_note}{domain_note}
+    {_outage_note(outages or [], standby)}{_streak_note(streak, standby, offset_hours)}{stale_note}{domain_note}
     <div class='kpi stagger-in'>{bar}</div>
 
     {_workbench(projects, resolvable=resolvable, reports=reports)}
@@ -4093,7 +4211,8 @@ def overview_page(*, overview: Optional[summary.Overview], error: str,
 
     {_trial_section()}
 
-    {_balance_section(balances or [], balance_error, runway, config, outages or [])}
+    {_balance_section(balances or [], balance_error, runway, config, outages or [],
+                      standby, offset_hours)}
 
     {_runs_section(runs or [], log_error, offset_hours)}
   </div>

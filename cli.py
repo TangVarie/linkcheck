@@ -33,7 +33,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from xhsearch import (daily_report, feishu, negatives as negatives_mod, panel_settings,
-                      providers, rows as rows_mod, runlock, runner, schema, tablespec)
+                      providers, rows as rows_mod, runlock, runner, schema, standby,
+                      tablespec)
 from xhsearch.config import Budget, Channels, Settings
 from xhsearch.envfile import load_dotenv
 
@@ -238,6 +239,39 @@ def _negative_ledger(settings: Settings):
     workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
     store = panel_settings.SettingsStore(workspace, workspace.table, registry_table.app_token)
     return negatives_mod.Ledger(store, settings)
+
+
+def _read_standby_cell() -> str | None:
+    """面板上那个「SocialDataX 备用通道」开关此刻存的原文（没有那一行 = None）。
+
+    只读这一个键（带筛选条件去读）：「面板设置」里还存着试跑的账本分段，整张表拉回来
+    是几十万字，每五分钟一轮不值。读不到就抛，由 standby.resolve 按「关」处理。
+    """
+    if not os.environ.get("FEISHU_REGISTRY", "").strip():
+        raise LookupError("没配 FEISHU_REGISTRY，面板上的开关没地方存；"
+                          f"要常开就设 {standby.ENV}=on")
+    app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
+    registry_table = _registry_table(app_id, app_secret)
+    workspace = feishu.Workspace(app_id=app_id, app_secret=app_secret)
+    store = panel_settings.SettingsStore(workspace, workspace.table, registry_table.app_token,
+                                         log=lambda _message: None)
+    return store.read_one(standby.KEY)
+
+
+def _apply_standby(settings: Settings, api_keys: dict[str, str]):
+    """按面板上的开关定这一轮 SocialDataX 当不当备胎（见 xhsearch/standby.py）。
+
+    → (settings, State)；SocialDataX 在哪个平台上都不是备胎（没配它的 Key、或者它就是
+    主通道）时开关管不着，不读飞书，State 是 None。
+    """
+    if not standby.standby_platforms(settings.channels, api_keys):
+        return settings, None
+    try:
+        state = standby.resolve(os.environ, _read_standby_cell)
+    except ValueError as exc:
+        sys.exit(f"❌ {exc}")
+    settings.channels = standby.apply(settings.channels, api_keys, state.enabled)
+    return settings, state
 
 
 def _journal_report(journal, table, report, run_id: str, *, started: bool = True,
@@ -606,6 +640,9 @@ def cmd_doctor(selected: list[str] | None = None) -> int:
 
     print("\n④ 数据通道 …")
     keys = _api_keys()
+    settings, standby_state = _apply_standby(settings, keys)
+    if standby_state is not None:
+        print(f"   SocialDataX 备用通道：{standby_state.describe()}")
     for platform in ("xhs", "douyin"):
         order = settings.channels.for_platform(platform)
         live = providers.usable_order(settings.channels, platform, keys)
@@ -804,8 +841,11 @@ def _refresh_table(mode: str, record_ids: list[str] | None, settings: Settings,
     print(f"待刷 {len(row_list)} 行，预计花费 ≈ ¥{yuan:.2f}"
           f"（按各行实际会走的通道计价："
           f"小红书主走 {_display_channel('xhs')}，"
-          f"抖音主走 {_display_channel('douyin')}；"
-          "提不出数字 ID 的抖音链接按 socialdatax 计）")
+          f"抖音主走 {_display_channel('douyin')}"
+          + ("；提不出数字 ID 的抖音链接按 socialdatax 计）"
+             if api_keys.get(providers.SOCIALDATAX)
+             and providers.SOCIALDATAX in settings.channels.for_platform("douyin")
+             else "）"))
     if settings.budget.describe() != "无上限":
         print(f"  本轮硬预算：{settings.budget.describe()}（超出的行保持原样，留给下一轮）")
 
@@ -1087,6 +1127,9 @@ def _run(mode: str, record_ids: list[str] | None,
     if not api_keys:
         sys.exit("一个数据通道的 Key 都没配：需要 TIKHUB_API_KEY 或 SOCIALDATAX_API_KEY"
                  "（参考 .env.example）")
+    # SocialDataX 当不当备胎听面板上的开关（默认关）。在拿租约之前定下来：
+    # 环境变量写错了要在发任何请求之前退出。
+    settings, standby_state = _apply_standby(settings, api_keys)
 
     # —— 运行租约（ROB-001）：同一时刻只允许一个付费执行者 ——
     # 拿不到就干净退出，一个付费请求都不发。RUN_LOCK_DISABLED=1 可以关掉
@@ -1107,7 +1150,8 @@ def _run(mode: str, record_ids: list[str] | None,
             print(f"⚠ 拿不到运行租约的锁文件（{exc}）：本轮**没有**跨进程互斥保护。"
                   "  设一个可写的 RUN_LOCK_PATH，或确认只有一个调度器在跑。")
     try:
-        return _run_locked(mode, record_ids, selected, settings, api_keys)
+        return _run_locked(mode, record_ids, selected, settings, api_keys,
+                           standby_state=standby_state)
     finally:
         if lease is not None:
             lease.release()
@@ -1115,7 +1159,8 @@ def _run(mode: str, record_ids: list[str] | None,
 
 def _run_locked(mode: str, record_ids: list[str] | None,
                 selected: list[str] | None,
-                settings: Settings, api_keys: dict[str, str]) -> int:
+                settings: Settings, api_keys: dict[str, str], *,
+                standby_state: "standby.State | None" = None) -> int:
     tables = _tables(selected)
     now = datetime.now(timezone.utc)
     multi = len(tables) > 1
@@ -1131,6 +1176,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
         # 日志里一个字都没有。
         print("⚠ 本轮**没有金额上界**（MAX_YUAN_PER_RUN 未设）"
               "——建议设一个，见 .env.example")
+    if standby_state is not None:
+        # 每一轮都打：「TikHub 出事那几轮为什么没降级」第一个要查的就是这一行。
+        print(f"⚙ SocialDataX 备用通道：{standby_state.describe()}")
 
     # 软截止是整次运行的预算，不是每张表各领一份——在这里算一次绝对
     # 截止点传给每张表共享，五张表就不会把时限放大成五倍。
@@ -1156,7 +1204,9 @@ def _run_locked(mode: str, record_ids: list[str] | None,
     runner.emit(on_event, runner.EVENT_RUN_START, mode=mode,
                 tables=[label for label, _ in tables],
                 started_at=now.isoformat(),
-                budget=settings.budget.describe())
+                budget=settings.budget.describe(),
+                # None = 开关管不着（SocialDataX 在哪儿都不是备胎）。
+                standby=None if standby_state is None else standby_state.enabled)
 
     def _finish(code: int, error: str = "") -> int:
         """收尾事件。**每一条退出路径都要经过它。**

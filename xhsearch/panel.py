@@ -58,8 +58,9 @@ from urllib.parse import parse_qs, urlparse
 
 from . import balance as balance_mod
 from . import (channels as channels_mod, feishu, negatives, panel_fonts, panel_settings,
-               panel_view, provision, railway, readout, registry, report_ai as report_ai_mod,
-               schema, summary, tablespec, trial as trial_mod)
+               panel_view, provision, railway, readout, registry,
+               report_ai as report_ai_mod, schema, standby as standby_mod, summary,
+               tablespec, trial as trial_mod)
 
 tablespec_BadTarget = tablespec.BadTarget
 from .config import Settings
@@ -1593,6 +1594,97 @@ class DailyReports:
         self.warning = ""
 
 
+class Standby:
+    """面板上那个「SocialDataX 备用通道」开关。存什么、关着意味着什么，见 standby.py。
+
+    读：只读这一个键（`read_one` 带筛选条件，不把试跑账本那几十万字拉回来），
+    结果在进程里留 CACHE_SECONDS；读失败一分钟后再试，期间显示「读不到」——cron 那头
+    读不到也按关，两边说的是同一件事。
+    写：只有面板写它。读和写在同一把锁里：一次慢的读不会在写完之后把旧值盖回来。
+    """
+
+    RETRY_SECONDS = 60.0
+
+    def __init__(self, projects: "Projects", settings: Settings, api_keys: Any, *,
+                 environ: Optional[dict] = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time):
+        self.projects = projects
+        self.settings = settings
+        self.keys = standby_mod.keys_of(api_keys)
+        self._environ = os.environ if environ is None else environ
+        self._clock = clock
+        self._wall = wall
+        self._lock = threading.Lock()
+        self._state: Optional[standby_mod.State] = None
+        self._read_at: Optional[float] = None
+
+    def platforms(self) -> list:
+        """按**通道顺序**判它在哪儿是备胎，不看面板自己配了哪些 Key：文档建议面板服务上
+        不配上游 Key，面板看不到 cron 那边的 Key，开关照样得摆出来。"""
+        return standby_mod.standby_platforms(self.settings.channels, None)
+
+    def _forced(self) -> Optional[standby_mod.State]:
+        """钉在环境变量里的（或者环境变量写错了）。None = 听面板的。"""
+        try:
+            forced = standby_mod.env_override(self._environ)
+        except ValueError as exc:
+            # cron 那头遇到它会直接退出；面板不退出，把话说出来。
+            return standby_mod.State(error=str(exc), source=standby_mod.SOURCE_ENV)
+        if forced is None:
+            return None
+        return standby_mod.State(enabled=forced, source=standby_mod.SOURCE_ENV)
+
+    def state(self) -> standby_mod.State:
+        """此刻的开关。**从不抛。**"""
+        forced = self._forced()
+        if forced is not None:
+            return forced
+        if not self.projects.enabled:
+            return standby_mod.State(error="没配 FEISHU_REGISTRY，开关没地方存")
+        with self._lock:
+            now = self._clock()
+            if self._state is not None and self._read_at is not None:
+                ttl = self.RETRY_SECONDS if self._state.error else panel_settings.CACHE_SECONDS
+                if now - self._read_at < ttl:
+                    return self._state
+            state = standby_mod.resolve(
+                {}, lambda: self.projects._store().read_one(standby_mod.KEY))
+            self._state, self._read_at = state, now
+            return state
+
+    def view(self) -> standby_mod.View:
+        state = self.state()
+        why = ""
+        if state.locked:
+            why = (state.error or
+                   f"钉在环境变量 {standby_mod.ENV}={'on' if state.enabled else 'off'} 里了；"
+                   "要改去 Railway 改这个变量（cron 和面板两个服务都要改）")
+        elif not self.projects.enabled:
+            why = self.projects.why_disabled()
+        return standby_mod.View(state=state, platforms=tuple(self.platforms()), why_locked=why,
+                                key_seen=bool(self.keys.get(standby_mod.NAME)))
+
+    def set(self, enabled: bool) -> standby_mod.State:
+        """改开关。改不了（钉死了、没地方存）抛 PermissionError；写飞书失败照原样抛。"""
+        view = self.view()
+        if not view.writable:
+            raise PermissionError(view.why_locked or "SocialDataX 在哪个平台上都不是备胎，"
+                                  "这个开关管不着")
+        now_ms = int(self._wall() * 1000)
+        with self._lock:
+            self.projects._store().set_json(standby_mod.KEY,
+                                            standby_mod.stored_value(enabled, now_ms))
+            self._state = standby_mod.State(enabled=bool(enabled), changed_at_ms=now_ms,
+                                            source=standby_mod.SOURCE_PANEL)
+            self._read_at = self._clock()
+            return self._state
+
+    def channels(self):
+        """按开关算出来的通道顺序——「哪条通道下线了」要按 cron 真正会走的那几家算。"""
+        return standby_mod.apply(self.settings.channels, self.keys, self.state().enabled)
+
+
 class Resolutions:
     """运营在面板上点的「已解决」。**不写业务表**——存在注册表 base 的「面板设置」
     表（键 todo.resolved，见 panel_settings），出页面之前按它把行收起来；
@@ -2159,6 +2251,8 @@ class _Deps:
     report_drafts: Optional["report_ai_mod.ReportDrafts"] = None
     # 「搜索可见试跑」那一栏（见 trial.py）。None = 没接登记表，那一栏只说一句怎么接。
     trial: Optional["trial_mod.Trial"] = None
+    # 「SocialDataX 备用通道」开关（见 standby.py）。None = 只测渲染的用例。
+    standby: Optional[Standby] = None
     throttle: LoginThrottle = field(default_factory=LoginThrottle)
     render_login: Callable[[str], str] = lambda message: ""
     render_page: Callable[..., str] = lambda **kw: ""
@@ -2381,6 +2475,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._queue_action()
         if path == "/api/resolve":
             return self._resolve_action()
+        if path == "/api/standby":
+            return self._standby_action()
         if path == "/api/refresh":
             # 只是让缓存立刻重取一遍飞书数据和 Railway 日志。
             # **不发任何付费请求。**
@@ -2391,6 +2487,31 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self.deps.balances.get(force=True)
             return self._send_json(200, self._overview_payload())
         return self._send_json(404, {"error": "not found"})
+
+    def _standby_action(self):
+        """开 / 关 SocialDataX 备用通道。**不发任何付费请求**——只写「面板设置」那一格，
+        cron 下一轮开跑时读到它。"""
+        sb = self.deps.standby
+        if sb is None:
+            return self._send_json(400, {"error": "面板没接上这个开关"})
+        body = self._read_body()
+        if body is None:
+            return None
+        try:
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+                raise ValueError("要 {\"enabled\": true|false}")
+        except (ValueError, TypeError) as exc:
+            return self._send_json(400, {"error": f"请求体不对：{exc}"})
+        try:
+            state = sb.set(payload["enabled"])
+        except PermissionError as exc:
+            return self._send_json(409, {"error": str(exc)})
+        except Exception as exc:                                # noqa: BLE001
+            return self._send_json(502, {"error": f"写「面板设置」失败（{type(exc).__name__}: "
+                                                  f"{exc}），开关没改，稍后再试"})
+        return self._send_json(200, {"enabled": state.enabled,
+                                     "changed_at_ms": state.changed_at_ms})
 
     def _report_ai_action(self):
         """按需生成单项目日报草稿。AI 调用是 POST + CSRF，不进入任何轮询。"""
@@ -2621,12 +2742,15 @@ class PanelHandler(BaseHTTPRequestHandler):
         runs, log_error = self._runs()
         balances, balance_error = self._balances()
         resolutions = self.deps.resolutions
+        sb = self.deps.standby
         return self.deps.render_page(
             overview=overview, error=error, fetched_at=fetched_at,
             config=self.deps.config, runs=runs, log_error=log_error,
             balances=balances, balance_error=balance_error,
             runway=runway_from_runs(balances, runs),
             outages=self._outages(balances),
+            standby=sb.view() if sb is not None else None,
+            streak=channels_mod.failing_streak(runs),
             resolvable=bool(resolutions and resolutions.enabled),
             csrf=csrf_token(self.deps.config, self._session_token()))
 
@@ -2638,6 +2762,10 @@ class PanelHandler(BaseHTTPRequestHandler):
         settings = self.deps.settings
         if settings is None:
             return []
+        if self.deps.standby is not None:
+            # 备用通道关着时 cron 根本不会走 SocialDataX：TikHub 空了就是「巡查停了」，
+            # 不是「降到了 SocialDataX」。按 cron 真正会走的顺序算。
+            settings = dataclasses.replace(settings, channels=self.deps.standby.channels())
         return channels_mod.outages(balances, settings, self.deps.config.api_keys)
 
     def _balances(self):
@@ -3094,6 +3222,7 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
                  reports: Optional["DailyReports"] = None,
                  report_drafts: Optional["report_ai_mod.ReportDrafts"] = None,
                  trial: Optional["trial_mod.Trial"] = None,
+                 standby: Optional[Standby] = None,
                  render_login=None, render_page=None,
                  host: str = "0.0.0.0") -> PanelServer:
     from . import panel_view
@@ -3101,7 +3230,7 @@ def build_server(config: PanelConfig, cache: Cache, *, logs: Optional[LogFeed] =
         config=config, cache=cache, settings=settings, logs=logs,
         balances=balances, projects=projects, queueing=queueing,
         resolutions=resolutions, reports=reports, report_drafts=report_drafts,
-        trial=trial,
+        trial=trial, standby=standby,
         render_login=render_login or panel_view.login_page,
         render_page=render_page or panel_view.overview_page,
     )
@@ -3165,7 +3294,8 @@ def serve(config: PanelConfig, produce: Callable[[], summary.Overview],
                           projects=projects, queueing=queueing,
                           settings=resolved, resolutions=resolutions, reports=reports,
                           report_drafts=report_drafts,
-                          trial=build_trial(config, projects, resolved))
+                          trial=build_trial(config, projects, resolved),
+                          standby=Standby(projects, resolved, config.api_keys))
     cache.start()
     # 日志和余额也先在后台取一趟：第一个打开面板的人不用等 Railway 和两家余额接口。
     if logs.enabled:

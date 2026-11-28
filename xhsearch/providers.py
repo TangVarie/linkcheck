@@ -507,7 +507,8 @@ _TIKHUB_HINTS: list[tuple[tuple[str, ...], Failure, bool]] = [
 ]
 
 
-def _tikhub_error(payload: dict[str, Any], http_status: int, api_key: str) -> Err:
+def _tikhub_error(payload: dict[str, Any], http_status: int, api_key: str,
+                  purpose: str = "") -> Err:
     # Cloudflare 的拦截长得完全不像 TikHub 的业务错误：没有 detail 信封，
     # 带的是 error_code / error_name / ray_id，而且 HTTP 是 403。
     # 403 默认会被归成 AUTH，那是错的——这不是 Key 的问题，是这条出口被拦了。
@@ -551,6 +552,21 @@ def _tikhub_error(payload: dict[str, Any], http_status: int, api_key: str) -> Er
         kind, definitive = Failure.RATE_LIMIT, True
     elif http_status >= 500 or http_status == 0:
         kind, definitive = Failure.TRANSPORT, True
+    elif http_status == 400 and purpose != SEARCH:
+        # 2026-11-28 北京时间 07:36–13:11，TikHub 对**每一个**请求都回 400
+        # 「请求失败，请重试……本次请求不会被扣费」。以前这里归 UNKNOWN（行级失败），
+        # 它不在 FAILOVER_KINDS 里，配好的 SocialDataX 一次都没被尝试：五个半小时
+        # 每一行都是「刷新失败」，备胎一分没花、一行没救。
+        #
+        # 单看一次 400 分不清是「参数它不认」（实测 note_id=zzzz 也回 400、不计费）
+        # 还是「它自己那一步挂了」（这次事故、2026-10 它跟短链时好时坏）——但两种的
+        # 正确处置一样：换一家试。TikHub 明说 400 不计费，换通道不会让这一次花两份钱。
+        # 备胎开没开由运营在面板上定（standby.py）；没开时和以前一样，这一行
+        # 「刷新失败」、原文写进诊断信息。
+        #
+        # 搜索不在内：搜索可见试跑只走 TikHub，没有备胎可换，而它的账本把
+        # TRANSPORT 当「再试一次」——为一句分不清的 400 多记一笔账不值。
+        kind, definitive = Failure.TRANSPORT, False
     else:
         kind, definitive = Failure.UNKNOWN, False
 
@@ -1063,7 +1079,7 @@ def _tikhub_parse(platform: str, purpose: str, http_status: int, content_type: s
     # 失败信封：整个错误对象塞在 detail 里。也兜住 Cloudflare 拦截时那种
     # 完全不同形状的响应（有 error_code / title，没有 detail）。
     if isinstance(payload.get("detail"), dict) or http_status >= 400:
-        return _tikhub_error(payload, http_status, api_key)
+        return _tikhub_error(payload, http_status, api_key, purpose)
 
     rid = str(payload.get("request_id") or request_id or "")
     return _tikhub_normalize(platform, purpose, payload, http_status, rid, api_key)

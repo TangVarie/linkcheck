@@ -18,6 +18,8 @@
 * `share.editor_chats`  → `[{"chat_id": "oc_…", "name": "梨响运营群"}, …]`
 * `todo.resolved`       → `{"tbl…/rec…": {"reasons": ["有负面"], "seen": 毫秒, "at": 毫秒}, …}`
   面板上点的「已解决」（见 panel.Resolutions、summary.apply_resolutions）。
+* `channels.standby`    → `{"enabled": true, "at": 毫秒}`：SocialDataX 备用通道开关
+  （见 standby.py）。面板写，cron 每一轮开跑时只读这一个键。没有这一行 = 关。
 * `trial.search.*`      → 搜索可见试跑的账本、拿到过的页、租约和最近一份报告
   （见 trial.py）。账本比一个单元格装得下的大，所以是切成几段存的——那几段不是
   JSON，走下面的 `read_texts` / `write_text`（原样的文本）。

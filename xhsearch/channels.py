@@ -255,3 +255,57 @@ def _group(records: list) -> list:
             if item not in outage.lost:
                 outage.lost.append(item)
     return list(found.values())
+
+
+# —— 「最近几轮一行都没刷成」——————————————————————————————————————————————
+#
+# 上面那一套只看**余额**。2026-11-28 那次 TikHub 余额好好的，只是对每个请求都回
+# 400，面板上的余额卡全是绿的；五个半小时里唯一的痕迹是待办里一行行冒出来的
+# 「刷新失败」——看着像几条帖子出了问题，而不是整条通道停了。
+#
+# 这里换一个口径：直接看运行历史（Railway 日志里每张表的汇总，零费用）。连着几轮
+# 处理过行、而且**一行都没成功**，那就不是哪几条帖子的事。它说不出是哪一家的问题
+# （表级汇总里只有「用了谁」，全失败的轮子这一栏是空的），所以只说现象、指路去看
+# 运行历史，再给出能做的那一件事（打开备用通道）。
+
+# 门槛：至少连着两轮、合计至少三行。一条坏链接被人连勾两次「排队刷新」是两轮各一行，
+# 凑不到三行，不该把它报成通道故障。
+STREAK_MIN_RUNS = 2
+STREAK_MIN_ROWS = 3
+_FAILED = "刷新失败"           # rows.STATUS_FAILED；不 import rows，免得这一层牵出整套行逻辑
+
+
+@dataclass(frozen=True)
+class FailingStreak:
+    runs: int                   # 连着几轮
+    rows: int                   # 这几轮合计处理了多少行（全是刷新失败）
+    since: Optional[float]      # 最早那一轮的开跑时刻（epoch 秒）；日志里没有就是 None
+
+
+def failing_streak(runs: Any) -> Optional[FailingStreak]:
+    """最近连着几轮「处理过行、一行都没刷成」。没有（或不够门槛）→ None。
+
+    `runs` 是 railway.build_runs 的结果，最近的排前面。没处理行的空轮（没到期）
+    既不算证据、也不打断——cron 五分钟一轮，大部分轮子本来就是空的。
+    """
+    count = rows = 0
+    since: Optional[float] = None
+    for run in runs or []:
+        tables = getattr(run, "tables", None) or []
+        attempted = sum(int(getattr(t, "rows", 0) or 0) for t in tables)
+        if attempted <= 0:
+            continue
+        failed = 0
+        for table in tables:
+            try:
+                failed += int((getattr(table, "counts", None) or {}).get(_FAILED, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        if failed < attempted:
+            break
+        count += 1
+        rows += attempted
+        since = getattr(run, "started_at", None) or since
+    if count >= STREAK_MIN_RUNS and rows >= STREAK_MIN_ROWS:
+        return FailingStreak(runs=count, rows=rows, since=since)
+    return None
